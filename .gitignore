@@ -1,0 +1,14 @@
+# build artifacts
+target/
+zig-out/
+.zig-cache/
+*.o
+*.so
+
+# vendored / toolchain (documented in .spike/vt-spike/README.md)
+vendor/
+.tools/
+
+# state
+*.key
+*.sock

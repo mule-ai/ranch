@@ -1,0 +1,9 @@
+[package]
+name = "vt-spike"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+
+[profile.release]
+opt-level = 2
