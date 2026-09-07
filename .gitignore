@@ -3,12 +3,17 @@ target/
 zig-out/
 .zig-cache/
 *.o
-*.so
 
-# vendored / toolchain (documented in .spike/vt-spike/README.md)
+# prebuilt shared lib (rebuild per .spike/vt-spike/README.md)
+.spike/vt-spike/lib/
+
+# vendored ghostty source (shallow clone, pinned in docs/SPEC.md §11)
 vendor/
+
+# toolchain
 .tools/
 
-# state
+# secrets / state
 *.key
 *.sock
+*.env
