@@ -470,12 +470,12 @@ Rust edition 2024, stable toolchain (matches forge: rustc 1.98).
 
 ## 12. MVP milestones
 
-- **M0 — spike (1–2 d)**: hello-world embedding `libghostty-vt` in
-  Rust: feed PTY output from a shell, extract dirty rows, print them.
-  Validates: build story for the C lib, API surface (rows/cursor/
-  scrollback/resize/key-encode), and that the coalesced-grid approach
-  works for real programs (bash, vim, TUI apps). **Gate: go/plan-B
-  decision (§4.1).**
+- **M0 — spike**: ✅ **DONE 2026-09-07 (PASS)** — `.spike/vt-spike`: Rust
+  binary (zero cargo deps) drives a PTY shell, feeds output into
+  `libghostty-vt`, diffs the formatted screen every 250 ms, emits
+  changed rows. Pinned ghostty commit:
+  `82232ecde55405559dec29c5466cb9e39938cb41` (libghostty-vt.so.0,
+  deps: libc/libm only). Go/Plan-B gate: **go**.
 - **M1 — local multiplexer (core)**: `ranchd` + `ranch` CLI/attach,
   unix socket only. Sessions/panes, split/switch/rename/kill,
   scrollback, resize/reflow, state file, systemd unit. Acceptance:
