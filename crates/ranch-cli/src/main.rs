@@ -556,13 +556,44 @@ impl CloudCfg {
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
         std::path::PathBuf::from(home).join(".config/ranch/config.json")
     }
-    fn load() -> Option<CloudCfg> {
-        let text = std::fs::read_to_string(Self::path()).ok()?;
-        let v: serde_json::Value = serde_json::from_str(&text).ok()?;
-        Some(CloudCfg {
-            supabase_url: v["supabase_url"].as_str()?.to_string(),
-            anon_key: v["anon_key"].as_str()?.to_string(),
-        })
+    /// Baked-in defaults (the Ranch project). Overridable via
+    /// `ranch config` (writes config.json) or RANCH_SUPABASE_URL /
+    /// RANCH_ANON_KEY env vars.
+    fn default_cfg() -> CloudCfg {
+        CloudCfg {
+            supabase_url: option_env!("RANCH_DEFAULT_SUPABASE_URL")
+                .unwrap_or("https://prqfseydoxyingbkmiic.supabase.co")
+                .to_string(),
+            anon_key: option_env!("RANCH_DEFAULT_ANON_KEY").unwrap_or(
+                "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBycWZzZXlkb3h5aW5nYmttaWljIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODg4NDk2NzQsImV4cCI6MjEwNDQyNTY3NH0.lGEKMCE_dWvIDrkXjdXz3KTZtC7Nbd9EtBDSmRYJ3mU",
+            ).to_string(),
+        }
+    }
+    fn load() -> CloudCfg {
+        // env override > config.json > baked-in default
+        if let (Ok(u), Ok(k)) = (
+            std::env::var("RANCH_SUPABASE_URL"),
+            std::env::var("RANCH_ANON_KEY"),
+        ) {
+            return CloudCfg {
+                supabase_url: u.trim_end_matches('/').to_string(),
+                anon_key: k,
+            };
+        }
+        if let Ok(text) = std::fs::read_to_string(Self::path()) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                if let (Some(u), Some(k)) = (
+                    v["supabase_url"].as_str(),
+                    v["anon_key"].as_str(),
+                ) {
+                    return CloudCfg {
+                        supabase_url: u.to_string(),
+                        anon_key: k.to_string(),
+                    };
+                }
+            }
+        }
+        Self::default_cfg()
     }
     fn save(&self) -> Result<(), String> {
         let p = Self::path();
@@ -685,10 +716,7 @@ fn jwt_claims(jwt: &str) -> Option<serde_json::Value> {
 /// redirect. Simplest robust path for a CLI: device-less browser flow
 /// with localhost callback listener.
 fn cmd_login(email: Option<String>) {
-    let cfg = match CloudCfg::load() {
-        Some(c) => c,
-        None => die("login: no cloud config — run `ranch config <supabase-url> <anon-key>` first"),
-    };
+    let cfg = CloudCfg::load();
     let session = match email {
         // email/password fallback: works before Google OAuth is configured
         // and on headless machines.
@@ -796,7 +824,7 @@ fn ensure_session(cfg: &CloudCfg) -> UserSession {
 
 /// List all machines owned by the logged-in user, with sessions count.
 fn cmd_machines() {
-    let cfg = CloudCfg::load().unwrap_or_else(|| die("no cloud config — run `ranch config`"));
+    let cfg = CloudCfg::load();
     let s = ensure_session(&cfg);
     let (status, body) = http_json(
         "GET",
@@ -828,7 +856,7 @@ fn cmd_machines() {
 
 /// List sessions across all machines (or one), from the mirror.
 fn cmd_cloud_sessions(machine: Option<String>) {
-    let cfg = CloudCfg::load().unwrap_or_else(|| die("no cloud config — run `ranch config`"));
+    let cfg = CloudCfg::load();
     let s = ensure_session(&cfg);
     let mut url = format!(
         "{}/rest/v1/sessions?select=id,name,kind,machine_id,machines_info!inner(name)&order=name",
@@ -1003,8 +1031,7 @@ fn urldecode(s: &str) -> String {
 /// user's account via the register_machine RPC (no service role needed).
 /// Prints the machine key once and writes 0600 daemon.toml for ranchd.
 fn cmd_register(name: Option<String>) {
-    let cfg = CloudCfg::load()
-        .unwrap_or_else(|| die("register: no cloud config — run `ranch config <url> <anon-key>` first"));
+    let cfg = CloudCfg::load();
     let session = ensure_session(&cfg);
 
     let name = name.unwrap_or_else(|| {

@@ -575,7 +575,11 @@ Rust edition 2024, stable toolchain (matches forge: rustc 1.98).
   unregister also clean up the auth user. Multiple daemons per
   account fully supported (RLS: machines.user_id = auth.uid()).
   Client state: ~/.config/ranch/config.json (public) + user.json
-  (0600, refreshable). Google provider must be enabled in the
+  (0600, refreshable). Cloud config resolution: RANCH_SUPABASE_URL /
+  RANCH_ANON_KEY env > config.json > baked-in defaults (the Ranch
+  project's URL + anon key, which are public identifiers), so `ranch
+  login` works out of the box for this project and self-hosters can
+  point their builds elsewhere via `make` env or `ranch config`. Google provider must be enabled in the
   Supabase dashboard (external_google_enabled) + redirect
   http://localhost:8737/callback added to the allow-list.
 - **M3 — mobile app**: Expo app, auth, machine/session lists, attach

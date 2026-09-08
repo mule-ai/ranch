@@ -1,0 +1,6 @@
+Script started on 2026-09-08 11:42:56-04:00 [COMMAND="ranch login x@y.z" <not executed on terminal>]
+wrongpw
+password: 
+ranch: login: POST http://127.0.0.1:9/auth/v1/token?grant_type=password: io: Connection refused
+
+Script done on 2026-09-08 11:42:56-04:00 [COMMAND_EXIT_CODE="1"]
