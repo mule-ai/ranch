@@ -11,3 +11,5 @@ libc = { workspace = true }
 uuid = { version = "1", features = ["v4"] }
 crossterm = "0.28"
 ratatui = "0.29"
+ureq = { version = "3", default-features = false, features = ["rustls", "json"] }
+sha2 = "0.10"

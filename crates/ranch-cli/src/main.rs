@@ -541,14 +541,243 @@ fn cmd_attach(ref_: &str) {
 
 // ---------- main ----------
 
+// ---------- cloud commands (M2) ----------
+
+mod cloud {
+    use serde_json::Value;
+
+    pub struct AdminEnv {
+        pub supabase_url: String,
+        pub anon_key: String,
+        pub service_role: String,
+        pub owner_email: String,
+        pub owner_password: String,
+    }
+
+    /// Parse the admin env file written once per Supabase project.
+    pub fn load_admin_env() -> Result<AdminEnv, String> {
+        let home = std::env::var("HOME").map_err(|_| "no HOME".to_string())?;
+        let path = std::path::PathBuf::from(home).join(".config/ranch/supabase-project.env");
+        let text = std::fs::read_to_string(&path)
+            .map_err(|e| format!("read {}: {e}", path.display()))?;
+        let get = |key: &str| -> Option<String> {
+            for line in text.lines() {
+                let i = line.find('=')?;
+                if line[..i].trim() == key {
+                    let mut v = line[i + 1..].trim().to_string();
+                    if v.starts_with('"') && v.ends_with('"') {
+                        v = v[1..v.len() - 1].to_string();
+                    }
+                    return Some(v);
+                }
+            }
+            None
+        };
+        let need = |k: &str| {
+            get(k).ok_or_else(|| format!("{k} missing in {}", path.display()))
+        };
+        Ok(AdminEnv {
+            supabase_url: need("SUPABASE_URL")?.trim_end_matches('/').to_string(),
+            anon_key: need("ANON_KEY")?,
+            service_role: need("SUPABASE_SERVICE_ROLE")?,
+            owner_email: need("OWNER_EMAIL")?,
+            owner_password: need("OWNER_PASSWORD")?,
+        })
+    }
+
+    fn post_json(url: &str, headers: &[(&str, String)], body: Value) -> Result<(u16, Value), String> {
+        let mut req = ureq::post(url);
+        for (k, v) in headers {
+            req = req.header(*k, v.as_str());
+        }
+        let mut resp = req
+            .send_json(body)
+            .map_err(|e| format!("POST {url}: {e}"))?;
+        let status = resp.status().as_u16();
+        let v: Value = resp.body_mut().read_json().unwrap_or(Value::Null);
+        Ok((status, v))
+    }
+
+    /// Owner password login -> (jwt, user id from `sub` claim).
+    pub fn owner_login(env: &AdminEnv) -> Result<(String, String), String> {
+        let (status, body) = post_json(
+            &format!("{}/auth/v1/token?grant_type=password", env.supabase_url),
+            &[("apikey", env.anon_key.clone())],
+            serde_json::json!({"email": env.owner_email, "password": env.owner_password}),
+        )?;
+        if status != 200 {
+            return Err(format!("owner login failed: {body}"));
+        }
+        let jwt = body["access_token"]
+            .as_str()
+            .ok_or("no access_token")?
+            .to_string();
+        // decode the sub claim from the JWT payload (no verification needed;
+        // it just came over TLS from Supabase)
+        let mid = jwt.split('.').nth(1).ok_or("malformed jwt")?;
+        let pad = (4 - mid.len() % 4) % 4;
+        let decoded = base64_decode_url(&format!("{}{}", mid, "=".repeat(pad)))
+            .ok_or("malformed jwt payload")?;
+        let claims: Value = serde_json::from_slice(&decoded).map_err(|e| e.to_string())?;
+        let uid = claims["sub"]
+            .as_str()
+            .ok_or("no sub in jwt")?
+            .to_string();
+        Ok((jwt, uid))
+    }
+
+    pub fn base64_decode_url(s: &str) -> Option<Vec<u8>> {
+        // tiny url-alphabet decoder (JWT payloads are unpadded base64url)
+        const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        let val = |b: u8| -> Option<u32> { A.iter().position(|&a| a == b).map(|p| p as u32) };
+        let bytes: Vec<u8> = s.bytes().filter(|&b| b != b'=').collect();
+        let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+        for ch in bytes.chunks(4) {
+            let v0 = val(*ch.first()?)?;
+            let v1 = val(*ch.get(1)?)?;
+            let v2 = ch.get(2).copied().and_then(val).unwrap_or(0);
+            let v3 = ch.get(3).copied().and_then(val).unwrap_or(0);
+            let n = (v0 << 18) | (v1 << 12) | (v2 << 6) | v3;
+            out.push((n >> 16) as u8);
+            if ch.len() > 2 { out.push((n >> 8) as u8); }
+            if ch.len() > 3 { out.push(n as u8); }
+        }
+        Some(out)
+    }
+
+    /// 32 chars of /dev/urandom entropy in a dense but readable alphabet.
+    pub fn gen_machine_key() -> String {
+        const ALPHA: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789";
+        let mut buf = [0u8; 32];
+        fill_random(&mut buf);
+        buf.iter().map(|&b| ALPHA[b as usize % ALPHA.len()] as char).collect()
+    }
+
+    fn fill_random(buf: &mut [u8]) {
+        use std::io::Read;
+        if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+            let _ = f.read_exact(buf);
+        }
+    }
+
+    pub fn sha256_hex(data: &str) -> String {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(data.as_bytes());
+        h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+    }
+}
+
+fn cmd_register(name: Option<String>) {
+    let env = match cloud::load_admin_env() {
+        Ok(e) => e,
+        Err(e) => die(&format!("register: {e} (admin env is provisioned once per Supabase project)")),
+    };
+    let name = name.unwrap_or_else(|| {
+        std::fs::read_to_string("/etc/hostname")
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|_| "ranch".into())
+    });
+    let email = format!("machine-{name}@ranch.local");
+
+    // 0. local config must not already exist for a *different* machine
+    let cfg_path = std::env::var("HOME")
+        .map(|h| std::path::PathBuf::from(h).join(".config/ranch/daemon.toml"))
+        .unwrap_or_else(|_| std::path::PathBuf::from("daemon.toml"));
+    if cfg_path.exists() {
+        die(&format!(
+            "register: {} already exists — delete it first to re-register",
+            cfg_path.display()
+        ));
+    }
+
+    // 1. owner login (for machines.user_id)
+    let (_owner_jwt, owner_id) = cloud::owner_login(&env).unwrap_or_else(|e| die(&format!("register: {e}")));
+
+    // 2. machine key + id
+    let machine_key = cloud::gen_machine_key();
+    let machine_id = Uuid::new_v4().to_string();
+    let key_hash = cloud::sha256_hex(&machine_key);
+
+    // 3. create the machine auth user (service role)
+    let (status, body) = {
+        let url = format!("{}/auth/v1/admin/users", env.supabase_url);
+        let mut resp = ureq::post(&url)
+            .header("apikey", &env.service_role)
+            .header("Authorization", &format!("Bearer {}", env.service_role))
+            .send_json(serde_json::json!({
+                "email": email,
+                "password": machine_key,
+                "email_confirm": true,
+                "user_metadata": {"machine_id": machine_id},
+            }))
+            .unwrap_or_else(|e| die(&format!("register: create auth user: {e}")));
+        let status = resp.status().as_u16();
+        let v: serde_json::Value = resp.body_mut().read_json().unwrap_or(serde_json::Value::Null);
+        (status, v)
+    };
+    if status != 200 && status != 201 {
+        die(&format!("register: auth user creation failed ({status}): {body}"));
+    }
+
+    // 4. machines row (service role bypasses RLS)
+    let url = format!("{}/rest/v1/machines", env.supabase_url);
+    let resp = ureq::post(&url)
+        .header("apikey", &env.service_role)
+        .header("Authorization", &format!("Bearer {}", env.service_role))
+        .header("Prefer", "return=representation")
+        .send_json(serde_json::json!({
+            "id": machine_id,
+            "user_id": owner_id,
+            "key_hash": key_hash,
+            "name": name,
+        }))
+        .unwrap_or_else(|e| die(&format!("register: machines insert: {e}")));
+    if resp.status().as_u16() != 201 {
+        let mut resp = resp;
+        let v: serde_json::Value = resp.body_mut().read_json().unwrap_or_default();
+        die(&format!("register: machines insert failed: {v}"));
+    }
+
+    // 5. daemon.toml (0600) — the machine key lives here, shown once below
+    if let Some(parent) = cfg_path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let cfg_text = format!(
+        "# ranch daemon config — machine credentials (chmod 600).\n\
+         # Generated by `ranch register`; the key is the password of the\n\
+         # machine's Supabase Auth user and gates the Realtime channel.\n\
+         machine_id = \"{machine_id}\"\n\
+         machine_email = \"{email}\"\n\
+         machine_key = \"{machine_key}\"\n\
+         supabase_url = \"{}\"\n\
+         anon_key = \"{}\"\n",
+        env.supabase_url, env.anon_key
+    );
+    std::fs::write(&cfg_path, &cfg_text).unwrap_or_else(|e| die(&format!("register: write config: {e}")));
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&cfg_path, std::fs::Permissions::from_mode(0o600)).ok();
+
+    println!("machine registered");
+    println!("  name:   {name}");
+    println!("  id:     {machine_id}");
+    println!("  config: {}", cfg_path.display());
+    println!();
+    println!("  machine key (shown once, also stored in the config above):");
+    println!("    {machine_key}");
+    println!();
+    println!("restart ranchd to connect the relay.");
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
-        eprintln!("usage: ranch <new|ls|attach|kill|rename|split|switch> [args]");
+        eprintln!("usage: ranch <new|ls|attach|kill|rename|split|switch|register> [args]");
         eprintln!("  socket: {}", socket_path().display());
         std::process::exit(2);
     }
     match args[0].as_str() {
+        "register" => cmd_register(args.get(1).cloned()),
         "new" => cmd_new(args.get(1).cloned()),
         "ls" | "list" => cmd_ls(),
         "attach" => match args.get(1) {

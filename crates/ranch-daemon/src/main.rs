@@ -15,6 +15,10 @@
 //! - sessions do not survive a daemon restart (state.json is written for
 //!   observability; true durability is post-M1)
 //! - single-threaded blocking poll loop: unix socket, clients, pty masters
+//! - when ~/.config/ranch/daemon.toml exists, a relay thread bridges the
+//!   same frames to the machine's Supabase Realtime channel (relay.rs)
+
+mod relay;
 
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{Read, Write};
@@ -33,6 +37,29 @@ const SCROLLBACK_CAP: usize = 2000;
 const POLLIN: i16 = 0x001;
 const POLLHUP: i16 = 0x00200;
 const POLLERR: i16 = 0x00004;
+
+/// Log with the daemon prefix (also used by the relay module).
+pub fn clog(msg: &str) {
+    eprintln!("ranchd: {msg}");
+}
+
+/// Convert unix seconds to (year, month, day, hour, min, sec) UTC.
+pub fn civil_from_unix(secs: i64) -> (i64, u32, u32, u32, u32, u32) {
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let (h, mi, s) = ((rem / 3600) as u32, ((rem % 3600) / 60) as u32, (rem % 60) as u32);
+    // Howard Hinnant's civil_from_days
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d, h, mi, s)
+}
 
 // ---------- pty FFI ----------
 
@@ -96,7 +123,15 @@ struct Session {
 }
 
 struct Client {
-    stream: UnixStream,
+    /// Local clients read frames here; the relay client has None (its
+    /// frames arrive via the relay pipe, read separately in the loop).
+    stream: Option<UnixStream>,
+    /// Frames written here are broadcast to remote clients over the relay.
+    /// Set only for the relay client.
+    relay_out: Option<std::fs::File>,
+    /// Remote frames land on this pipe (read end); set only for the relay
+    /// client. The write end lives in the relay thread.
+    relay_in: Option<std::fs::File>,
     decoder: Decoder,
     name: String,
     /// Session currently attached; None = not attached.
@@ -111,6 +146,8 @@ struct Daemon {
     sessions: BTreeMap<Uuid, Session>,
     clients: BTreeMap<RawFd, Client>,
     state_path: PathBuf,
+    /// send session mirror ops to the relay thread
+    mirror_tx: Option<std::sync::mpsc::Sender<relay::RelayOut>>,
 }
 
 // ---------- helpers ----------
@@ -125,6 +162,13 @@ fn default_socket_path() -> PathBuf {
 
 fn default_shell() -> String {
     std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string())
+}
+
+// SAFETY: takes ownership of a raw fd from pipe2; caller guarantees the
+// fd is not otherwise owned.
+fn fd_file(fd: RawFd) -> std::fs::File {
+    use std::os::fd::FromRawFd;
+    unsafe { std::fs::File::from_raw_fd(fd) }
 }
 
 fn hostname() -> String {
@@ -238,23 +282,20 @@ fn snapshot_session(s: &Session) -> Option<Frame> {
     })
 }
 
-/// Serialize + chunk a frame and write all bytes to the client stream.
+/// Serialize + chunk a frame and write all bytes to the client's sink.
 fn send_frame(c: &mut Client, frame: &Frame) {
     let cid = Uuid::new_v4().to_string();
     for line in ranch_protocol::encode_frame(frame, &cid) {
         let mut bytes = line.into_bytes();
         bytes.push(b'\n');
-        let mut off = 0usize;
-        while off < bytes.len() {
-            match c.stream.write(&bytes[off..]) {
-                Ok(0) => break,
-                Ok(w) => off += w,
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(e) => {
-                    eprintln!("ranchd: write: {e}");
-                    break;
-                }
-            }
+        let res = match (&mut c.stream, &mut c.relay_out) {
+            (Some(s), _) => s.write_all(&bytes),
+            (None, Some(w)) => w.write_all(&bytes),
+            (None, None) => Ok(()),
+        };
+        if let Err(e) = res {
+            eprintln!("ranchd: write: {e}");
+            break;
         }
     }
 }
@@ -276,15 +317,52 @@ impl Daemon {
         std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600)).ok();
         let state_path = socket_path.parent().unwrap().join("state.json");
 
+        // relay: enabled only when `ranch register` has run (daemon.toml)
+        let mut relay_client: Option<Client> = None;
+        let mut mirror_tx = None;
+        if let Some(cfg) = relay::load_config() {
+            match relay::make_pipes() {
+                Ok(((daemon_r, daemon_w), (relay_r, relay_w))) => {
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    relay::spawn(cfg, daemon_w, relay_r, rx);
+                    relay_client = Some(Client {
+                        stream: None,
+                        relay_out: Some(relay_w),
+                        relay_in: Some(fd_file(daemon_r)),
+                        decoder: Decoder::new(),
+                        name: "relay".into(),
+                        attach: None,
+                        scrollback_mode: false,
+                    });
+                    mirror_tx = Some(tx);
+
+                }
+                Err(e) => clog(&format!("relay: disabled: {e}")),
+            }
+        } else {
+            clog("relay: disabled (no ~/.config/ranch/daemon.toml — run `ranch register`)");
+        }
+
         eprintln!("ranchd: machine={}", hostname());
-        Ok(Daemon {
+        let mut daemon = Daemon {
             machine: hostname(),
             socket_path,
             listener,
             sessions: BTreeMap::new(),
             clients: BTreeMap::new(),
             state_path,
-        })
+            mirror_tx,
+        };
+        // register the relay as a client keyed by its read-pipe fd; remote
+        // frames arrive there and daemon->remote frames go out via relay_out
+        if let Some(rc) = relay_client {
+            let rfd = rc.relay_in.as_ref().map(|f| f.as_raw_fd());
+            if let Some(rfd) = rfd {
+                daemon.clients.insert(rfd, rc);
+                clog(&format!("relay: enabled (client fd {rfd})"));
+            }
+        }
+        Ok(daemon)
     }
 
     fn write_state(&self) {
@@ -327,6 +405,13 @@ impl Daemon {
                 ref_id: None,
             })
             .collect()
+    }
+
+    /// Fire-and-forget registry mirror op (no-op when relay disabled).
+    fn mirror(&self, op: relay::RelayOut) {
+        if let Some(tx) = &self.mirror_tx {
+            let _ = tx.send(op);
+        }
     }
 
     /// Deliver a full snapshot to every client attached to a session.
@@ -520,7 +605,7 @@ impl Daemon {
                     active: Uuid::nil(),
                     size: (80, 24),
                 };
-                match spawn_pane(&mut s) {
+                    match spawn_pane(&mut s) {
                     Ok(pid) => {
                         eprintln!("ranchd: created session {name} ({id}) pane {pid}");
                         let ack = Frame::SessionsAck {
@@ -530,6 +615,11 @@ impl Daemon {
                         };
                         self.sessions.insert(id, s);
                         self.write_state();
+                        self.mirror(relay::RelayOut::UpsertSession {
+                            id: id.to_string(),
+                            name,
+                            kind: "shell".into(),
+                        });
                         if let Some(c) = self.clients.get_mut(&from) {
                             send_frame(c, &ack);
                         }
@@ -549,10 +639,18 @@ impl Daemon {
             }
             Frame::SessionsRename { session, name } => {
                 if let Some(sid) = self.resolve_session(session).map(|s| s.id) {
+                    let kind = self.sessions.get(&sid).map(|s| s.kind.clone());
                     if let Some(s2) = self.sessions.get_mut(&sid) {
                         s2.name = name.clone();
                     }
                     self.write_state();
+                    if let Some(kind) = kind {
+                        self.mirror(relay::RelayOut::UpsertSession {
+                            id: sid.to_string(),
+                            name: name.clone(),
+                            kind,
+                        });
+                    }
                 }
             }
             Frame::SessionsKill { session } => {
@@ -561,6 +659,7 @@ impl Daemon {
                         eprintln!("ranchd: killed session {}", s.name);
                     }
                     self.write_state();
+                    self.mirror(relay::RelayOut::DeleteSession { id: sid.to_string() });
                     let gone = Frame::Meta {
                         session: sid.to_string(),
                         pane: None,
@@ -706,11 +805,19 @@ fn main() {
             revents: 0,
         });
         for c in daemon.clients.values() {
-            fds.push(pollfd {
-                fd: c.stream.as_raw_fd(),
-                events: POLLIN,
-                revents: 0,
-            });
+            match (&c.stream, &c.relay_in) {
+                (Some(s), _) => fds.push(pollfd {
+                    fd: s.as_raw_fd(),
+                    events: POLLIN,
+                    revents: 0,
+                }),
+                (None, Some(w)) => fds.push(pollfd {
+                    fd: w.as_raw_fd(),
+                    events: POLLIN,
+                    revents: 0,
+                }),
+                (None, None) => {}
+            }
         }
         for s in daemon.sessions.values() {
             for p in s.panes.values() {
@@ -740,7 +847,9 @@ fn main() {
                 daemon.clients.insert(
                     fd,
                     Client {
-                        stream,
+                        stream: Some(stream),
+                        relay_out: None,
+                        relay_in: None,
                         decoder: Decoder::new(),
                         name: format!("cli-{fd}"),
                         attach: None,
@@ -762,15 +871,35 @@ fn main() {
                 continue;
             }
             let mut buf = [0u8; 65536];
-            let r = match c.stream.read(&mut buf) {
-                Ok(r) => r,
-                Err(e) => {
-                    eprintln!("ranchd: client {fd} read: {e}");
-                    gone.push(*fd);
+            let r = if let Some(stream) = &mut c.stream {
+                match stream.read(&mut buf) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!("ranchd: client {fd} read: {e}");
+                        gone.push(*fd);
+                        continue;
+                    }
+                }
+            } else if let Some(pin) = &mut c.relay_in {
+                use std::os::fd::AsRawFd;
+                let r = unsafe { libc::read(pin.as_raw_fd(), buf.as_mut_ptr() as *mut _, buf.len()) };
+                if r < 0 {
+                    let err = std::io::Error::last_os_error();
+                    if err.kind() != std::io::ErrorKind::Interrupted {
+                        eprintln!("ranchd: relay pipe read: {err}");
+                    }
                     continue;
                 }
+                r as usize
+            } else {
+                continue;
             };
             if r == 0 {
+                // relay client: pipe closing means the thread exited; keep
+                // the client (the thread reconnects and keeps its ends)
+                if c.relay_in.is_some() {
+                    continue;
+                }
                 gone.push(*fd);
                 continue;
             }

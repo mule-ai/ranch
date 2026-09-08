@@ -5,10 +5,15 @@ Supabase Realtime relay. All frames are **JSON objects** ("frames").
 
 - **Local transport**: one frame per line (JSON-lines) over
   `~/.local/state/ranch/daemon.sock`.
-- **Relay transport**: each frame is the `payload` of a Supabase
+- **Relay transport**: each frame is the inner `payload` of a Supabase
   Realtime broadcast message on the private channel
-  `ranch:<machine_id>`:
-  `{"topic":"ranch:<machine_id>","event":"broadcast","payload":<frame>}`.
+  `realtime:machines:<machine_id>`:
+  `{"topic":"realtime:machines:<id>","event":"broadcast",
+    "payload":{"event":"frame","payload":<frame>}}`.
+  The WS URL carries the anon key; the joining user's JWT (machine or
+  owner) rides in the join payload as `access_token`. Realtime gates the
+  channel via RLS on `realtime.messages` (migration 0003): only the
+  machine itself and the owner may read/broadcast.
 
 The relay is a dumb, ordered-per-sender pipe. No assumptions about
 delivery guarantees beyond "usually gets there, in order, per sender."

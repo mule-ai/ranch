@@ -241,7 +241,8 @@ Rust, one process per machine, systemd unit. Responsibilities:
 - **Local server**: unix socket `~/.local/state/ranch/daemon.sock`
   (mode 0600); JSON-lines framing, same frame schema as the relay path.
 - **Relay client**: persistent outbound WebSocket to Supabase Realtime
-  private channel `ranch:<machine_id>`; forwards frames both ways with
+  private channel `realtime:machines:<machine_id>`; forwards
+frames both ways with
   a small routing header (frame is addressed to/from a session+pane or
   to the control plane). Reconnect + resync logic lives here.
 - **Integrators**: `forge` and `mule` clients (HTTP + SSE/WS) used for
@@ -258,8 +259,8 @@ No custom cloud code in MVP.
   daemon does *not* use user auth; it registers with a **machine key**.
 - **Schema** (see §9): `machines`, `sessions` (mirror).
 - **Realtime**: one **private** broadcast channel per machine,
-  `ranch:<machine_id>`. Supabase validates the sender's token against
-  RLS on the channel's topic; only the machine key holder (daemon) and
+  `realtime:machines:<machine_id>`. Realtime validates the joining
+  user's token against RLS on `realtime.messages` (migration 0003): only the machine key holder (daemon) and
   the owner's user JWT can join. The channel is a dumb pipe: all
   framing/semantics is Ranch's protocol.
 - The `sessions` mirror lets the mobile app list sessions even when a
@@ -543,10 +544,23 @@ Rust edition 2024, stable toolchain (matches forge: rustc 1.98).
   struct had a wrong `extra` layout (`i32` vs the real nested struct)
   causing `rc=-2`; (c) cursor x is a char index, not a byte offset —
   TUI slicing panicked on multi-byte prompt chars.
-- **M2 — relay + registration**: Supabase project, schema + RLS,
-  `ranch register`, daemon relay client, raw relay client test tool.
-  Acceptance: frames flow machine→cloud→client with seq-gap resync;
-  offline machine shows stale session list.
+- **M2 — relay + registration**: ✅ **DONE 2026-09-08** — Supabase
+  project `ranch` (us-east-1), schema + RLS (migrations 0001–0003),
+  `ranch register` (machine auth user + machines row + 0600
+  daemon.toml), relay thread in ranchd (tungstenite WS + ureq REST:
+  join/heartbeat/session-mirror/reconnect with backoff), raw test tool
+  `tools/relay-test.mjs`. Key discovery: private Realtime channels are
+  RLS-gated via probe inserts on `realtime.messages`, not the topic's
+  table — migration 0003 adds read/insert policies keyed on
+  `topic = 'machines:' || machine_id`. Relay client = a Client in the
+  daemon's map with pipe fds (remote frames arrive like local ones).
+  **Acceptance PASS:** frames flow machine→cloud→remote (HelloOk,
+  Snapshot, Update with `echo hi` visible at the remote end), remote
+  Input round-trip over the relay, remote SessionsKill (local + cloud
+  mirror converge), session mirror + heartbeat visible via owner JWT
+  while the daemon is offline (stale list), register/unregister.
+  Deferred to M3: seq-gap auto-resync on the client side (protocol
+  support exists; the test tool detects gaps and re-attaches).
 - **M3 — mobile app**: Expo app, auth, machine/session lists, attach
   view with input, scrollback, status. Acceptance: attach to a live
   session on a remote machine from a phone; input works; reconnect on
