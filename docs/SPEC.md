@@ -601,17 +601,22 @@ Rust edition 2024, stable toolchain (matches forge: rustc 1.98).
   view with input, scrollback, status. Acceptance: attach to a live
   session on a remote machine from a phone; input works; reconnect on
   app resume is exact.
-- **M2.7 — real multiplexing UI (next)**: the attach TUI currently
-  renders one full-screen pane; `Layout::Split` trees and pane-level
-  `cols/rows` are already in the protocol. Sub-goals, in order:
-  (a) client renders `Layout::Split` as real side-by-side/stacked
-  panes with per-pane VT state and a focus ring, input routed to the
-  focused pane; (b) session-tree sidebar (machine → session → pane)
-  toggled with `Ctrl-B s`, replacing the flat picker; (c) tmux-style
-  pane resize (`Ctrl-B` + arrows) and pane swap; (d) session windows
-  (session → windows → panes) if needed. Acceptance: split two shells
-  in one session, both visible side-by-side, input goes to the focused
-  pane, resizes reflow both.
+- **M2.7 — real multiplexing UI (2026-09-08)**: splits are now real.
+  The daemon keeps a weighted binary split tree per session
+  (`Layout::Split {dir, pct}`); every pane's PTY is sized to its leaf
+  (`TIOCSWINSZ` → SIGWINCH) and Snapshots carry per-pane sizes + the
+  tree. The attach TUI computes the same rectangles and renders panes
+  side-by-side/stacked with gutter bars and a highlighted border on
+  the focused pane; input routes to the focused pane. tmux bindings:
+  Prefix+`%`/`"` split, Prefix+arrows move focus (geometry-aware
+  neighbor lookup), Prefix+Ctrl-arrows resize (±2 cells, clamped ≥4),
+  Prefix+`x` kills a pane (sibling promoted). `Layout` gained a `pct`
+  field (default 50, back-compat on the wire). **Verified end-to-end**:
+  PTY-driven TUI tests confirm side-by-side render, focus movement,
+  input routing, resize (pct 50→48→54), pane kill (3→2 panes); relay
+  tests confirm remote clients can split and drive both panes through
+  Supabase Realtime. Not done (moved out of scope): session-tree
+  sidebar (flat picker remains), pane swap, windows.
 - **M4 — forge + mule first-class**: forge listing/status/attach
   (§7); mule listing + run-into-pane (§8). Acceptance: start a forge
   session locally, watch it from the phone; run a mule workflow into a

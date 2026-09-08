@@ -65,32 +65,25 @@ per app install for mobile so reconnects are stable).
 
 ### Data (daemon → client, ordered by `seq`)
 
-- **`snapshot`** — full pane state. Chunked (§5). Final chunk carries
-  `"end": true`. Contents:
+- **`snapshot`** — full pane state. Chunked (§5). Carries the session's
+  **split tree** (`layout`) plus one pane-snapshot per pane:
   ```jsonc
   {
-    "cols": 200, "rows": 50,
-    "grid": [[cell, cell, ...], ...],      // row-major, all `rows` rows
-    "cursor": {"x": 12, "y": 7, "hidden": false},
-    "scrollback_top": 8123,                // offset of first line in `history`
-    "history": [[cell,...], ...],          // tail of scrollback (≤ ~200 lines)
-    "title": "work",
-    "meta": {"kind": "shell"} | {"kind":"forge","ref":"<uuid>","status":"running"}
+    "layout": {"k":"split","dir":1,"pct":48,                 // pct = space to `a`
+               "a":{"k":"Leaf","pane":"<uuid>"},
+               "b":{"k":"Leaf","pane":"<uuid>"}},
+    "active_pane": "<uuid>",
+    "panes": [ {"id":"<uuid>", "cols":48, "rows":29,
+                 "lines":["…"], "cursor":{"x":12,"y":7,"visible":true}} ]
   }
   ```
-  A **cell** is compactly encoded:
-  `[text, style-id]` where `style-id` indexes a per-snapshot style
-  table (consecutive same-style cells are merged into one cell):
-  ```jsonc
-  "styles": [ {"fg": "#d8dee9", "bg": null, "bold": true, "ul": false} ]
-  ```
-  `text` is the codepoint string for that run (may be multi-codepoint;
-  wide chars count as 2 cells — renderer must measure, or the daemon
-  may emit padded runs; MVP: daemon pads wide-char runs with U+00A0
-  continuations so runs are cell-aligned).
-- **`update`** — `{"seq": n, "rows": [ [cell,...] ... ]  // absolute row
-  indices in a sibling "rows" map keyed by y, "cursor": {...},
-  "title"?: "..."}`. Semantics: *these rows are now exactly this.*
+  Each pane runs at its own (cols, rows) computed by the daemon from
+  the tree; the client computes screen rectangles the same way and
+  renders pane-by-pane. A single-pane session is `Leaf` and renders
+  borderless full-screen.
+  - **`update`** — `{"pane": "<uuid>", "cols": n, "rows": n, "seq": n,
+  "rows_upd": [[row_index, text], ...], "cursor": {...}}`.
+  Semantics: *these rows are now exactly this* (pane-local indices).
   Coalesced per tick (~30 ms). Droppable: any newer `update` with a
   higher `seq` that covers the same rows supersedes it.
 - **`scrollback`** — paged history: `{"offset": 0, "lines": [[cell,...]]}`
@@ -104,8 +97,18 @@ per app install for mobile so reconnects are stable).
   cols, rows}` → `sessions.ack {session, pane}`
 - **`sessions.rename`** `{session, name}`
 - **`sessions.kill`** `{session}` (kills all panes in it)
-- **`sessions.pane-split`** `{session, pane, "h"|"v"}` → new pane id
-- **`sessions.pane-kill`** `{session, pane}`
+- **`sessions.pane-split`** `{session, pane, dir}` — replaces `pane`'s
+  leaf in the session's split tree with a split node (`dir`: `0` =
+  top/bottom, `1` = left/right; the new pane is the `b` child).
+  Daemon answers with `sessions.ack {session, pane: <new-id>}` and
+  re-snapshots attached clients (sibling shrinks; every pane's PTY is
+  `SIGWINCH`ed at its leaf size).
+- **`sessions.pane-resize`** `{session, pane, dir, delta}` — adjusts the
+  percent split of the node directly containing `pane` along `dir` by
+  `delta` cells (positive grows `pane`'s side). Clamped so every leaf
+  keeps ≥ 4 cells. Daemon re-snapshots on change.
+- **`sessions.pane-kill`** `{session, pane}` — removes the leaf and
+  promotes its sibling subtree.
 - **`sessions.select`** `{session, pane}` — sets the session's active
   pane (used when attaching without a pane, and for UI)
 - **`mule.run`** `{workflow_id, params?}` → spawns/streams a workflow

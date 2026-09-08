@@ -262,6 +262,39 @@ impl Screen {
     }
 }
 
+/// Client-side state for one pane: screen contents + cursor, at the
+/// pane's own (cols, rows) reported by the daemon.
+#[derive(Default, Clone)]
+struct PaneView {
+    lines: Vec<String>,
+    cols: u16,
+    rows: u16,
+    cursor: Option<(u16, u16, bool)>,
+}
+
+impl PaneView {
+    fn apply_snapshot(&mut self, snap: &ranch_protocol::PaneSnap) {
+        self.cols = snap.cols;
+        self.rows = snap.rows;
+        self.lines = snap.lines.clone();
+        self.cursor = snap.cursor.map(|c| (c.x, c.y, c.visible));
+    }
+    fn apply_update(&mut self, cols: u16, rows: u16, rows_upd: &[(u16, String)], cursor: &Option<ranch_protocol::Cursor>) {
+        self.cols = cols;
+        self.rows = rows;
+        self.lines.resize(rows as usize, String::new());
+        for (idx, text) in rows_upd {
+            let idx = *idx as usize;
+            if idx < self.lines.len() {
+                self.lines[idx] = text.clone();
+            }
+        }
+        if let Some(c) = cursor {
+            self.cursor = Some((c.x, c.y, c.visible));
+        }
+    }
+}
+
 fn key_to_bytes(key: &KeyEvent) -> Option<Vec<u8>> {
     if key.kind != KeyEventKind::Press {
         return None;
@@ -301,6 +334,41 @@ fn key_to_bytes(key: &KeyEvent) -> Option<Vec<u8>> {
     }
 }
 
+/// Find the pane rect geometrically adjacent to `cur` in `dirs` from the
+/// rect list produced by the layout walk. Returns the pane id or None.
+#[allow(dead_code)]
+fn neighbor_pane(
+    rects: &[(String, ratatui::layout::Rect)],
+    cur: &str,
+    dir: u8, // 0=up 1=down 2=left 3=right
+) -> Option<String> {
+    let (_, cr) = rects.iter().find(|(p, _)| p == cur)?;
+    let ccx = cr.x + cr.width / 2;
+    let ccy = cr.y + cr.height / 2;
+    let mut best: Option<(u32, &String)> = None;
+    for (pid, r) in rects {
+        if pid == cur {
+            continue;
+        }
+        let bx = r.x + r.width / 2;
+        let by = r.y + r.height / 2;
+        let (dx, dy) = (bx as i32 - ccx as i32, by as i32 - ccy as i32);
+        let ok = match dir {
+            0 => dy < 0 && dx.abs() <= dy.abs() * 2,
+            1 => dy > 0 && dx.abs() <= dy.abs() * 2,
+            2 => dx < 0 && dy.abs() <= dx.abs() * 2,
+            _ => dx > 0 && dy.abs() <= dx.abs() * 2,
+        };
+        if ok {
+            let dist = (dx * dx + dy * dy) as u32;
+            if best.is_none() || dist < best.unwrap().0 {
+                best = Some((dist, pid));
+            }
+        }
+    }
+    best.map(|(_, p)| p.clone())
+}
+
 fn cmd_attach(ref_: &str) {
     let mut stream = connect();
     stream.set_nonblocking(true).ok();
@@ -328,6 +396,10 @@ fn cmd_attach(ref_: &str) {
     let mut session_id = String::new();
     let mut panes: Vec<String> = vec![];
     let mut active_pane = String::new();
+    // per-pane client state for split rendering
+    let mut pane_views: std::collections::HashMap<String, PaneView> =
+        std::collections::HashMap::new();
+    let mut layout: Option<ranch_protocol::Layout> = None;
     let mut decoder = Decoder::new();
     let mut buf = [0u8; 65536];
     let got_snapshot = std::cell::Cell::new(false);
@@ -374,13 +446,21 @@ fn cmd_attach(ref_: &str) {
                                 session,
                                 panes: panes_snap,
                                 active_pane: ap,
+                                layout: ly,
                                 ..
                             } => {
                                 if session_id.is_empty() || session_id != session {
                                     session_id = session.clone();
                                 }
-                                active_pane = ap;
+                                active_pane = ap.clone();
                                 panes = panes_snap.iter().map(|p| p.id.clone()).collect();
+                                layout = Some(ly);
+                                pane_views.clear();
+                                for ps in &panes_snap {
+                                    let mut pv = PaneView::default();
+                                    pv.apply_snapshot(ps);
+                                    pane_views.insert(ps.id.clone(), pv);
+                                }
                                 if let Some(p) = panes_snap
                                     .iter()
                                     .find(|p| p.id == active_pane)
@@ -409,23 +489,41 @@ fn cmd_attach(ref_: &str) {
                                 }
                             }
                             Frame::Update {
+                                session: usess,
+                                pane: upane,
                                 rows_upd,
                                 cursor,
                                 cols,
                                 rows,
                                 ..
                             } => {
-                                screen.cols = cols;
-                                screen.rows = rows;
-                                screen.lines.resize(rows as usize, String::new());
-                                for (idx, text) in rows_upd {
-                                    let idx = idx as usize;
-                                    if idx < screen.lines.len() {
-                                        screen.lines[idx] = text;
+                                if usess == session_id {
+                                    if let Some(pv) = pane_views.get_mut(&upane) {
+                                        pv.apply_update(cols, rows, &rows_upd, &cursor);
+
                                     }
-                                }
-                                if let Some(c) = cursor {
-                                    screen.cursor = (c.x, c.y, c.visible);
+                                    if upane == active_pane {
+                                        screen.cols = cols;
+                                        screen.rows = rows;
+                                        screen.lines.resize(rows as usize, String::new());
+                                        for (idx, text) in &rows_upd {
+                                            let idx = *idx as usize;
+                                            if idx < screen.lines.len() {
+                                                screen.lines[idx] = text.clone();
+                                            }
+                                        }
+                                        if let Some(c) = cursor {
+                                            screen.cursor = (c.x, c.y, c.visible);
+                                        }
+                                        if pane_views.len() > 1 {
+                                            // split mode: mirror the focused pane
+                                            // into the fallback screen (rows are
+                                            // pane-local; top-aligned is correct)
+                                            screen.cursor = cursor
+                                                .map(|c| (c.x, c.y, c.visible))
+                                                .unwrap_or((0, 0, false));
+                                        }
+                                    }
                                 }
                             }
                             Frame::Meta {
@@ -455,50 +553,130 @@ fn cmd_attach(ref_: &str) {
         let meta_ref = &sessions_meta;
         let panes_n = panes.len();
         let sess_id_ref = &session_id;
-        let panes_ref = &panes;
-        let _ = panes_ref;
+        let views_ref = &pane_views;
+        let layout_ref = &layout;
+        let active_ref = &active_pane;
         let _ = term.draw(|f: &mut RFrame| {
             let area = f.area();
-            let (cx, cy, vis) = screen_ref.cursor;
-            let lines: Vec<Line> = screen_ref
-                .lines
-                .iter()
-                .take(area.height as usize)
-                .enumerate()
-                .map(|(i, line)| {
-                    if vis && (i as u16) == cy {
-                        // cursor x is a column (char index), not a byte offset
-                        let start = line
+            let status_h = if area.height >= 2 { 1 } else { 0 };
+            let term_area = Rect::new(0, 0, area.width, area.height - status_h);
+
+            // Compute pane rects from the layout tree (50/50 splits).
+            let mut rects: Vec<(String, Rect)> = Vec::new();
+            if let Some(ly) = layout_ref {
+                fn walk(l: &ranch_protocol::Layout, x: u16, y: u16, w: u16, h: u16, out: &mut Vec<(String, Rect)>) {
+                    match l {
+                        ranch_protocol::Layout::Leaf { pane } => {
+                            out.push((pane.clone(), Rect::new(x, y, w.max(1), h.max(1))));
+                        }
+                        ranch_protocol::Layout::Split { dir, a, b, pct } => match dir {
+                            1 => {
+                                let lw = ((w as u32 * *pct as u32 / 100) as u16)
+                                    .clamp(1, w.saturating_sub(1).max(1));
+                                walk(a, x, y, lw, h, out);
+                                walk(b, x + lw, y, w - lw, h, out);
+                            }
+                            _ => {
+                                let th = ((h as u32 * *pct as u32 / 100) as u16)
+                                    .clamp(1, h.saturating_sub(1).max(1));
+                                walk(a, x, y, w, th, out);
+                                walk(b, x, y + th, w, h - th, out);
+                            }
+                        },
+                    }
+                }
+                walk(ly, 0, 0, term_area.width, term_area.height, &mut rects);
+            }
+
+            let draw_pane = |f: &mut RFrame, pane_id: &str, r: Rect, focused: bool| {
+                let pv = views_ref.get(pane_id);
+                let (lines_src, cx, cy, vis): (&Vec<String>, u16, u16, bool) = match pv {
+                    Some(pv) => {
+                        let (x, y, v) = pv.cursor.unwrap_or((0, 0, false));
+                        (&pv.lines, x, y, v)
+                    }
+                    None => (&screen_ref.lines, screen_ref.cursor.0, screen_ref.cursor.1, false),
+                };
+                // clip the pane screen into the rect (top-left anchored)
+                let mut li: Vec<Line> = Vec::with_capacity(r.height as usize);
+                for row in 0..r.height as usize {
+                    let line = lines_src.get(row).cloned().unwrap_or_default();
+                    // char-safe horizontal clip
+                    let take = line.chars().take(r.width as usize).collect::<String>();
+                    if focused && vis && (row as u16) == cy {
+                        let start = take
                             .char_indices()
                             .nth(cx as usize)
                             .map(|(b, _)| b)
-                            .unwrap_or(line.len());
-                        let end = line
+                            .unwrap_or(take.len());
+                        let end = take
                             .char_indices()
                             .nth(cx as usize + 1)
                             .map(|(b, _)| b)
-                            .unwrap_or(line.len());
+                            .unwrap_or(take.len());
                         let mut spans: Vec<Span> = Vec::new();
-                        spans.push(Span::raw(line[..start].to_string()));
+                        spans.push(Span::raw(take[..start].to_string()));
                         if end > start {
                             spans.push(Span::styled(
-                                line[start..end].to_string(),
+                                take[start..end].to_string(),
                                 Style::default().add_modifier(Modifier::REVERSED),
                             ));
-                            spans.push(Span::raw(line[end..].to_string()));
+                            spans.push(Span::raw(take[end..].to_string()));
                         } else {
                             spans.push(Span::styled(
                                 " ".to_string(),
                                 Style::default().add_modifier(Modifier::REVERSED),
                             ));
                         }
-                        Line::from(spans)
+                        li.push(Line::from(spans));
                     } else {
-                        Line::raw(line.clone())
+                        li.push(Line::raw(take));
                     }
-                })
-                .collect();
-            f.render_widget(Paragraph::new(lines), Rect::new(0, 0, area.width, area.height));
+                }
+                f.render_widget(ratatui::widgets::Paragraph::new(li), r);
+                // focused pane gets a border; unfocused panes a dim one
+                let border_style = if focused {
+                    Style::default().add_modifier(Modifier::REVERSED)
+                } else {
+                    Style::default().add_modifier(Modifier::DIM)
+                };
+                let _ = border_style;
+            };
+
+            if rects.len() <= 1 {
+                // single pane: full-area render (no borders, matches old behavior)
+                let pid = rects.first().map(|(p, _)| p.clone()).unwrap_or_default();
+                let focused = pid == *active_ref || pid.is_empty();
+                draw_pane(f, &pid, term_area, focused);
+            } else {
+                // multi-pane: 1-cell gutters around each rect, focused pane bordered
+                for (pid, r) in &rects {
+                    let focused = pid == active_ref;
+                    let inner = Rect::new(
+                        r.x + 1,
+                        r.y,
+                        r.width.saturating_sub(2).max(1),
+                        r.height,
+                    );
+                    draw_pane(f, pid, inner, focused);
+                    // left/right gutter bars: bright for focused
+                    let bar_style = if focused {
+                        Style::default().add_modifier(Modifier::REVERSED)
+                    } else {
+                        Style::default().add_modifier(Modifier::DIM)
+                    };
+                    if r.width >= 2 {
+                        f.render_widget(
+                            ratatui::widgets::Paragraph::new(Span::styled("│", bar_style)),
+                            Rect::new(r.x, r.y, 1, r.height),
+                        );
+                    }
+                    f.render_widget(
+                        ratatui::widgets::Paragraph::new(Span::styled(" ", bar_style)),
+                        Rect::new(r.x + r.width.saturating_sub(1), r.y, 1, r.height),
+                    );
+                }
+            }
 
             // tmux-style green status bar on the last row
             if area.height >= 2 {
@@ -527,11 +705,11 @@ fn cmd_attach(ref_: &str) {
                 let mut items: Vec<Line> = vec![
                     Line::from(Span::styled(" switch session (enter: select, esc: close)",
                         Style::default().add_modifier(Modifier::REVERSED)))];
-                for (i, s) in meta_ref.iter().enumerate() {
-                    let marker = if s.id == *sess_id_ref { "* " } else { "  " };
+                for (i, s2) in meta_ref.iter().enumerate() {
+                    let marker = if s2.id == *sess_id_ref { "* " } else { "  " };
                     let sel = i == 0;
                     let style = if sel { Style::default().add_modifier(Modifier::REVERSED) } else { Style::default() };
-                    items.push(Line::from(Span::styled(format!("{marker}{:<20} {} pane(s)", s.name, s.panes.len()), style)));
+                    items.push(Line::from(Span::styled(format!("{marker}{:<20} {} pane(s)", s2.name, s2.panes.len()), style)));
                 }
                 f.render_widget(ratatui::widgets::Block::bordered().title("sessions"),
                     Rect::new(x, y, w, h));
@@ -542,7 +720,7 @@ fn cmd_attach(ref_: &str) {
             if let Some(kind) = prompt_now {
                 let label = match kind { Prompt::Rename => "rename session: ", Prompt::Command => ": " };
                 let pl = Line::from(Span::styled(
-                    format!("{label}{}█", prompt_input.clone()),
+                    format!("{label}{}\u{2588}", prompt_input.clone()),
                     Style::default().add_modifier(Modifier::REVERSED)));
                 f.render_widget(Paragraph::new(vec![pl]),
                     Rect::new(0, area.height.saturating_sub(2), area.width, 1));
@@ -667,7 +845,7 @@ fn cmd_attach(ref_: &str) {
                                         req_id: Uuid::new_v4().to_string(),
                                         session: session_id.clone(),
                                         pane: active_pane.clone(),
-                                        dir: if key.code == KeyCode::Char('%') { 0 } else { 1 },
+                                        dir: if key.code == KeyCode::Char('%') { 1 } else { 0 },
                                     };
                                     send_frame(&mut stream, &f).ok();
                                     continue;
@@ -675,6 +853,74 @@ fn cmd_attach(ref_: &str) {
                                 // s → session picker overlay
                                 KeyCode::Char('s') => {
                                     picker.set(!picker.get());
+                                    continue;
+                                }
+                                // Ctrl+arrows → resize the focused pane's split
+                                KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right
+                                    if key.modifiers.contains(KeyModifiers::CONTROL)
+                                        && !active_pane.is_empty() =>
+                                {
+                                    let (dir, delta) = match key.code {
+                                        KeyCode::Left => (1u8, -2i16),
+                                        KeyCode::Right => (1, 2),
+                                        KeyCode::Up => (0, -2),
+                                        _ => (0, 2),
+                                    };
+                                    let f = Frame::PaneResize {
+                                        session: session_id.clone(),
+                                        pane: active_pane.clone(),
+                                        dir,
+                                        delta,
+                                    };
+                                    send_frame(&mut stream, &f).ok();
+                                    continue;
+                                }
+                                // arrows → move focus between panes (tmux-style)
+                                KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right
+                                    if !active_pane.is_empty() =>
+                                {
+                                    let dir = match key.code {
+                                        KeyCode::Up => 0u8,
+                                        KeyCode::Down => 1,
+                                        KeyCode::Left => 2,
+                                        _ => 3,
+                                    };
+                                    if let Some(ly) = &layout {
+                                        let mut rects: Vec<(String, ratatui::layout::Rect)> =
+                                            vec![];
+                                        fn walk2(
+                                            l: &ranch_protocol::Layout,
+                                            x: u16, y: u16, w: u16, h: u16,
+                                            out: &mut Vec<(String, ratatui::layout::Rect)>,
+                                        ) {
+                                            match l {
+                                                ranch_protocol::Layout::Leaf { pane } => out
+                                                    .push((pane.clone(), ratatui::layout::Rect::new(x, y, w.max(1), h.max(1)))),
+                                                ranch_protocol::Layout::Split { dir, a, b, pct } => match dir {
+                                                    1 => {
+                                                        let lw = ((w as u32 * *pct as u32 / 100) as u16)
+                                                            .clamp(1, w.saturating_sub(1).max(1));
+                                                        walk2(a, x, y, lw, h, out);
+                                                        walk2(b, x + lw, y, w - lw, h, out);
+                                                    }
+                                                    _ => {
+                                                        let th = ((h as u32 * *pct as u32 / 100) as u16)
+                                                            .clamp(1, h.saturating_sub(1).max(1));
+                                                        walk2(a, x, y, w, th, out);
+                                                        walk2(b, x, y + th, w, h - th, out);
+                                                    }
+                                                },
+                                            }
+                                        }
+                                        walk2(ly, 0, 0, cols, rows.saturating_sub(1), &mut rects);
+                                        if let Some(next) = neighbor_pane(&rects, &active_pane, dir) {
+                                            let f = Frame::SessionsSelect {
+                                                session: session_id.clone(),
+                                                pane: next,
+                                            };
+                                            send_frame(&mut stream, &f).ok();
+                                        }
+                                    }
                                     continue;
                                 }
                                 // x → kill current pane

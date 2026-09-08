@@ -137,6 +137,16 @@ pub enum Frame {
         /// 0 = horizontal (side-by-side), 1 = vertical (stacked)
         dir: u8,
     },
+    /// Client -> daemon: resize the split containing `pane`. The daemon
+    /// adjusts the split ratio of the smallest enclosing split that has
+    /// room. delta is in cells; positive grows `pane`'s side.
+    PaneResize {
+        session: String,
+        pane: String,
+        /// 0 = horizontal (top/bottom), 1 = vertical (left/right) axis
+        dir: u8,
+        delta: i16,
+    },
     PaneKill {
         session: String,
         pane: String,
@@ -214,7 +224,19 @@ pub struct Cursor {
 #[serde(tag = "k")]
 pub enum Layout {
     Leaf { pane: String },
-    Split { dir: u8, a: Box<Layout>, b: Box<Layout> },
+    Split {
+        dir: u8,
+        a: Box<Layout>,
+        b: Box<Layout>,
+        /// Percent of the space given to `a` (1..=99). Defaults to 50;
+        /// ignored on the wire when absent (older clients).
+        #[serde(default = "default_pct")]
+        pct: u8,
+    },
+}
+
+fn default_pct() -> u8 {
+    50
 }
 
 // ---------- base64 (no external deps for the spike-grade path) ----------

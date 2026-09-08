@@ -6,10 +6,10 @@
 //! speak the ranch-protocol frame set over a unix socket; the same frames
 //! later flow through the Supabase relay unchanged (SPEC §4, PROTOCOL.md).
 //!
-//! M1 scope decisions (SPEC §12):
-//! - one *visible* pane per session at a time (the active pane);
-//!   splits create additional panes you switch between — visual
-//!   side-by-side layout is post-M1
+//! M1 scope decisions (SPEC §12), as updated by M2.7:
+//! - splits render as real side-by-side/stacked panes (weighted 50/50
+//!   split tree, client draws rects from the Layout, focus ring on the
+//!   active pane; Prefix+arrows move focus, Prefix+Ctrl-arrows resize)
 //! - scrollback is a heuristic ring (lines observed scrolling off the
 //!   top of the formatted screen)
 //! - sessions do not survive a daemon restart (state.json is written for
@@ -86,7 +86,10 @@ unsafe extern "C" {
     fn tcsetpgrp(fd: c_int, pgid: c_int) -> c_int;
     fn kill(pid: c_int, sig: c_int) -> c_int;
     fn waitpid(pid: c_int, status: *mut c_int, options: c_int) -> c_int;
+    fn ioctl(fd: c_int, req: libc::c_ulong, ...) -> c_int;
 }
+
+const TIOCSWINSZ: libc::c_ulong = 0x5414;
 
 // ---------- model ----------
 
@@ -120,6 +123,203 @@ struct Session {
     panes: BTreeMap<Uuid, Pane>,
     active: Uuid,
     size: (u16, u16),
+    /// Binary split tree. The root leaf is the first pane; PaneSplit
+    /// replaces the split target's leaf with a new node. `pct` is the
+    /// percent of space given to `a`.
+    layout: Layout,
+}
+
+impl Session {
+    /// Replace the leaf `target` with a split whose second child is
+    /// `new_id`. Returns true when found.
+    fn split_leaf(&mut self, target: &str, new_id: &str, dir: u8) -> bool {
+        fn walk(l: &mut Layout, target: &str, new_id: &str, dir: u8) -> bool {
+            match l {
+                Layout::Leaf { pane } if pane == target => {
+                    let nb = Layout::Leaf { pane: new_id.to_string() };
+                    let na = std::mem::replace(l, Layout::Leaf { pane: String::new() });
+                    *l = Layout::Split { dir, a: Box::new(na), b: Box::new(nb), pct: 50 };
+                    true
+                }
+                Layout::Split { a, b, .. } => {
+                    walk(a, target, new_id, dir) || walk(b, target, new_id, dir)
+                }
+                _ => false,
+            }
+        }
+        walk(&mut self.layout, target, new_id, dir)
+    }
+
+    /// Remove a dead pane's leaf, promoting its sibling. Returns the
+    /// promoted sibling pane id.
+    fn remove_leaf(&mut self, pane: &str) -> Option<Uuid> {
+        fn walk(l: &mut Layout, pane: &str) -> Option<Uuid> {
+            match l {
+                Layout::Split { a, b, .. } => {
+                    let a_leaf = matches!(&**a, Layout::Leaf { pane: p } if p == pane);
+                    let b_leaf = matches!(&**b, Layout::Leaf { pane: p } if p == pane);
+                    if a_leaf || b_leaf {
+                        let keep = if a_leaf { b.as_mut() } else { a.as_mut() };
+                        let promoted = std::mem::replace(keep, Layout::Leaf { pane: String::new() });
+                        *l = promoted;
+                        // caller resolves the sibling pane id below
+                        None
+                    } else {
+                        walk(a, pane).or_else(|| walk(b, pane))
+                    }
+                }
+                _ => None,
+            }
+        }
+        walk(&mut self.layout, pane);
+        // after collapse, find any leaf (the promoted subtree's first leaf)
+        fn first_leaf(l: &Layout) -> Option<Uuid> {
+            match l {
+                Layout::Leaf { pane } => Uuid::parse_str(pane).ok(),
+                Layout::Split { a, b, .. } => first_leaf(a).or_else(|| first_leaf(b)),
+            }
+        }
+        first_leaf(&self.layout)
+    }
+
+    /// Compute each pane's (cols, rows) by walking the split tree.
+    /// dir 1 = vertical split (left/right, pct to a), dir 0 = horizontal
+    /// (top/bottom, pct to a).
+    fn pane_sizes(&self) -> Vec<(Uuid, u16, u16)> {
+        let mut out = Vec::new();
+        fn walk(l: &Layout, x: u16, y: u16, w: u16, h: u16, out: &mut Vec<(Uuid, u16, u16)>) {
+            match l {
+                Layout::Leaf { pane } => {
+                    if let Ok(pid) = Uuid::parse_str(pane) {
+                        out.push((pid, w.max(1), h.max(1)));
+                    }
+                }
+                Layout::Split { dir, a, b, pct } => {
+                    let pct = (*pct as u16).clamp(1, 99);
+                    if *dir == 1 {
+                        let lw = (w * pct / 100).max(1).min(w.saturating_sub(1).max(1));
+                        walk(a, x, y, lw, h, out);
+                        walk(b, x + lw, y, w - lw, h, out);
+                    } else {
+                        let th = (h * pct / 100).max(1).min(h.saturating_sub(1).max(1));
+                        walk(a, x, y, w, th, out);
+                        walk(b, x, y + th, w, h - th, out);
+                    }
+                }
+            }
+        }
+        walk(&self.layout, 0, 0, self.size.0, self.size.1, &mut out);
+        out
+    }
+
+    /// Apply computed sizes to every pane's PTY + VT (with SIGWINCH).
+    fn apply_sizes(&mut self) {
+        // bootstrap: root leaf may still point at the nil placeholder
+        if let Layout::Leaf { pane } = &self.layout {
+            if Uuid::parse_str(&pane).map(|u| u.is_nil()).unwrap_or(true) {
+                if let Some(first) = self.panes.keys().next().copied() {
+                    self.layout = Layout::Leaf { pane: first.to_string() };
+                }
+            }
+        }
+        let sizes = self.pane_sizes();
+        for (pid, cols, rows) in sizes {
+            if let Some(p) = self.panes.get_mut(&pid) {
+                if p.vt.dims() != (cols, rows) {
+                    p.vt.resize(cols, rows);
+                    let win = Winsize { ws_row: rows, ws_col: cols, ..Default::default() };
+                    unsafe { ioctl(p.master, TIOCSWINSZ, &win) };
+                    p.prev_screen.clear();
+                    p.dirty = true;
+                }
+            }
+        }
+    }
+
+    /// Resize the split containing `pane` along `dir` by `delta` cells,
+    /// clamped so every leaf keeps >= 4 cells. Two passes: locate the
+    /// node + geometry immutably, then update its pct.
+    fn resize_split(&mut self, pane: Uuid, dir: u8, delta: i16) {
+        let pref = pane.to_string();
+        fn find(l: &Layout, pane: &str) -> Option<(u8, String)> {
+            match l {
+                Layout::Leaf { .. } => None,
+                Layout::Split { dir, a, b, .. } => {
+                    let a_leaf = match &**a {
+                        Layout::Leaf { pane: p } => Some(p.clone()),
+                        _ => None,
+                    };
+                    let b_leaf = match &**b {
+                        Layout::Leaf { pane: p } => Some(p.clone()),
+                        _ => None,
+                    };
+                    if a_leaf.as_deref() == Some(pane) || b_leaf.as_deref() == Some(pane) {
+                        fn fl2(l: &Layout) -> Option<String> {
+                            match l {
+                                Layout::Leaf { pane } => Some(pane.clone()),
+                                Layout::Split { a, b, .. } => fl2(a).or_else(|| fl2(b)),
+                            }
+                        }
+                        fl2(a).map(|f| (*dir, f))
+                    } else {
+                        find(a, pane).or_else(|| find(b, pane))
+                    }
+                }
+            }
+        }
+        let Some((ndir, a_leaf)) = find(&self.layout, &pref) else {
+            return;
+        };
+        if ndir != dir {
+            return;
+        }
+        fn is_a(l: &Layout, pane: &str) -> Option<bool> {
+            match l {
+                Layout::Leaf { .. } => None,
+                Layout::Split { a, b, .. } => {
+                    let a_leaf = match &**a {
+                        Layout::Leaf { pane: p } => Some(p.clone()),
+                        _ => None,
+                    };
+                    if a_leaf.as_deref() == Some(pane) {
+                        return Some(true);
+                    }
+                    if matches!(&**b, Layout::Leaf { pane: p } if p == pane) {
+                        return Some(false);
+                    }
+                    is_a(a, pane).or_else(|| is_a(b, pane))
+                }
+            }
+        }
+        let a_is_target = is_a(&self.layout, &pref).unwrap_or(false);
+        let sizes = self.pane_sizes();
+        let axis = if dir == 1 { self.size.0 } else { self.size.1 };
+        let a_size = Uuid::parse_str(&a_leaf)
+            .ok()
+            .and_then(|pid| sizes.iter().find(|(id, _, _)| *id == pid))
+            .map(|(_, c, r)| if dir == 1 { *c } else { *r })
+            .unwrap_or(axis / 2);
+        let new_a = (a_size as i32
+            + if a_is_target { delta as i32 } else { -(delta as i32) })
+        .clamp(4, axis as i32 - 4) as u16;
+        let new_pct = ((new_a as u32 * 100) / axis.max(1) as u32).clamp(1, 99) as u8;
+        fn set_pct(l: &mut Layout, pane: &str, dir: u8, new_pct: u8) -> bool {
+            match l {
+                Layout::Leaf { .. } => false,
+                Layout::Split { dir: d, a, b, pct } => {
+                    let a_hits = matches!(&**a, Layout::Leaf { pane: p } if p == pane);
+                    let b_hits = matches!(&**b, Layout::Leaf { pane: p } if p == pane);
+                    if (a_hits || b_hits) && *d == dir {
+                        *pct = new_pct;
+                        true
+                    } else {
+                        set_pct(a, pane, dir, new_pct) || set_pct(b, pane, dir, new_pct)
+                    }
+                }
+            }
+        }
+        set_pct(&mut self.layout, &pref, dir, new_pct);
+    }
 }
 
 struct Client {
@@ -180,7 +380,9 @@ fn hostname() -> String {
         .unwrap_or_else(|| "ranch".into())
 }
 
-/// Spawn a new shell pane into a session (full-session size in M1).
+/// Spawn a new shell pane. The CALLER must insert the layout split
+/// (via `Session::split_leaf`) before or after; the PTY is sized with
+/// `session.size` and `apply_sizes` fixes it after the split is made.
 fn spawn_pane(session: &mut Session) -> Result<Uuid, String> {
     let (cols, rows) = session.size;
     let vt = Vt::new(cols, rows).map_err(|e| format!("vt: {e}"))?;
@@ -253,15 +455,21 @@ fn spawn_pane(session: &mut Session) -> Result<Uuid, String> {
 
 /// Build a full snapshot frame for a session (client field filled per-recipient).
 fn snapshot_session(s: &Session) -> Option<Frame> {
+    let sizes: std::collections::HashMap<Uuid, (u16, u16)> = s
+        .pane_sizes()
+        .into_iter()
+        .map(|(pid, c, r)| (pid, (c, r)))
+        .collect();
     let mut snaps = Vec::new();
     let mut active_seq: u64 = 0;
     for (pid, p) in &s.panes {
+        let (cols, rows) = sizes.get(pid).copied().unwrap_or(s.size);
         let lines = p.vt.screen();
         let (cx, cy, vis) = p.vt.cursor();
         let snap = PaneSnap {
             id: pid.to_string(),
-            cols: s.size.0,
-            rows: s.size.1,
+            cols,
+            rows,
             lines,
             cursor: Some(Cursor { x: cx, y: cy, visible: vis }),
         };
@@ -275,7 +483,7 @@ fn snapshot_session(s: &Session) -> Option<Frame> {
         client: String::new(), // filled per-recipient
         session: s.id.to_string(),
         seq: active_seq,
-        layout: Layout::Leaf { pane: s.active.to_string() },
+        layout: s.layout.clone(),
         active_pane: s.active.to_string(),
         panes: snaps,
         meta: vec![],
@@ -526,11 +734,7 @@ impl Daemon {
                     match s {
                         Some(s) if (s.size.0, s.size.1) != (*cols, *rows) => {
                             s.size = (*cols, *rows);
-                            for p in s.panes.values_mut() {
-                                p.vt.resize(*cols, *rows);
-                                p.prev_screen.clear();
-                                p.dirty = true;
-                            }
+                            s.apply_sizes();
                             true
                         }
                         _ => false,
@@ -604,9 +808,11 @@ impl Daemon {
                     panes: BTreeMap::new(),
                     active: Uuid::nil(),
                     size: (80, 24),
+                    layout: Layout::Leaf { pane: Uuid::nil().to_string() },
                 };
                     match spawn_pane(&mut s) {
                     Ok(pid) => {
+                        s.layout = Layout::Leaf { pane: pid.to_string() };
                         eprintln!("ranchd: created session {name} ({id}) pane {pid}");
                         let ack = Frame::SessionsAck {
                             req_id: req_id.clone(),
@@ -704,19 +910,37 @@ impl Daemon {
             Frame::PaneSplit {
                 req_id,
                 session,
-                pane: _pane,
-                dir: _dir,
+                pane,
+                dir,
             } => {
-                // M1: a split adds a second pane to the session; both panes
-                // run at the full session size and the client switches
-                // between them (visual side-by-side is post-M1).
+                // Real split: replace the target leaf with a split node,
+                // spawn the new pane, then re-apply sizes (sibling shrinks).
                 let sid = match self.resolve_session(session).map(|s| s.id) {
                     Some(s) => s,
                     None => return,
                 };
-                let new_pane = self.sessions.get_mut(&sid).and_then(|s| spawn_pane(s).ok());
+                let dir = *dir.min(&1); // 0 = top/bottom, 1 = left/right
+                let new_pane = self.sessions.get_mut(&sid).and_then(|s| {
+                    let target = match Uuid::parse_str(pane) {
+                        Ok(p) if s.panes.contains_key(&p) => p,
+                        _ => s.active,
+                    };
+                    match spawn_pane(s) {
+                        Ok(pid) => {
+                            s.split_leaf(&target.to_string(), &pid.to_string(), dir);
+                            s.active = pid;
+                            s.apply_sizes();
+                            Some(pid)
+                        }
+                        Err(e) => {
+                            eprintln!("ranchd: split failed: {e}");
+                            None
+                        }
+                    }
+                });
                 if let Some(pid) = new_pane {
                     self.write_state();
+                    self.resnap(&sid);
                     if let Some(c) = self.clients.get_mut(&from) {
                         send_frame(
                             c,
@@ -729,6 +953,23 @@ impl Daemon {
                     }
                 }
             }
+            Frame::PaneResize { session, pane, dir, delta } => {
+                let sid = match self.resolve_session(session).map(|s| s.id) {
+                    Some(s) => s,
+                    None => return,
+                };
+                let pid = match Uuid::parse_str(pane) {
+                    Ok(p) => p,
+                    Err(_) => return,
+                };
+                let did = self.sessions.get_mut(&sid).map(|s| {
+                    s.resize_split(pid, *dir, *delta);
+                    s.apply_sizes();
+                });
+                if did.is_some() {
+                    self.resnap(&sid);
+                }
+            }
             Frame::PaneKill { session, pane } => {
                 let sid = match self.resolve_session(session).map(|s| s.id) {
                     Some(s) => s,
@@ -738,10 +979,12 @@ impl Daemon {
                     Ok(p) => p,
                     Err(_) => return,
                 };
+                let mut need_snap = None;
                 if let Some(s) = self.sessions.get_mut(&sid) {
                     if let Some(p) = s.panes.remove(&pid) {
                         drop(p);
                     }
+                    s.remove_leaf(&pid.to_string());
                     if s.active == pid {
                         s.active = s
                             .panes
@@ -750,11 +993,18 @@ impl Daemon {
                             .copied()
                             .unwrap_or_else(Uuid::new_v4);
                     }
+                    s.apply_sizes();
                     if s.panes.is_empty() {
+                        need_snap = None;
                         self.sessions.remove(&sid);
+                    } else {
+                        need_snap = Some(sid);
                     }
                 }
                 self.write_state();
+                if let Some(sid) = need_snap {
+                    self.resnap(&sid);
+                }
             }
             Frame::Hb | Frame::Meta { .. } | Frame::Error { .. } | Frame::Chunk { .. }
             | Frame::HelloOk { .. }
@@ -959,6 +1209,7 @@ fn main() {
                     }
                 }
                 if p.dirty && alive {
+                    let (pcols, prows) = p.vt.dims();
                     let new_screen = p.vt.screen();
                     let (cx, cy, vis) = p.vt.cursor();
                     // scrollback heuristic: a line scrolled off the top when
@@ -994,8 +1245,8 @@ fn main() {
                         session: s.id.to_string(),
                         pane: pid.to_string(),
                         seq: p.seq,
-                        cols: s.size.0,
-                        rows: s.size.1,
+                        cols: pcols,
+                        rows: prows,
                         rows_upd,
                         cursor: Some(Cursor { x: cx, y: cy, visible: vis }),
                         title: None,
