@@ -43,7 +43,7 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
   const [history, setHistory] = useState<string[] | null>(null);
   const [blink, setBlink] = useState(true);
   const inputRef = useRef<TextInput | null>(null);
-  const lastText = useRef("");
+  const [capture, setCapture] = useState(" ");
   // predictive local echo: chars sent to the PTY that have not been
   // confirmed by an authoritative Update yet, rendered dimmed at the
   // cursor so typing feels instant despite the relay round trip
@@ -79,7 +79,11 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
           const next = new Map(panesRef.current);
           next.set(f.pane, { ...cur, lines, cursor: f.cursor ?? cur.cursor });
           setPanes(next);
-          setPred(null); // authoritative echo arrived
+          // drop the prediction once its own row is confirmed by the
+          // authoritative echo (other rows changing doesn't invalidate it)
+          setPred((pr) =>
+            pr && (f.rows_upd ?? []).some(([y]) => y === pr.row) ? null : pr
+          );
           break;
         }
         case "Scrollback":
@@ -119,49 +123,38 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
   };
 
   // Raw-mode typing: every keystroke goes straight to the PTY (like an
-  // SSH client). The field below is a hidden capture surface — the real
-  // echo comes back from the PTY in the pane view. Diffs between the
-  // IME's last and current text become input bytes: inserted chars
-  // stream through as-is, deletions become backspaces.
+  // SSH client). The capture field holds a single sentinel space; the
+  // visible-password keyboard disables IME composition (suggestions /
+  // autocorrect), so every key arrives as a discrete change:
+  // - text grew past the sentinel  -> the added chars are keystrokes
+  // - text is empty (sentinel deleted) -> backspace (DEL)
+  // - a newline in the added text  -> Enter (CR)
+  // The real echo comes back from the PTY in the pane view.
   const onType = (text: string) => {
-    const prev = lastText.current;
-    lastText.current = text;
-    let start = 0;
-    while (start < prev.length && start < text.length && prev[start] === text[start]) {
-      start++;
+    if (text === "") {
+      // backspace deleted the sentinel -> DEL
+      send("\u007f");
+      setPred((pr) => (pr ? { ...pr, text: pr.text.slice(0, -1) } : pr));
+      setCapture(" ");
+      return;
     }
-    let endPrev = prev.length;
-    let endNew = text.length;
-    while (endPrev > start && endNew > start && prev[endPrev - 1] === text[endNew - 1]) {
-      endPrev--;
-      endNew--;
-    }
-    const removed = prev.length - (endPrev - start) - start;
-    if (removed > 0) {
-      send("\u007f".repeat(removed));
+    if (text === " ") return; // reset, no input
+    const added = text.startsWith(" ") ? text.slice(1) : text;
+    setCapture(" "); // re-arm the sentinel
+    const normalized = added.replace(/\n/g, "\r");
+    send(normalized);
+    const printable = added.replace(/[\n\r]/g, "");
+    if (printable !== "") {
       setPred((pr) => {
-        if (!pr || pr.text === "") return null;
-        return { ...pr, text: pr.text.slice(0, Math.max(0, pr.text.length - removed)) };
+        if (!pr) {
+          const c = panesRef.current.get(activePane)?.cursor;
+          if (!c) return null;
+          return { row: c.y, col: c.x, text: printable };
+        }
+        return { ...pr, text: pr.text + printable };
       });
-    }
-    const added = text.slice(start, endNew);
-    if (added !== "") {
-      // Enter on a multiline IME shows up as a newline in the diff;
-      // newlines can't be predicted (command runs, output streams)
-      const printable = added.replace(/[\n\r]/g, "");
-      if (printable !== "") {
-        setPred((pr) => {
-          if (!pr) {
-            const c = panesRef.current.get(activePane)?.cursor;
-            if (!c) return null;
-            return { row: c.y, col: c.x, text: printable };
-          }
-          return { ...pr, text: pr.text + printable };
-        });
-      } else {
-        setPred(null);
-      }
-      send(added.replace(/\n/g, "\r"));
+    } else {
+      setPred(null); // Enter/output can't be predicted
     }
   };
 
@@ -269,8 +262,10 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
         ref={inputRef}
         style={styles.hiddenInput}
         multiline
-        value=""
+        value={capture}
         onChangeText={onType}
+        onSubmitEditing={() => send("\r")}
+        keyboardType="visible-password"
         autoCapitalize="none"
         autoCorrect={false}
         autoComplete="off"
