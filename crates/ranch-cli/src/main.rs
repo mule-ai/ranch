@@ -16,7 +16,7 @@ use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
 use crossterm::event::{
-    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, poll, read as read_event,
+    Event as CEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, poll, read as read_event,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -367,6 +367,268 @@ fn neighbor_pane(
         }
     }
     best.map(|(_, p)| p.clone())
+}
+
+fn refresh_sessions(stream: &mut UnixStream) {
+    let hello = Frame::Hello {
+        id: Uuid::new_v4().to_string(),
+        client: "cli".into(),
+        caps: vec![],
+    };
+    send_frame(stream, &hello).ok();
+}
+
+/// Interactive session manager — plain `ranch` with a TTY. Lists sessions,
+/// create, kill, rename, and attach. Returns the session ref to attach to,
+/// or None to exit.
+fn cmd_dashboard() -> Option<String> {
+    crossterm::terminal::enable_raw_mode().ok();
+    execute!(std::io::stdout(), EnterAlternateScreen).ok();
+    let restore = || {
+        crossterm::terminal::disable_raw_mode().ok();
+        execute!(std::io::stdout(), LeaveAlternateScreen).ok();
+    };
+
+    let mut stream = connect();
+    stream.set_nonblocking(true).ok();
+    let client_id = format!("cli-{}", Uuid::new_v4().as_simple());
+    hello(&mut stream, &client_id);
+
+    let mut decoder = Decoder::new();
+    let mut buf = [0u8; 65536];
+    let mut sessions: Vec<ranch_protocol::SessionMeta> = vec![];
+    let mut sel: usize = 0;
+    let mut status = String::new();
+    // Some(kind) while an inline input is active: "new" | "rename"
+    let mut input: Option<&'static str> = None;
+    let mut input_text = String::new();
+    let mut term = Terminal::new(CrosstermBackend::new(std::io::stdout()))
+        .expect("failed to init terminal");
+
+    loop {
+        // drain socket
+        loop {
+            match stream.read(&mut buf) {
+                Ok(0) => {
+                    restore();
+                    die("daemon closed the connection");
+                }
+                Ok(n) => {
+                    for f in decoder.feed(&buf[..n]) {
+                        match f {
+                            Frame::HelloOk { sessions: ss, .. } => {
+                                sessions = ss;
+                                if sel >= sessions.len() {
+                                    sel = sessions.len().saturating_sub(1);
+                                }
+                            }
+                            Frame::SessionsAck { session, .. } => {
+                                restore();
+                                drop(term);
+                                return Some(session);
+                            }
+                            Frame::Error { message, .. } => {
+                                status = format!("error: {message}");
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(_) => break,
+            }
+        }
+
+        // draw
+        let sess_ref = &sessions;
+        let sel_ref = sel;
+        let status_ref = &status;
+        let input_ref = input;
+        let input_text_ref = &input_text;
+        let _ = term.draw(|f: &mut RFrame| {
+            let area = f.area();
+            let mut lines: Vec<Line> = Vec::new();
+            lines.push(Line::from(Span::styled(
+                format!(
+                    " ranch — {} session{} on this machine",
+                    sess_ref.len(),
+                    if sess_ref.len() == 1 { "" } else { "s" }
+                ),
+                Style::default().add_modifier(Modifier::REVERSED),
+            )));
+            lines.push(Line::raw(""));
+            if sess_ref.is_empty() {
+                lines.push(Line::raw("  no sessions yet — press c to create one"));
+            }
+            for (i, s2) in sess_ref.iter().enumerate() {
+                let cur = i == sel_ref;
+                let style = if cur {
+                    Style::default().add_modifier(Modifier::REVERSED)
+                } else {
+                    Style::default()
+                };
+                let marker = if cur { ">" } else { " " };
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "{marker} {:<24} {:>7} {:>3} pane{}",
+                        s2.name,
+                        s2.kind,
+                        s2.panes.len(),
+                        if s2.panes.len() == 1 { "" } else { "s" }
+                    ),
+                    style,
+                )));
+            }
+            lines.push(Line::raw(""));
+            lines.push(Line::raw(
+                " enter: attach   c: new   n: new (named)   k: kill   r: rename   q: quit",
+            ));
+            if !status_ref.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    status_ref.clone(),
+                    Style::default().add_modifier(Modifier::DIM),
+                )));
+            }
+            if let Some(kind) = input_ref {
+                let label = match kind {
+                    "new" => "new session name (empty = auto): ",
+                    _ => "rename to: ",
+                };
+                lines.push(Line::from(Span::styled(
+                    format!("{label}{}\u{2588}", input_text_ref),
+                    Style::default().add_modifier(Modifier::REVERSED),
+                )));
+            }
+            f.render_widget(
+                Paragraph::new(lines),
+                Rect::new(0, 0, area.width, area.height),
+            );
+        });
+
+        // wait for one event (timeout keeps the socket drain flowing)
+        if !crossterm::event::poll(std::time::Duration::from_millis(120)).unwrap_or(false) {
+            continue;
+        }
+        let ev = match crossterm::event::read() {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        if let CEvent::Key(key) = ev {
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            if let Some(kind) = input {
+                match key.code {
+                    KeyCode::Esc => {
+                        input = None;
+                        input_text.clear();
+                    }
+                    KeyCode::Enter => {
+                        let text = input_text.trim().to_string();
+                        match kind {
+                            "new" => {
+                                let f = Frame::SessionsCreate {
+                                    req_id: Uuid::new_v4().to_string(),
+                                    name: if text.is_empty() { None } else { Some(text) },
+                                };
+                                send_frame(&mut stream, &f).ok();
+                                input = None;
+                                input_text.clear();
+                                // SessionsAck handler attaches
+                            }
+                            _ => {
+                                if let Some(s) = sessions.get(sel) {
+                                    if !text.is_empty() {
+                                        let f = Frame::SessionsRename {
+                                            session: s.id.clone(),
+                                            name: text,
+                                        };
+                                        send_frame(&mut stream, &f).ok();
+                                        refresh_sessions(&mut stream);
+                                    }
+                                }
+                                input = None;
+                                input_text.clear();
+                            }
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        input_text.pop();
+                    }
+                    KeyCode::Char(c) => input_text.push(c),
+                    _ => {}
+                }
+                continue;
+            }
+            match key.code {
+                KeyCode::Char('q') | KeyCode::Esc => {
+                    restore();
+                    drop(term);
+                    return None;
+                }
+                KeyCode::Up | KeyCode::Char('k') if !matches!(key.modifiers, KeyModifiers::CONTROL) => {
+                    if sel > 0 {
+                        sel -= 1;
+                    }
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if sel + 1 < sessions.len() {
+                        sel += 1;
+                    }
+                }
+                KeyCode::Char('c') => {
+                    let f = Frame::SessionsCreate {
+                        req_id: Uuid::new_v4().to_string(),
+                        name: None,
+                    };
+                    send_frame(&mut stream, &f).ok();
+                    // SessionsAck handler attaches
+                }
+                KeyCode::Char('n') => {
+                    input = Some("new");
+                    input_text.clear();
+                }
+                KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    // Ctrl-K: also kill, symmetric with j/k nav quirk
+                    if let Some(s) = sessions.get(sel) {
+                        let f = Frame::SessionsKill { session: s.id.clone() };
+                        send_frame(&mut stream, &f).ok();
+                        refresh_sessions(&mut stream);
+                    }
+                }
+                KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    // Ctrl-D on the dashboard: kill too (documented as k? use x)
+                    if let Some(s) = sessions.get(sel) {
+                        let f = Frame::SessionsKill { session: s.id.clone() };
+                        send_frame(&mut stream, &f).ok();
+                        refresh_sessions(&mut stream);
+                    }
+                }
+                KeyCode::Char('x') => {
+                    if let Some(s) = sessions.get(sel) {
+                        let f = Frame::SessionsKill { session: s.id.clone() };
+                        send_frame(&mut stream, &f).ok();
+                        status = format!("killed {}", s.name);
+                        refresh_sessions(&mut stream);
+                    }
+                }
+                KeyCode::Char('r') => {
+                    if !sessions.is_empty() {
+                        input = Some("rename");
+                        input_text.clear();
+                    }
+                }
+                KeyCode::Enter => {
+                    if let Some(s) = sessions.get(sel) {
+                        restore();
+                        drop(term);
+                        return Some(s.id.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 fn cmd_attach(ref_: &str) {
@@ -731,7 +993,7 @@ fn cmd_attach(ref_: &str) {
         if poll(Duration::from_millis(20)).unwrap_or(false) {
             if let Ok(event) = read_event() {
                 match event {
-                    Event::Resize(c, r) => {
+                    CEvent::Resize(c, r) => {
                         let f = Frame::Resize {
                             id: Uuid::new_v4().to_string(),
                             client: "attach".into(),
@@ -741,7 +1003,7 @@ fn cmd_attach(ref_: &str) {
                         };
                         send_frame(&mut stream, &f).ok();
                     }
-                    Event::Key(key) => {
+                    CEvent::Key(key) => {
                         if key.kind != KeyEventKind::Press {
                             continue;
                         }
@@ -1602,10 +1864,25 @@ fn cmd_config(url: String, key: String) {
     println!("cloud config saved to {}", CloudCfg::path().display());
 }
 
+fn libc_isatty() -> bool {
+    unsafe { libc::isatty(1) == 1 }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
+        // TTY → interactive session manager; otherwise print usage.
+        if libc_isatty() {
+            loop {
+                match cmd_dashboard() {
+                    Some(ref_) => cmd_attach(&ref_), // detach returns here
+                    None => break,
+                }
+            }
+            return;
+        }
         eprintln!("usage: ranch <new|ls|attach|kill|rename|split|switch|register|login|machines|cloud> [args]");
+        eprintln!("  (run plain `ranch` in a terminal for the interactive session manager)");
         eprintln!("  socket: {}", socket_path().display());
         std::process::exit(2);
     }

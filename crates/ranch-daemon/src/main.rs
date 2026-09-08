@@ -800,7 +800,19 @@ impl Daemon {
             }
             Frame::SessionsCreate { req_id, name } => {
                 let id = Uuid::new_v4();
-                let name = name.clone().unwrap_or_else(|| format!("s{}", id.as_simple()));
+                let name = name.clone().unwrap_or_else(|| {
+                    // short, tmux-like auto name: s0, s1, ... unique in this daemon
+                    let taken: std::collections::HashSet<String> =
+                        self.sessions.values().map(|s| s.name.clone()).collect();
+                    let mut n = 0;
+                    loop {
+                        let candidate = format!("s{}", n);
+                        if !taken.contains(&candidate) {
+                            return candidate;
+                        }
+                        n += 1;
+                    }
+                });
                 let mut s = Session {
                     id,
                     name: name.clone(),

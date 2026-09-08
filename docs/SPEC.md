@@ -617,6 +617,13 @@ Rust edition 2024, stable toolchain (matches forge: rustc 1.98).
   tests confirm remote clients can split and drive both panes through
   Supabase Realtime. Not done (moved out of scope): session-tree
   sidebar (flat picker remains), pane swap, windows.
+- **M2.8 — interactive session manager (2026-09-08)**: plain `ranch`
+  in a TTY opens the dashboard — list sessions (name/kind/panes),
+  `enter` attach, `c` new session (auto-attach), `n` new with name,
+  `x` kill, `r` rename, `j/k` navigate, `q` quit. Detaching from an
+  attached session returns to the dashboard (tmux-chooser behavior).
+  Auto-created sessions get short names (s0, s1, …). Non-TTY
+  invocations still print usage.
 - **M4 — forge + mule first-class**: forge listing/status/attach
   (§7); mule listing + run-into-pane (§8). Acceptance: start a forge
   session locally, watch it from the phone; run a mule workflow into a

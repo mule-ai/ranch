@@ -53,12 +53,15 @@ make install          # builds + installs to ~/.local/bin
 ranch login           # Google sign-in (once per device)
 ranch register        # on a daemon host: register with your account
 make service          # install + start the ranchd systemd user unit
-ranch new work        # create a session
-ranch attach work     # attach (Ctrl-B d to detach; session keeps running)
-ranch ls              # list local sessions
+ranch                 # interactive session manager: list/create/attach/kill
+ranch new work        # or straight to the point: create + `ranch attach work`
 ranch machines        # list your machines (any device)
 ranch cloud           # list sessions across machines
 ```
+
+Inside `ranch` (dashboard) or `attach`: `Ctrl-B` is the tmux-style
+prefix — `%`/`"` split, arrows move focus, Ctrl-arrows resize,
+`d` detaches. Sessions keep running while detached.
 
 Keys inside `attach`: see `Ctrl-B` table above; the status bar flashes
 `[prefix]` when the next key is a command.
