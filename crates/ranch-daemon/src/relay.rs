@@ -127,16 +127,7 @@ fn run(
     let topic = format!("realtime:machines:{}", cfg.machine_id);
     let mut backoff = 1u64;
     loop {
-        let jwt = match login(&cfg) {
-            Ok(j) => j,
-            Err(e) => {
-                clog(&format!("relay: login failed: {e} — retrying in {backoff}s"));
-                std::thread::sleep(Duration::from_secs(backoff));
-                backoff = (backoff * 2).min(60);
-                continue;
-            }
-        };
-        match ws_session(&cfg, &topic, &jwt, &mut to_daemon_w, to_relay_r, &mirror_rx) {
+        match ws_session(&cfg, &topic, &mut to_daemon_w, to_relay_r, &mirror_rx) {
             Ok(()) => {
                 clog("relay: session ended");
                 backoff = 1;
@@ -162,7 +153,7 @@ fn now_iso() -> String {
     format!("{y:04}-{mo:02}-{da:02}T{h:02}:{mi:02}:{s:02}Z")
 }
 
-fn login(cfg: &RelayConfig) -> Result<String, String> {
+fn login(cfg: &RelayConfig) -> Result<TokenSession, String> {
     let url = format!(
         "{}/auth/v1/token?grant_type=password",
         cfg.supabase_url
@@ -175,10 +166,46 @@ fn login(cfg: &RelayConfig) -> Result<String, String> {
         }))
         .map_err(|e| format!("http: {e}"))?;
     let body: Value = resp.body_mut().read_json().map_err(|e| format!("body: {e}"))?;
-    match body.get("access_token").and_then(|v| v.as_str()) {
-        Some(t) => Ok(t.to_string()),
-        None => Err(format!("no access_token in login response: {body}")),
-    }
+    token_session_from(body)
+}
+
+/// Rotate the access token with a refresh token.
+fn refresh_login(cfg: &RelayConfig, refresh_token: &str) -> Result<TokenSession, String> {
+    let url = format!(
+        "{}/auth/v1/token?grant_type=refresh_token",
+        cfg.supabase_url
+    );
+    let mut resp = ureq::post(&url)
+        .header("apikey", &cfg.anon_key)
+        .send_json(serde_json::json!({ "refresh_token": refresh_token }))
+        .map_err(|e| format!("http: {e}"))?;
+    let body: Value = resp.body_mut().read_json().map_err(|e| format!("body: {e}"))?;
+    token_session_from(body)
+}
+
+fn token_session_from(body: Value) -> Result<TokenSession, String> {
+    let access = body
+        .get("access_token")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| format!("no access_token in login response: {body}"))?
+        .to_string();
+    let refresh = body
+        .get("refresh_token")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| format!("no refresh_token in login response: {body}"))?
+        .to_string();
+    let expires_in = body.get("expires_in").and_then(|v| v.as_u64()).unwrap_or(3600);
+    Ok(TokenSession {
+        access_token: access,
+        refresh_token: refresh,
+        expires_in,
+    })
+}
+
+pub struct TokenSession {
+    pub access_token: String,
+    pub refresh_token: String,
+    pub expires_in: u64,
 }
 
 /// PATCH machines.last_seen_at (via the machines_info updatable view).
@@ -233,12 +260,18 @@ fn mirror_upsert(cfg: &RelayConfig, jwt: &str, op: &RelayOut) {
 fn ws_session(
     cfg: &RelayConfig,
     topic: &str,
-    jwt: &str,
     to_daemon_w: &mut std::fs::File,
     to_relay_r: RawFd,
     mirror_rx: &mpsc::Receiver<RelayOut>,
 ) -> Result<(), String> {
     use tungstenite::{Error as WsError, Message};
+
+    let session = login(cfg)?;
+    let mut jwt = session.access_token;
+    let mut refresh_tok = session.refresh_token;
+    // refresh 2 minutes before expiry (JWTs default to 1h)
+    let mut token_deadline = instant_now() + (session.expires_in as f64 - 120.0);
+    let mut refresh_failures: u32 = 0;
 
     let ws_url = format!(
         "{}/realtime/v1?apikey={}&vsn=1.0.0",
@@ -372,6 +405,35 @@ fn ws_session(
         }
 
         // --- timers ---
+        // token refresh: rotate before expiry and tell Realtime the new
+        // token (phoenix access_token event); on repeated failures drop
+        // the session and re-login from scratch
+        if instant_now() >= token_deadline {
+            match refresh_login(cfg, &refresh_tok) {
+                Ok(ts) => {
+                    jwt = ts.access_token;
+                    refresh_tok = ts.refresh_token;
+                    token_deadline = instant_now() + (ts.expires_in as f64 - 120.0);
+                    refresh_failures = 0;
+                    let msg = serde_json::json!({
+                        "topic": "phoenix",
+                        "event": "access_token",
+                        "payload": { "access_token": jwt },
+                        "ref": next_ref(),
+                    });
+                    ws_send(&mut ws, &msg.to_string())?;
+                    clog("relay: access token refreshed");
+                }
+                Err(e) => {
+                    refresh_failures += 1;
+                    clog(&format!("relay: token refresh failed ({e})"));
+                    if refresh_failures >= 3 {
+                        return Err("token refresh failed 3x — re-login".into());
+                    }
+                    token_deadline = instant_now() + 30.0; // retry soon
+                }
+            }
+        }
         if instant_now() - last_hb > 25.0 {
             let hb = serde_json::json!({
                 "topic": "phoenix", "event": "phx_heartbeat", "payload": {}, "ref": next_ref(),
@@ -380,7 +442,7 @@ fn ws_session(
             last_hb = instant_now();
         }
         if instant_now() - last_seen > 30.0 {
-            if let Err(e) = heartbeat(cfg, jwt) {
+            if let Err(e) = heartbeat(cfg, &jwt) {
                 clog(&format!("relay: {e}"));
             }
             last_seen = instant_now();
@@ -388,7 +450,7 @@ fn ws_session(
 
         // --- session mirror ops ---
         while let Ok(op) = mirror_rx.try_recv() {
-            mirror_upsert(cfg, jwt, &op);
+            mirror_upsert(cfg, &jwt, &op);
         }
     }
 }
