@@ -44,6 +44,10 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
   const [blink, setBlink] = useState(true);
   const inputRef = useRef<TextInput | null>(null);
   const lastText = useRef("");
+  // predictive local echo: chars sent to the PTY that have not been
+  // confirmed by an authoritative Update yet, rendered dimmed at the
+  // cursor so typing feels instant despite the relay round trip
+  const [pred, setPred] = useState<{ row: number; col: number; text: string } | null>(null);
   const panesRef = useRef(panes);
   panesRef.current = panes;
 
@@ -75,6 +79,7 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
           const next = new Map(panesRef.current);
           next.set(f.pane, { ...cur, lines, cursor: f.cursor ?? cur.cursor });
           setPanes(next);
+          setPred(null); // authoritative echo arrived
           break;
         }
         case "Scrollback":
@@ -132,10 +137,30 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
       endNew--;
     }
     const removed = prev.length - (endPrev - start) - start;
-    if (removed > 0) send("\u007f".repeat(removed));
+    if (removed > 0) {
+      send("\u007f".repeat(removed));
+      setPred((pr) => {
+        if (!pr || pr.text === "") return null;
+        return { ...pr, text: pr.text.slice(0, Math.max(0, pr.text.length - removed)) };
+      });
+    }
     const added = text.slice(start, endNew);
     if (added !== "") {
-      // Enter on a multiline IME shows up as a newline in the diff
+      // Enter on a multiline IME shows up as a newline in the diff;
+      // newlines can't be predicted (command runs, output streams)
+      const printable = added.replace(/[\n\r]/g, "");
+      if (printable !== "") {
+        setPred((pr) => {
+          if (!pr) {
+            const c = panesRef.current.get(activePane)?.cursor;
+            if (!c) return null;
+            return { row: c.y, col: c.x, text: printable };
+          }
+          return { ...pr, text: pr.text + printable };
+        });
+      } else {
+        setPred(null);
+      }
       send(added.replace(/\n/g, "\r"));
     }
   };
@@ -199,7 +224,22 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
                 <Text style={styles.mono}>
                   {(p?.lines ?? []).slice(0, r.h).map((line, yy) => {
                     const c = p?.cursor;
-                    if (focused && c && c.visible && blink && yy === c.y) {
+                    if (focused && c && yy === c.y && pred &&
+                        pred.row === c.y && pred.col === c.x && pred.text !== "") {
+                      // predicted (unconfirmed) keystrokes: dimmed, with the
+                      // cursor riding after them
+                      const at = line.charAt(c.x) || " ";
+                      return (
+                        <Text key={yy}>
+                          {line.slice(0, c.x)}
+                          <Text style={styles.predText}>{pred.text}</Text>
+                          <Text style={styles.cursor}>{at}</Text>
+                          {line.slice(c.x + 1)}
+                          {"\n"}
+                        </Text>
+                      );
+                    }
+                    if (focused && c && c.visible && yy === c.y && (blink || pred)) {
                       // block cursor: reverse-video the cell under it
                       const ch = line.charAt(c.x) || " ";
                       return (
@@ -306,6 +346,7 @@ const styles = StyleSheet.create({
   key: { backgroundColor: "#1f2430", borderRadius: 6, paddingVertical: 6, paddingHorizontal: 10 },
   keyText: { color: "#9ca3af", fontSize: 12 },
   cursor: { backgroundColor: "#d1d5db", color: "#101014" },
+  predText: { color: "#6b7280" },
   histWrap: {
     position: "absolute", bottom: 0, left: 8, right: 8, top: "18%",
     backgroundColor: "#14151c", borderRadius: 10, padding: 10,
