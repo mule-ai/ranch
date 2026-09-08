@@ -264,7 +264,14 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
         multiline
         value={capture}
         onChangeText={onType}
-        onSubmitEditing={() => send("\r")}
+        onSubmitEditing={() => {
+          send("\r");
+          setPred(null);
+          // visible-password keyboards treat Enter as DONE and dismiss
+          // the IME even with blurOnSubmit=false — yank focus straight
+          // back so the keyboard stays up
+          requestAnimationFrame(() => inputRef.current?.focus());
+        }}
         keyboardType="visible-password"
         autoCapitalize="none"
         autoCorrect={false}
