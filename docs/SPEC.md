@@ -561,6 +561,23 @@ Rust edition 2024, stable toolchain (matches forge: rustc 1.98).
   while the daemon is offline (stale list), register/unregister.
   Deferred to M3: seq-gap auto-resync on the client side (protocol
   support exists; the test tool detects gaps and re-attaches).
+
+- **M2.5 — multi-user OAuth + remote client (2026-09-08)**: identity
+  model upgraded from "admin-provisioned" to self-serve. `ranch
+  config` (one-time: project URL + anon key), `ranch login` (Google
+  OAuth via browser PKCE + localhost callback; `ranch login <email>`
+  as password fallback for headless machines), `ranch machines`
+  (list devices, online dot via last_seen), `ranch cloud` (sessions
+  across all machines from the mirror). `ranch register` no longer
+  needs the service role — it calls the `register_machine`
+  security-definer RPC (migration 0004) which mints the machine key,
+  creates the machine auth user, and inserts the row; 0005 makes
+  unregister also clean up the auth user. Multiple daemons per
+  account fully supported (RLS: machines.user_id = auth.uid()).
+  Client state: ~/.config/ranch/config.json (public) + user.json
+  (0600, refreshable). Google provider must be enabled in the
+  Supabase dashboard (external_google_enabled) + redirect
+  http://localhost:8737/callback added to the allow-list.
 - **M3 — mobile app**: Expo app, auth, machine/session lists, attach
   view with input, scrollback, status. Acceptance: attach to a live
   session on a remote machine from a phone; input works; reconnect on

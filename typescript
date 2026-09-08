@@ -1,0 +1,6 @@
+Script started on 2026-09-08 10:53:48-04:00 [COMMAND="HOME=/tmp/rcli target/debug/ranch-cli login owner@ranch.local" <not executed on terminal>]
+11p6DzJUyinzfMFHC-QEHQ
+password: 
+logged in as owner@ranch.local (4aa9f579-c2e5-4568-a170-25310f48521b)
+
+Script done on 2026-09-08 10:53:48-04:00 [COMMAND_EXIT_CODE="0"]

@@ -541,146 +541,475 @@ fn cmd_attach(ref_: &str) {
 
 // ---------- main ----------
 
-// ---------- cloud commands (M2) ----------
+// ---------- cloud commands ----------
 
-mod cloud {
-    use serde_json::Value;
+/// Supabase config the client learns once (from the project owner) and
+/// stores at ~/.config/ranch/config.json. Not secret: the anon key and
+/// project URL are public by design.
+struct CloudCfg {
+    supabase_url: String,
+    anon_key: String,
+}
 
-    pub struct AdminEnv {
-        pub supabase_url: String,
-        pub anon_key: String,
-        pub service_role: String,
-        pub owner_email: String,
-        pub owner_password: String,
+impl CloudCfg {
+    fn path() -> std::path::PathBuf {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        std::path::PathBuf::from(home).join(".config/ranch/config.json")
     }
-
-    /// Parse the admin env file written once per Supabase project.
-    pub fn load_admin_env() -> Result<AdminEnv, String> {
-        let home = std::env::var("HOME").map_err(|_| "no HOME".to_string())?;
-        let path = std::path::PathBuf::from(home).join(".config/ranch/supabase-project.env");
-        let text = std::fs::read_to_string(&path)
-            .map_err(|e| format!("read {}: {e}", path.display()))?;
-        let get = |key: &str| -> Option<String> {
-            for line in text.lines() {
-                let i = line.find('=')?;
-                if line[..i].trim() == key {
-                    let mut v = line[i + 1..].trim().to_string();
-                    if v.starts_with('"') && v.ends_with('"') {
-                        v = v[1..v.len() - 1].to_string();
-                    }
-                    return Some(v);
-                }
-            }
-            None
-        };
-        let need = |k: &str| {
-            get(k).ok_or_else(|| format!("{k} missing in {}", path.display()))
-        };
-        Ok(AdminEnv {
-            supabase_url: need("SUPABASE_URL")?.trim_end_matches('/').to_string(),
-            anon_key: need("ANON_KEY")?,
-            service_role: need("SUPABASE_SERVICE_ROLE")?,
-            owner_email: need("OWNER_EMAIL")?,
-            owner_password: need("OWNER_PASSWORD")?,
+    fn load() -> Option<CloudCfg> {
+        let text = std::fs::read_to_string(Self::path()).ok()?;
+        let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+        Some(CloudCfg {
+            supabase_url: v["supabase_url"].as_str()?.to_string(),
+            anon_key: v["anon_key"].as_str()?.to_string(),
         })
     }
-
-    fn post_json(url: &str, headers: &[(&str, String)], body: Value) -> Result<(u16, Value), String> {
-        let mut req = ureq::post(url);
-        for (k, v) in headers {
-            req = req.header(*k, v.as_str());
+    fn save(&self) -> Result<(), String> {
+        let p = Self::path();
+        if let Some(d) = p.parent() {
+            std::fs::create_dir_all(d).map_err(|e| e.to_string())?;
         }
-        let mut resp = req
-            .send_json(body)
-            .map_err(|e| format!("POST {url}: {e}"))?;
-        let status = resp.status().as_u16();
-        let v: Value = resp.body_mut().read_json().unwrap_or(Value::Null);
-        Ok((status, v))
-    }
-
-    /// Owner password login -> (jwt, user id from `sub` claim).
-    pub fn owner_login(env: &AdminEnv) -> Result<(String, String), String> {
-        let (status, body) = post_json(
-            &format!("{}/auth/v1/token?grant_type=password", env.supabase_url),
-            &[("apikey", env.anon_key.clone())],
-            serde_json::json!({"email": env.owner_email, "password": env.owner_password}),
-        )?;
-        if status != 200 {
-            return Err(format!("owner login failed: {body}"));
-        }
-        let jwt = body["access_token"]
-            .as_str()
-            .ok_or("no access_token")?
-            .to_string();
-        // decode the sub claim from the JWT payload (no verification needed;
-        // it just came over TLS from Supabase)
-        let mid = jwt.split('.').nth(1).ok_or("malformed jwt")?;
-        let pad = (4 - mid.len() % 4) % 4;
-        let decoded = base64_decode_url(&format!("{}{}", mid, "=".repeat(pad)))
-            .ok_or("malformed jwt payload")?;
-        let claims: Value = serde_json::from_slice(&decoded).map_err(|e| e.to_string())?;
-        let uid = claims["sub"]
-            .as_str()
-            .ok_or("no sub in jwt")?
-            .to_string();
-        Ok((jwt, uid))
-    }
-
-    pub fn base64_decode_url(s: &str) -> Option<Vec<u8>> {
-        // tiny url-alphabet decoder (JWT payloads are unpadded base64url)
-        const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-        let val = |b: u8| -> Option<u32> { A.iter().position(|&a| a == b).map(|p| p as u32) };
-        let bytes: Vec<u8> = s.bytes().filter(|&b| b != b'=').collect();
-        let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
-        for ch in bytes.chunks(4) {
-            let v0 = val(*ch.first()?)?;
-            let v1 = val(*ch.get(1)?)?;
-            let v2 = ch.get(2).copied().and_then(val).unwrap_or(0);
-            let v3 = ch.get(3).copied().and_then(val).unwrap_or(0);
-            let n = (v0 << 18) | (v1 << 12) | (v2 << 6) | v3;
-            out.push((n >> 16) as u8);
-            if ch.len() > 2 { out.push((n >> 8) as u8); }
-            if ch.len() > 3 { out.push(n as u8); }
-        }
-        Some(out)
-    }
-
-    /// 32 chars of /dev/urandom entropy in a dense but readable alphabet.
-    pub fn gen_machine_key() -> String {
-        const ALPHA: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789";
-        let mut buf = [0u8; 32];
-        fill_random(&mut buf);
-        buf.iter().map(|&b| ALPHA[b as usize % ALPHA.len()] as char).collect()
-    }
-
-    fn fill_random(buf: &mut [u8]) {
-        use std::io::Read;
-        if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-            let _ = f.read_exact(buf);
-        }
-    }
-
-    pub fn sha256_hex(data: &str) -> String {
-        use sha2::{Digest, Sha256};
-        let mut h = Sha256::new();
-        h.update(data.as_bytes());
-        h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+        std::fs::write(&p, serde_json::json!({
+            "supabase_url": self.supabase_url,
+            "anon_key": self.anon_key,
+        }).to_string()).map_err(|e| e.to_string())
     }
 }
 
-fn cmd_register(name: Option<String>) {
-    let env = match cloud::load_admin_env() {
-        Ok(e) => e,
-        Err(e) => die(&format!("register: {e} (admin env is provisioned once per Supabase project)")),
+/// Auth session for the human user (owner). Stored 0600.
+/// refresh token is long-lived; access token is refreshed on demand.
+#[derive(serde::Deserialize)]
+struct UserSession {
+    access_token: String,
+    refresh_token: String,
+    expires_at: u64, // unix seconds
+    user_id: String,
+    email: String,
+}
+
+impl UserSession {
+    fn path() -> std::path::PathBuf {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        std::path::PathBuf::from(home).join(".config/ranch/user.json")
+    }
+    fn load() -> Option<UserSession> {
+        let text = std::fs::read_to_string(Self::path()).ok()?;
+        serde_json::from_str(&text).ok()
+    }
+    fn save(&self) -> Result<(), String> {
+        let p = Self::path();
+        if let Some(d) = p.parent() {
+            std::fs::create_dir_all(d).map_err(|e| e.to_string())?;
+        }
+        std::fs::write(&p, serde_json::json!({
+            "access_token": self.access_token,
+            "refresh_token": self.refresh_token,
+            "expires_at": self.expires_at,
+            "user_id": self.user_id,
+            "email": self.email,
+        }).to_string()).map_err(|e| e.to_string())?;
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).ok();
+        Ok(())
+    }
+    fn valid(&self) -> bool {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs()).unwrap_or(0);
+        now + 60 < self.expires_at
+    }
+}
+
+fn http_json(
+    method: &str,
+    url: &str,
+    headers: &[(&str, &str)],
+    body: Option<serde_json::Value>,
+) -> Result<(u16, serde_json::Value), String> {
+    // ureq 3 types differ per body-ness, so dispatch per method with a
+    // small macro to apply headers uniformly.
+    macro_rules! hdrs {
+        ($r:expr) => {{
+            let mut r = $r;
+            for (k, v) in headers {
+                r = r.header(*k, *v);
+            }
+            r
+        }};
+    }
+    let resp = match method.to_ascii_uppercase().as_str() {
+        "GET" => hdrs!(ureq::get(url)).call(),
+        "DELETE" => hdrs!(ureq::delete(url)).call(),
+        "POST" => hdrs!(ureq::post(url)).send_json(body.unwrap_or(serde_json::Value::Null)),
+        "PATCH" => hdrs!(ureq::patch(url)).send_json(body.unwrap_or(serde_json::Value::Null)),
+        _ => return Err(format!("unsupported method {method}")),
     };
+    let mut resp = resp.map_err(|e| format!("{method} {url}: {e}"))?;
+    let status = resp.status().as_u16();
+    let mut text = String::new();
+    resp.body_mut().as_reader().read_to_string(&mut text).map_err(|e| e.to_string())?;
+    let v = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
+    Ok((status, v))
+}
+
+/// b64url decode for JWT payload inspection.
+fn b64url_decode(s: &str) -> Option<Vec<u8>> {
+    const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let val = |b: u8| -> Option<u32> { A.iter().position(|&a| a == b).map(|p| p as u32) };
+    let bytes: Vec<u8> = s.bytes().filter(|&b| b != b'=').collect();
+    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+    for ch in bytes.chunks(4) {
+        let v0 = val(*ch.first()?)?;
+        let v1 = val(*ch.get(1)?)?;
+        let v2 = ch.get(2).copied().and_then(val).unwrap_or(0);
+        let v3 = ch.get(3).copied().and_then(val).unwrap_or(0);
+        let n = (v0 << 18) | (v1 << 12) | (v2 << 6) | v3;
+        out.push((n >> 16) as u8);
+        if ch.len() > 2 { out.push((n >> 8) as u8); }
+        if ch.len() > 3 { out.push(n as u8); }
+    }
+    Some(out)
+}
+
+fn jwt_claims(jwt: &str) -> Option<serde_json::Value> {
+    let mid = jwt.split('.').nth(1)?;
+    let pad = (4 - mid.len() % 4) % 4;
+    let decoded = b64url_decode(&format!("{mid}{}", "=".repeat(pad)))?;
+    serde_json::from_slice(&decoded).ok()
+}
+
+/// Interactive login: opens the browser for Google OAuth via Supabase,
+/// then polls for the session (token-binding via the supabase-js-ish
+/// implicit flow is fragile — we use the PKCE-style magic: start an
+/// OAuth flow against /auth/v1/authorize and read the code from the
+/// redirect. Simplest robust path for a CLI: device-less browser flow
+/// with localhost callback listener.
+fn cmd_login(email: Option<String>) {
+    let cfg = match CloudCfg::load() {
+        Some(c) => c,
+        None => die("login: no cloud config — run `ranch config <supabase-url> <anon-key>` first"),
+    };
+    let session = match email {
+        // email/password fallback: works before Google OAuth is configured
+        // and on headless machines.
+        Some(e) => {
+            let password = rpassword::prompt_password("password: ").unwrap_or_else(|e| die(&format!("login: {e}")));
+            let email = e;
+            let (status, body) = match http_json(
+                "POST",
+                &format!("{}/auth/v1/token?grant_type=password", cfg.supabase_url),
+                &[("apikey", &cfg.anon_key), ("Content-Type", "application/json")],
+                Some(serde_json::json!({ "email": email, "password": password })),
+            ) {
+                Ok(r) => r,
+                Err(err) => die(&format!("login: {err}")),
+            };
+            if status != 200 {
+                die(&format!("login failed ({status}): {body}"));
+            }
+            let claims = jwt_claims(body["access_token"].as_str().unwrap_or_default());
+            UserSession {
+                access_token: body["access_token"].as_str().unwrap_or_default().to_string(),
+                refresh_token: body["refresh_token"].as_str().unwrap_or_default().to_string(),
+                expires_at: body["expires_at"].as_u64().unwrap_or(0),
+                user_id: claims.as_ref().and_then(|c| c["sub"].as_str()).unwrap_or_default().to_string(),
+                email: claims.as_ref().and_then(|c| c["email"].as_str()).unwrap_or_default().to_string(),
+            }
+        }
+        // default: Google OAuth via the browser (PKCE + localhost callback)
+        None => oauth_login(&cfg),
+    };
+    session.save().unwrap_or_else(|e| die(&format!("login: save session: {e}")));
+    println!("logged in as {} ({})", session.email, session.user_id);
+}
+
+/// Google OAuth (PKCE) via the system browser + localhost callback.
+fn oauth_login(cfg: &CloudCfg) -> UserSession {
+    let verifier = gen_pkce_verifier();
+    let challenge = pkce_challenge(&verifier);
+    let redirect_port = 8737u16;
+    let redirect = format!("http://localhost:{redirect_port}/callback");
+
+    println!("opening browser for Google sign-in…");
+    let url = format!(
+        "{}/auth/v1/authorize?provider=google&redirect_to={}&code_challenge={}&code_challenge_method=S256",
+        cfg.supabase_url,
+        urlencode(&redirect),
+        challenge
+    );
+    open_browser(&url);
+
+    let code = match listen_for_code(redirect_port, 300) {
+        Some(c) => c,
+        None => die("login: timed out waiting for browser callback"),
+    };
+
+    let (status, body) = match http_json(
+        "POST",
+        &format!("{}/auth/v1/token?grant_type=pkce", cfg.supabase_url),
+        &[("apikey", &cfg.anon_key), ("Content-Type", "application/json")],
+        Some(serde_json::json!({
+            "auth_code": code,
+            "code_verifier": verifier,
+        })),
+    ) {
+        Ok(r) => r,
+        Err(e) => die(&format!("login: token exchange: {e}")),
+    };
+    if status != 200 {
+        die(&format!("login: token exchange failed ({status}): {body}"));
+    }
+    let claims = jwt_claims(body["access_token"].as_str().unwrap_or_default());
+    UserSession {
+        access_token: body["access_token"].as_str().unwrap_or_default().to_string(),
+        refresh_token: body["refresh_token"].as_str().unwrap_or_default().to_string(),
+        expires_at: body["expires_at"].as_u64().unwrap_or(0),
+        user_id: claims.as_ref().and_then(|c| c["sub"].as_str()).unwrap_or_default().to_string(),
+        email: claims.as_ref().and_then(|c| c["email"].as_str()).unwrap_or_default().to_string(),
+    }
+}
+
+/// Refresh access token using the stored refresh token; returns fresh session.
+fn ensure_session(cfg: &CloudCfg) -> UserSession {
+    let mut s = match UserSession::load() {
+        Some(s) => s,
+        None => die("not logged in — run `ranch login`"),
+    };
+    if s.valid() {
+        return s;
+    }
+    let (status, body) = http_json(
+        "POST",
+        &format!("{}/auth/v1/token?grant_type=refresh_token", cfg.supabase_url),
+        &[("apikey", &cfg.anon_key), ("Content-Type", "application/json")],
+        Some(serde_json::json!({ "refresh_token": s.refresh_token })),
+    ).unwrap_or_else(|e| die(&format!("refresh session: {e}")));
+    if status != 200 {
+        die(&format!("session expired ({}), run `ranch login`", status));
+    }
+    s.access_token = body["access_token"].as_str().unwrap_or_default().to_string();
+    s.refresh_token = body["refresh_token"].as_str().unwrap_or_default().to_string();
+    s.expires_at = body["expires_at"].as_u64().unwrap_or(0);
+    s.save().ok();
+    s
+}
+
+/// List all machines owned by the logged-in user, with sessions count.
+fn cmd_machines() {
+    let cfg = CloudCfg::load().unwrap_or_else(|| die("no cloud config — run `ranch config`"));
+    let s = ensure_session(&cfg);
+    let (status, body) = http_json(
+        "GET",
+        &format!("{}/rest/v1/machines_info?select=id,name,last_seen_at&order=name", cfg.supabase_url),
+        &[("apikey", &cfg.anon_key), ("Authorization", &format!("Bearer {}", s.access_token))],
+        None,
+    ).unwrap_or_else(|e| die(&format!("machines: {e}")));
+    if status != 200 {
+        die(&format!("machines: {body}"));
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let list = body.as_array().cloned().unwrap_or_default();
+    if list.is_empty() {
+        println!("no machines registered — run `ranch register <name>` on a machine");
+        return;
+    }
+    for m in &list {
+        let name = m["name"].as_str().unwrap_or("?");
+        let id = m["id"].as_str().unwrap_or("?");
+        let last = m["last_seen_at"].as_str().unwrap_or("");
+        let online = last.contains("T") && {
+            // cheap staleness check: parse ISO ts to unix secs
+            epoch_from_iso(last).map(|t| now.saturating_sub(t) < 90).unwrap_or(false)
+        };
+        println!("  {}{}  {}  {}", if online { "●" } else { "○" }, name, id, last);
+    }
+}
+
+/// List sessions across all machines (or one), from the mirror.
+fn cmd_cloud_sessions(machine: Option<String>) {
+    let cfg = CloudCfg::load().unwrap_or_else(|| die("no cloud config — run `ranch config`"));
+    let s = ensure_session(&cfg);
+    let mut url = format!(
+        "{}/rest/v1/sessions?select=id,name,kind,machine_id,machines_info!inner(name)&order=name",
+        cfg.supabase_url
+    );
+    if let Some(m) = &machine {
+        url = format!(
+            "{}/rest/v1/sessions?select=id,name,kind,machine_id,machines_info!inner(name)&machine_id=eq.{}&order=name",
+            cfg.supabase_url, m
+        );
+    }
+    let (status, body) = http_json("GET", &url,
+        &[("apikey", &cfg.anon_key), ("Authorization", &format!("Bearer {}", s.access_token))],
+        None,
+    ).unwrap_or_else(|e| die(&format!("sessions: {e}")));
+    if status != 200 {
+        die(&format!("sessions: {body}"));
+    }
+    for row in body.as_array().cloned().unwrap_or_default() {
+        let mname = row["machines_info"]["name"].as_str().unwrap_or("?");
+        println!("  {}@{}  {}  {}", row["name"].as_str().unwrap_or("?"), mname, row["kind"].as_str().unwrap_or("shell"), row["id"].as_str().unwrap_or("?"));
+    }
+}
+
+fn epoch_from_iso(ts: &str) -> Option<u64> {
+    // "2026-09-08T13:46:04+00:00" → unix secs (UTC only; good enough for staleness)
+    let (date, time) = ts.split_once('T')?;
+    let mut dp = date.split('-');
+    let y: i64 = dp.next()?.parse().ok()?;
+    let mo: i64 = dp.next()?.parse().ok()?;
+    let da: i64 = dp.next()?.parse().ok()?;
+    let tp = time.trim_end_matches('Z').split('+').next()?.split('-').next()?.to_string();
+    let mut hp = tp.split(':');
+    let h: i64 = hp.next()?.parse().ok()?;
+    let mi: i64 = hp.next()?.parse().ok()?;
+    let se: f64 = hp.next().unwrap_or("0").parse().ok()?;
+    let days = days_from_civil(y, mo, da);
+    Some(((days * 86400) + h * 3600 + mi * 60 + se as i64) as u64)
+}
+
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+fn gen_pkce_verifier() -> String {
+    use std::io::Read;
+    const ALPHA: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~";
+    let mut buf = [0u8; 64];
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        let _ = f.read_exact(&mut buf);
+    }
+    buf.iter().map(|&b| ALPHA[b as usize % ALPHA.len()] as char).collect()
+}
+
+fn pkce_challenge(verifier: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(verifier.as_bytes());
+    b64url_encode(&digest)
+}
+
+fn b64url_encode(data: &[u8]) -> String {
+    const B: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    for ch in data.chunks(3) {
+        let b0 = ch[0] as u32;
+        let b1 = ch.get(1).copied().unwrap_or(0) as u32;
+        let b2 = ch.get(2).copied().unwrap_or(0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(B[(n >> 18) as usize & 63] as char);
+        out.push(B[(n >> 12) as usize & 63] as char);
+        out.push(if ch.len() > 1 { B[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if ch.len() > 2 { B[n as usize & 63] as char } else { '=' });
+    }
+    out.trim_end_matches('=').to_string()
+}
+
+fn urlencode(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+fn open_browser(url: &str) {
+    let ok = std::process::Command::new("xdg-open").arg(url).status().is_ok()
+        || std::process::Command::new("open").arg(url).status().is_ok();
+    if !ok {
+        println!("open this URL to sign in:
+  {url}");
+    }
+}
+
+/// Tiny localhost HTTP listener to catch the OAuth redirect code.
+fn listen_for_code(port: u16, timeout_secs: u64) -> Option<String> {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::time::{Duration, Instant};
+    let listener = TcpListener::bind(("127.0.0.1", port)).ok()?;
+    let start = Instant::now();
+    listener.set_nonblocking(false).ok();
+    loop {
+        if start.elapsed() > Duration::from_secs(timeout_secs) {
+            return None;
+        }
+        listener.set_nonblocking(true).ok();
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                let mut buf = [0u8; 8192];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                // GET /callback?code=… HTTP/1.1
+                let code = req.split_whitespace().nth(1)
+                    .and_then(|path| path.split('?').nth(1))
+                    .and_then(|q| q.split('&').find(|kv| kv.starts_with("code=")))
+                    .map(|kv| kv[5..].to_string());
+                let resp = if code.is_some() {
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<h1>Ranch: signed in.</h1><script>setTimeout(()=>window.close(),600)</script>"
+                } else {
+                    "HTTP/1.1 400 Bad Request\r\nContent-Type: text/html\r\n\r\n<h1>Ranch: missing ?code</h1>"
+                };
+                stream.write_all(resp.as_bytes()).ok();
+                if let Some(c) = code {
+                    return Some(urldecode(&c));
+                }
+                // browser may retry; keep listening
+            }
+            Err(_) => std::thread::sleep(Duration::from_millis(200)),
+        }
+    }
+}
+
+fn urldecode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or("");
+                if let Ok(b) = u8::from_str_radix(hex, 16) {
+                    out.push(b);
+                    i += 3;
+                } else {
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+            }
+            b'+' => { out.push(b' '); i += 1; }
+            b => { out.push(b); i += 1; }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// `ranch config <supabase-url> <anon-key>` — one-time client bootstrap.
+/// `ranch register [name]` — registers THIS machine with the logged-in
+/// user's account via the register_machine RPC (no service role needed).
+/// Prints the machine key once and writes 0600 daemon.toml for ranchd.
+/// `ranch register [name]` — registers THIS machine with the logged-in
+/// user's account via the register_machine RPC (no service role needed).
+/// Prints the machine key once and writes 0600 daemon.toml for ranchd.
+fn cmd_register(name: Option<String>) {
+    let cfg = CloudCfg::load()
+        .unwrap_or_else(|| die("register: no cloud config — run `ranch config <url> <anon-key>` first"));
+    let session = ensure_session(&cfg);
+
     let name = name.unwrap_or_else(|| {
         std::fs::read_to_string("/etc/hostname")
             .map(|s| s.trim().to_string())
-            .unwrap_or_else(|_| "ranch".into())
+            .unwrap_or_else(|_| "machine".into())
     });
-    let email = format!("machine-{name}@ranch.local");
 
-    // 0. local config must not already exist for a *different* machine
     let cfg_path = std::env::var("HOME")
         .map(|h| std::path::PathBuf::from(h).join(".config/ranch/daemon.toml"))
         .unwrap_or_else(|_| std::path::PathBuf::from("daemon.toml"));
@@ -691,55 +1020,25 @@ fn cmd_register(name: Option<String>) {
         ));
     }
 
-    // 1. owner login (for machines.user_id)
-    let (_owner_jwt, owner_id) = cloud::owner_login(&env).unwrap_or_else(|e| die(&format!("register: {e}")));
-
-    // 2. machine key + id
-    let machine_key = cloud::gen_machine_key();
-    let machine_id = Uuid::new_v4().to_string();
-    let key_hash = cloud::sha256_hex(&machine_key);
-
-    // 3. create the machine auth user (service role)
-    let (status, body) = {
-        let url = format!("{}/auth/v1/admin/users", env.supabase_url);
-        let mut resp = ureq::post(&url)
-            .header("apikey", &env.service_role)
-            .header("Authorization", &format!("Bearer {}", env.service_role))
-            .send_json(serde_json::json!({
-                "email": email,
-                "password": machine_key,
-                "email_confirm": true,
-                "user_metadata": {"machine_id": machine_id},
-            }))
-            .unwrap_or_else(|e| die(&format!("register: create auth user: {e}")));
-        let status = resp.status().as_u16();
-        let v: serde_json::Value = resp.body_mut().read_json().unwrap_or(serde_json::Value::Null);
-        (status, v)
-    };
-    if status != 200 && status != 201 {
-        die(&format!("register: auth user creation failed ({status}): {body}"));
+    let (status, body) = http_json(
+        "POST",
+        &format!("{}/rest/v1/rpc/register_machine", cfg.supabase_url),
+        &[
+            ("apikey", cfg.anon_key.as_str()),
+            ("Authorization", &format!("Bearer {}", session.access_token)),
+            ("Content-Type", "application/json"),
+        ],
+        Some(serde_json::json!({ "p_name": name })),
+    ).unwrap_or_else(|e| die(&format!("register: {e}")));
+    if status != 200 {
+        die(&format!("register: RPC failed ({status}): {body}"));
     }
+    let row = body.as_array().and_then(|a| a.first().cloned())
+        .unwrap_or_else(|| die(&format!("register: unexpected RPC response: {body}")));
+    let machine_id = row["machine_id"].as_str().unwrap_or_default().to_string();
+    let machine_key = row["machine_key"].as_str().unwrap_or_default().to_string();
+    let email = format!("machine-{machine_id}@ranch.local");
 
-    // 4. machines row (service role bypasses RLS)
-    let url = format!("{}/rest/v1/machines", env.supabase_url);
-    let resp = ureq::post(&url)
-        .header("apikey", &env.service_role)
-        .header("Authorization", &format!("Bearer {}", env.service_role))
-        .header("Prefer", "return=representation")
-        .send_json(serde_json::json!({
-            "id": machine_id,
-            "user_id": owner_id,
-            "key_hash": key_hash,
-            "name": name,
-        }))
-        .unwrap_or_else(|e| die(&format!("register: machines insert: {e}")));
-    if resp.status().as_u16() != 201 {
-        let mut resp = resp;
-        let v: serde_json::Value = resp.body_mut().read_json().unwrap_or_default();
-        die(&format!("register: machines insert failed: {v}"));
-    }
-
-    // 5. daemon.toml (0600) — the machine key lives here, shown once below
     if let Some(parent) = cfg_path.parent() {
         std::fs::create_dir_all(parent).ok();
     }
@@ -752,9 +1051,10 @@ fn cmd_register(name: Option<String>) {
          machine_key = \"{machine_key}\"\n\
          supabase_url = \"{}\"\n\
          anon_key = \"{}\"\n",
-        env.supabase_url, env.anon_key
+        cfg.supabase_url, cfg.anon_key
     );
-    std::fs::write(&cfg_path, &cfg_text).unwrap_or_else(|e| die(&format!("register: write config: {e}")));
+    std::fs::write(&cfg_path, &cfg_text)
+        .unwrap_or_else(|e| die(&format!("register: write config: {e}")));
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&cfg_path, std::fs::Permissions::from_mode(0o600)).ok();
 
@@ -769,15 +1069,32 @@ fn cmd_register(name: Option<String>) {
     println!("restart ranchd to connect the relay.");
 }
 
+/// `ranch config <supabase-url> <anon-key>` — one-time client bootstrap.
+fn cmd_config(url: String, key: String) {
+    let cfg = CloudCfg {
+        supabase_url: url.trim_end_matches('/').to_string(),
+        anon_key: key,
+    };
+    cfg.save().unwrap_or_else(|e| die(&format!("config: {e}")));
+    println!("cloud config saved to {}", CloudCfg::path().display());
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
-        eprintln!("usage: ranch <new|ls|attach|kill|rename|split|switch|register> [args]");
+        eprintln!("usage: ranch <new|ls|attach|kill|rename|split|switch|register|login|machines|cloud> [args]");
         eprintln!("  socket: {}", socket_path().display());
         std::process::exit(2);
     }
     match args[0].as_str() {
         "register" => cmd_register(args.get(1).cloned()),
+        "login" => cmd_login(args.get(1).cloned()),
+        "config" => match (args.get(1), args.get(2)) {
+            (Some(u), Some(k)) => cmd_config(u.clone(), k.clone()),
+            _ => die("usage: ranch config <supabase-url> <anon-key>"),
+        },
+        "machines" => cmd_machines(),
+        "cloud" => cmd_cloud_sessions(args.get(1).cloned()),
         "new" => cmd_new(args.get(1).cloned()),
         "ls" | "list" => cmd_ls(),
         "attach" => match args.get(1) {
