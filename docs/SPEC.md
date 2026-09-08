@@ -617,6 +617,20 @@ Rust edition 2024, stable toolchain (matches forge: rustc 1.98).
   tests confirm remote clients can split and drive both panes through
   Supabase Realtime. Not done (moved out of scope): session-tree
   sidebar (flat picker remains), pane swap, windows.
+- **M3 — mobile app verified on device (2026-09-08)**: Expo Go on
+  Android, end-to-end. Google OAuth through the system browser (the
+  `exp://**` URI-allow-list entry is what makes the final redirect hop
+  work — GoTrue globs with `.`/`/` as separators, so `*` cannot match
+  an IP host), machine list from `machines_info` with online state,
+  session create/attach, live pane updates over the private Realtime
+  channel with the owner JWT, input + quick keys, scrollback history
+  view, inline cursor. Realtime lesson: `channel.send()` before the
+  channel reaches SUBSCRIBED is silently dropped — `Relay.join()`
+  awaits the status transition. Machine ownership was moved from the
+  throwaway dev account to the real Google identity (RLS artifact).
+  Not done: dev-client/standalone APK (EAS), terminal font sizing on
+  real screens, session switcher gesture.
+
 - **M2.9 — scrollback correctness + mobile history (2026-09-08)**: fixed
   three real bugs found while wiring the mobile history view:
   1. The ghostty formatter emits the *whole scrollable area* (scrollback +

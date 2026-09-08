@@ -100,8 +100,8 @@ npm install
 npm start          # Expo dev server (Expo Go, or `npx expo run:android` for a dev build)
 ```
 
-- The Google OAuth flow redirects to `dev.ranch.app://callback`
-  (allow-listed server-side) — that scheme resolves in dev-client /
-  standalone builds; a password sign-in fallback exists for Expo Go.
+- Google sign-in works in Expo Go (the Supabase URI allow-list
+  includes `exp://**`); `dev.ranch.app://callback` covers future
+  dev-client/standalone builds. A password fallback exists for dev.
 - The pane renderer computes screen rectangles from the same
   `Layout` split tree as the desktop client; updates stream per-pane.
