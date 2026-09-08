@@ -132,7 +132,7 @@ seq-gap re-sync, and coalesced (droppable) frames.
    mobile app authenticates and attaches to any of the owner's
    sessions over Supabase Realtime; full snapshot + live incremental
    updates + input in both directions.
-5. **G5 — Mobile app**: iOS-first (Expo/React Native) — list
+5. **G5 — Mobile app**: Android-only (Expo/React Native) — list
    machines/sessions, attach to a pane, scrollback, basic keys.
 6. **G6 — Forge first-class**: browse Forge sessions in ranch lists
    (name + live status from the API); `ranch attach forge:<id>` opens a
@@ -191,7 +191,7 @@ seq-gap re-sync, and coalesced (droppable) frames.
    ┌──────┴───────┐
    │ ranch (CLI + │        ┌──────────────┐
    │ attach UI)   │        │ mobile app   │
-   └──────────────┘        │ (Expo, iOS)  │
+   └──────────────┘        │ (Expo, Android)│
                            └──────────────┘
 ```
 

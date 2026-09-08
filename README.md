@@ -87,3 +87,21 @@ ranch/
   detailed completion notes (M0/M1 ✅, M2/M2.5/M2.6 ✅)
 - `docs/PROTOCOL.md` — frame reference; same frames on the unix socket
   and the relay
+
+## Mobile (Android, M3)
+
+`mobile/` is an Expo (React Native) app — Android only. Sign in with
+Google (or password for dev), pick a machine, list/create sessions,
+attach, and type into a live pane over the Supabase Realtime relay.
+
+```sh
+cd mobile
+npm install
+npm start          # Expo dev server (Expo Go, or `npx expo run:android` for a dev build)
+```
+
+- The Google OAuth flow redirects to `dev.ranch.app://callback`
+  (allow-listed server-side) — that scheme resolves in dev-client /
+  standalone builds; a password sign-in fallback exists for Expo Go.
+- The pane renderer computes screen rectangles from the same
+  `Layout` split tree as the desktop client; updates stream per-pane.
