@@ -39,9 +39,11 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
   const [panes, setPanes] = useState<Map<string, PaneSnap>>(new Map());
   const [layout, setLayout] = useState<Layout | null>(null);
   const [activePane, setActivePane] = useState<string>("");
-  const [input, setInput] = useState("");
   const [conn, setConn] = useState("connecting…");
   const [history, setHistory] = useState<string[] | null>(null);
+  const [blink, setBlink] = useState(true);
+  const inputRef = useRef<TextInput | null>(null);
+  const lastText = useRef("");
   const panesRef = useRef(panes);
   panesRef.current = panes;
 
@@ -59,6 +61,7 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
           setLayout(f.layout);
           setActivePane(f.active_pane);
           setConn("online");
+          inputRef.current?.focus();
           break;
         }
         case "Update": {
@@ -103,17 +106,45 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
   }, [sessionId]);
 
   const send = (text: string) => {
-    if (!activePane) return;
+    if (!activePane || text === "") return;
     relay.send({
       t: "Input", id: nextId(), client: "mobile",
       session: sessionId, pane: activePane, data: b64(text),
     } as Frame);
   };
 
-  const submit = () => {
-    send(input + "\n");
-    setInput("");
+  // Raw-mode typing: every keystroke goes straight to the PTY (like an
+  // SSH client). The field below is a hidden capture surface — the real
+  // echo comes back from the PTY in the pane view. Diffs between the
+  // IME's last and current text become input bytes: inserted chars
+  // stream through as-is, deletions become backspaces.
+  const onType = (text: string) => {
+    const prev = lastText.current;
+    lastText.current = text;
+    let start = 0;
+    while (start < prev.length && start < text.length && prev[start] === text[start]) {
+      start++;
+    }
+    let endPrev = prev.length;
+    let endNew = text.length;
+    while (endPrev > start && endNew > start && prev[endPrev - 1] === text[endNew - 1]) {
+      endPrev--;
+      endNew--;
+    }
+    const removed = prev.length - (endPrev - start) - start;
+    if (removed > 0) send("\u007f".repeat(removed));
+    const added = text.slice(start, endNew);
+    if (added !== "") {
+      // Enter on a multiline IME shows up as a newline in the diff
+      send(added.replace(/\n/g, "\r"));
+    }
   };
+
+  // blinking cursor
+  useEffect(() => {
+    const t = setInterval(() => setBlink((b) => !b), 530);
+    return () => clearInterval(t);
+  }, []);
 
   const loadHistory = () => {
     if (!activePane) return;
@@ -126,7 +157,11 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
   const rects = layout ? layoutRects(layout, 0, 0, COLS, ROWS) : [];
 
   return (
-    <KeyboardAvoidingView style={styles.flex} behavior="height">
+    <KeyboardAvoidingView
+      style={styles.flex}
+      behavior="height"
+      onTouchStart={() => inputRef.current?.focus()}
+    >
       <View style={styles.header}>
         <Pressable onPress={onExit} hitSlop={8}>
           <Text style={styles.back}>‹ back</Text>
@@ -153,6 +188,7 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
                 },
               ]}
               onPress={() => {
+                inputRef.current?.focus();
                 setActivePane(r.pane);
                 relay.send({
                   t: "SessionsSelect", session: sessionId, pane: r.pane,
@@ -161,10 +197,22 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
             >
               <ScrollView horizontal={false}>
                 <Text style={styles.mono}>
-                  {(p?.lines ?? []).slice(0, r.h).join("\n")}
-                  {p?.cursor?.visible
-                    ? "\u2588".repeat(1) // block cursor indicator
-                    : ""}
+                  {(p?.lines ?? []).slice(0, r.h).map((line, yy) => {
+                    const c = p?.cursor;
+                    if (focused && c && c.visible && blink && yy === c.y) {
+                      // block cursor: reverse-video the cell under it
+                      const ch = line.charAt(c.x) || " ";
+                      return (
+                        <Text key={yy}>
+                          {line.slice(0, c.x)}
+                          <Text style={styles.cursor}>{ch}</Text>
+                          {line.slice(c.x + 1)}
+                          {"\n"}
+                        </Text>
+                      );
+                    }
+                    return <Text key={yy}>{line}\n</Text>;
+                  })}
                 </Text>
               </ScrollView>
             </Pressable>
@@ -175,23 +223,21 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
         )}
       </View>
 
-      <View style={styles.inputRow}>
-        <TextInput
-          style={[styles.mono, styles.input]}
-          value={input}
-          onChangeText={setInput}
-          onSubmitEditing={submit}
-          placeholder="type a command…"
-          placeholderTextColor="#4b5563"
-          autoCapitalize="none"
-          autoCorrect={false}
-          autoComplete="off"
-          spellCheck={false}
-        />
-        <Pressable style={styles.sendBtn} onPress={submit}>
-          <Text style={styles.btnText}>send</Text>
-        </Pressable>
-      </View>
+      {/* hidden keystroke capture surface — typing goes straight to the
+          PTY and the echo renders in the pane above, like SSH */}
+      <TextInput
+        ref={inputRef}
+        style={styles.hiddenInput}
+        multiline
+        value=""
+        onChangeText={onType}
+        autoCapitalize="none"
+        autoCorrect={false}
+        autoComplete="off"
+        spellCheck={false}
+        blurOnSubmit={false}
+        caretHidden
+      />
 
       {history !== null ? (
         <View style={styles.histWrap}>
@@ -252,15 +298,10 @@ const styles = StyleSheet.create({
     color: "#d1d5db", letterSpacing: -0.2,
   },
   dim: { color: "#6b7280", padding: 16 },
-  inputRow: {
-    flexDirection: "row", gap: 8, padding: 8, alignItems: "center",
+  hiddenInput: {
+    position: "absolute", opacity: 0.01, height: 1, width: 1,
+    left: 0, bottom: 0,
   },
-  input: {
-    flex: 1, backgroundColor: "#1a1b23", borderRadius: 8,
-    paddingHorizontal: 10, paddingVertical: 8, fontSize: 13, color: "#f3f4f6",
-  },
-  sendBtn: { backgroundColor: "#16a34a", borderRadius: 8, paddingHorizontal: 14, paddingVertical: 10 },
-  btnText: { color: "#fff", fontWeight: "700" },
   keys: { flexDirection: "row", gap: 6, paddingHorizontal: 8, paddingBottom: 28 },
   key: { backgroundColor: "#1f2430", borderRadius: 6, paddingVertical: 6, paddingHorizontal: 10 },
   keyText: { color: "#9ca3af", fontSize: 12 },
