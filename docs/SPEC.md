@@ -580,6 +580,9 @@ Rust edition 2024, stable toolchain (matches forge: rustc 1.98).
   project's URL + anon key, which are public identifiers), so `ranch
   login` works out of the box for this project and self-hosters can
   point their builds elsewhere via `make` env or `ranch config`.
+  Google OAuth is enabled on the project (external_google_enabled,
+  client `ranch-oauth` in the vault; redirect
+  http://localhost:8737/callback allow-listed).
 
 - **M2.6 — tmux keybindings + attach TUI status (2026-09-08)**: attach
   TUI is tmux-flavored (Ranch is a tmux *replacement*): `Ctrl-B` is the
@@ -590,13 +593,25 @@ Rust edition 2024, stable toolchain (matches forge: rustc 1.98).
   through; any other key after the prefix also passes `Ctrl-B` through
   so shell muscle memory (Ctrl-B + cursor jumps in readline) survives.
   Green status bar shows machine/session/pane count + `[prefix]`
-  indicator. Ctrl-C now flows through to the PTY like any other key. Google provider must be enabled in the
-  Supabase dashboard (external_google_enabled) + redirect
-  http://localhost:8737/callback added to the allow-list.
+  indicator. Ctrl-C now flows through to the PTY like any other key.
+  **Verified via PTY-driven TUI tests**: echo visible, detach, kill-
+  session, prefix passthrough. Split commands (`%`/`"`) create panes
+  but do not yet render side-by-side — see M2.7.
 - **M3 — mobile app**: Expo app, auth, machine/session lists, attach
   view with input, scrollback, status. Acceptance: attach to a live
   session on a remote machine from a phone; input works; reconnect on
   app resume is exact.
+- **M2.7 — real multiplexing UI (next)**: the attach TUI currently
+  renders one full-screen pane; `Layout::Split` trees and pane-level
+  `cols/rows` are already in the protocol. Sub-goals, in order:
+  (a) client renders `Layout::Split` as real side-by-side/stacked
+  panes with per-pane VT state and a focus ring, input routed to the
+  focused pane; (b) session-tree sidebar (machine → session → pane)
+  toggled with `Ctrl-B s`, replacing the flat picker; (c) tmux-style
+  pane resize (`Ctrl-B` + arrows) and pane swap; (d) session windows
+  (session → windows → panes) if needed. Acceptance: split two shells
+  in one session, both visible side-by-side, input goes to the focused
+  pane, resizes reflow both.
 - **M4 — forge + mule first-class**: forge listing/status/attach
   (§7); mule listing + run-into-pane (§8). Acceptance: start a forge
   session locally, watch it from the phone; run a mule workflow into a
