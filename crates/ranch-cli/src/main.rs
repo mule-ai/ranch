@@ -922,12 +922,15 @@ fn urlencode(s: &str) -> String {
 }
 
 fn open_browser(url: &str) {
-    let ok = std::process::Command::new("xdg-open").arg(url).status().is_ok()
-        || std::process::Command::new("open").arg(url).status().is_ok();
-    if !ok {
-        println!("open this URL to sign in:
-  {url}");
+    println!("sign-in URL (browser should open; copy this if not):\n  {url}");
+    if let Ok(b) = std::env::var("BROWSER") {
+        if !b.is_empty() {
+            let _ = std::process::Command::new(b).arg(url).status();
+            return;
+        }
     }
+    let _ = std::process::Command::new("xdg-open").arg(url).status()
+        .or_else(|_| std::process::Command::new("open").arg(url).status());
 }
 
 /// Tiny localhost HTTP listener to catch the OAuth redirect code.
