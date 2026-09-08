@@ -460,11 +460,61 @@ ranch/
     └── config.toml
 ```
 
-libghostty-vt build: pin a ghostty commit in the flake; build the C
-library on the host (zig build target for the vt lib) and link
-`libghostty-vt-sys` against it (build script points at the prebuilt
-`.so` + headers). Keep this isolated in one crate + build script so the
-rest of the workspace is unaffected.
+### 11.1 libghostty-vt build story (validated in M0)
+
+Validated on Omarchy Linux x86_64 (rustc 1.98) on 2026-09-07:
+
+- **Pinned commit**: `82232ecde55405559dec29c5466cb9e39938cb41` (shallow
+  clone in `vendor/ghostty`, gitignored; record the pin in
+  `justfile`/flake so it is reproducible).
+- **Toolchain**: Zig 0.16.0 (prebuilt tarball, `zig-x86_64-linux-0.16.0.tar.xz`).
+- **Build**: the vt shared lib builds as a side-effect of any example
+  build: `cd vendor/ghostty/example/c-vt-stream && zig build` →
+  `libghostty-vt.so` lands in that example's `.zig-cache/o/<hash>/`.
+  For the product, a dedicated `justfile` target (or flake) will copy it
+  to a stable path; the Zig build in `.spike/zt/` shows the minimal
+  wrapper (path dependency on the pinned source).
+- **Linking**: `libghostty-vt.so` has a runtime SONAME of
+  `libghostty-vt.so.0` — ship a symlink (or `-Wl,-soname`/install_name) or
+  the loader fails. Its only runtime deps are libc/libm.
+- **Rust binding**: hand-rolled `extern "C"` declarations against
+  `include/ghostty/vt/*.h` + `build.rs` that emits
+  `cargo:rustc-link-search=native=` / `cargo:rustc-link-lib=dylib=ghostty-vt` /
+  rpath. M0 proved this works; the published `libghostty-vt-sys` crates are
+  an alternative but track their own upstream pin, so hand-rolled + pinned
+  source is more controllable for MVP.
+
+**M0 findings carried into M1** (from `.spike/vt-spike`):
+
+1. **Formatter PLAIN is the MVP text source.**
+   `ghostty_formatter_terminal_new` + `GHOSTTY_FORMATTER_FORMAT_PLAIN` +
+   `ghostty_formatter_format_alloc` gives the full screen as plain text every
+   tick; diffing it is cheap and correct. No per-cell traversal needed for
+   the MVP renderer. Colored output later: `GHOSTTY_FORMATTER_FORMAT_VT`
+   (emits escape sequences — can be forwarded to the local TUI verbatim and
+   parsed once for the mobile client) or cell-level grid traversal
+   (`ghostty_terminal_grid_ref` + `ghostty_grid_ref_row`). Decision deferred
+   to M1: **MVP ships PLAIN-diff; wire the update frame as "rows of
+   strings" not "cells",** so M2 can swap payload to styled cells without
+   changing framing.
+2. **Remaining FFI surface to wire in M1** (all present in pinned
+   headers, none yet exercised):
+   - `ghostty_terminal_resize(cols, rows, cw, ch)` → reflow (test with vim)
+   - scrollback: `ghostty_terminal_grid_ref` with
+     `GHOSTTY_POINT_TAG_HISTORY` points (plus `ghostty_grid_ref_row` / `..._cell`
+     to read lines) + paged fetch; also `ghostty_terminal_scroll_viewport`
+   - key encoding: `include/ghostty/vt/key.h` (Kitty keyboard protocol)
+     for client input → bytes; mouse: `mouse.h` (SGR)
+   - `ghostty_terminal_vt_write_until_ground` — useful if the daemon ever
+     needs to inject its own sequences (e.g. pane titles)
+   - `ghostty_terminal_snapshot*` — later, for cross-device
+     state transfer instead of replaying scrollback
+3. **PTY lifecycle** (openpty/fork/execvp/poll/waitpid-WNOHANG) is stable
+   and dependency-free; wrap it in a small `pty` module in `ranch-daemon`
+   with the same shapes the spike uses (setsid + tcsetpgrp + dup2 slave).
+4. **Pane size policy** (spec §5): MVP uses "most-recent-active client wins"
+   — a client's `resize` sets the canonical VT size; all attached clients
+   re-render. Per-client virtual sizes are a post-MVP item.
 
 Rust edition 2024, stable toolchain (matches forge: rustc 1.98).
 
@@ -476,11 +526,23 @@ Rust edition 2024, stable toolchain (matches forge: rustc 1.98).
   changed rows. Pinned ghostty commit:
   `82232ecde55405559dec29c5466cb9e39938cb41` (libghostty-vt.so.0,
   deps: libc/libm only). Go/Plan-B gate: **go**.
-- **M1 — local multiplexer (core)**: `ranchd` + `ranch` CLI/attach,
-  unix socket only. Sessions/panes, split/switch/rename/kill,
-  scrollback, resize/reflow, state file, systemd unit. Acceptance:
-  `ranch new work; ranch attach work`, disconnect, reconnect — exact
-  state; run vim inside and survive disconnects.
+- **M1 — local multiplexer (core)**: ✅ **DONE 2026-09-07** —
+  `ranchd` + `ranch` CLI/attach, unix socket only. All sub-tasks
+  delivered: `ranch-protocol` (frame types, chunking, 6 tests incl.
+  multi-frame-in-one-read), `ranch-daemon` (pty FFI, ghostty-vt per
+  pane, 30 ms tick, dirty-row diff, session/pane registry, state.json,
+  unix-socket JSON-lines server, resize, scrollback ring buffer),
+  `ranch-cli` (attach TUI via ratatui, key encoding, new/ls/attach/
+  kill/rename/split/switch), `ranch-vt` FFI wrapper, systemd unit.
+  **Acceptance PASS (7/7):** HelloOk, SessionsAck, attach snapshot,
+  input round-trip (echo visible), state survives disconnect/reconnect
+  (exact screen), resize triggers reflow with new dims, kill.
+  Bugs found & fixed during M1: (a) daemon fed the full 64 KB stack
+  buffer into the line decoder instead of `&buf[..r]` — stale NULs
+  silently dropped coalesced frames; (b) ghostty formatter options
+  struct had a wrong `extra` layout (`i32` vs the real nested struct)
+  causing `rc=-2`; (c) cursor x is a char index, not a byte offset —
+  TUI slicing panicked on multi-byte prompt chars.
 - **M2 — relay + registration**: Supabase project, schema + RLS,
   `ranch register`, daemon relay client, raw relay client test tool.
   Acceptance: frames flow machine→cloud→client with seq-gap resync;
@@ -496,10 +558,11 @@ Rust edition 2024, stable toolchain (matches forge: rustc 1.98).
 
 ## 13. Risks & open questions
 
-1. **libghostty-vt API churn.** Mitigation: M0 gate; pin commit;
-   Plan B byte-stream mode. If the API is unusable, fallback
-   candidates: `vt100`-class Rust emulator in the daemon, or
-   client-side emulation with server ring buffer (tmux model).
+1. **libghostty-vt API churn.** M0 gate passed 2026-09-07 with pinned
+   commit `82232ecb`; build + linking story validated (§11.1). Residual
+   risk: API still in flux upstream — mitigated by pinning the source and
+   hand-rolling FFI against the pinned headers. Plan B (byte-stream +
+   client emulation) remains documented in §4.1 if the pin ever breaks.
 2. **Supabase Realtime limits** (message size, throughput, tier
    pricing, latency under mobile network flakiness). Mitigation:
    chunking, coalescing, droppable updates + resync; measure at M2 and

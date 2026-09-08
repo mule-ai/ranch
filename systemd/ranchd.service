@@ -1,0 +1,27 @@
+# ranchd — Ranch local daemon
+# Installs a user-level systemd unit:
+#   install -Dm644 systemd/ranchd.service ~/.config/systemd/user/ranchd.service
+#   systemctl --user enable --now ranchd
+#
+# The daemon listens on ~/.local/state/ranch/daemon.sock and keeps every
+# session's PTY + ghostty-vt alive in memory. Sessions do not survive a
+# daemon restart in M1 (state.json is written for observability only).
+
+[Unit]
+Description=Ranch local daemon (PTY + libghostty-vt multiplexer)
+After=default.target
+
+[Service]
+Type=simple
+# Adjust to your source tree / build output.
+ExecStart=/home/jbutler/src/ranch/target/release/ranch-daemon
+WorkingDirectory=/home/jbutler/src/ranch
+Restart=on-failure
+RestartSec=2
+
+# Environment overrides (optional)
+# Environment=RANCH_SOCKET=/custom/path/daemon.sock
+Environment=TERM=xterm-256color
+
+[Install]
+WantedBy=default.target

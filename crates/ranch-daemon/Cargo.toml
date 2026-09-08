@@ -1,0 +1,12 @@
+[package]
+name = "ranch-daemon"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ranch-protocol = { path = "../ranch-protocol" }
+ranch-vt = { path = "../ranch-vt" }
+libc = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { version = "1", features = ["v4"] }

@@ -1,0 +1,13 @@
+[package]
+name = "ranch-cli"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ranch-protocol = { path = "../ranch-protocol" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+libc = { workspace = true }
+uuid = { version = "1", features = ["v4"] }
+crossterm = "0.28"
+ratatui = "0.29"
