@@ -41,6 +41,7 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
   const [activePane, setActivePane] = useState<string>("");
   const [input, setInput] = useState("");
   const [conn, setConn] = useState("connecting…");
+  const [history, setHistory] = useState<string[] | null>(null);
   const panesRef = useRef(panes);
   panesRef.current = panes;
 
@@ -73,6 +74,9 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
           setPanes(next);
           break;
         }
+        case "Scrollback":
+          setHistory(f.lines);
+          break;
         case "Meta":
           if (f.kind === "exited") setConn("session ended");
           break;
@@ -109,6 +113,14 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
   const submit = () => {
     send(input + "\n");
     setInput("");
+  };
+
+  const loadHistory = () => {
+    if (!activePane) return;
+    relay.send({
+      t: "ScrollbackReq", id: nextId(), client: "mobile",
+      session: sessionId, pane: activePane, offset: 0, limit: 2000,
+    } as Frame);
   };
 
   const rects = layout ? layoutRects(layout, 0, 0, COLS, ROWS) : [];
@@ -181,23 +193,42 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
         </Pressable>
       </View>
 
-      <View style={styles.keys}>
-        {["Ctrl-C", "Ctrl-D", "Tab", "Esc", "↑", "↓"].map((k) => (
-          <Pressable
-            key={k}
-            style={styles.key}
-            onPress={() => {
-              const seq: Record<string, string> = {
-                "Ctrl-C": "\x03", "Ctrl-D": "\x04", Tab: "\t", Esc: "\x1b",
-                "↑": "\x1b[A", "↓": "\x1b[B",
-              };
-              send(seq[k] ?? "");
-            }}
-          >
-            <Text style={styles.keyText}>{k}</Text>
-          </Pressable>
-        ))}
-      </View>
+      {history !== null ? (
+        <View style={styles.histWrap}>
+          <View style={styles.histHeader}>
+            <Text style={styles.histTitle}>scrollback ({history.length})</Text>
+            <Pressable onPress={() => setHistory(null)} hitSlop={8}>
+              <Text style={styles.back}>close ✕</Text>
+            </Pressable>
+          </View>
+          <ScrollView style={styles.histScroll}>
+            <Text style={styles.mono}>{history.join("\n")}</Text>
+          </ScrollView>
+        </View>
+      ) : (
+        <View style={styles.keys}>
+          {["Enter", "Ctrl-C", "Ctrl-D", "Ctrl-L", "Tab", "Esc", "↑", "↓", "←", "→", "hist"].map((k) => (
+            <Pressable
+              key={k}
+              style={styles.key}
+              onPress={() => {
+                if (k === "hist") {
+                  loadHistory();
+                  return;
+                }
+                const seq: Record<string, string> = {
+                  Enter: "\n", "Ctrl-C": "\x03", "Ctrl-D": "\x04",
+                  "Ctrl-L": "\x0c", "Ctrl-R": "\x12", Tab: "\t", Esc: "\x1b",
+                  "↑": "\x1b[A", "↓": "\x1b[B", "←": "\x1b[D", "→": "\x1b[C",
+                };
+                send(seq[k] ?? "");
+              }}
+            >
+              <Text style={styles.keyText}>{k}</Text>
+            </Pressable>
+          ))}
+        </View>
+      )}
     </KeyboardAvoidingView>
   );
 }
@@ -233,4 +264,13 @@ const styles = StyleSheet.create({
   keys: { flexDirection: "row", gap: 6, paddingHorizontal: 8, paddingBottom: 28 },
   key: { backgroundColor: "#1f2430", borderRadius: 6, paddingVertical: 6, paddingHorizontal: 10 },
   keyText: { color: "#9ca3af", fontSize: 12 },
+  cursor: { backgroundColor: "#d1d5db", color: "#101014" },
+  histWrap: {
+    position: "absolute", bottom: 0, left: 8, right: 8, top: "18%",
+    backgroundColor: "#14151c", borderRadius: 10, padding: 10,
+    borderTopWidth: 1, borderTopColor: "#26262e",
+  },
+  histHeader: { flexDirection: "row", justifyContent: "space-between", marginBottom: 6 },
+  histTitle: { color: "#9ca3af", fontSize: 12, fontWeight: "700" },
+  histScroll: { flex: 1 },
 });

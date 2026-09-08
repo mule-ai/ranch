@@ -617,6 +617,24 @@ Rust edition 2024, stable toolchain (matches forge: rustc 1.98).
   tests confirm remote clients can split and drive both panes through
   Supabase Realtime. Not done (moved out of scope): session-tree
   sidebar (flat picker remains), pane swap, windows.
+- **M2.9 — scrollback correctness + mobile history (2026-09-08)**: fixed
+  three real bugs found while wiring the mobile history view:
+  1. The ghostty formatter emits the *whole scrollable area* (scrollback +
+     screen), not just the viewport — `Vt::screen()` now slices the last
+     `rows` lines, and unit tests pin exact screen bounds (the old tests
+     passed vacuously on `contains()`).
+  2. Once content scrolled, the formatter's viewport stayed at the top of
+     the scrollback — `Vt::write()`/`screen()` now pin the viewport to the
+     bottom (`ghostty_terminal_scroll_viewport`) so rendering follows the
+     active area.
+  3. The daemon's scrollback heuristic (shift detection) couldn't span
+     fast output that scrolls a full screen per tick. Replaced: the ring is
+     rebuilt each tick from `full_screen()[0..total-len]` — the rows above
+     the viewport per the terminal's own scrollbar state.
+  Plus zombie reaping: killed panes/sessions now get their child pids
+  reaped by the poll loop (no more zombie buildup). The mobile Terminal
+  screen gained a scrollback history view (ScrollbackReq) and an inline
+  reverse-video cursor.
 - **M2.8 — interactive session manager (2026-09-08)**: plain `ranch`
   in a TTY opens the dashboard — list sessions (name/kind/panes),
   `enter` attach, `c` new session (auto-attach), `n` new with name,

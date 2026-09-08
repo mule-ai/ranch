@@ -348,6 +348,8 @@ struct Daemon {
     state_path: PathBuf,
     /// send session mirror ops to the relay thread
     mirror_tx: Option<std::sync::mpsc::Sender<relay::RelayOut>>,
+    /// child pids whose Pane was removed before exit — reaped by the poll loop
+    orphans: Vec<c_int>,
 }
 
 // ---------- helpers ----------
@@ -560,6 +562,7 @@ impl Daemon {
             clients: BTreeMap::new(),
             state_path,
             mirror_tx,
+            orphans: Vec::new(),
         };
         // register the relay as a client keyed by its read-pipe fd; remote
         // frames arrive there and daemon->remote frames go out via relay_out
@@ -874,6 +877,9 @@ impl Daemon {
             Frame::SessionsKill { session } => {
                 if let Some(sid) = self.resolve_session(session).map(|s| s.id) {
                     if let Some(s) = self.sessions.remove(&sid) {
+                        for p in s.panes.values() {
+                            self.orphans.push(p.child);
+                        }
                         eprintln!("ranchd: killed session {}", s.name);
                     }
                     self.write_state();
@@ -994,7 +1000,8 @@ impl Daemon {
                 let mut need_snap = None;
                 if let Some(s) = self.sessions.get_mut(&sid) {
                     if let Some(p) = s.panes.remove(&pid) {
-                        drop(p);
+                        // master fd drops here (SIGHUP to the shell); reap later
+                        self.orphans.push(p.child);
                     }
                     s.remove_leaf(&pid.to_string());
                     if s.active == pid {
@@ -1207,6 +1214,20 @@ fn main() {
             }
         }
 
+        // --- reap orphaned pane children (killed panes/sessions) ---
+        if !daemon.orphans.is_empty() {
+            let mut status: c_int = 0;
+            daemon.orphans.retain(|&pid| {
+                let w = unsafe { waitpid(pid, &mut status, WNOHANG) };
+                if w == pid {
+                    eprintln!("ranchd: reaped orphan child {pid}");
+                    return false; // reaped — drop
+                }
+                // ECHILD => already gone; WNOHANG 0 => still running; keep both
+                !(w == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD))
+            });
+        }
+
         // --- child liveness + tick: coalesce dirty panes into updates ---
         let mut updates: Vec<Frame> = Vec::new();
         for (_sid, s) in daemon.sessions.iter_mut() {
@@ -1224,23 +1245,26 @@ fn main() {
                     let (pcols, prows) = p.vt.dims();
                     let new_screen = p.vt.screen();
                     let (cx, cy, vis) = p.vt.cursor();
-                    // scrollback heuristic: a line scrolled off the top when
-                    // most other lines are unchanged and the top line moved.
-                    if new_screen.len() == p.prev_screen.len()
-                        && !p.prev_screen.is_empty()
-                        && !p.prev_screen[0].is_empty()
-                        && p.prev_screen[0] != new_screen[0]
-                    {
-                        let same = (1..new_screen.len())
-                            .filter(|&i| new_screen[i] == p.prev_screen[i])
-                            .count();
-                        if same > new_screen.len() / 2 {
-                            p.scrollback.push_back(p.prev_screen[0].clone());
-                            while p.scrollback.len() > SCROLLBACK_CAP {
-                                p.scrollback.pop_front();
-                            }
+                    // Scrollback capture: the formatter's full area is
+                    // [scrollback rows..., visible rows...]. The scrollbar
+                    // total/len tell us where the visible viewport starts,
+                    // so the ring is simply the rows above it — rebuilt
+                    // wholesale each tick (cheap: <= cap+rows lines).
+                    let full = p.vt.full_screen();
+                    let (total, _, vlen) = p.vt.scrollbar();
+                    let visible_start = total.saturating_sub(vlen) as usize;
+                    if full.len() >= visible_start {
+                        p.scrollback = full[..visible_start]
+                            .iter()
+                            .filter(|l| !l.is_empty())
+                            .cloned()
+                            .collect::<VecDeque<String>>();
+                        if p.scrollback.len() > SCROLLBACK_CAP {
+                            let drop = p.scrollback.len() - SCROLLBACK_CAP;
+                            p.scrollback.drain(..drop);
                         }
                     }
+
                     let mut rows_upd: Vec<(u16, String)> = Vec::new();
                     for (i, line) in new_screen.iter().enumerate() {
                         let old = p.prev_screen.get(i).map(|s| s.as_str());

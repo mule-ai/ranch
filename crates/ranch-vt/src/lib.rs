@@ -73,6 +73,7 @@ unsafe extern "C" {
         cell_height_px: u32,
     ) -> GhosttyResult;
     fn ghostty_terminal_get(terminal: *mut c_void, data: i32, out: *mut c_void) -> GhosttyResult;
+    fn ghostty_terminal_scroll_viewport(terminal: *mut c_void, behavior: ScrollViewport);
     fn ghostty_formatter_terminal_new(
         allocator: *const c_void,
         formatter: *mut *mut c_void,
@@ -88,6 +89,17 @@ unsafe extern "C" {
     fn ghostty_formatter_free(formatter: *mut c_void);
     fn ghostty_free(allocator: *const c_void, ptr: *mut u8, len: usize);
 }
+
+/// Mirror of GhosttyTerminalScrollViewport (include/ghostty/vt/terminal.h).
+/// Tagged union: `tag: c_int` + 16-byte value union (alignment 8).
+#[repr(C)]
+struct ScrollViewport {
+    tag: i32,
+    _pad: i32,
+    value: [u64; 2], // union { intptr_t delta; size_t row; uint64_t _padding[2]; }
+}
+
+const SCROLL_VIEWPORT_BOTTOM: i32 = 1; // TOP=0, BOTTOM=1, DELTA=2, ROW=3
 
 /// A live terminal instance: one ghostty-vt state machine + a plain-text
 /// formatter bound to it.
@@ -142,7 +154,19 @@ impl Vt {
         if data.is_empty() {
             return;
         }
-        unsafe { ghostty_terminal_vt_write(self.h, data.as_ptr(), data.len()) };
+        unsafe {
+            ghostty_terminal_vt_write(self.h, data.as_ptr(), data.len());
+        }
+        self.pin_bottom();
+    }
+
+    fn pin_bottom(&self) {
+        let behavior = ScrollViewport {
+            tag: SCROLL_VIEWPORT_BOTTOM,
+            _pad: 0,
+            value: [0; 2],
+        };
+        unsafe { ghostty_terminal_scroll_viewport(self.h, behavior) };
     }
 
     /// Resize the grid (triggers reflow for the primary screen).
@@ -168,7 +192,16 @@ impl Vt {
         unsafe {
             ghostty_free(ptr::null(), buf, len);
         }
-        s.lines().map(|l| l.to_string()).collect()
+        // The formatter emits the whole scrollable area (scrollback +
+        // active screen). Only the visible viewport — the last `rows`
+        // lines — is the current screen.
+        let (_, rows) = self.dims();
+        let rows = rows as usize;
+        let mut lines: Vec<String> = s.lines().map(|l| l.to_string()).collect();
+        if lines.len() > rows {
+            lines.drain(..lines.len() - rows);
+        }
+        lines
     }
 
     /// (col, row, visible) cursor position in active-screen coordinates.
@@ -188,6 +221,44 @@ impl Vt {
             );
         }
         (x, y, visible)
+    }
+
+    /// The whole scrollable area (scrollback + active screen), oldest
+    /// first. Used for scrollback capture: diffing consecutive full
+    /// areas tells us exactly which rows scrolled off the top.
+    pub fn full_screen(&self) -> Vec<String> {
+        self.pin_bottom();
+        let mut buf: *mut u8 = ptr::null_mut();
+        let mut len: usize = 0;
+        let rc = unsafe {
+            ghostty_formatter_format_alloc(self.fmt, ptr::null(), &mut buf, &mut len)
+        };
+        if rc != 0 || buf.is_null() {
+            return Vec::new();
+        }
+        let text = unsafe { std::slice::from_raw_parts(buf, len) };
+        let s = String::from_utf8_lossy(text).into_owned();
+        unsafe {
+            ghostty_free(ptr::null(), buf, len);
+        }
+        s.lines().map(|l| l.to_string()).collect()
+    }
+
+    /// Scrollbar state: (total scrollable rows, viewport offset, visible len).
+    pub fn scrollbar(&self) -> (u64, u64, u64) {
+        // Mirror of GhosttyTerminalScrollbar { total, offset, len }
+        #[repr(C)]
+        struct Scrollbar { total: u64, offset: u64, len: u64 }
+        const DATA_SCROLLBAR: i32 = 9;
+        let mut sb = Scrollbar { total: 0, offset: 0, len: 0 };
+        unsafe {
+            let _ = ghostty_terminal_get(
+                self.h,
+                DATA_SCROLLBAR,
+                &mut sb as *mut Scrollbar as *mut c_void,
+            );
+        }
+        (sb.total, sb.offset, sb.len)
     }
 
     /// Current (cols, rows) of the grid.
@@ -214,5 +285,155 @@ impl Drop for Vt {
             unsafe { ghostty_terminal_free(self.h) };
             self.h = ptr::null_mut();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn screen_scrolls_when_full() {
+        let vt = Vt::new(80, 6).unwrap();
+        let mut input = String::new();
+        for i in 1..=20 {
+            input.push_str(&format!("LINE{i}\r\n"));
+        }
+        vt.write(input.as_bytes());
+        let screen = vt.screen();
+        let joined = screen.join("\n");
+        assert!(
+            joined.contains("LINE20"),
+            "screen should show the newest line; got:\n{joined}"
+        );
+        assert!(!joined.contains("LINE14"), "scrolled-off lines must not leak; got:\n{joined}");
+        assert_eq!(screen.len(), 6, "screen() must return exactly `rows` lines");
+    }
+
+    /// Reproduce the daemon's read pattern: many small write() batches.
+    #[test]
+    fn screen_scrolls_with_many_small_writes() {
+        let vt = Vt::new(80, 24).unwrap();
+        for i in 1..=30 {
+            vt.write(format!("LINE{i}\r\n").as_bytes());
+        }
+        let screen = vt.screen();
+        let joined = screen.join("\n");
+        assert!(
+            joined.contains("LINE30"),
+            "screen should show the newest line; got:\n{joined}"
+        );
+    }
+
+    /// The daemon resizes each pane right after spawn (session bootstrap).
+    /// Does a resize break viewport tracking?
+    #[test]
+    fn screen_scrolls_after_resize() {
+        let vt = Vt::new(80, 24).unwrap();
+        vt.resize(96, 24);
+        for i in 1..=30 {
+            vt.write(format!("LINE{i}\r\n").as_bytes());
+        }
+        let screen = vt.screen();
+        let joined = screen.join("\n");
+        assert!(
+            joined.contains("LINE30"),
+            "screen should show the newest line; got:\n{joined}"
+        );
+    }
+
+    /// Replay the exact bytes the daemon captured from a real bash/starship
+    /// PTY (/tmp/pty-capture.bin) — reproduces the stale-formatter bug.
+    #[test]
+    fn replay_real_pty_capture() {
+        let data = std::fs::read("/tmp/pty-capture.bin").expect("capture file");
+        let vt = Vt::new(80, 24).unwrap();
+        vt.write(&data);
+        let screen = vt.screen();
+        let joined = screen.join("\n");
+        eprintln!("replay screen tail: {:?}", screen.last());
+        eprintln!("replay has LINE30: {}", joined.contains("LINE30"));
+        let (t, o, l) = vt.scrollbar();
+        eprintln!("replay scrollbar: total={t} offset={o} len={l}");
+        assert!(joined.contains("LINE30"), "formatter must follow the viewport; got:\n{joined}");
+    }
+
+    /// Replay with the daemon's exact batch boundaries + interleaved
+    /// screen() calls (the daemon formats on every dirty tick).
+    #[test]
+    fn replay_in_daemon_batches() {
+        let data = std::fs::read("/tmp/pty-capture.bin").expect("capture file");
+        let vt = Vt::new(80, 24).unwrap();
+        // daemon trace batches: 32, 123, 53, 231, 32, 123, 11, 32, 123
+        let bounds = [32usize, 155, 208, 439, 471, 594];
+        let mut start = 0;
+        for &end in &bounds {
+            if end <= data.len() {
+                vt.write(&data[start..end]);
+                let _ = vt.screen(); // dirty tick format
+                start = end;
+            }
+        }
+        if start < data.len() {
+            vt.write(&data[start..]);
+        }
+        let screen = vt.screen();
+        let joined = screen.join("\n");
+        eprintln!("batched has LINE30: {}", joined.contains("LINE30"));
+        let (t, o, l) = vt.scrollbar();
+        eprintln!("batched scrollbar: total={t} offset={o} len={l}");
+        assert!(joined.contains("LINE30"), "formatter must follow; got:\n{joined}");
+    }
+
+    /// Prove scroll_viewport works: pin to TOP must move the viewport
+    /// offset to 0 (screen() re-pins to bottom, so assert on scrollbar).
+    #[test]
+    fn viewport_pin_takes_effect() {
+        let vt = Vt::new(80, 6).unwrap();
+        for i in 1..=20 {
+            vt.write(format!("LINE{i}\r\n").as_bytes());
+        }
+        assert_eq!(vt.scrollbar(), (21, 15, 6), "write() pins viewport to bottom");
+        unsafe {
+            let behavior = ScrollViewport { tag: 0, _pad: 0, value: [0; 2] }; // TOP
+            ghostty_terminal_scroll_viewport(vt.h, behavior);
+        }
+        assert_eq!(vt.scrollbar(), (21, 0, 6), "TOP pin must move offset to 0");
+    }
+
+    /// Starship-style prompt with escape sequences + scroll.
+    #[test]
+    fn screen_scrolls_with_escapes() {
+        let vt = Vt::new(80, 24).unwrap();
+        // prompt with color/cursor escapes
+        let prompt = "\x1b[1;32m\u{276f}\x1b[0m \x1b[36m~/src\x1b[0m \r\n";
+        vt.write(prompt.as_bytes());
+        // command echo comes from the pty too
+        vt.write(b"for i in $(seq 1 30); do echo LINE$i; done\r\n");
+        for i in 1..=30 {
+            vt.write(format!("LINE{i}\r\n").as_bytes());
+        }
+        let screen = vt.screen();
+        let joined = screen.join("\n");
+        assert!(
+            joined.contains("LINE30"),
+            "screen should show the newest line; got:\n{joined}"
+        );
+    }
+
+    /// The daemon formats the screen between writes (every dirty tick).
+    #[test]
+    fn screen_scrolls_with_interleaved_format() {
+        let vt = Vt::new(80, 24).unwrap();
+        for i in 1..=30 {
+            vt.write(format!("LINE{i}\r\n").as_bytes());
+            let _ = vt.screen(); // the daemon formats every dirty tick
+        }
+        let screen = vt.screen();
+        let joined = screen.join("\n");
+        assert!(
+            joined.contains("LINE30"),
+            "screen should show the newest line; got:\n{joined}"
+        );
     }
 }
