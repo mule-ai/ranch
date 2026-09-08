@@ -211,7 +211,7 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
                         </Text>
                       );
                     }
-                    return <Text key={yy}>{line}\n</Text>;
+                    return <Text key={yy}>{line + "\n"}</Text>;
                   })}
                 </Text>
               </ScrollView>
