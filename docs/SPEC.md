@@ -579,7 +579,18 @@ Rust edition 2024, stable toolchain (matches forge: rustc 1.98).
   RANCH_ANON_KEY env > config.json > baked-in defaults (the Ranch
   project's URL + anon key, which are public identifiers), so `ranch
   login` works out of the box for this project and self-hosters can
-  point their builds elsewhere via `make` env or `ranch config`. Google provider must be enabled in the
+  point their builds elsewhere via `make` env or `ranch config`.
+
+- **M2.6 — tmux keybindings + attach TUI status (2026-09-08)**: attach
+  TUI is tmux-flavored (Ranch is a tmux *replacement*): `Ctrl-B` is the
+  command prefix — `d` detach, `n`/`p` next/prev session, `o`/`l` next
+  pane, `c` new session, `&`/`k` kill session, `%`/`"` split h/v,
+  `x` kill pane, `s` session picker overlay, `,` rename, `:` command
+  prompt (`kill`, `detach`), `Ctrl-B Ctrl-B` passes a literal `Ctrl-B`
+  through; any other key after the prefix also passes `Ctrl-B` through
+  so shell muscle memory (Ctrl-B + cursor jumps in readline) survives.
+  Green status bar shows machine/session/pane count + `[prefix]`
+  indicator. Ctrl-C now flows through to the PTY like any other key. Google provider must be enabled in the
   Supabase dashboard (external_google_enabled) + redirect
   http://localhost:8737/callback added to the allow-list.
 - **M3 — mobile app**: Expo app, auth, machine/session lists, attach

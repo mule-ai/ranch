@@ -255,6 +255,11 @@ impl Screen {
             cursor: (0, 0, true),
         }
     }
+    /// Blank the local screen (switching sessions; a snapshot will refill it).
+    fn reset_blank(&mut self) {
+        self.lines = vec![String::new(); self.rows as usize];
+        self.cursor = (0, 0, true);
+    }
 }
 
 fn key_to_bytes(key: &KeyEvent) -> Option<Vec<u8>> {
@@ -327,6 +332,19 @@ fn cmd_attach(ref_: &str) {
     let mut buf = [0u8; 65536];
     let got_snapshot = std::cell::Cell::new(false);
     let sent_resize = std::cell::Cell::new(false);
+    // tmux prefix state + session list for prefix-n/p + picker
+    let prefix_mode = std::cell::Cell::new(false);
+    let session_list: std::rc::Rc<std::cell::RefCell<Vec<String>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(vec![]));
+    let picker = std::cell::Cell::new(false);
+    let picker_sel = std::cell::Cell::new(0usize);
+    #[derive(Clone, Copy, PartialEq)]
+    enum Prompt { Rename, Command }
+    let prompt = std::cell::Cell::new(None::<Prompt>);
+    let mut prompt_input = String::new();
+    let mut sessions_meta: Vec<ranch_protocol::SessionMeta> = vec![];
+    let _ = &mut sessions_meta;
+    let _ = &picker_sel;
 
     let (cols, rows) = size().unwrap_or((80, 24));
 
@@ -347,6 +365,11 @@ fn cmd_attach(ref_: &str) {
                 Ok(n) => {
                     for f in decoder.feed(&buf[..n]) {
                         match f {
+                            Frame::HelloOk { sessions, .. } => {
+                                *session_list.borrow_mut() =
+                                    sessions.iter().map(|s| s.id.clone()).collect();
+                                sessions_meta.clone_from(&sessions);
+                            }
                             Frame::Snapshot {
                                 session,
                                 panes: panes_snap,
@@ -426,7 +449,15 @@ fn cmd_attach(ref_: &str) {
 
         // render
         let screen_ref = &screen;
-        let _ = term.draw(move |f: &mut RFrame| {
+        let prefix_now = prefix_mode.get();
+        let picker_now = picker.get();
+        let prompt_now = prompt.get();
+        let meta_ref = &sessions_meta;
+        let panes_n = panes.len();
+        let sess_id_ref = &session_id;
+        let panes_ref = &panes;
+        let _ = panes_ref;
+        let _ = term.draw(|f: &mut RFrame| {
             let area = f.area();
             let (cx, cy, vis) = screen_ref.cursor;
             let lines: Vec<Line> = screen_ref
@@ -468,6 +499,54 @@ fn cmd_attach(ref_: &str) {
                 })
                 .collect();
             f.render_widget(Paragraph::new(lines), Rect::new(0, 0, area.width, area.height));
+
+            // tmux-style green status bar on the last row
+            if area.height >= 2 {
+                let nowix = meta_ref
+                    .iter()
+                    .find(|s| s.id == *sess_id_ref)
+                    .map(|s| s.name.clone())
+                    .unwrap_or_else(|| {
+                        if sess_id_ref.is_empty() { "(attaching…)".into() } else { sess_id_ref.clone() }
+                    });
+                let pfx = if prefix_now { "[prefix]" } else { "" };
+                let status = format!(" ranch  {nowix}  {panes_n} pane{} {} ",
+                    if panes_n == 1 { "" } else { "s" }, pfx);
+                let bar_style = Style::default().add_modifier(Modifier::REVERSED);
+                let bar = Line::from(Span::styled(format!("{:^width$}", status, width = area.width as usize), bar_style));
+                f.render_widget(Paragraph::new(vec![bar]),
+                    Rect::new(0, area.height - 1, area.width, 1));
+            }
+
+            // session picker overlay (prefix-s)
+            if picker_now && !meta_ref.is_empty() {
+                let h = (meta_ref.len() as u16 + 2).min(area.height.saturating_sub(2));
+                let w = 50.min(area.width);
+                let x = area.width.saturating_sub(w) / 2;
+                let y = area.height.saturating_sub(h) / 2;
+                let mut items: Vec<Line> = vec![
+                    Line::from(Span::styled(" switch session (enter: select, esc: close)",
+                        Style::default().add_modifier(Modifier::REVERSED)))];
+                for (i, s) in meta_ref.iter().enumerate() {
+                    let marker = if s.id == *sess_id_ref { "* " } else { "  " };
+                    let sel = i == 0;
+                    let style = if sel { Style::default().add_modifier(Modifier::REVERSED) } else { Style::default() };
+                    items.push(Line::from(Span::styled(format!("{marker}{:<20} {} pane(s)", s.name, s.panes.len()), style)));
+                }
+                f.render_widget(ratatui::widgets::Block::bordered().title("sessions"),
+                    Rect::new(x, y, w, h));
+                f.render_widget(Paragraph::new(items), Rect::new(x + 1, y + 1, w.saturating_sub(2), h.saturating_sub(2)));
+            }
+
+            // prompt line (rename / command)
+            if let Some(kind) = prompt_now {
+                let label = match kind { Prompt::Rename => "rename session: ", Prompt::Command => ": " };
+                let pl = Line::from(Span::styled(
+                    format!("{label}{}█", prompt_input.clone()),
+                    Style::default().add_modifier(Modifier::REVERSED)));
+                f.render_widget(Paragraph::new(vec![pl]),
+                    Rect::new(0, area.height.saturating_sub(2), area.width, 1));
+            }
         });
 
         // events
@@ -485,28 +564,196 @@ fn cmd_attach(ref_: &str) {
                         send_frame(&mut stream, &f).ok();
                     }
                     Event::Key(key) => {
-                        if key.kind == KeyEventKind::Press
-                            && key.code == KeyCode::Char('c')
-                            && key.modifiers.contains(KeyModifiers::CONTROL)
-                        {
-                            break; // detach
+                        if key.kind != KeyEventKind::Press {
+                            continue;
                         }
-                        // Alt-p: cycle to the next pane
-                        if key.kind == KeyEventKind::Press
-                            && key.code == KeyCode::Char('p')
-                            && key.modifiers.contains(KeyModifiers::ALT)
-                        {
-                            if panes.len() > 1 {
-                                let idx = panes
-                                    .iter()
-                                    .position(|p| p == &active_pane)
-                                    .map_or(0, |i| (i + 1) % panes.len());
-                                let next = panes[idx].clone();
-                                let f = Frame::SessionsSelect {
-                                    session: session_id.clone(),
-                                    pane: next,
-                                };
-                                send_frame(&mut stream, &f).ok();
+                        // tmux-style prefix handling: Ctrl-B opens the
+                        // command state; the next key is a command (or a
+                        // second Ctrl-B passes the prefix through).
+                        if !prefix_mode.get() {
+                            if key.code == KeyCode::Char('b')
+                                && key.modifiers.contains(KeyModifiers::CONTROL)
+                            {
+                                prefix_mode.set(true);
+                                continue;
+                            }
+                        } else {
+                            prefix_mode.set(false);
+                            match key.code {
+                                // Ctrl-B Ctrl-B → literal Ctrl-B to the PTY
+                                KeyCode::Char('b')
+                                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                {
+                                    let f = Frame::Input {
+                                        id: Uuid::new_v4().to_string(),
+                                        client: "attach".into(),
+                                        session: session_id.clone(),
+                                        pane: active_pane.clone(),
+                                        data: ranch_protocol::b64_encode(b"\x02"),
+                                    };
+                                    send_frame(&mut stream, &f).ok();
+                                    continue;
+                                }
+                                // d → detach
+                                KeyCode::Char('d') => break,
+                                // n / p → next / previous session (client order)
+                                KeyCode::Char('n') | KeyCode::Char('p') => {
+                                    let list = session_list.borrow().clone();
+                                    if list.len() > 1 {
+                                        let cur = list.iter().position(|s| *s == session_id);
+                                        let going_next = key.code == KeyCode::Char('n');
+                                        let next = match cur {
+                                            Some(i) if going_next => (i + 1) % list.len(),
+                                            Some(i) => (i + list.len() - 1) % list.len(),
+                                            None => 0,
+                                        };
+                                        let target = list[next].clone();
+                                        // re-attach to the other session
+                                        let rf = Frame::Attach {
+                                            id: Uuid::new_v4().to_string(),
+                                            client: "attach".into(),
+                                            session: target,
+                                            pane: None,
+                                        };
+                                        send_frame(&mut stream, &rf).ok();
+                                        screen.reset_blank();
+                                        sent_resize.set(false);
+                                    }
+                                    continue;
+                                }
+                                // o / l → next pane in session
+                                KeyCode::Char('o') | KeyCode::Char('l') => {
+                                    if panes.len() > 1 {
+                                        let idx = panes
+                                            .iter()
+                                            .position(|p| p == &active_pane)
+                                            .map_or(0, |i| (i + 1) % panes.len());
+                                        let next = panes[idx].clone();
+                                        let f = Frame::SessionsSelect {
+                                            session: session_id.clone(),
+                                            pane: next,
+                                        };
+                                        send_frame(&mut stream, &f).ok();
+                                    }
+                                    continue;
+                                }
+                                // c → new session (named by daemon), auto-attach
+                                KeyCode::Char('c') => {
+                                    let f = Frame::SessionsCreate {
+                                        req_id: Uuid::new_v4().to_string(),
+                                        name: None,
+                                    };
+                                    send_frame(&mut stream, &f).ok();
+                                    continue;
+                                }
+                                // & → kill current session
+                                KeyCode::Char('&') | KeyCode::Char('k') => {
+                                    let f = Frame::SessionsKill {
+                                        session: session_id.clone(),
+                                    };
+                                    send_frame(&mut stream, &f).ok();
+                                    screen.reset_blank();
+                                    continue;
+                                }
+                                // , → rename (reads a name from the prompt line)
+                                KeyCode::Char(',') => {
+                                    prompt.set(Some(Prompt::Rename));
+                                    prompt_input.clear();
+                                    continue;
+                                }
+                                // % / " → split pane
+                                KeyCode::Char('%') | KeyCode::Char('"') => {
+                                    let f = Frame::PaneSplit {
+                                        req_id: Uuid::new_v4().to_string(),
+                                        session: session_id.clone(),
+                                        pane: active_pane.clone(),
+                                        dir: if key.code == KeyCode::Char('%') { 0 } else { 1 },
+                                    };
+                                    send_frame(&mut stream, &f).ok();
+                                    continue;
+                                }
+                                // s → session picker overlay
+                                KeyCode::Char('s') => {
+                                    picker.set(!picker.get());
+                                    continue;
+                                }
+                                // x → kill current pane
+                                KeyCode::Char('x') => {
+                                    let f = Frame::PaneKill {
+                                        session: session_id.clone(),
+                                        pane: active_pane.clone(),
+                                    };
+                                    send_frame(&mut stream, &f).ok();
+                                    continue;
+                                }
+                                // q → show pane numbers briefly (MVP: status flash)
+                                KeyCode::Char('q') => continue,
+                                // : → command prompt (rename etc.)
+                                KeyCode::Char(':') => {
+                                    prompt.set(Some(Prompt::Command));
+                                    prompt_input.clear();
+                                    continue;
+                                }
+                                // prefix + any other key: pass the prefix
+                                // through to the PTY as Ctrl-B
+                                _ => {
+                                    let f = Frame::Input {
+                                        id: Uuid::new_v4().to_string(),
+                                        client: "attach".into(),
+                                        session: session_id.clone(),
+                                        pane: active_pane.clone(),
+                                        data: ranch_protocol::b64_encode(b"\x02"),
+                                    };
+                                    send_frame(&mut stream, &f).ok();
+                                    // fall through to also send this key
+                                }
+                            }
+                        }
+                        // rename/command prompt captures printable keys
+                        if prompt.get().is_some() {
+                            match key.code {
+                                KeyCode::Esc => {
+                                    prompt.set(None);
+                                    prompt_input.clear();
+                                }
+                                KeyCode::Enter => {
+                                    if let Some(kind) = prompt.take() {
+                                        match kind {
+                                            Prompt::Rename => {
+                                                if !prompt_input.is_empty() {
+                                                    let f = Frame::SessionsRename {
+                                                        session: session_id.clone(),
+                                                        name: prompt_input.clone(),
+                                                    };
+                                                    send_frame(&mut stream, &f).ok();
+                                                }
+                                            }
+                                            Prompt::Command => {
+                                                // minimal: :kill, :detach
+                                                match prompt_input.trim() {
+                                                    "kill" | "kill-session" => {
+                                                        let f = Frame::SessionsKill {
+                                                            session: session_id.clone(),
+                                                        };
+                                                        send_frame(&mut stream, &f).ok();
+                                                        screen.reset_blank();
+                                                    }
+                                                    "detach" | "d" => {
+                                                        prompt_input.clear();
+                                                        break;
+                                                    }
+                                                    _ => {}
+                                                }
+                                            }
+                                        }
+                                    }
+                                    prompt_input.clear();
+                                }
+                                KeyCode::Backspace => {
+                                    prompt_input.pop();
+                                }
+                                KeyCode::Char(c) => prompt_input.push(c),
+                                _ => {}
                             }
                             continue;
                         }
