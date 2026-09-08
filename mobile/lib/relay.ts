@@ -17,6 +17,8 @@ export class Relay {
     this.machineId = machineId;
   }
 
+  /** Join and resolve only once the channel is actually SUBSCRIBED —
+   *  frames sent before that are silently dropped by supabase-js. */
   async join(): Promise<void> {
     await supabase.realtime.setAuth();
     const topic = `machines:${this.machineId}`;
@@ -31,8 +33,28 @@ export class Relay {
       const f = payload as Frame | undefined;
       if (f && typeof f === "object" && "t" in f) this.onFrame(f);
     });
-    ch.subscribe();
+
     this.onStatus("connecting…");
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(
+        () => reject(new Error("realtime join timed out")),
+        15000
+      );
+      ch.subscribe((status) => {
+        if (status === "SUBSCRIBED") {
+          clearTimeout(timer);
+          this.onStatus("online");
+          resolve();
+        } else if (
+          status === "CHANNEL_ERROR" ||
+          status === "TIMED_OUT" ||
+          status === "CLOSED"
+        ) {
+          clearTimeout(timer);
+          reject(new Error(`realtime channel: ${status}`));
+        }
+      });
+    });
   }
 
   send(f: Frame) {

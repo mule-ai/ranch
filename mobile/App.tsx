@@ -66,7 +66,13 @@ export default function App() {
         }
       };
       setRelay(r);
-      await r.join();
+      try {
+        await r.join();
+      } catch (e: any) {
+        setSessions([]);
+        setErr(e.message ?? "realtime connection failed");
+        return;
+      }
       r.send({ t: "Hello", id: nextId(), client: "mobile" } as Frame);
     })();
     return () => {
