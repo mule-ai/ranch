@@ -2263,11 +2263,23 @@ fn main() {
         "cloud" => cmd_cloud_sessions(args.get(1).cloned()),
         "new" => cmd_new(args.get(1).cloned(), None, None),
         // ranch agent [name] [dir] — first-class agent session (runs pi)
-        "agent" => cmd_new(
-            args.get(1).cloned(),
-            Some("forge".into()),
-            args.get(2).cloned(),
-        ),
+        "agent" => {
+            // default dir: the shell's cwd — `cd project && ranch agent`
+            // anchors the agent to the project
+            let cwd = args
+                .get(2)
+                .cloned()
+                .map(Ok)
+                .unwrap_or_else(|| std::env::current_dir().map(|p| p.to_string_lossy().into_owned()));
+            let cwd = match cwd {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    eprintln!("warning: could not resolve cwd ({e}); agent uses forge default");
+                    None
+                }
+            };
+            cmd_new(args.get(1).cloned(), Some("forge".into()), cwd)
+        }
         "ls" | "list" => cmd_ls(),
         "attach" => match args.get(1) {
             Some(r) => cmd_attach(r),

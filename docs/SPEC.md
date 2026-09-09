@@ -652,7 +652,20 @@ Rust edition 2024, stable toolchain (matches forge: rustc 1.98).
   `FORGE_SESSIONS_DIR` (12-factor; was hardcoded /forge/sessions,
   CI-only with_base_path existed). Forge config rides daemon.toml:
   `forge_url`, `forge_api_key`, `forge_profile_id` (default first
-  profile). - **M8.2 — agent spawning everywhere (2026-09-09)**: `ranch agent
+  profile). - **M8.3 — agents anchored to real directories (2026-09-09)**: forge
+  (patch upstreamed, `944c890`) gains `POST /sessions {working_dir?}`
+  (migration 014, durable column): anchored sessions run the agent
+  directly in an existing directory — no per-session tree — and
+  `get_or_create` prefers the column over the sandbox cascade, so
+  resume lands in the same tree. Ranch wires it through everywhere:
+  `prefix-a` reads the focused terminal pane's cwd from
+  `/proc/<pid>/cwd` and anchors the agent split to it (the agent and
+  your shell work the same tree); `ranch agent [name] [dir]` defaults
+  `dir` to the invoking shell's cwd; phone-created agents fall back
+  to `$HOME`. Verified e2e: split in `/tmp/proj-alpha` → forge session
+  `working_dir=/tmp/proj-alpha`; `ranch agent` from `/tmp/proj-beta` →
+  `working_dir=/tmp/proj-beta`.
+- **M8.2 — agent spawning everywhere (2026-09-09)**: `ranch agent
   [name] [dir]` now auto-attaches when interactive (scripts keep
   getting the id). Dashboard: `a` prompts for an agent name, creates
   the forge session, attaches. In-session TUI: `prefix-a` splits the

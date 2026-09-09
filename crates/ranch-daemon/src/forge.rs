@@ -333,8 +333,10 @@ fn http_json(
 }
 
 /// Create a forge session (sync, localhost — called from the main loop).
+/// `working_dir` anchors the agent to an existing directory (forge
+/// migration 014) — e.g. the terminal pane's cwd for agent splits.
 /// Returns the forge session uuid.
-pub fn create_forge_session(cfg: &ForgeConfig, title: &str) -> Result<Uuid, String> {
+pub fn create_forge_session(cfg: &ForgeConfig, title: &str, working_dir: Option<&str>) -> Result<Uuid, String> {
     // profile: configured or the first one
     let profile_id = match &cfg.profile {
         Some(p) => p.clone(),
@@ -354,12 +356,11 @@ pub fn create_forge_session(cfg: &ForgeConfig, title: &str) -> Result<Uuid, Stri
                 .to_string()
         }
     };
-    let v = http_json(
-        cfg,
-        "POST",
-        "/sessions",
-        Some(&serde_json::json!({ "profile_id": profile_id, "title": title })),
-    )?;
+    let mut body = serde_json::json!({ "profile_id": profile_id, "title": title });
+    if let Some(dir) = working_dir {
+        body["working_dir"] = serde_json::Value::String(dir.to_string());
+    }
+    let v = http_json(cfg, "POST", "/sessions", Some(&body))?;
     // response wraps the session: {session: {...}, working_dir: "..."}
     let sess = v.get("session").unwrap_or(&v);
     let id = sess

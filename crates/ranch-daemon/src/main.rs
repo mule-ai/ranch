@@ -477,6 +477,12 @@ struct Daemon {
 
 // ---------- helpers ----------
 
+/// A pane child's current working directory (Linux: /proc symlink).
+fn pane_cwd(child: c_int) -> Option<PathBuf> {
+    let target = std::fs::read_link(format!("/proc/{child}/cwd")).ok()?;
+    Some(target)
+}
+
 fn home_dir() -> PathBuf {
     std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("/root"))
 }
@@ -1122,7 +1128,9 @@ impl Daemon {
                     let forge_cfg = forge::load_forge_config();
                     match forge_cfg
                         .as_ref()
-                        .map(|cfg| forge::create_forge_session(cfg, &name))
+                        .map(|cfg| {
+                            forge::create_forge_session(cfg, &name, cwd.as_deref())
+                        })
                         .unwrap_or(Err("forge not configured (set forge_api_key in daemon.toml)".into()))
                     {
                         Ok(forge_sid) => {
@@ -1301,9 +1309,19 @@ impl Daemon {
                     // agent split: chat pane bound to a fresh forge session
                     if kind == "forge" {
                         let fcfg = forge::load_forge_config();
+                        // anchor the agent to the focused pane's cwd so
+                        // terminal and agent work the same tree
+                        let anchor_dir = (|| {
+                            let fpid = s.panes.get(&target)?;
+                            pane_cwd(fpid.child)
+                        })();
                         let forge_sid = match fcfg
                             .as_ref()
-                            .map(|c| forge::create_forge_session(c, "agent pane"))
+                            .map(|c| forge::create_forge_session(
+                                c,
+                                "agent pane",
+                                anchor_dir.as_deref().map(|p| p.to_string_lossy()).as_deref(),
+                            ))
                             .unwrap_or(Err("forge not configured".into()))
                         {
                             Ok(id) => id,
