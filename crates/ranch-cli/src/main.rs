@@ -285,6 +285,8 @@ struct PaneView {
     kind: Option<String>,
     /// conversation for forge-chat panes
     chat: Vec<ranch_protocol::ChatMsg>,
+    /// agent working indicator (meta kind="agent" status)
+    agent_busy: bool,
 }
 
 impl PaneView {
@@ -300,18 +302,26 @@ impl PaneView {
         if let Some(chat) = &snap.chat {
             self.chat = chat.clone();
         }
+        // heuristic until the first meta arrives: a trailing user row
+        // means the agent is on it
+        self.agent_busy = self.chat.last().map(|m| m.role == "user").unwrap_or(false);
     }
     /// Apply an append-only chat diff from a `chat` frame.
     fn apply_chat(&mut self, msgs: &[ranch_protocol::ChatMsg], reset: bool) {
         if reset {
             self.chat = msgs.to_vec();
-            return;
-        }
-        for m in msgs {
-            if self.chat.last().map(|l| l.seq).is_none_or(|ls| m.seq > ls) {
-                self.chat.push(m.clone());
+        } else {
+            for m in msgs {
+                if self.chat.last().map(|l| l.seq).is_none_or(|ls| m.seq > ls) {
+                    self.chat.push(m.clone());
+                }
             }
         }
+        self.agent_busy = self.chat.last().map(|m| m.role == "user").unwrap_or(false);
+    }
+    /// Agent working indicator update (meta kind="agent").
+    fn apply_agent_status(&mut self, status: &str) {
+        self.agent_busy = status == "working";
     }
     fn apply_update(&mut self, cols: u16, rows: u16, rows_upd: &[(u16, String)], cursor: &Option<ranch_protocol::Cursor>) {
         self.cols = cols;
@@ -515,7 +525,7 @@ fn cmd_dashboard() -> Option<String> {
             }
             lines.push(Line::raw(""));
             lines.push(Line::raw(
-                " enter: attach   c: new   n: new (named)   a: new agent   k: kill   r: rename   q: quit",
+                " enter: attach   c: new   n: new (named)   a: new agent   x: kill   r: rename   q: quit",
             ));
             if !status_ref.is_empty() {
                 lines.push(Line::from(Span::styled(
@@ -643,8 +653,11 @@ fn cmd_dashboard() -> Option<String> {
                     input = Some("agent");
                     input_text.clear();
                 }
-                KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    // Ctrl-K: also kill, symmetric with j/k nav quirk
+                KeyCode::Char('x') | KeyCode::Char('k')
+                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    // kill the selected session (x OR Ctrl-K — plain k is
+                    // vim-nav up, do not shadow it)
                     if let Some(s) = sessions.get(sel) {
                         let f = Frame::SessionsKill { session: s.id.clone() };
                         send_frame(&mut stream, &f).ok();
@@ -839,10 +852,19 @@ fn cmd_attach(ref_: &str) {
                                 }
                             }
                             Frame::Chat { session: csess, pane: cpane, msgs, reset, .. } => {
-                                std::fs::write("/tmp/cli-chat.log", format!("chat frame sess-match={} pane={} n={} reset={}\n", csess == session_id, cpane, msgs.len(), reset)).ok();
                                 if csess == session_id {
                                     if let Some(pv) = pane_views.get_mut(&cpane) {
                                         pv.apply_chat(&msgs, reset);
+                                    }
+                                }
+                            }
+                            Frame::Meta { session: msess, pane: mpane, kind: mkind, status: mstat } => {
+                                if msess == session_id && mkind == "agent" {
+                                    if let (Some(pv), Some(status)) = (
+                                        pane_views.get_mut(mpane.as_deref().unwrap_or("")),
+                                        mstat.as_deref(),
+                                    ) {
+                                        pv.apply_agent_status(status);
                                     }
                                 }
                             }
@@ -885,9 +907,22 @@ fn cmd_attach(ref_: &str) {
                                 }
                             }
                             Frame::Meta {
-                                status: Some(s), ..
+                                session: msess,
+                                pane: mpane,
+                                kind: mkind,
+                                status: Some(s),
+                                ..
                             } => {
-                                eprintln!("ranch: {s}");
+                                if msess == session_id && mkind == "agent" {
+                                    if let (Some(pv), Some(status)) = (
+                                        pane_views.get_mut(mpane.as_deref().unwrap_or("")),
+                                        Some(s.as_str()),
+                                    ) {
+                                        pv.apply_agent_status(status);
+                                    }
+                                } else if mkind != "agent" {
+                                    eprintln!("ranch: {s}");
+                                }
                             }
                             Frame::Error { message, .. } => {
                                 // attach-refusal errors are fatal; request
@@ -973,45 +1008,139 @@ fn cmd_attach(ref_: &str) {
                 let pv = views_ref.get(pane_id);
                 if let Some(pv) = pv {
                     if pv.is_chat() {
-                        // forge-chat rendering: role-styled conversation,
-                        // bottom input line when focused
+                        // messenger rendering: bg-filled bubbles (user
+                        // right/green, agent left/dark), tool chips, a
+                        // working spinner, and a rounded input box
+                        let w = r.width.max(10) as usize;
+                        let user_w = ((w as f32) * 0.55).max(10.0) as usize;
+                        let agent_w = ((w as f32) * 0.78).max(14.0) as usize;
+                        let wrap = |text: &str, max: usize| -> Vec<String> {
+                            if text.is_empty() {
+                                return vec![String::new()];
+                            }
+                            text.chars()
+                                .collect::<Vec<_>>()
+                                .chunks(max.max(1))
+                                .map(|c| c.iter().collect::<String>())
+                                .collect()
+                        };
+                        let user_style = Style::default()
+                            .fg(ratatui::style::Color::Black)
+                            .bg(ratatui::style::Color::Green);
+                        let agent_style = Style::default()
+                            .fg(ratatui::style::Color::Rgb(230, 232, 240))
+                            .bg(ratatui::style::Color::Rgb(34, 34, 42));
+                        let dim = Style::default()
+                            .fg(ratatui::style::Color::Rgb(110, 114, 126));
                         let mut li: Vec<Line> = Vec::new();
-                        let w = r.width as usize;
+                        li.push(Line::from(Span::raw("")));
                         for m in &pv.chat {
-                            let (tag, style, text): (&str, Style, String) = match m.role.as_str() {
-                                "user" => ("❯ ", Style::default().fg(ratatui::style::Color::Green), m.text.clone()),
-                                "tool" => (
-                                    "⚙ ",
-                                    Style::default().add_modifier(Modifier::DIM),
-                                    match (&m.tool_name, m.duration_ms) {
-                                        (Some(n), Some(d)) => format!("{n} ({d}ms)"),
+                            let ts = m
+                                .created_at
+                                .as_deref()
+                                .filter(|c| c.len() >= 16)
+                                .and_then(|c| c.get(11..16))
+                                .unwrap_or("");
+                            match m.role.as_str() {
+                                "user" => {
+                                    // right-aligned green bubble
+                                    let inner = user_w.saturating_sub(2);
+                                    for chunk in wrap(&m.text, inner) {
+                                        let bw = chunk.chars().count() + 2 + if ts.is_empty() { 0 } else { 6 };
+                                        let lead = w.saturating_sub(bw + 1);
+                                        let mut spans = vec![Span::raw(" ".repeat(lead))];
+                                        spans.push(Span::styled(
+                                            format!(" {chunk} "), user_style));
+                                        if !ts.is_empty() {
+                                            spans.push(Span::styled(format!(" {ts}"), dim));
+                                        }
+                                        li.push(Line::from(spans));
+                                    }
+                                }
+                                "tool" => {
+                                    let label = match (&m.tool_name, m.duration_ms) {
+                                        (Some(n), Some(d)) => format!("{n} · {d}ms"),
                                         (Some(n), None) => n.clone(),
                                         _ => "tool".into(),
-                                    },
-                                ),
-                                _ => ("● ", Style::default(), m.text.clone()),
-                            };
-                            // naive word-wrap at pane width
-                            for (i, chunk) in text.chars().collect::<Vec<_>>().chunks(w.saturating_sub(2).max(1)).map(|c| c.iter().collect::<String>()).enumerate() {
-                                let line_text = if i == 0 { format!("{tag}{chunk}") } else { format!("  {chunk}") };
-                                li.push(Line::from(Span::styled(line_text, style)));
+                                    };
+                                    li.push(Line::from(Span::styled(
+                                        format!("   ⚙ {label}"), dim)));
+                                }
+                                _ => {
+                                    // left-aligned dark bubble
+                                    let inner = agent_w.saturating_sub(2);
+                                    for chunk in wrap(&m.text, inner) {
+                                        li.push(Line::from(vec![
+                                            Span::raw(" "),
+                                            Span::styled(format!(" {chunk} "), agent_style),
+                                        ]));
+                                    }
+                                }
                             }
+                            li.push(Line::from(Span::raw("")));
                         }
-                        // input line pinned to the bottom when focused
+                        // working indicator: animated braille spinner
+                        // (time-based frame pick — no state needed)
+                        if pv.agent_busy {
+                            const SPIN: [&str; 10] =
+                                ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+                            let ms = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_millis())
+                                .unwrap_or(0);
+                            let f = SPIN[((ms / 100) % SPIN.len() as u128) as usize];
+                            li.push(Line::from(Span::styled(
+                                format!(" {f}  agent is working…"),
+                                dim.add_modifier(Modifier::ITALIC),
+                            )));
+                        }
+                        // rounded input box pinned to the bottom
                         let input_row = chat_input_ref.clone();
-                        let inp = Line::from(Span::styled(
-                            format!("❯ {input_row}▊"),
-                            Style::default().fg(ratatui::style::Color::Green),
-                        ));
-                        let h = r.height as usize;
-                        let rows_msgs = li.len();
-                        let keep = h.saturating_sub(1);
-                        let drop = rows_msgs.saturating_sub(keep);
-                        let _ = drop;
-                        let visible: Vec<Line> = li.into_iter().skip(rows_msgs.saturating_sub(keep)).collect();
-                        let mut rows: Vec<Line> = visible;
-                        if focused {
-                            rows.push(inp);
+                        let bh = if r.height >= 6 { 3 } else { 1 };
+                        let keep = r.height as usize - bh;
+                        let skip = li.len().saturating_sub(keep);
+                        let mut rows: Vec<Line> = li.iter().skip(skip).cloned().collect();
+                        let border = if focused {
+                            Style::default().fg(ratatui::style::Color::Green)
+                        } else {
+                            dim
+                        };
+                        if bh == 3 {
+                            let label = if input_row.is_empty() {
+                                "message the agent…".to_string()
+                            } else {
+                                input_row.clone()
+                            };
+                            let inner_w = w.saturating_sub(2).max(1);
+                            let title = if input_row.is_empty() {
+                                Span::styled(" message the agent…", dim)
+                            } else {
+                                Span::raw("")
+                            };
+                            rows.push(Line::from(Span::styled(
+                                format!("╭{}╮", "─".repeat(inner_w - 1)), border)));
+                            let shown: String = label.chars().take(inner_w - 3).collect();
+                            rows.push(Line::from(vec![
+                                Span::styled("│", border),
+                                Span::styled(format!(" {shown}"), if input_row.is_empty() {
+                                    dim
+                                } else {
+                                    Style::default().fg(ratatui::style::Color::Rgb(230, 232, 240))
+                                }),
+                                Span::styled("▊ ", if focused {
+                                    Style::default().fg(ratatui::style::Color::Green)
+                                } else {
+                                    dim
+                                }),
+                                Span::styled(format!("{}│", " ".repeat(
+                                    inner_w.saturating_sub(shown.chars().count() + 3))), border),
+                            ]));
+                            let _ = title;
+                            rows.push(Line::from(Span::styled(
+                                format!("╰{}╯", "─".repeat(inner_w - 1)), border)));
+                        } else {
+                            rows.push(Line::from(Span::styled(
+                                format!("❯ {input_row}▊"), border)));
                         }
                         f.render_widget(ratatui::widgets::Paragraph::new(rows), r);
                         return;

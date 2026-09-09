@@ -79,7 +79,10 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
             // rows and must always land
             const pad = [...p0.lines];
             while (pad.length < p0.rows) pad.push("");
-            m.set(p0.id, { ...p0, lines: pad });
+            // heuristic: a trailing user row means the agent is on it
+            const chat = p0.chat ?? [];
+            const busy = chat[chat.length - 1]?.role === "user";
+            m.set(p0.id, { ...p0, lines: pad, agentBusy: busy });
             // seed dedup tracking from the pane's seq at snapshot time:
             // updates at/below this are duplicates or reordered stragglers
             if (p0.seq) lastSeq.current.set(p0.id, p0.seq);
@@ -153,6 +156,14 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
           break;
         case "Meta":
           if (f.kind === "exited") setConn("session ended");
+          if (f.kind === "agent" && f.pane) {
+            const cur = panesRef.current.get(f.pane);
+            if (cur) {
+              const next = new Map(panesRef.current);
+              next.set(f.pane, { ...cur, agentBusy: f.status === "working" });
+              setPanes(next);
+            }
+          }
           break;
         case "Error":
           setConn(`error: ${f.message}`);
@@ -333,6 +344,11 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
             ))}
             {chatMsgs.length === 0 && (
               <Text style={styles.dim}>say something to the agent…</Text>
+            )}
+            {activeSnap?.agentBusy && (
+              <View style={[styles.bubble, styles.bubbleAgent]}>
+                <Text style={styles.workingText}>● ● ●</Text>
+              </View>
             )}
           </ScrollView>
           <View style={styles.chatInputRow}>
@@ -668,6 +684,7 @@ const styles = StyleSheet.create({
   },
   toolText: { color: "#9ca3af", fontSize: 12, fontFamily: "JetBrainsMono NF Mono" },
   toolOut: { color: "#6b7280", fontSize: 11, fontFamily: "JetBrainsMono NF Mono", marginTop: 4 },
+  workingText: { color: "#9ca3af", fontSize: 12, letterSpacing: 3 },
   toolOutOpen: { maxHeight: 220, marginTop: 6 },
   toolOutFull: { color: "#8b8b96", fontSize: 11, fontFamily: "JetBrainsMono NF Mono" },
   chatInputRow: {

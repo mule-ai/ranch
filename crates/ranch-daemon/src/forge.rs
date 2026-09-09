@@ -217,6 +217,11 @@ fn handle_event(state: &Arc<WatchState>, cfg: &ForgeConfig, w: &PipeWriter, name
                 return; // reconnect catch-up duplicate
             }
             state.last_seq.store(msg.seq, Ordering::Relaxed);
+            // a user row means the agent took the message; it works
+            // until turn_ended. Clients show the working indicator.
+            if msg.role == "user" {
+                write_agent_status(w, state.pane, "working");
+            }
             write_frame(
                 w,
                 &Frame::Chat {
@@ -228,13 +233,30 @@ fn handle_event(state: &Arc<WatchState>, cfg: &ForgeConfig, w: &PipeWriter, name
                 },
             );
         }
-        "turn_ended" | "heartbeat" | "lagged" => {
+        "turn_ended" => {
+            // agent finished the turn — clear the working indicator
+            write_agent_status(w, state.pane, "idle");
+        }
+        "heartbeat" | "lagged" => {
             // lagged: forge already backfilled the missed rows as
             // `message` events before this one — nothing to do
         }
         _ => {}
     }
     let _ = cfg;
+}
+
+/// Agent busy/idle signal (client typing indicator).
+fn write_agent_status(w: &PipeWriter, pane: Uuid, status: &str) {
+    write_frame(
+        w,
+        &Frame::Meta {
+            session: String::new(), // filled by the main loop
+            pane: Some(pane.to_string()),
+            kind: "agent".into(),
+            status: Some(status.into()),
+        },
+    );
 }
 
 /// Job thread: watches registry + blocking POSTs for sends.
@@ -284,7 +306,9 @@ pub fn spawn_worker(
                     }
                     ForgeJob::Send { pane, forge_sid, text } => {
                         let _ = http_post_message(&cfg, forge_sid, &text);
-                        // rows land via the SSE stream
+                        // the working indicator starts as soon as the
+                        // POST is accepted; rows land via the SSE stream
+                        write_agent_status(&pipe, pane, "working");
                     }
                 },
                 Err(mpsc::RecvError) => return,

@@ -662,6 +662,22 @@ Rust edition 2024, stable toolchain (matches forge: rustc 1.98).
   affordance — "killing doesn't work" was partly that, partly
   prefix-& now being WINDOW-kill (tmux semantics, M5): whole-session
   kill is `:kill-session` / the dashboard / the phone long-press).
+- **M8.6 — messenger rendering + agent-working indicator (2026-09-09)**:
+  the CLI chat pane now looks like a messenger, not a terminal: bg-fill
+  bubbles (user right/green with HH:MM timestamp, agent left/dark),
+  tool chips (⚙ name · duration), animated braille "agent is
+  working…" line, and a rounded input box pinned to the bottom
+  (placeholder "message the agent…", green border when focused).
+  Busy signal: the forge worker emits `meta kind="agent"
+  status="working"/"idle"` — working fires on ChatSend POST + any user
+  row, idle on forge's `turn_ended` SSE event (the agent-finished
+  signal). Clients: CLI PaneView.agent_busy (+ snapshot heuristic:
+  trailing user row = busy) and the phone renders a typing bubble
+  (● ● ●) off the same metas — plus a snapshot heuristic. The old
+  catch-all Meta arm was swallowing the agent metas (eprintln'd them
+  into the pty); agent-kind metas now route to the pane state.
+  Verified live against the lab forge: send → working → real agent
+  reply (laguna) → idle.
 - **M8.4 — non-fatal error feedback (2026-09-09)**: a failed agent
   split (forge down) used to `die()` the whole attach client — "prefix
   a doesn't work" with zero feedback. Now: attach-refusal errors

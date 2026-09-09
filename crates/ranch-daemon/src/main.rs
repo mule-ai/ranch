@@ -886,6 +886,35 @@ impl Daemon {
             // everyone attached to the session (pipe client has no
             // attach; the frame carries the session in `session` —
             // the worker leaves it blank, so resolve from the pane)
+            // forge worker agent-status: resolve + broadcast
+            Frame::Meta { session, pane, kind, status } if session.is_empty() && kind == "agent" => {
+                let pid = Uuid::parse_str(pane.as_deref().unwrap_or("")).ok();
+                let found = pid.and_then(|pid| {
+                    self.sessions.iter().find_map(|(sid, s)| {
+                        s.chats.contains_key(&pid).then_some((*sid, pid))
+                    })
+                });
+                if let Some((sid, pid)) = found {
+                    let out = Frame::Meta {
+                        session: sid.to_string(),
+                        pane: Some(pid.to_string()),
+                        kind: kind.clone(),
+                        status: status.clone(),
+                    };
+                    let recipients: Vec<RawFd> = self
+                        .clients
+                        .iter()
+                        .filter(|(_, c)| c.attach == Some(sid))
+                        .map(|(f, _)| *f)
+                        .collect();
+                    for rfd in recipients {
+                        if let Some(c) = self.clients.get_mut(&rfd) {
+                            send_frame(c, &out);
+                        }
+                    }
+                }
+                return;
+            }
             Frame::Chat { session, pane, .. } if session.is_empty() => {
                 let fsid = Uuid::parse_str(pane).ok();
                 let found = self.sessions.iter().find_map(|(sid, s)| {
