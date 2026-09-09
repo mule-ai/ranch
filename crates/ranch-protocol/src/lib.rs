@@ -127,6 +127,24 @@ pub enum Frame {
         /// Working directory for the session's first pane (default $HOME).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cwd: Option<String>,
+        /// kind="forge" only: adopt an EXISTING forge session instead of
+        /// creating one (resume). The pane binds to it and the SSE watch
+        /// replays history.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        forge_session: Option<String>,
+    },
+    /// Client -> daemon: list resumable forge sessions.
+    ForgeList {
+        id: String,
+        client: String,
+        /// echoed back in ForgeListOk so clients match the reply
+        req_id: String,
+    },
+    /// Daemon -> client: forge sessions available for resume.
+    ForgeListOk {
+        id: String,
+        req_id: String,
+        sessions: Vec<ForgeSessionInfo>,
     },
     /// Daemon -> client: ack a create/split with the new ids.
     SessionsAck {
@@ -283,6 +301,18 @@ pub struct WindowSnap {
     pub id: String,
     pub name: String,
     pub layout: Layout,
+}
+
+/// A resumable forge session (ForgeListOk row).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ForgeSessionInfo {
+    pub id: String,
+    pub title: String,
+    /// last_active timestamp string as forge reports it
+    pub updated: String,
+    /// forge's ended_at, when the session was severed/ended
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

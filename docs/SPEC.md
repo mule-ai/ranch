@@ -662,6 +662,18 @@ Rust edition 2024, stable toolchain (matches forge: rustc 1.98).
   affordance — "killing doesn't work" was partly that, partly
   prefix-& now being WINDOW-kill (tmux semantics, M5): whole-session
   kill is `:kill-session` / the dashboard / the phone long-press).
+- **M9 — resume + local-pi agent panes (2026-09-09)**:
+  `:resume` in the TUI (and `ranch resume [query]`) lists the lab
+  forge's sessions (`forge-list`/`forge-list-ok` proxy frames) in a
+  picker; picking one creates an agent pane that ADOPTS the forge
+  session — SSE watch replays the full history, so old conversations
+  continue in place. `:pi [dir]`, `prefix-A`, and `ranch pi [dir]`
+  create a LOCAL agent pane: the daemon spawns `pi --mode rpc` in the
+  pane's cwd (terminal-split anchor: the focused pane's cwd), feeds
+  prompts over stdin, and maps pi's RPC events to the same Chat rows
+  and working/idle metas — identical UX, different harness. Verified:
+  local pi round-trip (reply + tools), forge session adoption with
+  full replay, list against the lab.
 - **M8.6 — messenger rendering + agent-working indicator (2026-09-09)**:
   the CLI chat pane now looks like a messenger, not a terminal: bg-fill
   bubbles (user right/green with HH:MM timestamp, agent left/dark),

@@ -122,6 +122,7 @@ fn cmd_new(name: Option<String>, kind: Option<String>, cwd: Option<String>) {
             name,
             kind,
             cwd,
+            forge_session: None,
         },
         "ack",
         |f| match f {
@@ -131,6 +132,105 @@ fn cmd_new(name: Option<String>, kind: Option<String>, cwd: Option<String>) {
     );
     // interactive use: drop straight into the new session; scripts
     // (non-tty) keep getting the id printed
+    if let Frame::SessionsAck { session, .. } = f {
+        if libc_isatty() {
+            cmd_attach(&session);
+            return;
+        }
+        println!("session {session}");
+    }
+}
+
+fn cmd_resume(query: Option<String>) {
+    use std::io::Read as _;
+    let mut stream = connect();
+    hello(&mut stream, "cli");
+    let rid = Uuid::new_v4().to_string();
+    send_frame(
+        &mut stream,
+        &Frame::ForgeList {
+            id: Uuid::new_v4().to_string(),
+            client: "cli".into(),
+            req_id: rid.clone(),
+        },
+    )
+    .ok();
+    let mut decoder = Decoder::new();
+    let mut buf = [0u8; 65536];
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+    let mut found = None;
+    while std::time::Instant::now() < deadline {
+        let n = match stream.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        for f in decoder.feed(&buf[..n]) {
+            if let Frame::ForgeListOk { req_id, sessions, .. } = f {
+                if req_id == rid.as_str() {
+                    found = Some(sessions.clone());
+                    break;
+                }
+            }
+        }
+        if found.is_some() {
+            break;
+        }
+    }
+    let sessions = match found {
+        Some(s) if !s.is_empty() => s,
+        Some(_) => die("no forge sessions to resume"),
+        None => die("forge did not answer (forge down?)"),
+    };
+    // filter by query (title/id substring) when given
+    let candidates: Vec<_> = match &query {
+        Some(q) => {
+            let ql = q.to_lowercase();
+            let hits: Vec<_> = sessions
+                .iter()
+                .filter(|f| {
+                    f.title.to_lowercase().contains(&ql) || f.id.starts_with(&ql)
+                })
+                .collect();
+            if hits.is_empty() {
+                die(&format!("no forge session matches {q:?}"));
+            }
+            hits
+        }
+        None => sessions.iter().collect(),
+    };
+    // single hit + query: resume directly; otherwise show a menu
+    let pick = if candidates.len() == 1 && query.is_some() {
+        0
+    } else {
+        for (i, f) in candidates.iter().enumerate() {
+            let ended = if f.ended.is_some() { " (ended)" } else { "" };
+            println!("{:>3}. {}{} [{}]", i + 1, f.title, ended, &f.id[..8]);
+        }
+        print!("resume #> ");
+        use std::io::Write as _;
+        std::io::stdout().flush().ok();
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line).ok();
+        match line.trim().parse::<usize>() {
+            Ok(n) if n >= 1 && n <= candidates.len() => n - 1,
+            _ => die("cancelled"),
+        }
+    };
+    let fsid = candidates[pick].id.clone();
+    let f = one_shot(
+        |req_id| Frame::SessionsCreate {
+            req_id: req_id.to_string(),
+            name: None,
+            kind: Some("forge".into()),
+            cwd: None,
+            forge_session: Some(fsid),
+        },
+        "ack",
+        |f| match f {
+            Frame::Error { message, .. } => eprintln!("error: {message}"),
+            _ => {}
+        },
+    );
     if let Frame::SessionsAck { session, .. } = f {
         if libc_isatty() {
             cmd_attach(&session);
@@ -577,7 +677,8 @@ fn cmd_dashboard() -> Option<String> {
                                     name: if text.is_empty() { None } else { Some(text) },
                                     kind: None,
                                     cwd: None,
-                                };
+                                    forge_session: None,
+};
                                 send_frame(&mut stream, &f).ok();
                                 input = None;
                                 input_text.clear();
@@ -589,7 +690,8 @@ fn cmd_dashboard() -> Option<String> {
                                     name: if text.is_empty() { None } else { Some(text) },
                                     kind: Some("forge".into()),
                                     cwd: None,
-                                };
+                                    forge_session: None,
+};
                                 send_frame(&mut stream, &f).ok();
                                 input = None;
                                 input_text.clear();
@@ -641,7 +743,8 @@ fn cmd_dashboard() -> Option<String> {
                         name: None,
                         kind: None,
                         cwd: None,
-                    };
+                        forge_session: None,
+};
                     send_frame(&mut stream, &f).ok();
                     // SessionsAck handler attaches
                 }
@@ -753,6 +856,15 @@ fn cmd_attach(ref_: &str) {
     const SIDEBAR_W: u16 = 26;
     let picker = std::cell::Cell::new(false);
     let picker_sel = std::cell::Cell::new(0usize);
+    // :resume — forge-session picker (modal; j/k/enter/esc). Items land
+    // asynchronously via ForgeListOk (matched on req_id).
+    let resume_open = std::cell::Cell::new(false);
+    let resume_sel = std::cell::Cell::new(0usize);
+    let resume_pending: std::rc::Rc<std::cell::RefCell<Option<String>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(None));
+    let resume_items: std::rc::Rc<std::cell::RefCell<Vec<ranch_protocol::ForgeSessionInfo>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(vec![]));
+    let _ = &resume_sel;
     #[derive(Clone, Copy, PartialEq)]
     enum Prompt { RenameWindow, Command }
     let prompt = std::cell::Cell::new(None::<Prompt>);
@@ -904,6 +1016,17 @@ fn cmd_attach(ref_: &str) {
                                                 .unwrap_or((0, 0, false));
                                         }
                                     }
+                                }
+                            }
+                            Frame::ForgeListOk { req_id, sessions, .. } => {
+                                let matches_req =
+                                    resume_pending.borrow().as_deref() == Some(req_id.as_str());
+                                if matches_req {
+                                    *resume_pending.borrow_mut() = None;
+                                    resume_items.borrow_mut().clear();
+                                    resume_items.borrow_mut().extend(sessions);
+                                    resume_sel.set(0);
+                                    resume_open.set(true);
                                 }
                             }
                             Frame::Meta {
@@ -1341,6 +1464,51 @@ fn cmd_attach(ref_: &str) {
                 );
             }
 
+            // :resume modal — centered forge session list
+            if resume_open.get() {
+                let (mw, mh) = (62.min(term_area.width), 18.min(term_area.height));
+                let mx = (term_area.width.saturating_sub(mw)) / 2;
+                let my = (term_area.height.saturating_sub(mh)) / 2;
+                let marea = Rect::new(mx, my, mw, mh);
+                f.render_widget(
+                    ratatui::widgets::Clear,
+                    marea,
+                );
+                let block = ratatui::widgets::Block::bordered()
+                    .title(" resume forge session ")
+                    .border_style(Style::default().fg(ratatui::style::Color::Green));
+                let inner = block.inner(marea);
+                f.render_widget(block, marea);
+                let items: Vec<Line> = resume_items
+                    .borrow()
+                    .iter()
+                    .enumerate()
+                    .map(|(i, fs)| {
+                        let sel = i == resume_sel.get();
+                        let mut style = Style::default();
+                        if sel {
+                            style = style.add_modifier(Modifier::REVERSED);
+                        } else if fs.ended.is_some() {
+                            style = style.add_modifier(Modifier::DIM);
+                        }
+                        let mark = if sel { ">" } else { " " };
+                        let title = if fs.title.is_empty() {
+                            fs.id[..8.min(fs.id.len())].to_string()
+                        } else {
+                            fs.title.clone()
+                        };
+                        Line::from(Span::styled(
+                            format!("{mark} {:.52}", title),
+                            style,
+                        ))
+                    })
+                    .collect();
+                f.render_widget(
+                    Paragraph::new(items),
+                    Rect::new(inner.x, inner.y, inner.width, inner.height),
+                );
+            }
+
             // prompt line (rename / command)
             if let Some(kind) = prompt_now {
                 let label = match kind {
@@ -1372,6 +1540,46 @@ fn cmd_attach(ref_: &str) {
                     }
                     CEvent::Key(key) => {
                         if key.kind != KeyEventKind::Press {
+                            continue;
+                        }
+                        // :resume modal: forge session picker
+                        if resume_open.get() {
+                            match key.code {
+                                KeyCode::Esc | KeyCode::Char('q') => {
+                                    resume_open.set(false);
+                                }
+                                KeyCode::Up | KeyCode::Char('k') => {
+                                    let sel = resume_sel.get();
+                                    if sel > 0 {
+                                        resume_sel.set(sel - 1);
+                                    }
+                                }
+                                KeyCode::Down | KeyCode::Char('j') => {
+                                    let sel = resume_sel.get();
+                                    if sel + 1 < resume_items.borrow().len() {
+                                        resume_sel.set(sel + 1);
+                                    }
+                                }
+                                KeyCode::Enter => {
+                                    let picked = resume_items
+                                        .borrow()
+                                        .get(resume_sel.get())
+                                        .map(|f| f.id.clone());
+                                    if let Some(fsid) = picked {
+                                        resume_open.set(false);
+                                        let f = Frame::SessionsCreate {
+                                            req_id: Uuid::new_v4().to_string(),
+                                            name: None,
+                                            kind: Some("forge".into()),
+                                            cwd: None,
+                                            forge_session: Some(fsid),
+                                        };
+                                        send_frame(&mut stream, &f).ok();
+                                        // SessionsAck attaches
+                                    }
+                                }
+                                _ => {}
+                            }
                             continue;
                         }
                         // sidebar modal: navigation + attach while open
@@ -1634,6 +1842,19 @@ fn cmd_attach(ref_: &str) {
                                     send_frame(&mut stream, &f).ok();
                                     continue;
                                 }
+                                // A → local pi agent split (pi --mode rpc
+                                // child on THIS machine, same chat UX)
+                                KeyCode::Char('A') => {
+                                    let f = Frame::PaneSplit {
+                                        req_id: Uuid::new_v4().to_string(),
+                                        session: session_id.clone(),
+                                        pane: active_pane.clone(),
+                                        dir: 1,
+                                        kind: Some("pi".into()),
+                                    };
+                                    send_frame(&mut stream, &f).ok();
+                                    continue;
+                                }
                                 // { / } → swap focused pane with previous / next
                                 // pane in layout order (tmux swap-pane semantics)
                                 KeyCode::Char('{') | KeyCode::Char('}') => {
@@ -1713,7 +1934,36 @@ fn cmd_attach(ref_: &str) {
                                                 }
                                             }
                                             Prompt::Command => {
-                                                // minimal: :agent <name>, :kill, :detach
+                                                // minimal: :agent <name>, :pi [dir],
+                                                // :resume, :kill, :detach
+                                                if prompt_input.trim() == "resume" {
+                                                    let rid = Uuid::new_v4().to_string();
+                                                    *resume_pending.borrow_mut() =
+                                                        Some(rid.clone());
+                                                    let f = Frame::ForgeList {
+                                                        id: Uuid::new_v4().to_string(),
+                                                        client: "attach".into(),
+                                                        req_id: rid,
+                                                    };
+                                                    send_frame(&mut stream, &f).ok();
+                                                    prompt_input.clear();
+                                                    continue;
+                                                }
+                                                if let Some(rest) =
+                                                    prompt_input.trim().strip_prefix("pi")
+                                                {
+                                                    let dir = rest.trim().to_string();
+                                                    let f = Frame::PaneSplit {
+                                                        req_id: Uuid::new_v4().to_string(),
+                                                        session: session_id.clone(),
+                                                        pane: active_pane.clone(),
+                                                        dir: 1,
+                                                        kind: Some("pi".into()),
+                                                    };
+                                                    send_frame(&mut stream, &f).ok();
+                                                    prompt_input.clear();
+                                                    continue;
+                                                }
                                                 if let Some(rest) = prompt_input.trim().strip_prefix("agent") {
                                                     let name = rest.trim().to_string();
                                                     let f = Frame::SessionsCreate {
@@ -1721,7 +1971,8 @@ fn cmd_attach(ref_: &str) {
                                                         name: if name.is_empty() { None } else { Some(name) },
                                                         kind: Some("forge".into()),
                                                         cwd: None,
-                                                    };
+                                                        forge_session: None,
+};
                                                     send_frame(&mut stream, &f).ok();
                                                     prompt_input.clear();
                                                     continue;
@@ -2421,6 +2672,24 @@ fn main() {
         "machines" => cmd_machines(),
         "cloud" => cmd_cloud_sessions(args.get(1).cloned()),
         "new" => cmd_new(args.get(1).cloned(), None, None),
+        // ranch pi [dir] — agent pane backed by a LOCAL pi --mode rpc
+        "pi" => {
+            let cwd = args
+                .get(1)
+                .cloned()
+                .map(Ok)
+                .unwrap_or_else(|| std::env::current_dir().map(|p| p.to_string_lossy().into_owned()));
+            let cwd = match cwd {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    eprintln!("warning: could not resolve cwd ({e}); using $HOME");
+                    None
+                }
+            };
+            cmd_new(None, Some("pi".into()), cwd)
+        }
+        // ranch resume [query] — resume a forge session in an agent pane
+        "resume" => cmd_resume(args.get(1).cloned()),
         // ranch agent [name] [dir] — first-class agent session (runs pi)
         "agent" => {
             // default dir: the shell's cwd — `cd project && ranch agent`

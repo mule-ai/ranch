@@ -153,6 +153,26 @@ per app install for mobile so reconnects are stable).
 - The daemon also re-snapshots automatically on: relay reconnect,
   canonical size change, and when a client attaches.
 
+### Agent panes (M9)
+
+- `sessions-create` gains `kind: "pi"` — the pane is a chat pane backed
+  by a **local** `pi --mode rpc` child (spawned in `cwd`, default
+  `$HOME`). Same UX as forge panes; `PaneSnap.kind` stays
+  `"forge-chat"` with `forge_session` absent.
+- `sessions-create` gains `forge_session: <uuid>` (with `kind:
+  "forge"`) — **adopt** an existing forge session instead of creating
+  one. The daemon watches its SSE stream; history replays into the
+  pane (`since=0` catch-up), so resume is a no-op client-side.
+- `forge-list {req_id}` → `forge-list-ok {req_id, sessions[]}` — the
+  daemon proxies `GET /sessions` from the lab forge (worker thread;
+  broadcast to all clients, matched by `req_id`). Each row:
+  `{id, title, updated, ended?}`.
+- Chat panes with `forge_session == nil` are local-pi backed; the
+  daemon routes `chat-send` to the child's stdin as
+  `{"type":"prompt","message":...}` and maps pi RPC events
+  (`message_end`, `tool_execution_*`, `turn_end`) to `chat` rows and
+  `meta kind="agent"` status.
+
 ## 4. Coalescing & sequencing
 
 - The daemon maintains, per pane, a `seq` counter and a dirty-row set.

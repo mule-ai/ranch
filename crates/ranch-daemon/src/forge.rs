@@ -72,6 +72,8 @@ pub enum ForgeJob {
     Unwatch { pane: Uuid },
     /// POST a user message (spawns/wakes pi inside forge).
     Send { pane: Uuid, forge_sid: Uuid, text: String },
+    /// List resumable forge sessions (GET /sessions).
+    List { req_id: String },
 }
 
 /// Shared per-watch state: the SSE thread owns one; the job thread
@@ -90,7 +92,7 @@ struct WatchState {
 }
 
 /// Shared pipe writer (SSE threads + job thread all emit frames).
-type PipeWriter = Arc<Mutex<std::fs::File>>;
+pub type PipeWriter = Arc<Mutex<std::fs::File>>;
 
 fn write_frame(w: &PipeWriter, frame: &Frame) {
     let cid = Uuid::new_v4().to_string();
@@ -331,6 +333,76 @@ pub fn spawn_worker(
                         // POST is accepted; rows land via the SSE stream
                         write_agent_status(&pipe, pane, "working");
                     }
+                    ForgeJob::List { req_id } => match http_json(&cfg, "GET", "/sessions", None) {
+                        Ok(v) => {
+                            // response is {sessions: [...]} (or a bare array)
+                            let arr = v
+                                .get("sessions")
+                                .and_then(|x| x.as_array())
+                                .cloned()
+                                .or_else(|| v.as_array().cloned())
+                                .unwrap_or_default();
+                            let sessions: Vec<ranch_protocol::ForgeSessionInfo> = arr
+                                .iter()
+                                .filter_map(|s| {
+                                    let id = s.get("id")?.as_str()?.to_string();
+                                    let title = s
+                                        .get("title")
+                                        .and_then(|t| t.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
+                                    let updated = s
+                                        .get("last_active")
+                                        .and_then(|t| t.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
+                                    let ended = s
+                                        .get("ended_at")
+                                        .and_then(|t| t.as_str())
+                                        .map(|t| t.to_string());
+                                    Some(ranch_protocol::ForgeSessionInfo {
+                                        id,
+                                        title,
+                                        updated,
+                                        ended,
+                                    })
+                                })
+                                .collect();
+                            let cid = uuid::Uuid::new_v4().to_string();
+                            if let Ok(mut f) = pipe.lock() {
+                                use std::io::Write as _;
+                                for line in ranch_protocol::encode_frame(
+                                    &ranch_protocol::Frame::ForgeListOk {
+                                        id: String::new(),
+                                        req_id: req_id.clone(),
+                                        sessions,
+                                    },
+                                    &cid,
+                                ) {
+                                    let _ = f.write_all(line.as_bytes());
+                                    let _ = f.write_all(b"\n");
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("ranchd: forge list failed: {e}");
+                            let cid = uuid::Uuid::new_v4().to_string();
+                            if let Ok(mut f) = pipe.lock() {
+                                use std::io::Write as _;
+                                for line in ranch_protocol::encode_frame(
+                                    &ranch_protocol::Frame::ForgeListOk {
+                                        id: String::new(),
+                                        req_id: req_id.clone(),
+                                        sessions: Vec::new(),
+                                    },
+                                    &cid,
+                                ) {
+                                    let _ = f.write_all(line.as_bytes());
+                                    let _ = f.write_all(b"\n");
+                                }
+                            }
+                        }
+                    },
                 },
                 Err(mpsc::RecvError) => return,
             }

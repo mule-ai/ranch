@@ -19,6 +19,7 @@
 //!   same frames to the machine's Supabase Realtime channel (relay.rs)
 
 mod forge;
+mod pilocal;
 mod relay;
 
 use std::collections::{BTreeMap, VecDeque};
@@ -473,6 +474,12 @@ struct Daemon {
     orphans: Vec<c_int>,
     /// forge worker jobs (None when forge is not configured)
     forge_tx: Option<std::sync::mpsc::Sender<forge::ForgeJob>>,
+    /// local pi agents (pane -> child handle) for kind="pi" chat panes
+    pi_agents: BTreeMap<Uuid, std::sync::Arc<pilocal::LocalPi>>,
+    /// clone of the forge pipe writer — local-pi panes emit their
+    /// Chat/Meta frames through the same pipe (the pre-match resolves
+    /// + broadcasts them identically)
+    forge_pipe_w: Option<std::sync::Arc<std::sync::Mutex<std::fs::File>>>,
 }
 
 // ---------- helpers ----------
@@ -734,6 +741,8 @@ impl Daemon {
             mirror_tx,
             orphans: Vec::new(),
             forge_tx: None,
+            pi_agents: BTreeMap::new(),
+            forge_pipe_w: None,
         };
         // register the relay as a client keyed by its read-pipe fd; remote
         // frames arrive there and daemon->remote frames go out via relay_out
@@ -755,6 +764,10 @@ impl Daemon {
             match relay::make_pipes() {
                 Ok(((f_daemon_r, f_daemon_w), (_u1, _u2))) => {
                     let (tx, rx) = std::sync::mpsc::channel();
+                    if let Ok(clone) = f_daemon_w.try_clone() {
+                        daemon.forge_pipe_w =
+                            Some(std::sync::Arc::new(std::sync::Mutex::new(clone)));
+                    }
                     forge::spawn_worker(fcfg, f_daemon_w, rx);
                     let fclient = Client {
                         stream: None,
@@ -872,7 +885,16 @@ impl Daemon {
                 let Ok(pid) = Uuid::parse_str(pane) else { return };
                 if let Some(s) = self.sessions.get(&sid) {
                     if let Some(cp) = s.chats.get(&pid) {
-                        if let Some(tx) = &self.forge_tx {
+                        if cp.forge_sid.is_nil() {
+                            // local pi backing: prompt the child directly
+                            if let Some(lp) = self.pi_agents.get(&pid) {
+                                if let Some(pipe_w) = &self.forge_pipe_w {
+                                    if let Err(e) = lp.prompt(pipe_w, &text.clone()) {
+                                        eprintln!("ranchd: pi prompt failed: {e}");
+                                    }
+                                }
+                            }
+                        } else if let Some(tx) = &self.forge_tx {
                             let _ = tx.send(forge::ForgeJob::Send {
                                 pane: pid,
                                 forge_sid: cp.forge_sid,
@@ -886,6 +908,23 @@ impl Daemon {
             // everyone attached to the session (pipe client has no
             // attach; the frame carries the session in `session` —
             // the worker leaves it blank, so resolve from the pane)
+            // client -> forge: list resumable sessions (blocking HTTP
+            // on the worker thread)
+            Frame::ForgeList { req_id, .. } => {
+                if let Some(tx) = &self.forge_tx {
+                    let _ = tx.send(forge::ForgeJob::List {
+                        req_id: req_id.clone(),
+                    });
+                } else if let Some(c) = self.clients.get_mut(&from) {
+                    // forge not configured: empty reply (no error — the
+                    // client just shows nothing to resume)
+                    send_frame(c, &Frame::ForgeListOk {
+                        id: String::new(),
+                        req_id: req_id.clone(),
+                        sessions: Vec::new(),
+                    });
+                }
+            }
             // forge worker agent-status: resolve + broadcast
             Frame::Meta { session, pane, kind, status } if session.is_empty() && kind == "agent" => {
                 let pid = Uuid::parse_str(pane.as_deref().unwrap_or("")).ok();
@@ -959,7 +998,17 @@ impl Daemon {
                 }
                 return;
             }
-            _ => {}
+            // forge worker -> clients: the session list reply is not
+            // pane-addressable; broadcast (clients match on req_id)
+            Frame::ForgeListOk { .. } => {
+                let recipients: Vec<RawFd> = self.clients.keys().copied().collect();
+                for rfd in recipients {
+                    if let Some(c) = self.clients.get_mut(&rfd) {
+                        send_frame(c, frame);
+                    }
+                }
+                return;
+            }
             _ => {}
         }
         match frame {
@@ -1115,13 +1164,15 @@ impl Daemon {
                     );
                 }
             }
-            Frame::SessionsCreate { req_id, name, kind, cwd } => {
+            Frame::SessionsCreate { req_id, name, kind, cwd, forge_session } => {
                 let kind = kind.clone().unwrap_or_else(|| "shell".into());
-                if kind != "shell" && kind != "forge" {
+                if kind != "shell" && kind != "forge" && kind != "pi" {
                     if let Some(c) = self.clients.get_mut(&from) {
                         send_frame(c, &Frame::Error {
                             req_id: Some(req_id.clone()),
-                            message: format!("unknown session kind {kind:?} (shell|forge)"),
+                            message: format!(
+                                "unknown session kind {kind:?} (shell|forge|pi)"
+                            ),
                         });
                     }
                     return;
@@ -1151,17 +1202,30 @@ impl Daemon {
                     win: 0,
                     chats: BTreeMap::new(),
                 };
-                if kind == "forge" {
-                    // first-class agent session: a chat pane bound to a
-                    // fresh forge session (no PTY)
-                    let forge_cfg = forge::load_forge_config();
-                    match forge_cfg
-                        .as_ref()
-                        .map(|cfg| {
-                            forge::create_forge_session(cfg, &name, cwd.as_deref())
-                        })
-                        .unwrap_or(Err("forge not configured (set forge_api_key in daemon.toml)".into()))
-                    {
+                if kind == "forge" || kind == "pi" {
+                    // first-class agent session: a chat pane (no PTY).
+                    // Backing resolution:
+                    //   kind=forge + forge_session -> adopt (resume)
+                    //   kind=forge                 -> fresh forge session
+                    //   kind=pi                    -> local `pi --mode rpc`
+                    let backing: Result<Uuid, String> = if kind == "pi" {
+                        Ok(Uuid::nil()) // nil forge_sid = local pi backing
+                    } else if let Some(fsid) = &forge_session {
+                        Uuid::parse_str(fsid)
+                            .map_err(|_| format!("bad forge_session id {fsid:?}"))
+                    } else {
+                        let forge_cfg = forge::load_forge_config();
+                        forge_cfg
+                            .as_ref()
+                            .map(|cfg| {
+                                forge::create_forge_session(cfg, &name, cwd.as_deref())
+                            })
+                            .unwrap_or(Err(
+                                "forge not configured (set forge_api_key in daemon.toml)"
+                                    .into(),
+                            ))
+                    };
+                    match backing {
                         Ok(forge_sid) => {
                             let pid = Uuid::new_v4();
                             s.chats.insert(
@@ -1176,12 +1240,52 @@ impl Daemon {
                             s.windows[0].layout =
                                 Layout::Leaf { pane: pid.to_string() };
                             s.active = pid;
-                            eprintln!(
-                                "ranchd: created agent session {name} ({id}) chat pane {pid} -> forge {forge_sid}"
-                            );
-                            // start the poll worker on this pane
-                            if let Some(tx) = &self.forge_tx {
-                                let _ = tx.send(forge::ForgeJob::Watch { pane: pid, forge_sid });
+                            if kind == "pi" {
+                                // local pi: spawn the rpc child now
+                                let dir = cwd.clone().unwrap_or_else(|| {
+                                    std::env::var("HOME").unwrap_or_default()
+                                });
+                                match &self.forge_pipe_w {
+                                    Some(pipe_w) => {
+                                        if let Err(e) = pilocal::LocalPi::spawn(
+                                            pid,
+                                            &dir,
+                                            pipe_w.clone(),
+                                            &mut self.pi_agents,
+                                        ) {
+                                            eprintln!("ranchd: pi spawn failed: {e}");
+                                            if let Some(c) = self.clients.get_mut(&from) {
+                                                send_frame(c, &Frame::Error {
+                                                    req_id: Some(req_id.clone()),
+                                                    message: e,
+                                                });
+                                            }
+                                            return;
+                                        }
+                                    }
+                                    None => {
+                                        eprintln!(
+                                            "ranchd: pi spawn failed: no forge pipe (forge disabled?)"
+                                        );
+                                    }
+                                }
+                                eprintln!(
+                                    "ranchd: created agent session {name} ({id}) chat pane {pid} -> local pi ({dir})"
+                                );
+                            } else {
+                                eprintln!(
+                                    "ranchd: created agent session {name} ({id}) chat pane {pid} -> forge {forge_sid}"
+                                );
+                            }
+                            // start the SSE watch on forge-backed panes
+                            // (local pi panes stream from the child)
+                            if kind == "forge" {
+                                if let Some(tx) = &self.forge_tx {
+                                    let _ = tx.send(forge::ForgeJob::Watch {
+                                        pane: pid,
+                                        forge_sid,
+                                    });
+                                }
                             }
                             let ack = Frame::SessionsAck {
                                 req_id: req_id.clone(),
@@ -1270,6 +1374,15 @@ impl Daemon {
                         for p in s.panes.values() {
                             self.orphans.push(p.child);
                         }
+                        // stop the chat panes' backing agents
+                        for pid in s.chats.keys() {
+                            if let Some(lp) = self.pi_agents.remove(pid) {
+                                lp.kill();
+                            }
+                            if let Some(tx) = &self.forge_tx {
+                                let _ = tx.send(forge::ForgeJob::Unwatch { pane: *pid });
+                            }
+                        }
                         eprintln!("ranchd: killed session {}", s.name);
                     }
                     self.write_state();
@@ -1336,7 +1449,7 @@ impl Daemon {
                         _ => s.active,
                     };
                     // agent split: chat pane bound to a fresh forge session
-                    if kind == "forge" {
+                    if kind == "forge" || kind == "pi" {
                         let fcfg = forge::load_forge_config();
                         // anchor the agent to the focused pane's cwd so
                         // terminal and agent work the same tree
@@ -1344,6 +1457,50 @@ impl Daemon {
                             let fpid = s.panes.get(&target)?;
                             pane_cwd(fpid.child)
                         })();
+                        // pi split: local `pi --mode rpc` child, no forge
+                        if kind == "pi" {
+                            let pid = Uuid::new_v4();
+                            let dir_str = anchor_dir
+                                .clone()
+                                .map(|p| p.to_string_lossy().to_string())
+                                .unwrap_or_else(|| {
+                                    std::env::var("HOME").unwrap_or_default()
+                                });
+                            match &self.forge_pipe_w {
+                                Some(pipe_w) => {
+                                    if let Err(e) = pilocal::LocalPi::spawn(
+                                        pid,
+                                        &dir_str,
+                                        pipe_w.clone(),
+                                        &mut self.pi_agents,
+                                    ) {
+                                        eprintln!("ranchd: pi split failed: {e}");
+                                        if let Some(c) = self.clients.get_mut(&from) {
+                                            send_frame(c, &Frame::Error {
+                                                req_id: Some(req_id.clone()),
+                                                message: e,
+                                            });
+                                        }
+                                        return None;
+                                    }
+                                }
+                                None => {
+                                    eprintln!("ranchd: pi split failed: no forge pipe");
+                                    return None;
+                                }
+                            }
+                            s.chats.insert(
+                                pid,
+                                ChatPane { forge_sid: Uuid::nil(), cols: 80, rows: 24, chat: vec![] },
+                            );
+                            s.win_mut().split_leaf(&target.to_string(), &pid.to_string(), dir);
+                            s.active = pid;
+                            s.apply_sizes();
+                            eprintln!(
+                                "ranchd: agent split: chat pane {pid} -> local pi ({dir_str})"
+                            );
+                            return Some(pid);
+                        }
                         let forge_sid = match fcfg
                             .as_ref()
                             .map(|c| forge::create_forge_session(
@@ -1599,6 +1756,15 @@ impl Daemon {
                     if let Some(p) = s.panes.remove(&pid) {
                         // master fd drops here (SIGHUP to the shell); reap later
                         self.orphans.push(p.child);
+                    }
+                    // chat pane kill: stop its backing agent
+                    if s.chats.remove(&pid).is_some() {
+                        if let Some(lp) = self.pi_agents.remove(&pid) {
+                            lp.kill();
+                        }
+                        if let Some(tx) = &self.forge_tx {
+                            let _ = tx.send(forge::ForgeJob::Unwatch { pane: pid });
+                        }
                     }
                     let dead = s.remove_pane_everywhere(&pid.to_string());
                     s.apply_sizes();
