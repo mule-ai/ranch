@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { useFonts } from "expo-font";
 import {
   ActivityIndicator,
+  Alert,
   FlatList,
   Keyboard,
   Pressable,
@@ -176,7 +177,25 @@ export default function App() {
               <Text style={s.dim}>No sessions. Create one below.</Text>
             }
             renderItem={({ item }) => (
-              <Pressable style={s.row} onPress={() => setAttached(item)}>
+              <Pressable
+                style={s.row}
+                onPress={() => setAttached(item)}
+                onLongPress={() =>
+                  Alert.alert("kill session", `kill "${item.name}"?`, [
+                    { text: "cancel", style: "cancel" },
+                    {
+                      text: "kill",
+                      style: "destructive",
+                      onPress: () => {
+                        relay?.send({ t: "SessionsKill", session: item.id } as Frame);
+                        setSessions(
+                          (sessions ?? []).filter((x) => x.id !== item.id)
+                        );
+                      },
+                    },
+                  ])
+                }
+              >
                 <Text style={s.rowTitle}>{item.name}</Text>
                 <Text style={s.dim}>
                   {item.kind} · {item.panes.length} pane{item.panes.length === 1 ? "" : "s"}

@@ -652,7 +652,17 @@ Rust edition 2024, stable toolchain (matches forge: rustc 1.98).
   `FORGE_SESSIONS_DIR` (12-factor; was hardcoded /forge/sessions,
   CI-only with_base_path existed). Forge config rides daemon.toml:
   `forge_url`, `forge_api_key`, `forge_profile_id` (default first
-  profile). - **M8.4 — non-fatal error feedback (2026-09-09)**: a failed agent
+  profile). - **M8.5 — lab forge + phone kill (2026-09-09)**: forge integration
+  points at the LAB deployment (mini: `http://10.10.199.29:8110`,
+  vault key, Laguna profile) — no local forge (service removed;
+  patch deploys with the next forge-alc image rebuild; until then
+  working_dir is ignored by the deployed serde and agents run in the
+  per-session tree). Phone: long-press a session row → confirm →
+  SessionsKill + live list removal (the phone previously had NO kill
+  affordance — "killing doesn't work" was partly that, partly
+  prefix-& now being WINDOW-kill (tmux semantics, M5): whole-session
+  kill is `:kill-session` / the dashboard / the phone long-press).
+- **M8.4 — non-fatal error feedback (2026-09-09)**: a failed agent
   split (forge down) used to `die()` the whole attach client — "prefix
   a doesn't work" with zero feedback. Now: attach-refusal errors
   (before the first snapshot) stay fatal; every other daemon error
