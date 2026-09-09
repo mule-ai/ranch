@@ -859,41 +859,67 @@ fn cmd_attach(ref_: &str) {
                     }
                     None => (&screen_ref.lines, screen_ref.cursor.0, screen_ref.cursor.1, false),
                 };
-                // clip the pane screen into the rect (top-left anchored)
                 let mut li: Vec<Line> = Vec::with_capacity(r.height as usize);
                 for row in 0..r.height as usize {
                     let line = lines_src.get(row).cloned().unwrap_or_default();
-                    // char-safe horizontal clip
-                    let take = line.chars().take(r.width as usize).collect::<String>();
-                    if focused && vis && (row as u16) == cy {
-                        let start = take
-                            .char_indices()
-                            .nth(cx as usize)
-                            .map(|(b, _)| b)
-                            .unwrap_or(take.len());
-                        let end = take
-                            .char_indices()
-                            .nth(cx as usize + 1)
-                            .map(|(b, _)| b)
-                            .unwrap_or(take.len());
-                        let mut spans: Vec<Span> = Vec::new();
-                        spans.push(Span::raw(take[..start].to_string()));
-                        if end > start {
-                            spans.push(Span::styled(
-                                take[start..end].to_string(),
-                                Style::default().add_modifier(Modifier::REVERSED),
-                            ));
-                            spans.push(Span::raw(take[end..].to_string()));
-                        } else {
-                            spans.push(Span::styled(
-                                " ".to_string(),
-                                Style::default().add_modifier(Modifier::REVERSED),
-                            ));
+                    // parse SGR runs into styled spans; rows are one grid
+                    // row each so the parse is row-local
+                    use ansi_to_tui::IntoText as _;
+                    let spans: Vec<Span> = match line.as_bytes().into_text() {
+                        Ok(t) => t
+                            .lines
+                            .into_iter()
+                            .next()
+                            .map(|l| l.spans)
+                            .unwrap_or_default(),
+                        Err(_) => vec![Span::raw(line.clone())],
+                    };
+                    // clip spans to the rect width by cell count, applying
+                    // the reversed cursor cell on the focused pane
+                    let mut out: Vec<Span> = Vec::new();
+                    let mut col = 0usize;
+                    let cursor_cell = focused && vis && (row as u16) == cy;
+                    let mut cursor_done = !cursor_cell;
+                    for span in spans {
+                        if col >= r.width as usize {
+                            break;
                         }
-                        li.push(Line::from(spans));
-                    } else {
-                        li.push(Line::raw(take));
+                        let chars: Vec<char> = span.content.chars().collect();
+                        if chars.is_empty() {
+                            continue;
+                        }
+                        for (i, ch) in chars.iter().enumerate() {
+                            if col >= r.width as usize {
+                                break;
+                            }
+                            let is_cursor_cell = !cursor_done && col == cx as usize;
+                            if is_cursor_cell {
+                                out.push(Span::styled(
+                                    ch.to_string(),
+                                    span.style.add_modifier(Modifier::REVERSED),
+                                ));
+                                cursor_done = true;
+                            } else {
+                                out.push(Span::styled(ch.to_string(), span.style));
+                            }
+                            col += 1;
+                            let _ = i;
+                        }
                     }
+                    // cursor at/past the line end: reversed blank cell
+                    if cursor_cell && !cursor_done {
+                        out.push(Span::styled(
+                            " ".to_string(),
+                            Style::default().add_modifier(Modifier::REVERSED),
+                        ));
+                        cursor_done = true;
+                    }
+                    // pad to full width so the pane background is uniform
+                    while col < r.width as usize {
+                        out.push(Span::raw(" ".to_string()));
+                        col += 1;
+                    }
+                    li.push(Line::from(out));
                 }
                 f.render_widget(ratatui::widgets::Paragraph::new(li), r);
                 // focused pane gets a border; unfocused panes a dim one

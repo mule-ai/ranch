@@ -11,6 +11,7 @@ import {
 } from "react-native";
 import { Frame, Layout, PaneSnap, b64, nextId } from "../lib/frames";
 import { Relay } from "../lib/relay";
+import { parseSgrRow, Span as SgrSpan } from "../lib/sgr";
 
 // Compute screen rects from the split tree (mirrors the desktop client).
 export type Rect = { pane: string; x: number; y: number; w: number; h: number };
@@ -33,8 +34,8 @@ export function layoutRects(l: Layout, x: number, y: number, w: number, h: numbe
 
 type Props = { relay: Relay; sessionId: string; sessionName: string; onExit: () => void };
 
-const COLS = 96;
-const ROWS = 30;
+const FONT_SIZE = 10; // px; JetBrainsMono advance is 0.6em
+const LINE_HEIGHT = 13;
 
 export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props) {
   const [panes, setPanes] = useState<Map<string, PaneSnap>>(new Map());
@@ -45,6 +46,9 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
   const [blink, setBlink] = useState(true);
   const inputRef = useRef<TextInput | null>(null);
   const [capture, setCapture] = useState(" ");
+  const [geom, setGeom] = useState({ cols: 80, rows: 24 });
+  const geomRef = useRef(geom);
+  geomRef.current = geom;
   // predictive local echo: chars sent to the PTY that have not been
   // confirmed by an authoritative Update yet, rendered dimmed at the
   // cursor so typing feels instant despite the relay round trip
@@ -135,7 +139,7 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
       } as Frame);
       relay.send({
         t: "Resize", id: nextId(), client: "mobile", session: sessionId,
-        cols: COLS, rows: ROWS,
+        cols: geomRef.current.cols, rows: geomRef.current.rows,
       } as Frame);
     };
     poke();
@@ -227,6 +231,8 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
     } as Frame);
   };
 
+  const COLS = geom.cols;
+  const ROWS = geom.rows;
   const rects = layout ? layoutRects(layout, 0, 0, COLS, ROWS) : [];
 
   return (
@@ -246,7 +252,23 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
         <Text style={styles.conn}>{conn}</Text>
       </View>
 
-      <View style={styles.screenWrap}>
+      <View
+        style={styles.screenWrap}
+        onLayout={(e) => {
+          const w = e.nativeEvent.layout.width;
+          const h = e.nativeEvent.layout.height;
+          const cols = Math.max(20, Math.floor(w / (FONT_SIZE * 0.6)) - 1);
+          const rows = Math.max(10, Math.floor(h / LINE_HEIGHT) - 1);
+          if (cols !== geom.cols || rows !== geom.rows) {
+            setGeom({ cols, rows });
+            // resize the daemon PTY to the device
+            relay.send({
+              t: "Resize", id: nextId(), client: "mobile", session: sessionId,
+              cols, rows,
+            } as Frame);
+          }
+        }}
+      >
         {rects.map((r) => {
           const p = panes.get(r.pane);
           const focused = r.pane === activePane;
@@ -275,34 +297,80 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
                 <Text style={styles.mono}>
                   {(p?.lines ?? []).slice(0, r.h).map((line, yy) => {
                     const c = p?.cursor;
+                    const spans = parseSgrRow(line);
+                    const renderSpans = (spans2: SgrSpan[], extraStyle?: object) =>
+                      spans2.map((sp, si) => (
+                        <Text
+                          key={si}
+                          style={[
+                            extraStyle,
+                            {
+                              color: sp.fg,
+                              backgroundColor: sp.bg,
+                              fontWeight: sp.bold ? "700" : undefined,
+                              fontStyle: sp.italic ? "italic" : undefined,
+                              textDecorationLine: sp.underline ? "underline" : undefined,
+                            },
+                          ]}
+                        >
+                          {sp.text}
+                        </Text>
+                      ));
                     if (focused && c && yy === c.y && pred &&
                         pred.row === c.y && pred.col === c.x && pred.text !== "") {
-                      // predicted (unconfirmed) keystrokes: dimmed, with the
-                      // cursor riding after them
-                      const at = line.charAt(c.x) || " ";
                       return (
                         <Text key={yy}>
-                          {line.slice(0, c.x)}
-                          <Text style={styles.predText}>{pred.text}</Text>
-                          <Text style={styles.cursor}>{at}</Text>
-                          {line.slice(c.x + 1)}
+                          {renderSpans(spans, styles.predText)}
+                          <Text style={styles.cursor}> </Text>
                           {"\n"}
                         </Text>
                       );
                     }
                     if (focused && c && c.visible && yy === c.y && (blink || pred)) {
-                      // block cursor: reverse-video the cell under it
-                      const ch = line.charAt(c.x) || " ";
+                      // reverse-video the cell under the cursor: split spans
+                      // at the cursor cell boundary
+                      const out: React.ReactNode[] = [];
+                      let col = 0;
+                      let done = false;
+                      spans.forEach((sp, si) => {
+                        for (let k = 0; k < sp.text.length; k++) {
+                          if (done) {
+                            out.push(
+                              <Text key={`${si}-${k}`} style={{ color: sp.fg, backgroundColor: sp.bg }}>
+                                {sp.text[k]}
+                              </Text>
+                            );
+                          } else if (col === c!.x) {
+                            out.push(
+                              <Text key={`${si}-${k}`} style={styles.cursor}>
+                                {sp.text[k]}
+                              </Text>
+                            );
+                            done = true;
+                          } else {
+                            out.push(
+                              <Text key={`${si}-${k}`} style={{ color: sp.fg, backgroundColor: sp.bg }}>
+                                {sp.text[k]}
+                              </Text>
+                            );
+                          }
+                          col++;
+                        }
+                      });
+                      if (!done) out.push(<Text key="cend" style={styles.cursor}> </Text>);
                       return (
                         <Text key={yy}>
-                          {line.slice(0, c.x)}
-                          <Text style={styles.cursor}>{ch}</Text>
-                          {line.slice(c.x + 1)}
+                          {out}
                           {"\n"}
                         </Text>
                       );
                     }
-                    return <Text key={yy}>{line + "\n"}</Text>;
+                    return (
+                      <Text key={yy}>
+                        {renderSpans(spans)}
+                        {"\n"}
+                      </Text>
+                    );
                   })}
                 </Text>
               </ScrollView>
@@ -393,8 +461,8 @@ const styles = StyleSheet.create({
   },
   pane: { position: "absolute", borderWidth: 1, padding: 2 },
   mono: {
-    fontFamily: "monospace", fontSize: 9, lineHeight: 12,
-    color: "#d1d5db", letterSpacing: -0.2,
+    fontFamily: "JetBrainsMono NF Mono", fontSize: FONT_SIZE,
+    lineHeight: LINE_HEIGHT, color: "#d1d5db",
   },
   dim: { color: "#6b7280", padding: 16 },
   hiddenInput: {

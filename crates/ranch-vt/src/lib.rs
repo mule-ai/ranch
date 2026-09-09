@@ -148,36 +148,8 @@ impl Vt {
             return Err(format!("ghostty_terminal_new failed: rc={rc}"));
         }
         let mut fmt: *mut c_void = ptr::null_mut();
-        let opts = FormatterOptions {
-            size: std::mem::size_of::<FormatterOptions>(),
-            emit: 0, // PLAIN
-            // unwrap merges soft-wrapped lines — that breaks the
-            // one-line-per-grid-row contract row updates depend on (a
-            // full-width TUI line would merge with its neighbor and
-            // shift every row after it)
-            unwrap: false,
-            trim: true,
-            extra: FormatterTerminalExtra {
-                size: std::mem::size_of::<FormatterTerminalExtra>(),
-                palette: false,
-                modes: false,
-                scrolling_region: false,
-                tabstops: false,
-                pwd: false,
-                keyboard: false,
-                screen: FormatterScreenExtra {
-                    size: std::mem::size_of::<FormatterScreenExtra>(),
-                    cursor: false,
-                    style: false,
-                    hyperlink: false,
-                    protection: false,
-                    kitty_keyboard: false,
-                    charsets: false,
-                },
-            },
-            selection: ptr::null(),
-        };
-        let rc = unsafe { ghostty_formatter_terminal_new(ptr::null(), &mut fmt, h, opts) };
+        let rc =
+            unsafe { ghostty_formatter_terminal_new(ptr::null(), &mut fmt, h, Self::formatter_opts()) };
         if rc != 0 || fmt.is_null() {
             unsafe { ghostty_terminal_free(h) };
             return Err(format!("ghostty_formatter_terminal_new failed: rc={rc}"));
@@ -297,7 +269,37 @@ impl Vt {
         s.lines().map(|l| l.to_string()).collect()
     }
 
-    /// Scrollbar state: (total scrollable rows, viewport offset, visible len).
+    fn formatter_opts() -> FormatterOptions {
+        FormatterOptions {
+            size: std::mem::size_of::<FormatterOptions>(),
+            emit: 1, // VT: one line per grid row with inline SGR runs
+            // unwrap merges soft-wrapped lines — that breaks the
+            // one-line-per-grid-row contract row updates depend on
+            unwrap: false,
+            trim: true,
+            extra: FormatterTerminalExtra {
+                size: std::mem::size_of::<FormatterTerminalExtra>(),
+                palette: false,
+                modes: false,
+                scrolling_region: false,
+                tabstops: false,
+                pwd: false,
+                keyboard: false,
+                screen: FormatterScreenExtra {
+                    size: std::mem::size_of::<FormatterScreenExtra>(),
+                    cursor: false,
+                    style: true,
+                    hyperlink: false,
+                    protection: false,
+                    kitty_keyboard: false,
+                    charsets: false,
+                },
+            },
+            selection: ptr::null(),
+        }
+    }
+
+    /// Scrollbar state:    /// Scrollbar state: (total scrollable rows, viewport offset, visible len).
     pub fn scrollbar(&self) -> (u64, u64, u64) {
         // Mirror of GhosttyTerminalScrollbar { total, offset, len }
         #[repr(C)]
@@ -516,5 +518,23 @@ mod alt_tests {
         let screen = vt.screen();
         eprintln!("after 1049l: {:?}", screen);
         assert!(screen.iter().any(|l| l.contains("PRIMARY")));
+    }
+}
+
+#[cfg(test)]
+mod vt_format_tests {
+    use super::*;
+
+    // VT-mode formatter: what shape is the output? (rows with SGR runs?)
+    #[test]
+    fn vt_emit_shape() {
+        let vt = Vt::new(40, 6).unwrap();
+        // colored text via direct escapes
+        vt.write(b"\x1b[1;31mRED\x1b[0m plain\r\n");
+        vt.write(b"\x1b[32mGREEN\x1b[0m\r\n");
+        let out = vt.screen();
+        eprintln!("VT OUTPUT: {:?}", out);
+        assert!(out[0].contains("\u{1b}[1m") || out[0].contains("RED"), "styled rows expected");
+        assert!(out[0].contains("plain"));
     }
 }
