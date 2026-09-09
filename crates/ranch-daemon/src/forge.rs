@@ -1,23 +1,25 @@
 //! Forge (../forge) integration: chat panes bound to forge sessions.
 //!
 //! A forge-chat pane is NOT a PTY — the conversation lives in forge's
-//! `messages` table (the source of truth). The daemon polls
-//! `GET /messages` on a worker thread (blocking HTTP must never stall
-//! the single-threaded poll loop) and writes `Frame::Chat` broadcasts
-//! into a pipe, exactly like the relay thread does. Client sends go
-//! out as `Frame::ChatSend`, which this module POSTs to
-//! `POST /messages` (202 ACCEPTED; the rows come back through the
-//! poll).
+//! `messages` table (the source of truth). One worker thread per
+//! watched forge session streams `GET /sessions/{id}/events?since=`
+//! (SSE: `message` rows, catch-up on connect/reconnect, heartbeats)
+//! and writes `Frame::Chat` broadcasts into a pipe read by the main
+//! loop like any client (the relay-pipe pattern). Client sends go out
+//! as `Frame::ChatSend`, POSTed to `POST /messages` on the job thread
+//! (blocking HTTP must never stall the single-threaded poll loop).
 //!
 //! Auth: `forge_api_key` in ~/.config/ranch/daemon.toml (forge login
 //! returns it; X-API-Key header). `forge_profile_id` is optional —
 //! the first profile is used when absent.
 
 use ranch_protocol::{encode_frame, ChatMsg, Frame};
-use crate::relay::load_config;
-use std::io::{Read as _, Write as _};
+use std::io::{BufRead as _, Write as _};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::mpsc::RecvError;
 use std::sync::mpsc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use uuid::Uuid;
 
 pub struct ForgeConfig {
     pub base: String,
@@ -27,9 +29,8 @@ pub struct ForgeConfig {
 
 /// Extract the forge section from daemon.toml (optional keys).
 pub fn load_forge_config() -> Option<ForgeConfig> {
-    // load_config returns None when daemon.toml is missing entirely;
-    // forge config rides in the same file.
-    load_config()?;
+    // forge config rides in daemon.toml (same file as the relay);
+    // forge keys are optional — integration is off when absent
     let home = std::env::var("HOME").ok()?;
     let text = std::fs::read_to_string(
         std::path::PathBuf::from(home).join(".config/ranch/daemon.toml"),
@@ -65,62 +66,39 @@ pub fn load_forge_config() -> Option<ForgeConfig> {
 
 /// Jobs the main loop hands to the worker.
 pub enum ForgeJob {
-    /// Start polling a chat pane's forge session.
+    /// Start streaming a chat pane's forge session.
     Watch { pane: Uuid, forge_sid: Uuid },
-    /// Stop polling (pane killed).
+    /// Stop streaming (pane killed).
     Unwatch { pane: Uuid },
     /// POST a user message (spawns/wakes pi inside forge).
     Send { pane: Uuid, forge_sid: Uuid, text: String },
 }
 
-use uuid::Uuid;
-
-struct Watch {
+/// Shared per-watch state: the SSE thread owns one; the job thread
+/// flips `stop` on Unwatch.
+struct WatchState {
     pane: Uuid,
     forge_sid: Uuid,
-    /// highest message `sequence` seen
-    last_seq: i64,
+    /// highest message `sequence` delivered (dedup across reconnects —
+    /// forge re-sends catch-up rows after every reconnect and
+    /// dedupes by sequence server-side too)
+    last_seq: AtomicI64,
+    stop: AtomicBool,
 }
 
-/// One-shot JSON request helper (blocking; worker thread only).
-fn http_json(
-    cfg: &ForgeConfig,
-    method: &str,
-    path: &str,
-    body: Option<&serde_json::Value>,
-) -> Result<serde_json::Value, String> {
-    let url = format!("{}{}", cfg.base, path);
-    let method = method.to_ascii_uppercase();
-    // ureq 3 types differ per body-ness — dispatch per method
-    let sent = match (method.as_str(), body) {
-        ("GET", _) => ureq::get(&url).header("X-API-Key", &cfg.key).call(),
-        ("DELETE", _) => ureq::delete(&url).header("X-API-Key", &cfg.key).call(),
-        ("POST", b) => ureq::post(&url)
-            .header("X-API-Key", &cfg.key)
-            .send_json(b.cloned().unwrap_or(serde_json::Value::Null))
-            .map(|r| r),
-        _ => return Err(format!("forge: unsupported method {method}")),
-    };
-    let mut res = sent.map_err(|e| format!("forge {method} {path}: {e}"))?;
-    let mut text = String::new();
-    res.body_mut()
-        .as_reader()
-        .read_to_string(&mut text)
-        .map_err(|e| format!("forge read {path}: {e}"))?;
-    serde_json::from_str(&text).map_err(|e| format!("forge decode {path}: {e}"))
-}
+/// Shared pipe writer (SSE threads + job thread all emit frames).
+type PipeWriter = Arc<Mutex<std::fs::File>>;
 
-/// Extract message rows from `GET /messages?session_id=` responses.
-/// The response shape has evolved; accept either a bare array or
-/// `{messages: [...]}`.
-fn rows_of(v: &serde_json::Value) -> Vec<serde_json::Value> {
-    match v {
-        serde_json::Value::Array(a) => a.clone(),
-        other => other
-            .get("messages")
-            .and_then(|m| m.as_array())
-            .cloned()
-            .unwrap_or_default(),
+fn write_frame(w: &PipeWriter, frame: &Frame) {
+    let cid = Uuid::new_v4().to_string();
+    let mut lines = Vec::new();
+    for line in encode_frame(frame, &cid) {
+        lines.push(line);
+        lines.push("\n".into());
+    }
+    if let Ok(mut f) = w.lock() {
+        let _ = f.write_all(lines.join("").as_bytes());
+        let _ = f.flush();
     }
 }
 
@@ -162,98 +140,196 @@ fn to_chat_msg(r: &serde_json::Value) -> Option<ChatMsg> {
     })
 }
 
-fn write_frame(w: &mut std::fs::File, frame: &Frame) {
-    let cid = uuid::Uuid::new_v4().to_string();
-    for line in encode_frame(frame, &cid) {
-        if w.write_all(line.as_bytes()).is_err() || w.write_all(b"\n").is_err() {
+/// One SSE connection per watched forge session. Streams `message`
+/// events; each triggers a Chat frame with the (deduped) new rows.
+/// Reconnects with backoff — `since=` on reconnect gives server-side
+/// catch-up, and the last_seq high-water mark dedupes locally.
+fn run_sse(state: Arc<WatchState>, cfg: ForgeConfig, w: PipeWriter) {
+    let mut backoff = std::time::Duration::from_secs(1);
+    loop {
+        if state.stop.load(Ordering::Relaxed) {
             return;
         }
-    }
-    let _ = w.flush();
-}
-
-/// Poll all watches; append-only diffs go out as Chat frames.
-fn poll_all(cfg: &ForgeConfig, watches: &mut Vec<Watch>, w: &mut std::fs::File) {
-    for watch in watches.iter_mut() {
-        let path = format!("/messages?session_id={}", watch.forge_sid);
-        let Ok(v) = http_json(cfg, "GET", &path, None) else {
-            continue; // forge down or pane gone — retry next tick
-        };
-        let rows = rows_of(&v);
-        let fresh: Vec<ChatMsg> = rows
-            .iter()
-            .filter_map(to_chat_msg)
-            .filter(|m| m.seq > watch.last_seq)
-            .collect();
-        if fresh.is_empty() {
-            continue;
-        }
-        if let Some(mx) = fresh.iter().map(|m| m.seq).max() {
-            watch.last_seq = mx;
-        }
-        write_frame(
-            w,
-            &Frame::Chat {
-                id: String::new(),
-                session: String::new(), // filled by the main loop
-                pane: watch.pane.to_string(),
-                msgs: fresh,
-                reset: false,
-            },
+        let url = format!(
+            "{}/sessions/{}/events?since={}",
+            cfg.base,
+            state.forge_sid,
+            state.last_seq.load(Ordering::Relaxed)
         );
-    }
-}
-
-/// Worker thread: owns all blocking forge HTTP. Job channel in,
-/// `Frame::Chat` lines out through the pipe.
-pub fn spawn_worker(
-    cfg: ForgeConfig,
-    mut pipe_w: std::fs::File,
-    rx: mpsc::Receiver<ForgeJob>,
-) {
-    std::thread::spawn(move || {
-        let mut watches: Vec<Watch> = Vec::new();
-        loop {
-            // drain pending jobs; timeout makes the poll tick
-            let mut did_work = false;
-            loop {
-                match rx.recv_timeout(Duration::from_millis(if did_work { 50 } else { 1100 })) {
-                    Ok(job) => {
-                        did_work = true;
-                        match job {
-                            ForgeJob::Watch { pane, forge_sid } => {
-                                // re-watch replaces (resets seq so the
-                                // next poll sends the full history)
-                                watches.retain(|w| w.pane != pane);
-                                watches.push(Watch { pane, forge_sid, last_seq: 0 });
-                            }
-                            ForgeJob::Unwatch { pane } => {
-                                watches.retain(|w| w.pane != pane);
-                            }
-                            ForgeJob::Send { pane, forge_sid, text } => {
-                                let _ = http_json(
-                                    &cfg,
-                                    "POST",
-                                    "/messages",
-                                    Some(&serde_json::json!({
-                                        "session_id": forge_sid.to_string(),
-                                        "content": text,
-                                    })),
-                                );
-                                // rows land via the poll; nudge it soon
-                                // by shortening the next recv timeout
+        let resp = ureq::get(&url)
+            .header("X-API-Key", &cfg.key)
+            .header("Accept", "text/event-stream")
+            .call();
+        match resp {
+            Ok(res) => {
+                eprintln!("forge-sse: connected to {}", state.forge_sid);
+                backoff = std::time::Duration::from_secs(1);
+                // stream lines: SSE frames are `event: <name>` +
+                // `data: <json>` + blank line. buf borrows res and
+                // drops before it (reverse declaration order).
+                let mut res = res;
+                let mut buf = std::io::BufReader::new(res.body_mut().as_reader());
+                let mut event_name = String::new();
+                let mut data = String::new();
+                loop {
+                    if state.stop.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let mut line = String::new();
+                    match buf.read_line(&mut line) {
+                        Ok(0) => break, // stream closed
+                        Ok(_) => {
+                            let line = line.trim_end().to_string();
+                            if let Some(name) = line.strip_prefix("event:") {
+                                event_name = name.trim().to_string();
+                            } else if let Some(d) = line.strip_prefix("data:") {
+                                data.push_str(d.trim());
+                            } else if line.is_empty() {
+                                // dispatch
+                                handle_event(&state, &cfg, &w, &event_name, &data);
+                                event_name.clear();
+                                data.clear();
                             }
                         }
+                        Err(_) => break,
                     }
-                    Err(mpsc::RecvTimeoutError::Timeout) => break,
-                    Err(mpsc::RecvTimeoutError::Disconnected) => return,
                 }
             }
-            if !watches.is_empty() {
-                poll_all(&cfg, &mut watches, &mut pipe_w);
+            Err(e) => {
+                eprintln!("forge-sse: connect failed: {e}");
+            }
+        }
+        if state.stop.load(Ordering::Relaxed) {
+            return;
+        }
+        std::thread::sleep(backoff);
+        backoff = (backoff * 2).min(std::time::Duration::from_secs(5));
+    }
+}
+
+fn handle_event(state: &Arc<WatchState>, cfg: &ForgeConfig, w: &PipeWriter, name: &str, data: &str) {
+    match name {
+        "message" => {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else { return };
+            let Some(msg) = to_chat_msg(&v) else { return };
+            let last = state.last_seq.load(Ordering::Relaxed);
+            if msg.seq <= last {
+                return; // reconnect catch-up duplicate
+            }
+            state.last_seq.store(msg.seq, Ordering::Relaxed);
+            write_frame(
+                w,
+                &Frame::Chat {
+                    id: String::new(),
+                    session: String::new(), // filled by the main loop
+                    pane: state.pane.to_string(),
+                    msgs: vec![msg],
+                    reset: false,
+                },
+            );
+        }
+        "turn_ended" | "heartbeat" | "lagged" => {
+            // lagged: forge already backfilled the missed rows as
+            // `message` events before this one — nothing to do
+        }
+        _ => {}
+    }
+    let _ = cfg;
+}
+
+/// Job thread: watches registry + blocking POSTs for sends.
+pub fn spawn_worker(
+    cfg: ForgeConfig,
+    pipe_w: std::fs::File,
+    rx: mpsc::Receiver<ForgeJob>,
+) {
+    let pipe: PipeWriter = Arc::new(Mutex::new(pipe_w));
+    std::thread::spawn(move || {
+        let mut threads: Vec<(Uuid, Arc<WatchState>)> = Vec::new();
+        loop {
+            match rx.recv() {
+                Ok(job) => match job {
+                    ForgeJob::Watch { pane, forge_sid } => {
+                        // re-watch replaces (fresh high-water mark)
+                        if let Some((_, old)) = threads
+                            .iter()
+                            .position(|(_, st)| st.pane == pane)
+                            .map(|i| threads.remove(i))
+                        {
+                            old.stop.store(true, Ordering::Relaxed);
+                        }
+                        let st = Arc::new(WatchState {
+                            pane,
+                            forge_sid,
+                            last_seq: AtomicI64::new(0),
+                            stop: AtomicBool::new(false),
+                        });
+                        let t_cfg = ForgeConfig {
+                            base: cfg.base.clone(),
+                            key: cfg.key.clone(),
+                            profile: cfg.profile.clone(),
+                        };
+                        let t_pipe = pipe.clone();
+                        let t_state = st.clone();
+                        std::thread::spawn(move || {
+                            run_sse(t_state, t_cfg, t_pipe);
+                        });
+                        threads.push((pane, st));
+                    }
+                    ForgeJob::Unwatch { pane } => {
+                        if let Some(i) = threads.iter().position(|(_, st)| st.pane == pane) {
+                            let (_, st) = threads.remove(i);
+                            st.stop.store(true, Ordering::Relaxed);
+                        }
+                    }
+                    ForgeJob::Send { pane, forge_sid, text } => {
+                        let _ = http_post_message(&cfg, forge_sid, &text);
+                        // rows land via the SSE stream
+                    }
+                },
+                Err(mpsc::RecvError) => return,
             }
         }
     });
+}
+
+/// Send a user message (job thread only — blocking).
+fn http_post_message(cfg: &ForgeConfig, forge_sid: Uuid, text: &str) -> Result<(), String> {
+    let url = format!("{}/messages", cfg.base);
+    let _ = ureq::post(&url)
+        .header("X-API-Key", &cfg.key)
+        .send_json(serde_json::json!({
+            "session_id": forge_sid.to_string(),
+            "content": text,
+        }))
+        .map_err(|e| format!("forge POST /messages: {e}"))?;
+    Ok(())
+}
+
+/// One-shot JSON request helper (sync; main loop only — localhost).
+fn http_json(
+    cfg: &ForgeConfig,
+    method: &str,
+    path: &str,
+    body: Option<&serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    let url = format!("{}{}", cfg.base, path);
+    let m = method.to_ascii_uppercase();
+    let sent = match (m.as_str(), body) {
+        ("GET", _) => ureq::get(&url).header("X-API-Key", &cfg.key).call(),
+        ("POST", b) => ureq::post(&url)
+            .header("X-API-Key", &cfg.key)
+            .send_json(b.cloned().unwrap_or(serde_json::Value::Null)),
+        _ => return Err(format!("forge: unsupported method {method}")),
+    };
+    let mut res = sent.map_err(|e| format!("forge {method} {path}: {e}"))?;
+    let mut text = String::new();
+    use std::io::Read as _;
+    res.body_mut()
+        .as_reader()
+        .read_to_string(&mut text)
+        .map_err(|e| format!("forge read {path}: {e}"))?;
+    serde_json::from_str(&text).map_err(|e| format!("forge decode {path}: {e}"))
 }
 
 /// Create a forge session (sync, localhost — called from the main loop).

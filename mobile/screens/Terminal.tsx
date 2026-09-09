@@ -604,16 +604,30 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
 function ChatBubble({ msg }: { msg: ChatMsg }) {
   const isUser = msg.role === "user";
   const isTool = msg.role === "tool";
+  // tool rows: collapsed to one line, tap to expand the full output
+  const [open, setOpen] = useState(false);
   if (isTool) {
     const label = msg.tool_name || "tool";
     const dur = msg.duration_ms != null ? ` · ${msg.duration_ms}ms` : "";
     return (
-      <View style={styles.toolRow}>
-        <Text style={styles.toolText}>⚙ {label}{dur}</Text>
+      <Pressable
+        style={styles.toolRow}
+        onPress={() => msg.tool_output && setOpen((o) => !o)}
+        disabled={!msg.tool_output}
+      >
+        <Text style={styles.toolText}>
+          ⚙ {label}{dur}{msg.tool_output ? (open ? " ▲" : " ▼") : ""}
+        </Text>
         {msg.tool_output ? (
-          <Text style={styles.toolOut} numberOfLines={4}>{msg.tool_output}</Text>
+          open ? (
+            <ScrollView style={styles.toolOutOpen} nestedScrollEnabled>
+              <Text style={styles.toolOutFull}>{msg.tool_output}</Text>
+            </ScrollView>
+          ) : (
+            <Text style={styles.toolOut} numberOfLines={2}>{msg.tool_output}</Text>
+          )
         ) : null}
-      </View>
+      </Pressable>
     );
   }
   return (
@@ -654,6 +668,8 @@ const styles = StyleSheet.create({
   },
   toolText: { color: "#9ca3af", fontSize: 12, fontFamily: "JetBrainsMono NF Mono" },
   toolOut: { color: "#6b7280", fontSize: 11, fontFamily: "JetBrainsMono NF Mono", marginTop: 4 },
+  toolOutOpen: { maxHeight: 220, marginTop: 6 },
+  toolOutFull: { color: "#8b8b96", fontSize: 11, fontFamily: "JetBrainsMono NF Mono" },
   chatInputRow: {
     flexDirection: "row", borderTopWidth: 1, borderTopColor: "#23232c",
     padding: 8, gap: 8, alignItems: "flex-end",

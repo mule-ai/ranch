@@ -881,7 +881,6 @@ impl Daemon {
             // attach; the frame carries the session in `session` —
             // the worker leaves it blank, so resolve from the pane)
             Frame::Chat { session, pane, .. } if session.is_empty() => {
-                eprintln!("ranchd: forge pipe delivered Chat for pane {pane}");
                 let fsid = Uuid::parse_str(pane).ok();
                 let found = self.sessions.iter().find_map(|(sid, s)| {
                     s.chats
