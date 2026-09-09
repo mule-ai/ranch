@@ -18,3 +18,4 @@ vendor/
 *.sock
 *.env
 node_modules/
+releases/
