@@ -248,14 +248,25 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
   }, []);
 
   // Android keeps TextInput focus even after the keyboard is dismissed,
-  // so plain focus() is a no-op — force a blur/refocus cycle
+  // so plain focus() can be a no-op — track real focus state and force a
+  // blur/refocus cycle only when reopening after a dismiss
+  const [focused, setFocused] = useState(false);
+  // gentle: opens the keyboard if unfocused, no-op (no flicker) if focused
+  const ensureFocus = () => {
+    if (!focused) inputRef.current?.focus();
+  };
   const openKeyboard = () => {
+    if (focused) return;
     inputRef.current?.blur();
     setTimeout(() => inputRef.current?.focus(), 60);
   };
   const toggleKeyboard = () => {
-    if (kbOpen) Keyboard.dismiss();
-    else openKeyboard();
+    if (kbOpen) {
+      Keyboard.dismiss();
+      inputRef.current?.blur(); // clear the quirk: focus without keyboard
+    } else {
+      openKeyboard();
+    }
   };
 
   const loadHistory = () => {
@@ -271,10 +282,7 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
   const rects = layout ? layoutRects(layout, 0, 0, COLS, ROWS) : [];
 
   return (
-    <View
-      style={[styles.flex, { paddingBottom: kbHeight }]}
-      onTouchStart={openKeyboard}
-    >
+    <View style={[styles.flex, { paddingBottom: kbHeight }]}>
       <View style={styles.header}>
         <Pressable onPress={onExit} hitSlop={8}>
           <Text style={styles.back}>‹ back</Text>
@@ -323,7 +331,7 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
                 },
               ]}
               onPress={() => {
-                openKeyboard();
+                ensureFocus();
                 setActivePane(r.pane);
                 relay.send({
                   t: "SessionsSelect", session: sessionId, pane: r.pane,
@@ -454,6 +462,8 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
         ref={inputRef}
         style={styles.hiddenInput}
         value={capture}
+        onFocus={() => setFocused(true)}
+        onBlur={() => setFocused(false)}
         onChangeText={onType}
         onSubmitEditing={() => {
           // Enter = run the command
@@ -492,14 +502,20 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
               onPress={() => {
                 if (k === "hist") {
                   loadHistory();
+                  ensureFocus();
                   return;
                 }
                 const seq: Record<string, string> = {
-                  Enter: "\n", "Ctrl-C": "\x03", "Ctrl-D": "\x04",
+                  Enter: "\r", "Ctrl-C": "\x03", "Ctrl-D": "\x04",
                   "Ctrl-L": "\x0c", "Ctrl-R": "\x12", Tab: "\t", Esc: "\x1b",
                   "↑": "\x1b[A", "↓": "\x1b[B", "←": "\x1b[D", "→": "\x1b[C",
                 };
+                // predictions only model printable typing — control keys
+                // invalidate them (and never let a button tap bounce the
+                // keyboard: plain focus is a no-op when already focused)
+                setPred(null);
                 send(seq[k] ?? "");
+                ensureFocus();
               }}
             >
               <Text style={styles.keyText}>{k}</Text>
