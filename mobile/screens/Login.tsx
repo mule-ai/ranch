@@ -32,9 +32,11 @@ export function LoginScreen({ onSignedIn }: { onSignedIn: () => void }) {
     setErr("");
     setBusy(true);
     try {
-      // In Expo Go: exp://…; in a dev-client/standalone build: dev.ranch.app://callback
-      // (both are allow-listed in the Supabase auth URL config)
-      const redirectTo = makeRedirectUri({ native: "dev.ranch.app://callback" });
+      // In Expo Go: exp://…; in a dev-client/standalone build: the app
+      // scheme (registered in the manifest intent filter, allow-listed
+      // in the Supabase auth URL config). The redirect MUST match a
+      // registered scheme or the browser hands it to nothing and hangs.
+      const redirectTo = makeRedirectUri({ native: "ranch://callback" });
       const { data, error } = await supabase.auth.signInWithOAuth({
         provider: "google",
         options: { redirectTo, skipBrowserRedirect: true },
