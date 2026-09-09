@@ -1,5 +1,6 @@
 import { useEffect, useState, useCallback, useRef } from "react";
 import {
+  Keyboard,
   KeyboardAvoidingView,
   Pressable,
   ScrollView,
@@ -72,7 +73,7 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
           setLayout(f.layout);
           setActivePane(f.active_pane);
           setConn("online");
-          inputRef.current?.focus();
+          openKeyboard();
           break;
         }
         case "Update": {
@@ -171,6 +172,28 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
     return () => clearInterval(t);
   }, []);
 
+  // keyboard visibility tracking (for the toggle button)
+  const [kbOpen, setKbOpen] = useState(false);
+  useEffect(() => {
+    const show = Keyboard.addListener("keyboardDidShow", () => setKbOpen(true));
+    const hide = Keyboard.addListener("keyboardDidHide", () => setKbOpen(false));
+    return () => {
+      show.remove();
+      hide.remove();
+    };
+  }, []);
+
+  // Android keeps TextInput focus even after the keyboard is dismissed,
+  // so plain focus() is a no-op — force a blur/refocus cycle
+  const openKeyboard = () => {
+    inputRef.current?.blur();
+    setTimeout(() => inputRef.current?.focus(), 60);
+  };
+  const toggleKeyboard = () => {
+    if (kbOpen) Keyboard.dismiss();
+    else openKeyboard();
+  };
+
   const loadHistory = () => {
     if (!activePane) return;
     relay.send({
@@ -185,13 +208,16 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
     <KeyboardAvoidingView
       style={styles.flex}
       behavior="height"
-      onTouchStart={() => inputRef.current?.focus()}
+      onTouchStart={openKeyboard}
     >
       <View style={styles.header}>
         <Pressable onPress={onExit} hitSlop={8}>
           <Text style={styles.back}>‹ back</Text>
         </Pressable>
         <Text style={styles.title} numberOfLines={1}>{sessionName}</Text>
+        <Pressable onPress={toggleKeyboard} hitSlop={8}>
+          <Text style={styles.kbBtn}>{kbOpen ? "▼ hide" : "▲ kb"}</Text>
+        </Pressable>
         <Text style={styles.conn}>{conn}</Text>
       </View>
 
@@ -213,7 +239,7 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
                 },
               ]}
               onPress={() => {
-                inputRef.current?.focus();
+                openKeyboard();
                 setActivePane(r.pane);
                 relay.send({
                   t: "SessionsSelect", session: sessionId, pane: r.pane,
@@ -275,7 +301,7 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
           send("\r");
           setPred(null);
           setCapture(" ");
-          requestAnimationFrame(() => inputRef.current?.focus());
+          requestAnimationFrame(openKeyboard);
         }}
         returnKeyType="send"
         autoCapitalize="none"
@@ -335,6 +361,7 @@ const styles = StyleSheet.create({
   back: { color: "#4ade80", fontSize: 15 },
   title: { color: "#f3f4f6", fontWeight: "700", flex: 1, fontSize: 16 },
   conn: { color: "#6b7280", fontSize: 12 },
+  kbBtn: { color: "#4ade80", fontSize: 13 },
   screenWrap: {
     flex: 1, backgroundColor: "#0a0a0e", marginHorizontal: 8,
     borderRadius: 8, overflow: "hidden",
