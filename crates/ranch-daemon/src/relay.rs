@@ -294,7 +294,10 @@ fn ws_session(
             "access_token": jwt,
         },
     });
-    ws_send(&mut ws, &join.to_string())?;
+    // re-joinable: token refreshes re-join (a bare access_token event
+    // does not recover a channel the server has dropped)
+    let join_frame = join.to_string();
+    ws_send(&mut ws, &join_frame)?;
 
     use std::os::fd::AsRawFd as _;
     let ws_fd = match ws.get_ref() {
@@ -314,6 +317,11 @@ fn ws_session(
     let mut last_hb = instant_now();
     let mut last_seen = instant_now();
     let mut join_ok = false;
+    // server liveness: TCP can look healthy while the Realtime session
+    // is long dead (suspend/resume, NAT timeouts). Heartbeats buffer
+    // into a zombie socket without erroring — so "no server traffic"
+    // is the only reliable death signal.
+    let mut last_server_seen = instant_now();
 
     loop {
         // poll both the socket and the daemon->relay pipe
@@ -336,11 +344,11 @@ fn ws_session(
             loop {
                 match ws.read() {
                     Ok(Message::Text(text)) => {
-                        handle_ws_text(topic, &text, to_daemon_w, &mut ws, &mut join_ok)?;
+                        handle_ws_text(topic, &text, to_daemon_w, &mut ws, &mut join_ok, &mut last_server_seen)?;
                     }
                     Ok(Message::Binary(b)) => {
                         if let Ok(text) = String::from_utf8(b.to_vec()) {
-                            handle_ws_text(topic, &text, to_daemon_w, &mut ws, &mut join_ok)?;
+                            handle_ws_text(topic, &text, to_daemon_w, &mut ws, &mut join_ok, &mut last_server_seen)?;
                         }
                     }
                     Ok(Message::Ping(p)) => {
@@ -422,6 +430,10 @@ fn ws_session(
                         "ref": next_ref(),
                     });
                     ws_send(&mut ws, &msg.to_string())?;
+                    // re-join: the server may have dropped the channel
+                    // since the last token; the access_token event alone
+                    // does not re-establish it
+                    ws_send(&mut ws, &join_frame)?;
                     clog("relay: access token refreshed");
                 }
                 Err(e) => {
@@ -447,6 +459,12 @@ fn ws_session(
             }
             last_seen = instant_now();
         }
+        // zombie-connection guard: no server traffic for 75s (3 missed
+        // heartbeat cycles) means the Realtime session is gone even
+        // though TCP looks fine — force a full reconnect + re-join
+        if instant_now() - last_server_seen > 75.0 {
+            return Err("no server traffic for 75s — zombie connection, reconnecting".into());
+        }
 
         // --- session mirror ops ---
         while let Ok(op) = mirror_rx.try_recv() {
@@ -461,11 +479,13 @@ fn handle_ws_text(
     to_daemon_w: &mut std::fs::File,
     ws: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>,
     join_ok: &mut bool,
+    last_server_seen: &mut f64,
 ) -> Result<(), String> {
     let msg: Value = match serde_json::from_str(text) {
         Ok(v) => v,
         Err(_) => return Ok(()),
     };
+    *last_server_seen = instant_now();
     let event = msg.get("event").and_then(|v| v.as_str()).unwrap_or("");
     let msg_topic = msg.get("topic").and_then(|v| v.as_str()).unwrap_or("");
     let payload = msg.get("payload").cloned().unwrap_or(Value::Null);
