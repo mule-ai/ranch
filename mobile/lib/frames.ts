@@ -17,6 +17,7 @@ export type PaneSnap = {
   cols: number;
   rows: number;
   lines: string[]; // full screen, row-major, plain text
+  seq?: number; // pane update seq at snapshot time (dedup/gap seed)
   cursor?: Cursor;
 };
 

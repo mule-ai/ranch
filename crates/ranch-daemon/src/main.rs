@@ -474,6 +474,7 @@ fn snapshot_session(s: &Session) -> Option<Frame> {
             cols,
             rows,
             lines,
+            seq: p.seq,
             cursor: Some(Cursor { x: cx, y: cy, visible: vis }),
         };
         if *pid == s.active {
@@ -488,7 +489,7 @@ fn snapshot_session(s: &Session) -> Option<Frame> {
         seq: active_seq,
         layout: s.layout.clone(),
         active_pane: s.active.to_string(),
-        panes: snaps,
+        panes: snaps, // each pane carries its own seq
         meta: vec![],
     })
 }

@@ -206,6 +206,12 @@ pub struct PaneSnap {
     pub rows: u16,
     /// Full screen, row-major, plain text (trimmed).
     pub lines: Vec<String>,
+    /// The pane's update sequence at snapshot time. Clients seed their
+    /// per-pane dedup/gap tracking from this so reordered or duplicated
+    /// updates (Realtime broadcast makes no ordering guarantee) are
+    /// dropped instead of overwriting fresh rows with stale content.
+    #[serde(default)]
+    pub seq: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cursor: Option<Cursor>,
 }
@@ -485,6 +491,7 @@ mod tests {
                 cols: 80,
                 rows: 24,
                 lines: vec![big; 24],
+                seq: 7,
                 cursor: None,
             }],
             meta: vec![],

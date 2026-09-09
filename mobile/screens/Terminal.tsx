@@ -55,6 +55,8 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
   // confirmed by an authoritative Update yet, rendered dimmed at the
   // cursor so typing feels instant despite the relay round trip
   const [pred, setPred] = useState<{ row: number; col: number; text: string } | null>(null);
+  const predRef = useRef(pred);
+  predRef.current = pred;
   // per-pane update sequence: a gap means updates were lost (mobile
   // networks drop WS connections; broadcast has no replay) — re-attach
   // so the daemon re-snapshots
@@ -80,6 +82,9 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
             const pad = [...p0.lines];
             while (pad.length < p0.rows) pad.push("");
             m.set(p0.id, { ...p0, lines: pad });
+            // seed dedup tracking from the pane's seq at snapshot time:
+            // updates at/below this are duplicates or reordered stragglers
+            if (p0.seq) lastSeq.current.set(p0.id, p0.seq);
           }
           setPanes(m);
           setLayout(f.layout);
@@ -99,7 +104,13 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
           if (!cur) return;
           const prevSeq = lastSeq.current.get(f.pane) ?? 0;
           if (prevSeq > 0 && f.seq !== prevSeq + 1) {
-            // seq gap: missed updates — a re-attach makes the daemon
+            if (f.seq <= prevSeq) {
+              // duplicate or reordered frame (Realtime broadcast makes no
+              // ordering guarantee). Applying it would overwrite fresh
+              // rows with stale content. Drop silently.
+              break;
+            }
+            // forward gap: missed updates — a re-attach makes the daemon
             // re-snapshot; stale rows resolve in ~1 RTT
             lastSeq.current.delete(f.pane);
             relay.send({
@@ -151,8 +162,16 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
     };
     poke();
     const retryTimer = setInterval(poke, 3000);
+    // soft resync: Realtime broadcast can drop or reorder frames; dropped
+    // frames leave rows stale forever (no replay). Periodically re-attach
+    // so the daemon re-snapshots and any divergence self-heals.
+    const resyncTimer = setInterval(() => {
+      if (predRef.current) return; // don't disturb in-flight predictions
+      relay.send({ t: "Attach", id: nextId(), client: "mobile", session: sessionId } as Frame);
+    }, 15000);
     return () => {
       clearInterval(retryTimer);
+      clearInterval(resyncTimer);
       relay.send({ t: "Detach", id: nextId(), client: "mobile" } as Frame);
       relay.onFrame = () => {};
     };
