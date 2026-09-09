@@ -11,7 +11,11 @@ export class Relay {
   channel: RealtimeChannel | null = null;
   machineId: string;
   onFrame: FrameHandler = () => {};
+  /** fired every time the channel reaches SUBSCRIBED (initial + reconnects) */
+  onReady: () => void = () => {};
   onStatus: (s: string) => void = () => {};
+  // chunk reassembly: chunk_id -> { parts, received, n }
+  private chunks = new Map<string, { parts: (string | null)[]; received: number }>();
 
   constructor(machineId: string) {
     this.machineId = machineId;
@@ -31,7 +35,32 @@ export class Relay {
     // {event:"frame", payload:<frame>}, so `payload` here IS the frame.
     ch.on("broadcast", { event: "frame" }, ({ payload }) => {
       const f = payload as Frame | undefined;
-      if (f && typeof f === "object" && "t" in f) this.onFrame(f);
+      if (!f || typeof f !== "object" || !("t" in f)) return;
+      if (f.t === "Chunk") {
+        const c = f as unknown as { chunk_id: string; i: number; n: number; data: string };
+        let entry = this.chunks.get(c.chunk_id);
+        if (!entry) {
+          entry = { parts: Array(c.n).fill(null), received: 0 };
+          this.chunks.set(c.chunk_id, entry);
+        }
+        if (entry.parts[c.i] === null) {
+          entry.parts[c.i] = c.data;
+          entry.received++;
+        }
+        if (entry.received === c.n) {
+          this.chunks.delete(c.chunk_id);
+          try {
+            const assembled = JSON.parse(entry.parts.join("")) as Frame;
+            if (assembled && typeof assembled === "object" && "t" in assembled) {
+              this.onFrame(assembled);
+            }
+          } catch {
+            // torn batch — the seq-gap / re-attach path recovers
+          }
+        }
+        return;
+      }
+      this.onFrame(f);
     });
 
     this.onStatus("connecting…");
@@ -44,14 +73,16 @@ export class Relay {
         if (status === "SUBSCRIBED") {
           clearTimeout(timer);
           this.onStatus("online");
+          this.onReady();
           resolve();
         } else if (
           status === "CHANNEL_ERROR" ||
           status === "TIMED_OUT" ||
           status === "CLOSED"
         ) {
-          clearTimeout(timer);
-          reject(new Error(`realtime channel: ${status}`));
+          // don't reject after the initial join — supabase-js resubscribes
+          // automatically; onReady fires again when it's back
+          this.onStatus("reconnecting…");
         }
       });
     });

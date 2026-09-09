@@ -52,6 +52,16 @@ export default function App() {
       setErr("");
       r = new Relay(machine.id);
       let gotHello = false;
+      const hello = () => r?.send({ t: "Hello", id: nextId(), client: "mobile" } as Frame);
+      r.onReady = () => {
+        // initial join and every reconnect: (re)request the session list
+        gotHello = false;
+        hello();
+        if (retryTimer) clearInterval(retryTimer);
+        retryTimer = setInterval(() => {
+          if (!gotHello) hello();
+        }, 3000);
+      };
       r.onFrame = (f: Frame) => {
         switch (f.t) {
           case "HelloOk":
@@ -83,13 +93,6 @@ export default function App() {
         setErr(e.message ?? "realtime connection failed");
         return;
       }
-      const hello = () => {
-        if (!gotHello) {
-          r?.send({ t: "Hello", id: nextId(), client: "mobile" } as Frame);
-        }
-      };
-      hello();
-      retryTimer = setInterval(hello, 3000);
     })();
     return () => {
       if (retryTimer) clearInterval(retryTimer);

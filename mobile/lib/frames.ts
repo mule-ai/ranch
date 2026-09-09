@@ -73,6 +73,7 @@ export type Frame =
   | { t: "PaneResize"; session: string; pane: string; dir: 0 | 1; delta: number }
   | { t: "PaneKill"; session: string; pane: string }
   | { t: "Meta"; session: string; pane?: string; kind: string; status?: string; preview?: string }
+  | { t: "Chunk"; chunk_id: string; i: number; n: number; data: string }
   | { t: "Error"; id?: string; of?: string; message: string };
 
 let n = 0;

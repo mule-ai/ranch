@@ -49,6 +49,10 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
   // confirmed by an authoritative Update yet, rendered dimmed at the
   // cursor so typing feels instant despite the relay round trip
   const [pred, setPred] = useState<{ row: number; col: number; text: string } | null>(null);
+  // per-pane update sequence: a gap means updates were lost (mobile
+  // networks drop WS connections; broadcast has no replay) — re-attach
+  // so the daemon re-snapshots
+  const lastSeq = useRef<Map<string, number>>(new Map());
   const panesRef = useRef(panes);
   panesRef.current = panes;
 
@@ -62,6 +66,7 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
           if (f.session !== sessionId) return;
           gotSnap = true;
           const m = new Map<string, PaneSnap>();
+          lastSeq.current.clear();
           for (const p0 of f.panes) {
             // pad to the pane's full row height — the daemon trims
             // trailing blank rows, but row updates address absolute
@@ -81,6 +86,17 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
           if (f.session !== sessionId) return;
           const cur = panesRef.current.get(f.pane);
           if (!cur) return;
+          const prevSeq = lastSeq.current.get(f.pane) ?? 0;
+          if (prevSeq > 0 && f.seq !== prevSeq + 1) {
+            // seq gap: missed updates — a re-attach makes the daemon
+            // re-snapshot; stale rows resolve in ~1 RTT
+            lastSeq.current.delete(f.pane);
+            relay.send({
+              t: "Attach", id: nextId(), client: "mobile", session: sessionId,
+            } as Frame);
+            break;
+          }
+          lastSeq.current.set(f.pane, f.seq);
           const lines = cur.lines.slice();
           for (const [y, text] of f.rows_upd) {
             while (lines.length <= y) lines.push("");
