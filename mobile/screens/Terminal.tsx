@@ -1,7 +1,6 @@
 import { useEffect, useState, useCallback, useRef } from "react";
 import {
   Keyboard,
-  KeyboardAvoidingView,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -49,7 +48,6 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
   const [geom, setGeom] = useState({ cols: 80, rows: 24 });
   const geomRef = useRef(geom);
   geomRef.current = geom;
-  const lastWidth = useRef(0);
   const kbAuto = useRef(false);
   // predictive local echo: chars sent to the PTY that have not been
   // confirmed by an authoritative Update yet, rendered dimmed at the
@@ -227,11 +225,22 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
     return () => clearInterval(t);
   }, []);
 
-  // keyboard visibility tracking (for the toggle button)
+  // keyboard visibility + height. RN 0.86 runs edge-to-edge on Android,
+  // where KeyboardAvoidingView miscomputes — pad the container manually
+  // with the measured keyboard height instead. The shorter container
+  // re-measures screenWrap, which resizes the PTY so the TUI's bottom
+  // line (status bar / input box) rides above the keyboard.
   const [kbOpen, setKbOpen] = useState(false);
+  const [kbHeight, setKbHeight] = useState(0);
   useEffect(() => {
-    const show = Keyboard.addListener("keyboardDidShow", () => setKbOpen(true));
-    const hide = Keyboard.addListener("keyboardDidHide", () => setKbOpen(false));
+    const show = Keyboard.addListener("keyboardDidShow", (e) => {
+      setKbOpen(true);
+      setKbHeight(e.endCoordinates?.height ?? 0);
+    });
+    const hide = Keyboard.addListener("keyboardDidHide", () => {
+      setKbOpen(false);
+      setKbHeight(0);
+    });
     return () => {
       show.remove();
       hide.remove();
@@ -262,9 +271,8 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
   const rects = layout ? layoutRects(layout, 0, 0, COLS, ROWS) : [];
 
   return (
-    <KeyboardAvoidingView
-      style={styles.flex}
-      behavior="height"
+    <View
+      style={[styles.flex, { paddingBottom: kbHeight }]}
       onTouchStart={openKeyboard}
     >
       <View style={styles.header}>
@@ -283,13 +291,9 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
         onLayout={(e) => {
           const w = e.nativeEvent.layout.width;
           const h = e.nativeEvent.layout.height;
-          // the Android keyboard resizes the window (adjustResize), so
-          // height changes here are usually just the keyboard toggling —
-          // resizing the PTY for that would reflow the terminal AND
-          // re-snapshot, which thrashes the keyboard. Track width only
-          // (covers rotation and initial measure).
-          if (w === lastWidth.current) return;
-          lastWidth.current = w;
+          // height changes here are real: the keyboard shrinks the
+          // container (padded above), so resizing the PTY keeps the
+          // TUI's bottom line visible above the keyboard
           const cols = Math.max(20, Math.floor(w / (FONT_SIZE * 0.6)) - 1);
           const rows = Math.max(10, Math.floor(h / LINE_HEIGHT) - 1);
           if (cols !== geomRef.current.cols || rows !== geomRef.current.rows) {
@@ -331,30 +335,63 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
                   {(p?.lines ?? []).slice(0, r.h).map((line, yy) => {
                     const c = p?.cursor;
                     const spans = parseSgrRow(line);
-                    const renderSpans = (spans2: SgrSpan[], extraStyle?: object) =>
+                    const spanStyle = (sp: SgrSpan): object => ({
+                      color: sp.fg,
+                      backgroundColor: sp.bg,
+                      fontWeight: sp.bold ? "700" : undefined,
+                      fontStyle: sp.italic ? "italic" : undefined,
+                      textDecorationLine: sp.underline ? "underline" : undefined,
+                    });
+                    const renderSpans = (spans2: SgrSpan[]) =>
                       spans2.map((sp, si) => (
-                        <Text
-                          key={si}
-                          style={[
-                            extraStyle,
-                            {
-                              color: sp.fg,
-                              backgroundColor: sp.bg,
-                              fontWeight: sp.bold ? "700" : undefined,
-                              fontStyle: sp.italic ? "italic" : undefined,
-                              textDecorationLine: sp.underline ? "underline" : undefined,
-                            },
-                          ]}
-                        >
+                        <Text key={si} style={spanStyle(sp)}>
                           {sp.text}
                         </Text>
                       ));
                     if (focused && c && yy === c.y && pred &&
                         pred.row === c.y && pred.col === c.x && pred.text !== "") {
+                      // predictive echo: the authoritative row hasn't landed
+                      // yet, so splice the dimmed prediction at the cursor
+                      // cell — mid-line edits render in place, not at EOL
+                      const out: React.ReactNode[] = [];
+                      let col = 0;
+                      let spliced = false;
+                      spans.forEach((sp, si) => {
+                        for (let k = 0; k < sp.text.length; k++) {
+                          if (!spliced && col === c!.x) {
+                            out.push(
+                              <Text key={`p-${si}-${k}`} style={styles.predText}>
+                                {pred.text}
+                              </Text>
+                            );
+                            out.push(
+                              <Text key={`c-${si}-${k}`} style={styles.cursor}>
+                                {sp.text[k]}
+                              </Text>
+                            );
+                            spliced = true;
+                          } else {
+                            out.push(
+                              <Text key={`${si}-${k}`} style={spanStyle(sp)}>
+                                {sp.text[k]}
+                              </Text>
+                            );
+                          }
+                          col++;
+                        }
+                      });
+                      if (!spliced) {
+                        // cursor at/past end of line
+                        out.push(
+                          <Text key="pred" style={styles.predText}>
+                            {pred.text}
+                          </Text>
+                        );
+                        out.push(<Text key="cend" style={styles.cursor}> </Text>);
+                      }
                       return (
                         <Text key={yy}>
-                          {renderSpans(spans, styles.predText)}
-                          <Text style={styles.cursor}> </Text>
+                          {out}
                           {"\n"}
                         </Text>
                       );
@@ -364,13 +401,6 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
                       // at the cursor cell boundary. Each char keeps its full
                       // span style (bold/italic/underline included) — dropping
                       // any of them makes the row visibly restyle on blink.
-                      const charStyle = (sp: SgrSpan): object => ({
-                        color: sp.fg,
-                        backgroundColor: sp.bg,
-                        fontWeight: sp.bold ? "700" : undefined,
-                        fontStyle: sp.italic ? "italic" : undefined,
-                        textDecorationLine: sp.underline ? "underline" : undefined,
-                      });
                       const out: React.ReactNode[] = [];
                       let col = 0;
                       let done = false;
@@ -385,7 +415,7 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
                             done = true;
                           } else {
                             out.push(
-                              <Text key={`${si}-${k}`} style={charStyle(sp)}>
+                              <Text key={`${si}-${k}`} style={spanStyle(sp)}>
                                 {sp.text[k]}
                               </Text>
                             );
@@ -477,7 +507,7 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
           ))}
         </View>
       )}
-    </KeyboardAvoidingView>
+    </View>
   );
 }
 

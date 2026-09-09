@@ -3,6 +3,7 @@ import { useFonts } from "expo-font";
 import {
   ActivityIndicator,
   FlatList,
+  Keyboard,
   Pressable,
   StyleSheet,
   Text,
@@ -30,6 +31,19 @@ export default function App() {
   const [attached, setAttached] = useState<SessionMeta | null>(null);
   const [newName, setNewName] = useState("");
   const [err, setErr] = useState("");
+  // keyboard inset: edge-to-edge Android doesn't lift bottom inputs, so
+  // pad the sessions screen by the measured keyboard height
+  const [kbHeight, setKbHeight] = useState(0);
+  useEffect(() => {
+    const show = Keyboard.addListener("keyboardDidShow", (e) =>
+      setKbHeight(e.endCoordinates?.height ?? 0)
+    );
+    const hide = Keyboard.addListener("keyboardDidHide", () => setKbHeight(0));
+    return () => {
+      show.remove();
+      hide.remove();
+    };
+  }, []);
 
   // auth state
   useEffect(() => {
@@ -140,7 +154,7 @@ export default function App() {
 
   if (!attached) {
     return (
-      <View style={s.wrap}>
+      <View style={[s.wrap, { paddingBottom: kbHeight }]}>
         <View style={s.header}>
           <Pressable onPress={() => setMachine(null)} hitSlop={8}>
             <Text style={s.back}>‹ machines</Text>
