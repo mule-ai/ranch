@@ -436,6 +436,7 @@ fn spawn_pane(session: &mut Session) -> Result<Uuid, String> {
     unsafe {
         libc::close(aslave);
     }
+    vt.attach_pty(amaster); // terminal query responses flow back to the child
     let id = Uuid::new_v4();
     session.panes.insert(
         id,

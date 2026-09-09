@@ -5,6 +5,7 @@
 //! (the daemon event loop). No interior mutability.
 
 use std::ffi::c_void;
+use std::os::fd::RawFd;
 use std::ptr;
 
 type GhosttyResult = i32;
@@ -49,6 +50,32 @@ struct FormatterOptions {
     selection: *const c_void,
 }
 
+// GhosttyTerminalOption enum values (include/ghostty/vt/terminal.h)
+const OPT_USERDATA: i32 = 0;
+const OPT_WRITE_PTY: i32 = 1;
+
+unsafe extern "C" {
+    fn write(fd: i32, buf: *const u8, count: usize) -> isize;
+}
+
+/// GhosttyTerminalWritePtyFn — responses to terminal queries (DSR, OSC
+/// status, DA, mode reports) are written back to the PTY so the
+/// application inside sees them, exactly like a real terminal.
+/// userdata carries the PTY master fd as an integer.
+unsafe extern "C" fn on_write_pty(
+    _terminal: *mut c_void,
+    userdata: *mut c_void,
+    data: *const u8,
+    len: usize,
+) {
+    let fd = userdata as i32;
+    if fd > 0 && len > 0 && !data.is_null() {
+        unsafe {
+            write(fd, data, len);
+        }
+    }
+}
+
 // GhosttyTerminalData enum values (include/ghostty/vt/terminal.h)
 const DATA_COLS: i32 = 1;
 const DATA_ROWS: i32 = 2;
@@ -73,6 +100,11 @@ unsafe extern "C" {
         cell_height_px: u32,
     ) -> GhosttyResult;
     fn ghostty_terminal_get(terminal: *mut c_void, data: i32, out: *mut c_void) -> GhosttyResult;
+    fn ghostty_terminal_set(
+        terminal: *mut c_void,
+        option: i32,
+        value: *const c_void,
+    ) -> GhosttyResult;
     fn ghostty_terminal_scroll_viewport(terminal: *mut c_void, behavior: ScrollViewport);
     fn ghostty_formatter_terminal_new(
         allocator: *const c_void,
@@ -171,6 +203,17 @@ impl Vt {
             value: [0; 2],
         };
         unsafe { ghostty_terminal_scroll_viewport(self.h, behavior) };
+    }
+
+    /// Bind the terminal to a PTY master fd: terminal query responses
+    /// (device attributes, colors, modes) are written back to the fd so
+    /// applications inside receive them. Without this, capability
+    /// queries go unanswered and TUIs degrade to fallback rendering.
+    pub fn attach_pty(&self, master_fd: RawFd) {
+        unsafe {
+            ghostty_terminal_set(self.h, OPT_USERDATA, master_fd as *const c_void);
+            ghostty_terminal_set(self.h, OPT_WRITE_PTY, on_write_pty as *const c_void);
+        }
     }
 
     /// Resize the grid (triggers reflow for the primary screen).
