@@ -60,6 +60,7 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
           break;
         case "Snapshot": {
           if (f.session !== sessionId) return;
+          gotSnap = true;
           const m = new Map<string, PaneSnap>();
           for (const p0 of f.panes) {
             // pad to the pane's full row height — the daemon trims
@@ -107,16 +108,24 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
       }
     };
     relay.onStatus = setConn;
-    // hello + attach (resize first so the daemon sizes the PTY for a phone)
-    relay.send({ t: "Hello", id: nextId(), client: "mobile" } as Frame);
-    relay.send({
-      t: "Attach", id: nextId(), client: "mobile", session: sessionId,
-    } as Frame);
-    relay.send({
-      t: "Resize", id: nextId(), client: "mobile", session: sessionId,
-      cols: COLS, rows: ROWS,
-    } as Frame);
+    // hello + attach + resize, retried every 3s until the first
+    // snapshot lands (the daemon may be mid-reconnect)
+    let gotSnap = false;
+    const poke = () => {
+      if (gotSnap) return;
+      relay.send({ t: "Hello", id: nextId(), client: "mobile" } as Frame);
+      relay.send({
+        t: "Attach", id: nextId(), client: "mobile", session: sessionId,
+      } as Frame);
+      relay.send({
+        t: "Resize", id: nextId(), client: "mobile", session: sessionId,
+        cols: COLS, rows: ROWS,
+      } as Frame);
+    };
+    poke();
+    const retryTimer = setInterval(poke, 3000);
     return () => {
+      clearInterval(retryTimer);
       relay.send({ t: "Detach", id: nextId(), client: "mobile" } as Frame);
       relay.onFrame = () => {};
     };

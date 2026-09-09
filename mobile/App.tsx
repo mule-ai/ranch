@@ -39,17 +39,27 @@ export default function App() {
 
   const signedIn = useCallback(() => setAuthed(true), []);
 
-  // when a machine is picked: open relay, hello, list sessions
+  // when a machine is picked: open relay, hello, list sessions.
+  // Hello is retried every 3s until the daemon answers — the daemon's
+  // relay reconnects with backoff after network blips, and a Hello sent
+  // during that window is simply lost.
   useEffect(() => {
     if (!machine) return;
     let r: Relay | null = null;
+    let retryTimer: ReturnType<typeof setInterval> | null = null;
     (async () => {
       setSessions(null);
       setErr("");
       r = new Relay(machine.id);
+      let gotHello = false;
       r.onFrame = (f: Frame) => {
         switch (f.t) {
           case "HelloOk":
+            gotHello = true;
+            if (retryTimer) {
+              clearInterval(retryTimer);
+              retryTimer = null;
+            }
             setSessions(f.sessions);
             break;
           case "SessionsAck":
@@ -73,9 +83,16 @@ export default function App() {
         setErr(e.message ?? "realtime connection failed");
         return;
       }
-      r.send({ t: "Hello", id: nextId(), client: "mobile" } as Frame);
+      const hello = () => {
+        if (!gotHello) {
+          r?.send({ t: "Hello", id: nextId(), client: "mobile" } as Frame);
+        }
+      };
+      hello();
+      retryTimer = setInterval(hello, 3000);
     })();
     return () => {
+      if (retryTimer) clearInterval(retryTimer);
       r?.leave();
       setRelay(null);
       setSessions(null);
