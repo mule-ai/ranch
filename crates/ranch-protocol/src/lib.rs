@@ -49,11 +49,19 @@ pub enum Frame {
         client: String,
         session: String,
         seq: u64,
+        /// Active window's split tree (kept for pre-window clients).
         layout: Layout,
         active_pane: String,
         panes: Vec<PaneSnap>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         meta: Vec<PaneMeta>,
+        /// Window stack (M5). Absent from single-window snapshots of
+        /// older daemons; clients treat a missing field as one window.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        windows: Vec<WindowSnap>,
+        /// Active window id.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        window: Option<String>,
     },
     /// Daemon -> client: incremental row updates for one pane. Droppable:
     /// a newer update for the same pane supersedes an older one.
@@ -112,6 +120,13 @@ pub enum Frame {
     SessionsCreate {
         req_id: String,
         name: Option<String>,
+        /// "shell" (default) or "forge" — a forge session's panes run the
+        /// `pi` agent instead of a bare shell.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<String>,
+        /// Working directory for the session's first pane (default $HOME).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
     },
     /// Daemon -> client: ack a create/split with the new ids.
     SessionsAck {
@@ -159,6 +174,36 @@ pub enum Frame {
         a: String,
         b: String,
     },
+    // ----- windows (M5) -----
+    /// Client -> daemon: create a window (one new pane, auto-named).
+    WindowNew {
+        req_id: String,
+        session: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+    },
+    /// Client -> daemon: make `window` (id) active.
+    WindowSelect {
+        session: String,
+        window: String,
+    },
+    /// Client -> daemon: move `delta` windows around the ring.
+    WindowNext {
+        session: String,
+        delta: i16,
+    },
+    /// Client -> daemon: kill a window (and its panes). Killing the
+    /// last window kills the session.
+    WindowKill {
+        session: String,
+        window: String,
+    },
+    /// Client -> daemon: rename a window.
+    WindowRename {
+        session: String,
+        window: String,
+        name: String,
+    },
     /// Out-of-band status (no screen change).
     Meta {
         session: String,
@@ -185,6 +230,15 @@ pub enum Frame {
     },
 }
 
+/// One window in a session's window stack (M5). A window is a named
+/// layout tree; exactly one is active per session.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WindowSnap {
+    pub id: String,
+    pub name: String,
+    pub layout: Layout,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SessionMeta {
     pub id: String,
@@ -194,6 +248,9 @@ pub struct SessionMeta {
     pub panes: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ref_id: Option<String>,
+    /// Window names in order (M5; absent from older daemons).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub windows: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

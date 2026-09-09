@@ -65,7 +65,7 @@ export type Frame =
   | { t: "Resize"; id: string; client: string; session: string; cols: number; rows: number }
   | { t: "ScrollbackReq"; id: string; client: string; session: string; pane: string; offset: number; limit: number }
   | { t: "Scrollback"; id: string; client: string; session: string; pane: string; offset: number; lines: string[] }
-  | { t: "SessionsCreate"; req_id: string; name?: string }
+  | { t: "SessionsCreate"; req_id: string; name?: string; kind?: "shell" | "forge"; cwd?: string }
   | { t: "SessionsAck"; req_id: string; session: string; pane: string }
   | { t: "SessionsRename"; session: string; name: string }
   | { t: "SessionsKill"; session: string }

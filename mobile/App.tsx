@@ -30,6 +30,8 @@ export default function App() {
   const [sessions, setSessions] = useState<SessionMeta[] | null>(null);
   const [attached, setAttached] = useState<SessionMeta | null>(null);
   const [newName, setNewName] = useState("");
+  // session kind for the create row: shell or forge (agent running pi)
+  const [newKind, setNewKind] = useState<"shell" | "forge">("shell");
   const [err, setErr] = useState("");
   // keyboard inset: edge-to-edge Android doesn't lift bottom inputs, so
   // pad the sessions screen by the measured keyboard height
@@ -94,7 +96,7 @@ export default function App() {
             // created via the sessions screen → attach to it
             setSessions((prev) => [
               ...(prev ?? []),
-              { id: f.session, name: newName || f.session.slice(0, 8), kind: "shell", active_pane: f.pane, panes: [f.pane] },
+              { id: f.session, name: newName || f.session.slice(0, 8), kind: newKind, active_pane: f.pane, panes: [f.pane] },
             ]);
             setNewName("");
             break;
@@ -183,20 +185,33 @@ export default function App() {
             )}
           />
         )}
+        <View style={s.kindRow}>
+          {(["shell", "forge"] as const).map((k) => (
+            <Pressable
+              key={k}
+              style={[s.kindChip, newKind === k && s.kindChipOn]}
+              onPress={() => setNewKind(k)}
+            >
+              <Text style={[s.kindText, newKind === k && s.kindTextOn]}>
+                {k === "forge" ? "agent" : "shell"}
+              </Text>
+            </Pressable>
+          ))}
+        </View>
         <View style={s.newRow}>
           <TextInput
             style={s.input}
             value={newName}
             onChangeText={setNewName}
-            placeholder="new session name (optional)"
+            placeholder={newKind === "forge" ? "agent name (runs pi)" : "new session name (optional)"}
             placeholderTextColor="#4b5563"
             autoCapitalize="none"
           />
           <Pressable
-            style={s.sendBtn}
-            onPress={() => relay?.send({ t: "SessionsCreate", req_id: nextId(), name: newName || undefined } as Frame)}
+            style={[s.sendBtn, newKind === "forge" && s.sendBtnAgent]}
+            onPress={() => relay?.send({ t: "SessionsCreate", req_id: nextId(), name: newName || undefined, kind: newKind } as Frame)}
           >
-            <Text style={s.btnText}>new</Text>
+            <Text style={s.btnText}>{newKind === "forge" ? "agent" : "new"}</Text>
           </Pressable>
         </View>
       </View>
@@ -229,6 +244,15 @@ const s = StyleSheet.create({
   dim: { color: "#6b7280", fontSize: 13 },
   err: { color: "#f87171", marginBottom: 8 },
   newRow: { flexDirection: "row", gap: 8, paddingBottom: 30, paddingTop: 8 },
+  kindRow: { flexDirection: "row", gap: 8, paddingBottom: 4 },
+  kindChip: {
+    borderWidth: 1, borderColor: "#374151", borderRadius: 999,
+    paddingHorizontal: 12, paddingVertical: 4,
+  },
+  kindChipOn: { borderColor: "#4ade80", backgroundColor: "rgba(74,222,128,0.12)" },
+  kindText: { color: "#9ca3af", fontSize: 13 },
+  kindTextOn: { color: "#4ade80", fontSize: 13, fontWeight: "600" },
+  sendBtnAgent: { backgroundColor: "#a855f7" },
   input: {
     flex: 1, backgroundColor: "#1a1b23", borderRadius: 8,
     paddingHorizontal: 12, paddingVertical: 8, color: "#f3f4f6",

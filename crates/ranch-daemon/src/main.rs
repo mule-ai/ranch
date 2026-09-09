@@ -116,20 +116,19 @@ impl Drop for Pane {
     }
 }
 
-struct Session {
+struct Window {
     id: Uuid,
     name: String,
-    kind: String,
-    panes: BTreeMap<Uuid, Pane>,
-    active: Uuid,
-    size: (u16, u16),
     /// Binary split tree. The root leaf is the first pane; PaneSplit
     /// replaces the split target's leaf with a new node. `pct` is the
     /// percent of space given to `a`.
     layout: Layout,
 }
 
-impl Session {
+impl Window {
+    fn new(layout: Layout, name: String) -> Self {
+        Window { id: Uuid::new_v4(), name, layout }
+    }
     /// Replace the leaf `target` with a split whose second child is
     /// `new_id`. Returns true when found.
     fn split_leaf(&mut self, target: &str, new_id: &str, dir: u8) -> bool {
@@ -212,6 +211,83 @@ impl Session {
         rename(&mut self.layout, &sentinel, b)
     }
 
+    /// Panes present in this window's layout tree.
+    fn pane_ids(&self) -> Vec<Uuid> {
+        let mut out = Vec::new();
+        fn walk(l: &Layout, out: &mut Vec<Uuid>) {
+            match l {
+                Layout::Leaf { pane } => {
+                    if let Ok(pid) = Uuid::parse_str(pane) {
+                        out.push(pid);
+                    }
+                }
+                Layout::Split { a, b, .. } => {
+                    walk(a, out);
+                    walk(b, out);
+                }
+            }
+        }
+        walk(&self.layout, &mut out);
+        out
+    }
+}
+
+struct Session {
+    id: Uuid,
+    name: String,
+    kind: String,
+    panes: BTreeMap<Uuid, Pane>,
+    /// Active pane (within the active window).
+    active: Uuid,
+    size: (u16, u16),
+    /// Window stack; exactly one window (index `win`) is active.
+    windows: Vec<Window>,
+    win: usize,
+}
+
+impl Session {
+    /// Remove `pane` from whichever window holds it; drop windows that
+    /// run out of panes (active window index follows). Returns true when
+    /// no windows remain (caller kills the session).
+    fn remove_pane_everywhere(&mut self, pane: &str) -> bool {
+        for i in 0..self.windows.len() {
+            if self.windows[i].pane_ids().iter().any(|p| p.to_string() == pane) {
+                self.windows[i].remove_leaf(pane);
+                break;
+            }
+        }
+        let mut i = 0;
+        while i < self.windows.len() {
+            if self.windows[i].pane_ids().is_empty() {
+                self.windows.remove(i);
+                if self.win >= i && self.win > 0 {
+                    self.win -= 1;
+                }
+            } else {
+                i += 1;
+            }
+        }
+        if self.windows.is_empty() {
+            return true;
+        }
+        if self.win >= self.windows.len() {
+            self.win = self.windows.len() - 1;
+        }
+        let ids = self.win().pane_ids();
+        if !ids.contains(&self.active) {
+            self.active = ids.first().copied().unwrap_or_else(Uuid::nil);
+        }
+        false
+    }
+
+    fn win(&self) -> &Window {
+        &self.windows[self.win]
+    }
+    fn win_mut(&mut self) -> &mut Window {
+        let i = self.win.min(self.windows.len().saturating_sub(1));
+        &mut self.windows[i]
+    }
+
     /// Compute each pane's (cols, rows) by walking the split tree.
     /// dir 1 = vertical split (left/right, pct to a), dir 0 = horizontal
     /// (top/bottom, pct to a).
@@ -238,17 +314,17 @@ impl Session {
                 }
             }
         }
-        walk(&self.layout, 0, 0, self.size.0, self.size.1, &mut out);
+        walk(&self.win().layout, 0, 0, self.size.0, self.size.1, &mut out);
         out
     }
 
     /// Apply computed sizes to every pane's PTY + VT (with SIGWINCH).
     fn apply_sizes(&mut self) {
         // bootstrap: root leaf may still point at the nil placeholder
-        if let Layout::Leaf { pane } = &self.layout {
+        if let Layout::Leaf { pane } = &self.win().layout {
             if Uuid::parse_str(&pane).map(|u| u.is_nil()).unwrap_or(true) {
                 if let Some(first) = self.panes.keys().next().copied() {
-                    self.layout = Layout::Leaf { pane: first.to_string() };
+                    self.win_mut().layout = Layout::Leaf { pane: first.to_string() };
                 }
             }
         }
@@ -297,7 +373,7 @@ impl Session {
                 }
             }
         }
-        let Some((ndir, a_leaf)) = find(&self.layout, &pref) else {
+        let Some((ndir, a_leaf)) = find(&self.win().layout, &pref) else {
             return;
         };
         if ndir != dir {
@@ -321,7 +397,7 @@ impl Session {
                 }
             }
         }
-        let a_is_target = is_a(&self.layout, &pref).unwrap_or(false);
+        let a_is_target = is_a(&self.win().layout, &pref).unwrap_or(false);
         let sizes = self.pane_sizes();
         let axis = if dir == 1 { self.size.0 } else { self.size.1 };
         let a_size = Uuid::parse_str(&a_leaf)
@@ -348,7 +424,7 @@ impl Session {
                 }
             }
         }
-        set_pct(&mut self.layout, &pref, dir, new_pct);
+        set_pct(&mut self.win_mut().layout, &pref, dir, new_pct);
     }
 }
 
@@ -415,7 +491,7 @@ fn hostname() -> String {
 /// Spawn a new shell pane. The CALLER must insert the layout split
 /// (via `Session::split_leaf`) before or after; the PTY is sized with
 /// `session.size` and `apply_sizes` fixes it after the split is made.
-fn spawn_pane(session: &mut Session) -> Result<Uuid, String> {
+fn spawn_pane(session: &mut Session, pane_kind: &str, cwd: Option<&str>) -> Result<Uuid, String> {
     let (cols, rows) = session.size;
     let vt = Vt::new(cols, rows).map_err(|e| format!("vt: {e}"))?;
 
@@ -456,10 +532,26 @@ fn spawn_pane(session: &mut Session) -> Result<Uuid, String> {
                 b"xterm-256color\0".as_ptr() as *const i8,
                 1,
             );
+            // agent sessions run `pi` via a login shell (so the mise
+            // shim PATH from the user profile applies); shells run bare
             let shell = default_shell();
             let shell_c = shell.as_ptr();
-            let argv: [*const u8; 2] = [shell_c, std::ptr::null()];
-            execvp(shell_c, argv.as_ptr());
+            if pane_kind == "forge" {
+                let dir = cwd.map(std::path::PathBuf::from)
+                    .unwrap_or_else(home_dir);
+                let d_c = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes())
+                    .unwrap_or_default();
+                if unsafe { libc::chdir(d_c.as_ptr()) } != 0 {
+                    eprintln!("ranchd: chdir {:?} failed", dir);
+                }
+                let arg = b"exec pi\0";
+                let argv: [*const u8; 4] =
+                    [shell_c, b"-lc\0".as_ptr(), arg.as_ptr(), std::ptr::null()];
+                execvp(shell_c, argv.as_ptr());
+            } else {
+                let argv: [*const u8; 2] = [shell_c, std::ptr::null()];
+                execvp(shell_c, argv.as_ptr());
+            }
             std::process::exit(1);
         }
     }
@@ -471,7 +563,7 @@ fn spawn_pane(session: &mut Session) -> Result<Uuid, String> {
     session.panes.insert(
         id,
         Pane {
-            kind: "shell".into(),
+            kind: pane_kind.to_string(),
             master: amaster,
             child: pid,
             vt,
@@ -517,10 +609,16 @@ fn snapshot_session(s: &Session) -> Option<Frame> {
         client: String::new(), // filled per-recipient
         session: s.id.to_string(),
         seq: active_seq,
-        layout: s.layout.clone(),
+        layout: s.win().layout.clone(),
         active_pane: s.active.to_string(),
         panes: snaps, // each pane carries its own seq
         meta: vec![],
+        windows: s.windows.iter().map(|w| ranch_protocol::WindowSnap {
+            id: w.id.to_string(),
+            name: w.name.clone(),
+            layout: w.layout.clone(),
+        }).collect(),
+        window: s.windows.get(s.win).map(|w| w.id.to_string()),
     })
 }
 
@@ -617,6 +715,11 @@ impl Daemon {
                 "kind": s.kind,
                 "active": s.active.to_string(),
                 "size": [s.size.0, s.size.1],
+                "win": s.win,
+                "windows": s.windows.iter().map(|w| serde_json::json!({
+                    "id": w.id.to_string(),
+                    "name": w.name,
+                })).collect::<Vec<_>>(),
                 "panes": s.panes.iter().map(|(pid, p)| serde_json::json!({
                     "id": pid.to_string(),
                     "kind": p.kind,
@@ -643,6 +746,7 @@ impl Daemon {
                 id: s.id.to_string(),
                 name: s.name.clone(),
                 kind: s.kind.clone(),
+                windows: s.windows.iter().map(|w| w.name.clone()).collect(),
                 active_pane: s.active.to_string(),
                 panes: s.panes.keys().map(|p| p.to_string()).collect(),
                 ref_id: None,
@@ -833,7 +937,17 @@ impl Daemon {
                     );
                 }
             }
-            Frame::SessionsCreate { req_id, name } => {
+            Frame::SessionsCreate { req_id, name, kind, cwd } => {
+                let kind = kind.clone().unwrap_or_else(|| "shell".into());
+                if kind != "shell" && kind != "forge" {
+                    if let Some(c) = self.clients.get_mut(&from) {
+                        send_frame(c, &Frame::Error {
+                            req_id: Some(req_id.clone()),
+                            message: format!("unknown session kind {kind:?} (shell|forge)"),
+                        });
+                    }
+                    return;
+                }
                 let id = Uuid::new_v4();
                 let name = name.clone().unwrap_or_else(|| {
                     // short, tmux-like auto name: s0, s1, ... unique in this daemon
@@ -851,15 +965,17 @@ impl Daemon {
                 let mut s = Session {
                     id,
                     name: name.clone(),
-                    kind: "shell".into(),
+                    kind: kind.clone(),
                     panes: BTreeMap::new(),
                     active: Uuid::nil(),
                     size: (80, 24),
-                    layout: Layout::Leaf { pane: Uuid::nil().to_string() },
+                    windows: vec![Window::new(Layout::Leaf { pane: Uuid::nil().to_string() }, "0".into())],
+                    win: 0,
                 };
-                    match spawn_pane(&mut s) {
+                    match spawn_pane(&mut s, &kind, cwd.as_deref()) {
                     Ok(pid) => {
-                        s.layout = Layout::Leaf { pane: pid.to_string() };
+                        s.windows[0].layout = Layout::Leaf { pane: pid.to_string() };
+                        s.active = pid;
                         eprintln!("ranchd: created session {name} ({id}) pane {pid}");
                         let ack = Frame::SessionsAck {
                             req_id: req_id.clone(),
@@ -871,7 +987,7 @@ impl Daemon {
                         self.mirror(relay::RelayOut::UpsertSession {
                             id: id.to_string(),
                             name,
-                            kind: "shell".into(),
+                            kind,
                         });
                         if let Some(c) = self.clients.get_mut(&from) {
                             send_frame(c, &ack);
@@ -975,9 +1091,9 @@ impl Daemon {
                         Ok(p) if s.panes.contains_key(&p) => p,
                         _ => s.active,
                     };
-                    match spawn_pane(s) {
+                    match spawn_pane(s, "shell", None) {
                         Ok(pid) => {
-                            s.split_leaf(&target.to_string(), &pid.to_string(), dir);
+                            s.win_mut().split_leaf(&target.to_string(), &pid.to_string(), dir);
                             s.active = pid;
                             s.apply_sizes();
                             Some(pid)
@@ -1026,13 +1142,158 @@ impl Daemon {
                     None => return,
                 };
                 let did = self.sessions.get_mut(&sid).map(|s| {
-                    let ok = s.swap_leaves(a, b);
+                    let ok = s.win_mut().swap_leaves(a, b);
+                    if ok {
+                        // focus stays on the same pane (tmux swap-panes)
+                    }
                     if ok {
                         s.apply_sizes();
                     }
                     ok
                 });
                 if did.unwrap_or(false) {
+                    self.resnap(&sid);
+                }
+            }
+            Frame::WindowNew { req_id, session, name } => {
+                let sid = match self.resolve_session(session).map(|s| s.id) {
+                    Some(s) => s,
+                    None => return,
+                };
+                let new_win = self.sessions.get_mut(&sid).and_then(|s| {
+                    match spawn_pane(s, "shell", None) {
+                        Ok(pid) => {
+                            // auto name: window number, unique in the session
+                            let wname = name.clone().unwrap_or_else(|| {
+                                let mut n = 0;
+                                loop {
+                                    let cand = n.to_string();
+                                    if s.windows.iter().all(|w| w.name != cand) {
+                                        return cand;
+                                    }
+                                    n += 1;
+                                }
+                            });
+                            let w = Window::new(Layout::Leaf { pane: pid.to_string() }, wname);
+                            let wid = w.id;
+                            s.windows.push(w);
+                            s.win = s.windows.len() - 1;
+                            s.active = pid;
+                            s.apply_sizes();
+                            eprintln!("ranchd: window created in {sid} (pane {pid})");
+                            if let Some(c) = self.clients.get_mut(&from) {
+                                send_frame(c, &Frame::SessionsAck {
+                                    req_id: req_id.clone(),
+                                    session: sid.to_string(),
+                                    pane: pid.to_string(),
+                                });
+                            }
+                            Some(wid)
+                        }
+                        Err(e) => {
+                            eprintln!("ranchd: window create failed: {e}");
+                            None
+                        }
+                    }
+                });
+                if new_win.is_some() {
+                    self.write_state();
+                    self.resnap(&sid);
+                }
+            }
+            Frame::WindowSelect { session, window } => {
+                let sid = match self.resolve_session(session).map(|s| s.id) {
+                    Some(s) => s,
+                    None => return,
+                };
+                let did = self.sessions.get_mut(&sid).map(|s| {
+                    let idx = s.windows.iter().position(|w| w.id.to_string() == *window);
+                    if let Some(i) = idx {
+                        s.win = i;
+                        s.active = s.windows[i].pane_ids().first().copied().unwrap_or_else(Uuid::nil);
+                        s.apply_sizes();
+                    }
+                    idx.is_some()
+                });
+                if did.unwrap_or(false) {
+                    self.write_state();
+                    self.resnap(&sid);
+                }
+            }
+            Frame::WindowNext { session, delta } => {
+                let sid = match self.resolve_session(session).map(|s| s.id) {
+                    Some(s) => s,
+                    None => return,
+                };
+                let n = self.sessions.get_mut(&sid).map(|s| {
+                    let len = s.windows.len() as i32;
+                    let cur = s.win as i32;
+                    let next = ((cur + *delta as i32) % len + len) % len;
+                    s.win = next as usize;
+                    s.active = s.windows[next as usize].pane_ids().first().copied().unwrap_or_else(Uuid::nil);
+                    s.apply_sizes();
+                    s.windows[next as usize].id.to_string()
+                });
+                if n.is_some() {
+                    self.write_state();
+                    self.resnap(&sid);
+                }
+            }
+            Frame::WindowKill { session, window } => {
+                let sid = match self.resolve_session(session).map(|s| s.id) {
+                    Some(s) => s,
+                    None => return,
+                };
+                let outcome = self.sessions.get_mut(&sid).and_then(|s| {
+                    let idx = s.windows.iter().position(|w| w.id.to_string() == *window)?;
+                    let w = s.windows.remove(idx);
+                    for pid in w.pane_ids() {
+                        if let Some(p) = s.panes.remove(&pid) {
+                            self.orphans.push(p.child);
+                        }
+                    }
+                    if s.win >= s.windows.len() {
+                        s.win = s.windows.len().saturating_sub(1);
+                    }
+                    if !s.windows.is_empty() {
+                        s.active = s.win().pane_ids().first().copied().unwrap_or_else(Uuid::nil);
+                    }
+                    Some(s.windows.is_empty())
+                });
+                match outcome {
+                    Some(true) | None => {
+                        // last window gone: kill the whole session
+                        if let Some(s) = self.sessions.remove(&sid) {
+                            for p in s.panes.values() {
+                                self.orphans.push(p.child);
+                            }
+                            eprintln!("ranchd: killed session {} (last window closed)", s.name);
+                        }
+                        self.write_state();
+                        self.mirror(relay::RelayOut::DeleteSession { id: sid.to_string() });
+                    }
+                    Some(false) => {
+                        self.write_state();
+                        self.resnap(&sid);
+                    }
+                }
+            }
+            Frame::WindowRename { session, window, name } => {
+                let sid = match self.resolve_session(session).map(|s| s.id) {
+                    Some(s) => s,
+                    None => return,
+                };
+                let did = self.sessions.get_mut(&sid).map(|s| {
+                    match s.windows.iter_mut().find(|w| w.id.to_string() == *window) {
+                        Some(w) => {
+                            w.name = name.clone();
+                            true
+                        }
+                        None => false,
+                    }
+                });
+                if did.unwrap_or(false) {
+                    self.write_state();
                     self.resnap(&sid);
                 }
             }
@@ -1051,18 +1312,11 @@ impl Daemon {
                         // master fd drops here (SIGHUP to the shell); reap later
                         self.orphans.push(p.child);
                     }
-                    s.remove_leaf(&pid.to_string());
-                    if s.active == pid {
-                        s.active = s
-                            .panes
-                            .keys()
-                            .next()
-                            .copied()
-                            .unwrap_or_else(Uuid::new_v4);
-                    }
+                    let dead = s.remove_pane_everywhere(&pid.to_string());
                     s.apply_sizes();
-                    if s.panes.is_empty() {
+                    if dead || s.panes.is_empty() {
                         need_snap = None;
+                        eprintln!("ranchd: last window closed, killing session {}", s.name);
                         self.sessions.remove(&sid);
                     } else {
                         need_snap = Some(sid);

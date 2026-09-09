@@ -93,8 +93,12 @@ per app install for mobile so reconnects are stable).
 
 ### Control (both directions)
 
-- **`sessions.create`** `{name?, kind?:"shell"|"forge"|"mule", ref_id?,
-  cols, rows}` → `sessions.ack {session, pane}`
+- **`sessions.create`** `{name?, kind?:"shell"|"forge", cwd?}` →
+  `sessions.ack {session, pane}`. `kind:"forge"` is a first-class
+  **agent session**: its panes run the `pi` agent (via a login shell so
+  the user's toolchain PATH applies) with `cwd` as the working
+  directory (default `$HOME`). The kind surfaces on
+  `machines_info`/session lists so clients can badge agent sessions.
 - **`sessions.rename`** `{session, name}`
 - **`sessions.kill`** `{session}` (kills all panes in it)
 - **`sessions.pane-split`** `{session, pane, dir}` — replaces `pane`'s
@@ -109,6 +113,16 @@ per app install for mobile so reconnects are stable).
   keeps ≥ 4 cells. Daemon re-snapshots on change.
 - **`sessions.pane-kill`** `{session, pane}` — removes the leaf and
   promotes its sibling subtree.
+- **`sessions.window-new`** `{session, name?}` — new window (one pane,
+  auto-named by index); becomes active. Daemon re-snapshots.
+- **`sessions.window-select`** `{session, window}` — activate a window
+  by id. Its panes resize to the session geometry (`SIGWINCH`); the
+  other window's panes keep their sizes.
+- **`sessions.window-next`** `{session, delta}` — ring-walk the window
+  stack (tmux `next/previous-window`).
+- **`sessions.window-kill`** `{session, window}` — kill a window and
+  its panes; killing the last window kills the session.
+- **`sessions.window-rename`** `{session, window, name}`.
 - **`sessions.pane-swap`** `{session, a, b}` — the two panes' rectangles
   trade places in the split tree; each pane keeps its own PTY/VT state
   (shell, running programs). Both PTYs are `SIGWINCH`ed to their new

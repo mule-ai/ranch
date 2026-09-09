@@ -628,6 +628,31 @@ Rust edition 2024, stable toolchain (matches forge: rustc 1.98).
   Verified e2e over the unix socket: asymmetric 52/28 split, swap,
   geometry traded exactly, shell markers stayed with their panes,
   traversal order rotated, swap-back restored the original geometry.
+- **M5 — windows (2026-09-09)**: tmux-style window stack per session.
+  `Session` holds `windows: Vec<Window>` (`Window {id, name, layout}`)
+  + active index; the layout ops (`split/kill/swap/resize`) now operate
+  on the ACTIVE window's tree. Snapshot gains `windows`/`window`
+  (serde-default, back-compat: `layout` remains the active window's
+  tree, so pre-window clients — including the phone — render the
+  active window untouched). Frames: `WindowNew/Select/Next/Kill/Rename`
+  — new windows spawn a pane, ring-walk with wrap, killing the last
+  window kills the session (pane-exit cleanup is window-aware via
+  `remove_pane_everywhere`). CLI bindings move to tmux semantics:
+  prefix `c` new window, `n/p` next/prev window, `0-9` select, `,`
+  rename window, `&` kill window (session-level ops live in the
+  sidebar/manager); the status bar renders a tmux-style window list
+  (`0:main* 1:build`). Verified e2e: socket tests (create/add/markers/
+  next/select/rename/kill-to-session-death) + real-PTY TUI tests
+  checking daemon state after each binding.
+- **M6 — first-class agents (2026-09-09)**: `sessions.create` gains
+  `kind` ("shell" default, "forge") + `cwd`. A forge session's panes
+  exec `$SHELL -lc "exec pi"` after `chdir` (login shell so the mise
+  toolchain PATH applies; default dir `$HOME`). Kind is recorded on
+  the session AND pane (state.json), mirrored to the phone, and shown
+  by clients. CLI: `ranch agent [name] [dir]`. Phone: shell/agent
+  chips on the create row (agent button purple, placeholder explains
+  pi), session rows badge the kind. Verified e2e: forge session boots
+  pi's TUI (truecolor styled rows) in the pane; state records forge.
   Test lesson: polling snapshots on a shared socket returns stale
   frames (updates + old snapshots queue ahead); fresh-connection
   snapshots read clean.

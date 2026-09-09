@@ -115,11 +115,13 @@ fn frame_matches(f: &Frame, tag: &str) -> bool {
 
 // ---------- commands ----------
 
-fn cmd_new(name: Option<String>) {
+fn cmd_new(name: Option<String>, kind: Option<String>, cwd: Option<String>) {
     one_shot(
         |req_id| Frame::SessionsCreate {
             req_id: req_id.to_string(),
             name,
+            kind,
+            cwd,
         },
         "ack",
         |f| match f {
@@ -530,6 +532,8 @@ fn cmd_dashboard() -> Option<String> {
                                 let f = Frame::SessionsCreate {
                                     req_id: Uuid::new_v4().to_string(),
                                     name: if text.is_empty() { None } else { Some(text) },
+                                    kind: None,
+                                    cwd: None,
                                 };
                                 send_frame(&mut stream, &f).ok();
                                 input = None;
@@ -580,6 +584,8 @@ fn cmd_dashboard() -> Option<String> {
                     let f = Frame::SessionsCreate {
                         req_id: Uuid::new_v4().to_string(),
                         name: None,
+                        kind: None,
+                        cwd: None,
                     };
                     send_frame(&mut stream, &f).ok();
                     // SessionsAck handler attaches
@@ -662,6 +668,9 @@ fn cmd_attach(ref_: &str) {
     let mut pane_views: std::collections::HashMap<String, PaneView> =
         std::collections::HashMap::new();
     let mut layout: Option<ranch_protocol::Layout> = None;
+    // window stack (M5): entries in order + the active window's id
+    let mut windows: Vec<ranch_protocol::WindowSnap> = vec![];
+    let mut cur_window = String::new();
     let mut decoder = Decoder::new();
     let mut buf = [0u8; 65536];
     let got_snapshot = std::cell::Cell::new(false);
@@ -678,7 +687,7 @@ fn cmd_attach(ref_: &str) {
     let picker = std::cell::Cell::new(false);
     let picker_sel = std::cell::Cell::new(0usize);
     #[derive(Clone, Copy, PartialEq)]
-    enum Prompt { Rename, Command }
+    enum Prompt { RenameWindow, Command }
     let prompt = std::cell::Cell::new(None::<Prompt>);
     let mut prompt_input = String::new();
     let mut sessions_meta: Vec<ranch_protocol::SessionMeta> = vec![];
@@ -714,6 +723,8 @@ fn cmd_attach(ref_: &str) {
                                 panes: panes_snap,
                                 active_pane: ap,
                                 layout: ly,
+                                windows: wins,
+                                window: wid,
                                 ..
                             } => {
                                 if session_id.is_empty() || session_id != session {
@@ -722,6 +733,10 @@ fn cmd_attach(ref_: &str) {
                                 active_pane = ap.clone();
                                 panes = panes_snap.iter().map(|p| p.id.clone()).collect();
                                 layout = Some(ly);
+                                if !wins.is_empty() {
+                                    windows = wins;
+                                    cur_window = wid.unwrap_or_default();
+                                }
                                 pane_views.clear();
                                 for ps in &panes_snap {
                                     let mut pv = PaneView::default();
@@ -821,6 +836,8 @@ fn cmd_attach(ref_: &str) {
         let prompt_now = prompt.get();
         let meta_ref = &sessions_meta;
         let panes_n = panes.len();
+        let wins_ref = &windows;
+        let curwin_ref = &cur_window;
         let sess_id_ref = &session_id;
         let views_ref = &pane_views;
         let layout_ref = &layout;
@@ -985,7 +1002,15 @@ fn cmd_attach(ref_: &str) {
                         if sess_id_ref.is_empty() { "(attaching…)".into() } else { sess_id_ref.clone() }
                     });
                 let pfx = if prefix_now { "[prefix]" } else { "" };
-                let status = format!(" ranch  {nowix}  {panes_n} pane{} {} ",
+                let winlist = wins_ref.iter().enumerate().map(|(i, w)| {
+                    if w.id == *curwin_ref {
+                        format!("{}:{}*", i, w.name)
+                    } else {
+                        format!("{}:{}", i, w.name)
+                    }
+                }).collect::<Vec<_>>().join(" ");
+                let winlist = if winlist.is_empty() { String::new() } else { format!("  {winlist} ") };
+                let status = format!(" ranch  {nowix}{winlist} {panes_n} pane{} {} ",
                     if panes_n == 1 { "" } else { "s" }, pfx);
                 let bar_style = Style::default().add_modifier(Modifier::REVERSED);
                 let bar = Line::from(Span::styled(format!("{:^width$}", status, width = area.width as usize), bar_style));
@@ -1040,7 +1065,10 @@ fn cmd_attach(ref_: &str) {
 
             // prompt line (rename / command)
             if let Some(kind) = prompt_now {
-                let label = match kind { Prompt::Rename => "rename session: ", Prompt::Command => ": " };
+                let label = match kind {
+                    Prompt::RenameWindow => "rename window: ",
+                    Prompt::Command => ": ",
+                };
                 let pl = Line::from(Span::styled(
                     format!("{label}{}\u{2588}", prompt_input.clone()),
                     Style::default().add_modifier(Modifier::REVERSED)));
@@ -1149,33 +1177,40 @@ fn cmd_attach(ref_: &str) {
                                     send_frame(&mut stream, &f).ok();
                                     continue;
                                 }
-                                // d → detach
-                                KeyCode::Char('d') => break,
-                                // n / p → next / previous session (client order)
+                                // c → new window (tmux: one session, many windows)
+                                KeyCode::Char('c') => {
+                                    let f = Frame::WindowNew {
+                                        req_id: Uuid::new_v4().to_string(),
+                                        session: session_id.clone(),
+                                        name: None,
+                                    };
+                                    send_frame(&mut stream, &f).ok();
+                                    continue;
+                                }
+                                // n / p → next / previous window (tmux semantics;
+                                // session switching lives in the sidebar)
                                 KeyCode::Char('n') | KeyCode::Char('p') => {
-                                    let list = session_list.borrow().clone();
-                                    if list.len() > 1 {
-                                        let cur = list.iter().position(|s| *s == session_id);
-                                        let going_next = key.code == KeyCode::Char('n');
-                                        let next = match cur {
-                                            Some(i) if going_next => (i + 1) % list.len(),
-                                            Some(i) => (i + list.len() - 1) % list.len(),
-                                            None => 0,
+                                    let f = Frame::WindowNext {
+                                        session: session_id.clone(),
+                                        delta: if key.code == KeyCode::Char('n') { 1 } else { -1 },
+                                    };
+                                    send_frame(&mut stream, &f).ok();
+                                    continue;
+                                }
+                                // 0-9 → select window by index
+                                KeyCode::Char(c @ '0'..='9') => {
+                                    let i = (c as u8 - b'0') as usize;
+                                    if let Some(w) = windows.get(i) {
+                                        let f = Frame::WindowSelect {
+                                            session: session_id.clone(),
+                                            window: w.id.clone(),
                                         };
-                                        let target = list[next].clone();
-                                        // re-attach to the other session
-                                        let rf = Frame::Attach {
-                                            id: Uuid::new_v4().to_string(),
-                                            client: "attach".into(),
-                                            session: target,
-                                            pane: None,
-                                        };
-                                        send_frame(&mut stream, &rf).ok();
-                                        screen.reset_blank();
-                                        sent_resize.set(false);
+                                        send_frame(&mut stream, &f).ok();
                                     }
                                     continue;
                                 }
+                                // d → detach
+                                KeyCode::Char('d') => break,
                                 // o / l → next pane in session
                                 KeyCode::Char('o') | KeyCode::Char('l') => {
                                     if panes.len() > 1 {
@@ -1192,27 +1227,23 @@ fn cmd_attach(ref_: &str) {
                                     }
                                     continue;
                                 }
-                                // c → new session (named by daemon), auto-attach
-                                KeyCode::Char('c') => {
-                                    let f = Frame::SessionsCreate {
-                                        req_id: Uuid::new_v4().to_string(),
-                                        name: None,
-                                    };
-                                    send_frame(&mut stream, &f).ok();
-                                    continue;
-                                }
-                                // & → kill current session
+                                // & / k → kill current window (the session
+                                // dies with its last window; whole sessions
+                                // are killed from the sidebar / manager)
                                 KeyCode::Char('&') | KeyCode::Char('k') => {
-                                    let f = Frame::SessionsKill {
-                                        session: session_id.clone(),
-                                    };
-                                    send_frame(&mut stream, &f).ok();
-                                    screen.reset_blank();
+                                    if !cur_window.is_empty() {
+                                        let f = Frame::WindowKill {
+                                            session: session_id.clone(),
+                                            window: cur_window.clone(),
+                                        };
+                                        send_frame(&mut stream, &f).ok();
+                                        screen.reset_blank();
+                                    }
                                     continue;
                                 }
-                                // , → rename (reads a name from the prompt line)
+                                // , → rename the current window (prompt line)
                                 KeyCode::Char(',') => {
-                                    prompt.set(Some(Prompt::Rename));
+                                    prompt.set(Some(Prompt::RenameWindow));
                                     prompt_input.clear();
                                     continue;
                                 }
@@ -1379,10 +1410,11 @@ fn cmd_attach(ref_: &str) {
                                 KeyCode::Enter => {
                                     if let Some(kind) = prompt.take() {
                                         match kind {
-                                            Prompt::Rename => {
-                                                if !prompt_input.is_empty() {
-                                                    let f = Frame::SessionsRename {
+                                            Prompt::RenameWindow => {
+                                                if !prompt_input.is_empty() && !cur_window.is_empty() {
+                                                    let f = Frame::WindowRename {
                                                         session: session_id.clone(),
+                                                        window: cur_window.clone(),
                                                         name: prompt_input.clone(),
                                                     };
                                                     send_frame(&mut stream, &f).ok();
@@ -2033,7 +2065,8 @@ fn main() {
             }
             return;
         }
-        eprintln!("usage: ranch <new|ls|attach|kill|rename|split|switch|register|login|machines|cloud> [args]");
+        eprintln!("usage: ranch <new|agent|ls|attach|kill|rename|split|switch|register|login|machines|cloud> [args]");
+        eprintln!("  agent [name] [dir]   new agent session (runs pi in dir)");
         eprintln!("  (run plain `ranch` in a terminal for the interactive session manager)");
         eprintln!("  socket: {}", socket_path().display());
         std::process::exit(2);
@@ -2047,7 +2080,13 @@ fn main() {
         },
         "machines" => cmd_machines(),
         "cloud" => cmd_cloud_sessions(args.get(1).cloned()),
-        "new" => cmd_new(args.get(1).cloned()),
+        "new" => cmd_new(args.get(1).cloned(), None, None),
+        // ranch agent [name] [dir] — first-class agent session (runs pi)
+        "agent" => cmd_new(
+            args.get(1).cloned(),
+            Some("forge".into()),
+            args.get(2).cloned(),
+        ),
         "ls" | "list" => cmd_ls(),
         "attach" => match args.get(1) {
             Some(r) => cmd_attach(r),
