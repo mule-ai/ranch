@@ -204,6 +204,28 @@ pub enum Frame {
         window: String,
         name: String,
     },
+    // ----- forge chat panes (M8) -----
+    /// Client -> daemon: send a chat message to a forge-chat pane.
+    /// The daemon POSTs to the forge API on its worker thread; the
+    /// resulting rows come back as `chat` broadcasts.
+    ChatSend {
+        id: String,
+        client: String,
+        session: String,
+        pane: String,
+        text: String,
+    },
+    /// Daemon -> client: conversation rows for a forge-chat pane.
+    /// `reset` replaces whatever the client has (snapshot semantics);
+    /// otherwise `msgs` are appends in sequence order.
+    Chat {
+        id: String,
+        session: String,
+        pane: String,
+        msgs: Vec<ChatMsg>,
+        #[serde(default)]
+        reset: bool,
+    },
     /// Out-of-band status (no screen change).
     Meta {
         session: String,
@@ -228,6 +250,26 @@ pub enum Frame {
         n: u32,
         data: String,
     },
+}
+
+/// One row of a forge agent conversation (M8). Mirrors a forge
+/// `messages` row: user prompts, assistant replies, and tool calls
+/// (linked by `tool_call_id`) in `sequence` order.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ChatMsg {
+    pub seq: i64,
+    pub role: String,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_output: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
 }
 
 /// One window in a session's window stack (M5). A window is a named
@@ -279,6 +321,16 @@ pub struct PaneSnap {
     pub seq: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cursor: Option<Cursor>,
+    /// "pty" (default) or "forge-chat" (M8). Chat panes carry `chat`
+    /// instead of terminal rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// Full conversation for forge-chat panes (absent for PTY panes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat: Option<Vec<ChatMsg>>,
+    /// For forge-chat panes: the forge session uuid this pane is bound to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forge_session: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]

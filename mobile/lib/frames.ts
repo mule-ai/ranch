@@ -19,6 +19,21 @@ export type PaneSnap = {
   lines: string[]; // full screen, row-major, plain text
   seq?: number; // pane update seq at snapshot time (dedup/gap seed)
   cursor?: Cursor;
+  kind?: "pty" | "forge-chat";
+  chat?: ChatMsg[];
+  forge_session?: string;
+};
+
+// One row of a forge agent conversation (M8)
+export type ChatMsg = {
+  seq: number;
+  role: string; // "user" | "assistant" | "tool"
+  text: string;
+  tool_name?: string;
+  tool_call_id?: string;
+  tool_output?: string;
+  duration_ms?: number;
+  created_at?: string;
 };
 
 // Binary split tree, mirrors ranch_protocol::Layout
@@ -66,6 +81,8 @@ export type Frame =
   | { t: "ScrollbackReq"; id: string; client: string; session: string; pane: string; offset: number; limit: number }
   | { t: "Scrollback"; id: string; client: string; session: string; pane: string; offset: number; lines: string[] }
   | { t: "SessionsCreate"; req_id: string; name?: string; kind?: "shell" | "forge"; cwd?: string }
+  | { t: "ChatSend"; id: string; client: string; session: string; pane: string; text: string }
+  | { t: "Chat"; id: string; session: string; pane: string; msgs: ChatMsg[]; reset?: boolean }
   | { t: "SessionsAck"; req_id: string; session: string; pane: string }
   | { t: "SessionsRename"; session: string; name: string }
   | { t: "SessionsKill"; session: string }

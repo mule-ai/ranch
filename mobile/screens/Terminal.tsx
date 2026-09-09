@@ -8,7 +8,7 @@ import {
   TextInput,
   View,
 } from "react-native";
-import { Frame, Layout, PaneSnap, b64, nextId } from "../lib/frames";
+import { ChatMsg, Frame, Layout, PaneSnap, b64, nextId } from "../lib/frames";
 import { Relay } from "../lib/relay";
 import { parseSgrRow, Span as SgrSpan } from "../lib/sgr";
 
@@ -132,6 +132,22 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
           );
           break;
         }
+        case "Chat": {
+          if (f.session !== sessionId) break;
+          const cur = panesRef.current.get(f.pane);
+          if (!cur) break;
+          const chat = f.reset ? [...(f.msgs ?? [])] : [...(cur.chat ?? [])];
+          if (!f.reset) {
+            for (const m of f.msgs ?? []) {
+              const last = chat[chat.length - 1];
+              if (!last || m.seq > last.seq) chat.push(m);
+            }
+          }
+          const next = new Map(panesRef.current);
+          next.set(f.pane, { ...cur, chat });
+          setPanes(next);
+          break;
+        }
         case "Scrollback":
           setHistory(f.lines);
           break;
@@ -219,6 +235,11 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
     }
   };
 
+  // forge-chat pane draft (the focused pane is a chat pane when set)
+  const [chatDraft, setChatDraft] = useState("");
+  const chatRef = useRef<TextInput | null>(null);
+  const chatScrollRef = useRef<ScrollView | null>(null);
+
   // blinking cursor
   useEffect(() => {
     const t = setInterval(() => setBlink((b) => !b), 530);
@@ -280,6 +301,11 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
   const COLS = geom.cols;
   const ROWS = geom.rows;
   const rects = layout ? layoutRects(layout, 0, 0, COLS, ROWS) : [];
+  // forge-chat pane UX: when the focused pane is a chat pane the screen
+  // becomes a conversation view (bubbles + input) instead of a grid
+  const activeSnap = activePane ? panes.get(activePane) : undefined;
+  const chatMode = activeSnap?.kind === "forge-chat";
+  const chatMsgs = activeSnap?.chat ?? [];
 
   return (
     <View style={[styles.flex, { paddingBottom: kbHeight }]}>
@@ -294,6 +320,48 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
         <Text style={styles.conn}>{conn}</Text>
       </View>
 
+      {chatMode ? (
+        // forge-chat pane: conversation bubbles + input, full area
+        <View style={styles.chatWrap}>
+          <ScrollView
+            contentContainerStyle={styles.chatList}
+            onContentSizeChange={(_, h) => chatScrollRef.current?.scrollToEnd({ animated: false })}
+            ref={chatScrollRef}
+          >
+            {chatMsgs.map((m, i) => (
+              <ChatBubble key={i} msg={m} />
+            ))}
+            {chatMsgs.length === 0 && (
+              <Text style={styles.dim}>say something to the agent…</Text>
+            )}
+          </ScrollView>
+          <View style={styles.chatInputRow}>
+            <TextInput
+              ref={chatRef}
+              style={styles.chatInput}
+              value={chatDraft}
+              onChangeText={setChatDraft}
+              placeholder="message the agent"
+              placeholderTextColor="#4b5563"
+              multiline
+            />
+            <Pressable
+              style={styles.chatSend}
+              onPress={() => {
+                const text = chatDraft.trim();
+                if (!text || !activePane) return;
+                relay.send({
+                  t: "ChatSend", id: nextId(), client: "mobile",
+                  session: sessionId, pane: activePane, text,
+                } as Frame);
+                setChatDraft("");
+              }}
+            >
+              <Text style={styles.chatSendText}>send</Text>
+            </Pressable>
+          </View>
+        </View>
+      ) : (
       <View
         style={styles.screenWrap}
         onLayout={(e) => {
@@ -455,9 +523,11 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
           <Text style={styles.dim}>waiting for snapshot…</Text>
         )}
       </View>
+      )}
 
       {/* hidden keystroke capture surface — typing goes straight to the
           PTY and the echo renders in the pane above, like SSH */}
+      {!chatMode && (
       <TextInput
         ref={inputRef}
         style={styles.hiddenInput}
@@ -480,6 +550,7 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
         blurOnSubmit={false}
         caretHidden
       />
+      )}
 
       {history !== null ? (
         <View style={styles.histWrap}>
@@ -493,6 +564,9 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
             <Text style={styles.mono}>{history.join("\n")}</Text>
           </ScrollView>
         </View>
+      ) : chatMode ? (
+        // chat pane: no terminal quick keys
+        <View style={{ height: 0 }} />
       ) : (
         <View style={styles.keys}>
           {["Enter", "Ctrl-C", "Ctrl-D", "Ctrl-L", "Tab", "Esc", "↑", "↓", "←", "→", "hist"].map((k) => (
@@ -527,6 +601,28 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
   );
 }
 
+function ChatBubble({ msg }: { msg: ChatMsg }) {
+  const isUser = msg.role === "user";
+  const isTool = msg.role === "tool";
+  if (isTool) {
+    const label = msg.tool_name || "tool";
+    const dur = msg.duration_ms != null ? ` · ${msg.duration_ms}ms` : "";
+    return (
+      <View style={styles.toolRow}>
+        <Text style={styles.toolText}>⚙ {label}{dur}</Text>
+        {msg.tool_output ? (
+          <Text style={styles.toolOut} numberOfLines={4}>{msg.tool_output}</Text>
+        ) : null}
+      </View>
+    );
+  }
+  return (
+    <View style={[styles.bubble, isUser ? styles.bubbleUser : styles.bubbleAgent]}>
+      <Text style={[styles.bubbleText, isUser && { color: "#052e16" }]}>{msg.text}</Text>
+    </View>
+  );
+}
+
 const styles = StyleSheet.create({
   flex: { flex: 1, backgroundColor: "#101014" },
   header: {
@@ -542,6 +638,33 @@ const styles = StyleSheet.create({
     borderRadius: 8, overflow: "hidden",
   },
   pane: { position: "absolute", borderWidth: 1, padding: 2 },
+  chatWrap: { flex: 1, backgroundColor: "#0a0a0e", marginHorizontal: 8, borderRadius: 8, overflow: "hidden" },
+  chatList: { padding: 10, gap: 8 },
+  bubble: {
+    maxWidth: "85%", borderRadius: 14, paddingHorizontal: 12,
+    paddingVertical: 8, marginVertical: 2,
+  },
+  bubbleUser: { alignSelf: "flex-end", backgroundColor: "#22c55e" },
+  bubbleAgent: { alignSelf: "flex-start", backgroundColor: "#1e1e26", borderWidth: 1, borderColor: "#2c2c36" },
+  bubbleText: { color: "#e5e7eb", fontSize: 14, lineHeight: 19 },
+  toolRow: {
+    alignSelf: "flex-start", backgroundColor: "#14141a", borderRadius: 8,
+    paddingHorizontal: 10, paddingVertical: 6, borderWidth: 1,
+    borderColor: "#23232c", maxWidth: "90%",
+  },
+  toolText: { color: "#9ca3af", fontSize: 12, fontFamily: "JetBrainsMono NF Mono" },
+  toolOut: { color: "#6b7280", fontSize: 11, fontFamily: "JetBrainsMono NF Mono", marginTop: 4 },
+  chatInputRow: {
+    flexDirection: "row", borderTopWidth: 1, borderTopColor: "#23232c",
+    padding: 8, gap: 8, alignItems: "flex-end",
+  },
+  chatInput: {
+    flex: 1, backgroundColor: "#16161c", borderRadius: 10, color: "#f3f4f6",
+    paddingHorizontal: 12, paddingVertical: 8, fontSize: 14,
+    maxHeight: 100,
+  },
+  chatSend: { backgroundColor: "#a855f7", borderRadius: 10, paddingHorizontal: 14, paddingVertical: 10, justifyContent: "center" },
+  chatSendText: { color: "#fff", fontWeight: "700", fontSize: 13 },
   mono: {
     fontFamily: "JetBrainsMono NF Mono", fontSize: FONT_SIZE,
     lineHeight: LINE_HEIGHT, color: "#d1d5db",

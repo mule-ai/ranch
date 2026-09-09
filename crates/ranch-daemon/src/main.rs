@@ -18,6 +18,7 @@
 //! - when ~/.config/ranch/daemon.toml exists, a relay thread bridges the
 //!   same frames to the machine's Supabase Realtime channel (relay.rs)
 
+mod forge;
 mod relay;
 
 use std::collections::{BTreeMap, VecDeque};
@@ -28,7 +29,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use libc::{c_int, pollfd, SIGINT, WNOHANG};
-use ranch_protocol::{Cursor, Decoder, Frame, Layout, PaneSnap, SessionMeta};
+use ranch_protocol::{ChatMsg, Cursor, Decoder, Frame, Layout, PaneSnap, SessionMeta};
 use ranch_vt::Vt;
 use uuid::Uuid;
 
@@ -114,6 +115,16 @@ impl Drop for Pane {
             libc::close(self.master);
         }
     }
+}
+
+/// A forge-chat pane (M8): no PTY — the conversation lives in forge's
+/// message table; the forge worker thread polls and this cache holds
+/// what we've seen (for snapshots).
+struct ChatPane {
+    forge_sid: Uuid,
+    cols: u16,
+    rows: u16,
+    chat: Vec<ChatMsg>,
 }
 
 struct Window {
@@ -243,6 +254,10 @@ struct Session {
     /// Window stack; exactly one window (index `win`) is active.
     windows: Vec<Window>,
     win: usize,
+    /// Forge-chat panes keyed by pane uuid (M8). Chat leaves live in
+    /// the layout like PTY leaves; PTY-specific loops skip them
+    /// (nothing here intersects `panes`).
+    chats: BTreeMap<Uuid, ChatPane>,
 }
 
 impl Session {
@@ -456,6 +471,8 @@ struct Daemon {
     mirror_tx: Option<std::sync::mpsc::Sender<relay::RelayOut>>,
     /// child pids whose Pane was removed before exit — reaped by the poll loop
     orphans: Vec<c_int>,
+    /// forge worker jobs (None when forge is not configured)
+    forge_tx: Option<std::sync::mpsc::Sender<forge::ForgeJob>>,
 }
 
 // ---------- helpers ----------
@@ -598,11 +615,28 @@ fn snapshot_session(s: &Session) -> Option<Frame> {
             lines,
             seq: p.seq,
             cursor: Some(Cursor { x: cx, y: cy, visible: vis }),
+            kind: Some("pty".into()),
+            chat: None,
+            forge_session: None,
         };
         if *pid == s.active {
             active_seq = p.seq;
         }
         snaps.push(snap);
+    }
+    for (pid, cp) in &s.chats {
+        let (cols, rows) = sizes.get(pid).copied().unwrap_or((cp.cols, cp.rows));
+        snaps.push(PaneSnap {
+            id: pid.to_string(),
+            cols,
+            rows,
+            lines: vec![],
+            seq: 0,
+            cursor: None,
+            kind: Some("forge-chat".into()),
+            chat: Some(cp.chat.clone()),
+            forge_session: Some(cp.forge_sid.to_string()),
+        });
     }
     Some(Frame::Snapshot {
         id: Uuid::new_v4().to_string(),
@@ -693,6 +727,7 @@ impl Daemon {
             state_path,
             mirror_tx,
             orphans: Vec::new(),
+            forge_tx: None,
         };
         // register the relay as a client keyed by its read-pipe fd; remote
         // frames arrive there and daemon->remote frames go out via relay_out
@@ -703,6 +738,43 @@ impl Daemon {
                 clog(&format!("relay: enabled (client fd {rfd})"));
             }
         }
+
+        // forge worker: chat-pane polling + sends on a dedicated thread
+        // (blocking HTTP must never stall the poll loop); results come
+        // back as frame lines on a pipe, read like any client below
+        let forge_tx = if let Some(fcfg) = forge::load_forge_config() {
+            // the forge worker gets its OWN pipe pair: worker frames ->
+            // daemon (daemon_r/daemon_w); the second pair is ignored
+            // (make_pipes always returns two)
+            match relay::make_pipes() {
+                Ok(((f_daemon_r, f_daemon_w), (_u1, _u2))) => {
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    forge::spawn_worker(fcfg, f_daemon_w, rx);
+                    let fclient = Client {
+                        stream: None,
+                        relay_out: None,
+                        relay_in: Some(fd_file(f_daemon_r)),
+                        decoder: Decoder::new(),
+                        name: "forge".into(),
+                        attach: None,
+                        scrollback_mode: false,
+                    };
+                    if let Some(rfd) = fclient.relay_in.as_ref().map(|f| f.as_raw_fd()) {
+                        daemon.clients.insert(rfd, fclient);
+                        eprintln!("ranchd: forge: worker started (pipe fd {rfd})");
+                    }
+                    Some(tx)
+                }
+                Err(e) => {
+                    eprintln!("ranchd: forge: disabled: {e}");
+                    None
+                }
+            }
+        } else {
+            eprintln!("ranchd: forge: disabled (no forge_api_key in daemon.toml)");
+            None
+        };
+        daemon.forge_tx = forge_tx;
         Ok(daemon)
     }
 
@@ -784,6 +856,78 @@ impl Daemon {
     }
 
     fn handle_frame(&mut self, from: RawFd, frame: &Frame) {
+        match frame {
+            // client -> forge: hand to the worker thread (blocking HTTP)
+            Frame::ChatSend { session, pane, text, .. } => {
+                let sid = match self.resolve_session(session).map(|s| s.id) {
+                    Some(s) => s,
+                    None => return,
+                };
+                let Ok(pid) = Uuid::parse_str(pane) else { return };
+                if let Some(s) = self.sessions.get(&sid) {
+                    if let Some(cp) = s.chats.get(&pid) {
+                        if let Some(tx) = &self.forge_tx {
+                            let _ = tx.send(forge::ForgeJob::Send {
+                                pane: pid,
+                                forge_sid: cp.forge_sid,
+                                text: text.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+            // forge worker -> clients: broadcast new chat rows to
+            // everyone attached to the session (pipe client has no
+            // attach; the frame carries the session in `session` —
+            // the worker leaves it blank, so resolve from the pane)
+            Frame::Chat { session, pane, .. } if session.is_empty() => {
+                eprintln!("ranchd: forge pipe delivered Chat for pane {pane}");
+                let fsid = Uuid::parse_str(pane).ok();
+                let found = self.sessions.iter().find_map(|(sid, s)| {
+                    s.chats
+                        .iter()
+                        .find(|(pid, cp)| fsid == Some(**pid) || cp.forge_sid.to_string() == *pane)
+                        .map(|(pid, _)| (*sid, *pid))
+                });
+                if let Some((sid, pid)) = found {
+                    let mut filled = frame.clone();
+                    if let Frame::Chat { session, pane, .. } = &mut filled {
+                        *session = sid.to_string();
+                        *pane = pid.to_string();
+                    }
+                    // apply to the local cache + broadcast
+                    if let Some(s) = self.sessions.get_mut(&sid) {
+                        if let Some(cp) = s.chats.get_mut(&pid) {
+                            if let Frame::Chat { msgs, reset, .. } = &filled {
+                                if *reset {
+                                    cp.chat = msgs.clone();
+                                } else {
+                                    for m in msgs {
+                                        if cp.chat.last().map(|l| l.seq) .is_none_or(|ls| m.seq > ls) {
+                                            cp.chat.push(m.clone());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let recipients: Vec<RawFd> = self
+                        .clients
+                        .iter()
+                        .filter(|(_, c)| c.attach == Some(sid))
+                        .map(|(f, _)| *f)
+                        .collect();
+                    for rfd in recipients {
+                        if let Some(c) = self.clients.get_mut(&rfd) {
+                            send_frame(c, &filled);
+                        }
+                    }
+                }
+                return;
+            }
+            _ => {}
+            _ => {}
+        }
         match frame {
             Frame::Hello { id, client, .. } => {
                 eprintln!("ranchd: hello from {client} ({id})");
@@ -971,7 +1115,69 @@ impl Daemon {
                     size: (80, 24),
                     windows: vec![Window::new(Layout::Leaf { pane: Uuid::nil().to_string() }, "0".into())],
                     win: 0,
+                    chats: BTreeMap::new(),
                 };
+                if kind == "forge" {
+                    // first-class agent session: a chat pane bound to a
+                    // fresh forge session (no PTY)
+                    let forge_cfg = forge::load_forge_config();
+                    match forge_cfg
+                        .as_ref()
+                        .map(|cfg| forge::create_forge_session(cfg, &name))
+                        .unwrap_or(Err("forge not configured (set forge_api_key in daemon.toml)".into()))
+                    {
+                        Ok(forge_sid) => {
+                            let pid = Uuid::new_v4();
+                            s.chats.insert(
+                                pid,
+                                ChatPane {
+                                    forge_sid,
+                                    cols: 80,
+                                    rows: 24,
+                                    chat: vec![],
+                                },
+                            );
+                            s.windows[0].layout =
+                                Layout::Leaf { pane: pid.to_string() };
+                            s.active = pid;
+                            eprintln!(
+                                "ranchd: created agent session {name} ({id}) chat pane {pid} -> forge {forge_sid}"
+                            );
+                            // start the poll worker on this pane
+                            if let Some(tx) = &self.forge_tx {
+                                let _ = tx.send(forge::ForgeJob::Watch { pane: pid, forge_sid });
+                            }
+                            let ack = Frame::SessionsAck {
+                                req_id: req_id.clone(),
+                                session: id.to_string(),
+                                pane: pid.to_string(),
+                            };
+                            self.sessions.insert(id, s);
+                            self.write_state();
+                            self.mirror(relay::RelayOut::UpsertSession {
+                                id: id.to_string(),
+                                name,
+                                kind,
+                            });
+                            if let Some(c) = self.clients.get_mut(&from) {
+                                send_frame(c, &ack);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("ranchd: agent session failed: {e}");
+                            if let Some(c) = self.clients.get_mut(&from) {
+                                send_frame(
+                                    c,
+                                    &Frame::Error {
+                                        req_id: Some(req_id.clone()),
+                                        message: e,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    return;
+                }
                     match spawn_pane(&mut s, &kind, cwd.as_deref()) {
                     Ok(pid) => {
                         s.windows[0].layout = Layout::Leaf { pane: pid.to_string() };
@@ -1335,6 +1541,7 @@ impl Daemon {
             | Frame::Scrollback { .. } => {
                 // client->daemon direction: not expected; ignore
             }
+            _ => {}
         }
     }
 }

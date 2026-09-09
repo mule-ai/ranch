@@ -272,14 +272,37 @@ struct PaneView {
     cols: u16,
     rows: u16,
     cursor: Option<(u16, u16, bool)>,
+    /// "pty" | "forge-chat" (M8); None = legacy pty
+    kind: Option<String>,
+    /// conversation for forge-chat panes
+    chat: Vec<ranch_protocol::ChatMsg>,
 }
 
 impl PaneView {
+    fn is_chat(&self) -> bool {
+        self.kind.as_deref() == Some("forge-chat")
+    }
     fn apply_snapshot(&mut self, snap: &ranch_protocol::PaneSnap) {
         self.cols = snap.cols;
         self.rows = snap.rows;
         self.lines = snap.lines.clone();
         self.cursor = snap.cursor.map(|c| (c.x, c.y, c.visible));
+        self.kind = snap.kind.clone();
+        if let Some(chat) = &snap.chat {
+            self.chat = chat.clone();
+        }
+    }
+    /// Apply an append-only chat diff from a `chat` frame.
+    fn apply_chat(&mut self, msgs: &[ranch_protocol::ChatMsg], reset: bool) {
+        if reset {
+            self.chat = msgs.to_vec();
+            return;
+        }
+        for m in msgs {
+            if self.chat.last().map(|l| l.seq).is_none_or(|ls| m.seq > ls) {
+                self.chat.push(m.clone());
+            }
+        }
     }
     fn apply_update(&mut self, cols: u16, rows: u16, rows_upd: &[(u16, String)], cursor: &Option<ranch_protocol::Cursor>) {
         self.cols = cols;
@@ -671,6 +694,8 @@ fn cmd_attach(ref_: &str) {
     // window stack (M5): entries in order + the active window's id
     let mut windows: Vec<ranch_protocol::WindowSnap> = vec![];
     let mut cur_window = String::new();
+    // draft line for the focused forge-chat pane (M8)
+    let mut chat_input = String::new();
     let mut decoder = Decoder::new();
     let mut buf = [0u8; 65536];
     let got_snapshot = std::cell::Cell::new(false);
@@ -771,6 +796,14 @@ fn cmd_attach(ref_: &str) {
                                     sent_resize.set(true);
                                 }
                             }
+                            Frame::Chat { session: csess, pane: cpane, msgs, reset, .. } => {
+                                std::fs::write("/tmp/cli-chat.log", format!("chat frame sess-match={} pane={} n={} reset={}\n", csess == session_id, cpane, msgs.len(), reset)).ok();
+                                if csess == session_id {
+                                    if let Some(pv) = pane_views.get_mut(&cpane) {
+                                        pv.apply_chat(&msgs, reset);
+                                    }
+                                }
+                            }
                             Frame::Update {
                                 session: usess,
                                 pane: upane,
@@ -838,6 +871,7 @@ fn cmd_attach(ref_: &str) {
         let panes_n = panes.len();
         let wins_ref = &windows;
         let curwin_ref = &cur_window;
+        let chat_input_ref = chat_input.clone();
         let sess_id_ref = &session_id;
         let views_ref = &pane_views;
         let layout_ref = &layout;
@@ -878,6 +912,52 @@ fn cmd_attach(ref_: &str) {
 
             let draw_pane = |f: &mut RFrame, pane_id: &str, r: Rect, focused: bool| {
                 let pv = views_ref.get(pane_id);
+                if let Some(pv) = pv {
+                    if pv.is_chat() {
+                        // forge-chat rendering: role-styled conversation,
+                        // bottom input line when focused
+                        let mut li: Vec<Line> = Vec::new();
+                        let w = r.width as usize;
+                        for m in &pv.chat {
+                            let (tag, style, text): (&str, Style, String) = match m.role.as_str() {
+                                "user" => ("❯ ", Style::default().fg(ratatui::style::Color::Green), m.text.clone()),
+                                "tool" => (
+                                    "⚙ ",
+                                    Style::default().add_modifier(Modifier::DIM),
+                                    match (&m.tool_name, m.duration_ms) {
+                                        (Some(n), Some(d)) => format!("{n} ({d}ms)"),
+                                        (Some(n), None) => n.clone(),
+                                        _ => "tool".into(),
+                                    },
+                                ),
+                                _ => ("● ", Style::default(), m.text.clone()),
+                            };
+                            // naive word-wrap at pane width
+                            for (i, chunk) in text.chars().collect::<Vec<_>>().chunks(w.saturating_sub(2).max(1)).map(|c| c.iter().collect::<String>()).enumerate() {
+                                let line_text = if i == 0 { format!("{tag}{chunk}") } else { format!("  {chunk}") };
+                                li.push(Line::from(Span::styled(line_text, style)));
+                            }
+                        }
+                        // input line pinned to the bottom when focused
+                        let input_row = chat_input_ref.clone();
+                        let inp = Line::from(Span::styled(
+                            format!("❯ {input_row}▊"),
+                            Style::default().fg(ratatui::style::Color::Green),
+                        ));
+                        let h = r.height as usize;
+                        let rows_msgs = li.len();
+                        let keep = h.saturating_sub(1);
+                        let drop = rows_msgs.saturating_sub(keep);
+                        let _ = drop;
+                        let visible: Vec<Line> = li.into_iter().skip(rows_msgs.saturating_sub(keep)).collect();
+                        let mut rows: Vec<Line> = visible;
+                        if focused {
+                            rows.push(inp);
+                        }
+                        f.render_widget(ratatui::widgets::Paragraph::new(rows), r);
+                        return;
+                    }
+                }
                 let (lines_src, cx, cy, vis): (&Vec<String>, u16, u16, bool) = match pv {
                     Some(pv) => {
                         let (x, y, v) = pv.cursor.unwrap_or((0, 0, false));
@@ -1445,6 +1525,42 @@ fn cmd_attach(ref_: &str) {
                                     prompt_input.pop();
                                 }
                                 KeyCode::Char(c) => prompt_input.push(c),
+                                _ => {}
+                            }
+                            continue;
+                        }
+                        // forge-chat capture: the focused chat pane takes
+                        // printable keys into its draft line; Enter sends
+                        if pane_views
+                            .get(&active_pane)
+                            .map(|pv| pv.is_chat())
+                            .unwrap_or(false)
+                        {
+                            match key.code {
+                                KeyCode::Enter => {
+                                    let text = chat_input.trim().to_string();
+                                    if !text.is_empty() {
+                                        let f = Frame::ChatSend {
+                                            id: Uuid::new_v4().to_string(),
+                                            client: "attach".into(),
+                                            session: session_id.clone(),
+                                            pane: active_pane.clone(),
+                                            text,
+                                        };
+                                        send_frame(&mut stream, &f).ok();
+                                    }
+                                    chat_input.clear();
+                                }
+                                KeyCode::Backspace => {
+                                    chat_input.pop();
+                                }
+                                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                    chat_input.clear();
+                                }
+                                KeyCode::Esc => {
+                                    chat_input.clear();
+                                }
+                                KeyCode::Char(c) => chat_input.push(c),
                                 _ => {}
                             }
                             continue;

@@ -628,6 +628,32 @@ Rust edition 2024, stable toolchain (matches forge: rustc 1.98).
   Verified e2e over the unix socket: asymmetric 52/28 split, swap,
   geometry traded exactly, shell markers stayed with their panes,
   traversal order rotated, swap-back restored the original geometry.
+- **M8 — first-class forge chat panes (2026-09-09)**: agent sessions
+  are no longer `pi`-in-a-PTY. A `kind:"forge"` session creates a
+  **chat pane** bound to a real forge session (ranchd POSTs
+  `/sessions` with the configured/first profile). Chat panes have no
+  PTY: the conversation lives in forge's `messages` table. A worker
+  thread (`forge.rs`) owns all blocking forge HTTP — it polls
+  `GET /messages` per watched pane (~1.1s), diffs by `sequence`, and
+  writes `chat` frames into a pipe read like any client (the
+  relay-pipe pattern; the worker gets its OWN pipe pair — sharing the
+  relay's pair silently routes agent output to Supabase).
+  `ChatSend` from any client POSTs `POST /messages`. The daemon
+  caches rows per pane (snapshots carry the full conversation,
+  back-compat via optional `kind`/`chat`/`forge_session` on
+  PaneSnap). CLI renders role-tagged wrapped rows (❯ user green,
+  ● assistant, ⚙ tool dim w/ duration) + a bottom input line; typing
+  on a focused chat pane drafts + Enter sends. Phone renders real
+  chat bubbles (user right/green, agent left/dark, tool rows
+  collapsed w/ output preview) + a multiline input row. Verified
+  e2e against a live forge-api (local, FORGE_SESSIONS_DIR patch):
+  create→bind, ChatSend→forge row, poll→chat frame→both clients,
+  snapshot carries history. Forge patch upstreamed: honor
+  `FORGE_SESSIONS_DIR` (12-factor; was hardcoded /forge/sessions,
+  CI-only with_base_path existed). Forge config rides daemon.toml:
+  `forge_url`, `forge_api_key`, `forge_profile_id` (default first
+  profile). Not done: SSE instead of polling; tool-output expansion
+  UI; mule workflow panes.
 - **M5 — windows (2026-09-09)**: tmux-style window stack per session.
   `Session` holds `windows: Vec<Window>` (`Window {id, name, layout}`)
   + active index; the layout ops (`split/kill/swap/resize`) now operate

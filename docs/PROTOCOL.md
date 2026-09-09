@@ -74,7 +74,9 @@ per app install for mobile so reconnects are stable).
                "b":{"k":"Leaf","pane":"<uuid>"}},
     "active_pane": "<uuid>",
     "panes": [ {"id":"<uuid>", "cols":48, "rows":29,
-                 "lines":["…"], "cursor":{"x":12,"y":7,"visible":true}} ]
+                 "lines":["…"], "cursor":{"x":12,"y":7,"visible":true},
+                 "kind":"pty"|"forge-chat",
+                 "chat":[…], "forge_session":"<uuid>"} ]
   }
   ```
   Each pane runs at its own (cols, rows) computed by the daemon from
@@ -133,6 +135,14 @@ per app install for mobile so reconnects are stable).
   pane (used when attaching without a pane, and for UI)
 - **`mule.run`** `{workflow_id, params?}` → spawns/streams a workflow
   pane (§SPEC 8)
+- **`chat.send`** `{session, pane, text}` — send a user message to a
+  **forge-chat pane**. The daemon POSTs to the forge API
+  (`POST /messages`) on its worker thread.
+- **`chat`** `{pane, msgs, reset?}` (daemon → client) — conversation
+  rows for a forge-chat pane: appends in sequence order, or a full
+  replacement when `reset` (snapshot semantics). Rows mirror forge
+  `messages`: `{seq, role: "user"|"assistant"|"tool", text,
+  tool_name?, tool_output?, duration_ms?, created_at?}`.
 - **`error`** — `{"of": "<frame id>", "message": "..."}` for any failed
   request.
 
