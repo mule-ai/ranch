@@ -361,19 +361,22 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
                     }
                     if (focused && c && c.visible && yy === c.y && (blink || pred)) {
                       // reverse-video the cell under the cursor: split spans
-                      // at the cursor cell boundary
+                      // at the cursor cell boundary. Each char keeps its full
+                      // span style (bold/italic/underline included) — dropping
+                      // any of them makes the row visibly restyle on blink.
+                      const charStyle = (sp: SgrSpan): object => ({
+                        color: sp.fg,
+                        backgroundColor: sp.bg,
+                        fontWeight: sp.bold ? "700" : undefined,
+                        fontStyle: sp.italic ? "italic" : undefined,
+                        textDecorationLine: sp.underline ? "underline" : undefined,
+                      });
                       const out: React.ReactNode[] = [];
                       let col = 0;
                       let done = false;
                       spans.forEach((sp, si) => {
                         for (let k = 0; k < sp.text.length; k++) {
-                          if (done) {
-                            out.push(
-                              <Text key={`${si}-${k}`} style={{ color: sp.fg, backgroundColor: sp.bg }}>
-                                {sp.text[k]}
-                              </Text>
-                            );
-                          } else if (col === c!.x) {
+                          if (col === c!.x) {
                             out.push(
                               <Text key={`${si}-${k}`} style={styles.cursor}>
                                 {sp.text[k]}
@@ -382,7 +385,7 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
                             done = true;
                           } else {
                             out.push(
-                              <Text key={`${si}-${k}`} style={{ color: sp.fg, backgroundColor: sp.bg }}>
+                              <Text key={`${si}-${k}`} style={charStyle(sp)}>
                                 {sp.text[k]}
                               </Text>
                             );
