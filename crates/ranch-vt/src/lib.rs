@@ -119,7 +119,11 @@ impl Vt {
         let opts = FormatterOptions {
             size: std::mem::size_of::<FormatterOptions>(),
             emit: 0, // PLAIN
-            unwrap: true,
+            // unwrap merges soft-wrapped lines — that breaks the
+            // one-line-per-grid-row contract row updates depend on (a
+            // full-width TUI line would merge with its neighbor and
+            // shift every row after it)
+            unwrap: false,
             trim: true,
             extra: FormatterTerminalExtra {
                 size: std::mem::size_of::<FormatterTerminalExtra>(),
@@ -185,6 +189,9 @@ impl Vt {
             ghostty_formatter_format_alloc(self.fmt, ptr::null(), &mut buf, &mut len)
         };
         if rc != 0 || buf.is_null() {
+            if std::env::var("RANCH_VT_DEBUG").is_ok() {
+                eprintln!("vt: format_alloc failed rc={rc} buf_null={}", buf.is_null());
+            }
             return Vec::new();
         }
         let text = unsafe { std::slice::from_raw_parts(buf, len) };
@@ -198,6 +205,9 @@ impl Vt {
         let (_, rows) = self.dims();
         let rows = rows as usize;
         let mut lines: Vec<String> = s.lines().map(|l| l.to_string()).collect();
+        if std::env::var("RANCH_VT_DEBUG").is_ok() {
+            eprintln!("vt: format ok raw={} lines={} rows={rows}", s.len(), lines.len());
+        }
         if lines.len() > rows {
             lines.drain(..lines.len() - rows);
         }
@@ -435,5 +445,33 @@ mod tests {
             joined.contains("LINE30"),
             "screen should show the newest line; got:\n{joined}"
         );
+    }
+}
+
+#[cfg(test)]
+mod alt_tests {
+    use super::*;
+
+    #[test]
+    fn alt_screen_content() {
+        let vt = Vt::new(80, 24).unwrap();
+        vt.write(b"\x1b[?1049h"); // enter alt screen
+        vt.write(b"\x1b[2J\x1b[H"); // clear
+        vt.write(b"ALT SCREEN TOP\r\n");
+        vt.write(b"second line\r\n");
+        let screen = vt.screen();
+        eprintln!("alt screen: {:?}", screen);
+        assert!(screen.iter().any(|l| l.contains("ALT SCREEN TOP")), "alt screen content must render; got {:?}", screen);
+    }
+
+    #[test]
+    fn primary_after_alt_return() {
+        let vt = Vt::new(80, 24).unwrap();
+        vt.write(b"PRIMARY\r\n");
+        vt.write(b"\x1b[?1049hALT\r\n");
+        vt.write(b"\x1b[?1049l"); // back to primary
+        let screen = vt.screen();
+        eprintln!("after 1049l: {:?}", screen);
+        assert!(screen.iter().any(|l| l.contains("PRIMARY")));
     }
 }
