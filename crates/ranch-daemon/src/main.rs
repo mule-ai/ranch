@@ -32,7 +32,7 @@ use ranch_protocol::{Cursor, Decoder, Frame, Layout, PaneSnap, SessionMeta};
 use ranch_vt::Vt;
 use uuid::Uuid;
 
-const TICK_MS: i32 = 8;
+const TICK_MS: i32 = 30;
 const SCROLLBACK_CAP: usize = 2000;
 const POLLIN: i16 = 0x001;
 const POLLHUP: i16 = 0x00200;
