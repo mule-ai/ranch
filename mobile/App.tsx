@@ -22,13 +22,6 @@ export default function App() {
   const [fontsLoaded] = useFonts({
     "JetBrainsMono NF Mono": require("./assets/fonts/JetBrainsMonoNerdFontMono-Regular.ttf"),
   });
-  if (!fontsLoaded) {
-    return (
-      <View style={{ flex: 1, backgroundColor: "#101014", justifyContent: "center", alignItems: "center" }}>
-        <ActivityIndicator color="#4ade80" />
-      </View>
-    );
-  }
   // screens: login → (email fallback lives on login screen) → machines → sessions → terminal
   const [authed, setAuthed] = useState<boolean | null>(null);
   const [machine, setMachine] = useState<Machine | null>(null);
@@ -113,6 +106,14 @@ export default function App() {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [machine?.id]);
+
+  if (!fontsLoaded) {
+    return (
+      <View style={{ flex: 1, backgroundColor: "#101014", justifyContent: "center", alignItems: "center" }}>
+        <ActivityIndicator color="#4ade80" />
+      </View>
+    );
+  }
 
   if (authed === null) {
     return (
