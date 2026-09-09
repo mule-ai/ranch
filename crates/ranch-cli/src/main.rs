@@ -670,6 +670,11 @@ fn cmd_attach(ref_: &str) {
     let prefix_mode = std::cell::Cell::new(false);
     let session_list: std::rc::Rc<std::cell::RefCell<Vec<String>>> =
         std::rc::Rc::new(std::cell::RefCell::new(vec![]));
+    // prefix-s toggles the docked-left session sidebar (modal for keys:
+    // up/down select, enter attaches, esc closes). While open the
+    // terminal area shrinks by SIDEBAR_W columns and the session is
+    // resized to fit.
+    const SIDEBAR_W: u16 = 26;
     let picker = std::cell::Cell::new(false);
     let picker_sel = std::cell::Cell::new(0usize);
     #[derive(Clone, Copy, PartialEq)]
@@ -739,11 +744,12 @@ fn cmd_attach(ref_: &str) {
                                 got_snapshot.set(true);
                                 // tell the daemon our real terminal size once
                                 if !sent_resize.get() && !session.is_empty() {
+                                    let sb = if picker.get() { SIDEBAR_W } else { 0 };
                                     let rf = Frame::Resize {
                                         id: Uuid::new_v4().to_string(),
                                         client: "attach".into(),
                                         session: session.clone(),
-                                        cols,
+                                        cols: cols.saturating_sub(sb),
                                         rows,
                                     };
                                     send_frame(&mut stream, &rf).ok();
@@ -811,6 +817,7 @@ fn cmd_attach(ref_: &str) {
         let screen_ref = &screen;
         let prefix_now = prefix_mode.get();
         let picker_now = picker.get();
+        let picker_sel_now = picker_sel.get();
         let prompt_now = prompt.get();
         let meta_ref = &sessions_meta;
         let panes_n = panes.len();
@@ -847,7 +854,9 @@ fn cmd_attach(ref_: &str) {
                         },
                     }
                 }
-                walk(ly, 0, 0, term_area.width, term_area.height, &mut rects);
+                let x0 = if picker_now { SIDEBAR_W.min(term_area.width) } else { 0 };
+                let w0 = term_area.width.saturating_sub(x0);
+                walk(ly, x0, 0, w0, term_area.height, &mut rects);
             }
 
             let draw_pane = |f: &mut RFrame, pane_id: &str, r: Rect, focused: bool| {
@@ -984,24 +993,49 @@ fn cmd_attach(ref_: &str) {
                     Rect::new(0, area.height - 1, area.width, 1));
             }
 
-            // session picker overlay (prefix-s)
-            if picker_now && !meta_ref.is_empty() {
-                let h = (meta_ref.len() as u16 + 2).min(area.height.saturating_sub(2));
-                let w = 50.min(area.width);
-                let x = area.width.saturating_sub(w) / 2;
-                let y = area.height.saturating_sub(h) / 2;
-                let mut items: Vec<Line> = vec![
-                    Line::from(Span::styled(" switch session (enter: select, esc: close)",
-                        Style::default().add_modifier(Modifier::REVERSED)))];
+            // docked session sidebar (prefix-s): sessions with their pane
+            // trees; the selected session highlights, enter attaches
+            if picker_now {
+                let sbw = SIDEBAR_W.min(area.width);
+                let mut items: Vec<Line> = Vec::new();
                 for (i, s2) in meta_ref.iter().enumerate() {
-                    let marker = if s2.id == *sess_id_ref { "* " } else { "  " };
-                    let sel = i == 0;
-                    let style = if sel { Style::default().add_modifier(Modifier::REVERSED) } else { Style::default() };
-                    items.push(Line::from(Span::styled(format!("{marker}{:<20} {} pane(s)", s2.name, s2.panes.len()), style)));
+                    let cur = s2.id == *sess_id_ref;
+                    let sel = i == picker_sel_now;
+                    let mut style = Style::default();
+                    if sel {
+                        style = style.add_modifier(Modifier::REVERSED);
+                    } else if cur {
+                        style = style.add_modifier(Modifier::BOLD);
+                    }
+                    let marker = if cur { "*" } else { " " };
+                    items.push(Line::from(Span::styled(
+                        format!("{marker} {} ({}p)", s2.name, s2.panes.len()),
+                        style,
+                    )));
+                    // pane tree under the current session
+                    if cur {
+                        for (pi, p2) in s2.panes.iter().enumerate() {
+                            let active = *p2 == s2.active_pane;
+                            let st = if active {
+                                Style::default().fg(ratatui::style::Color::Green)
+                            } else {
+                                Style::default().add_modifier(Modifier::DIM)
+                            };
+                            items.push(Line::from(Span::styled(
+                                format!("  {} pane {}", if active { ">" } else { "·" }, pi + 1),
+                                st,
+                            )));
+                        }
+                    }
                 }
-                f.render_widget(ratatui::widgets::Block::bordered().title("sessions"),
-                    Rect::new(x, y, w, h));
-                f.render_widget(Paragraph::new(items), Rect::new(x + 1, y + 1, w.saturating_sub(2), h.saturating_sub(2)));
+                let block = ratatui::widgets::Block::bordered()
+                    .title("sessions")
+                    .border_style(Style::default().fg(ratatui::style::Color::Green));
+                f.render_widget(block, Rect::new(0, 0, sbw, term_area.height));
+                f.render_widget(
+                    Paragraph::new(items),
+                    Rect::new(1, 1, sbw.saturating_sub(2), term_area.height.saturating_sub(2)),
+                );
             }
 
             // prompt line (rename / command)
@@ -1020,17 +1054,72 @@ fn cmd_attach(ref_: &str) {
             if let Ok(event) = read_event() {
                 match event {
                     CEvent::Resize(c, r) => {
+                        let sb = if picker.get() { SIDEBAR_W } else { 0 };
                         let f = Frame::Resize {
                             id: Uuid::new_v4().to_string(),
                             client: "attach".into(),
                             session: session_id.clone(),
-                            cols: c,
+                            cols: c.saturating_sub(sb),
                             rows: r,
                         };
                         send_frame(&mut stream, &f).ok();
                     }
                     CEvent::Key(key) => {
                         if key.kind != KeyEventKind::Press {
+                            continue;
+                        }
+                        // sidebar modal: navigation + attach while open
+                        if picker.get() {
+                            match key.code {
+                                KeyCode::Char('q') | KeyCode::Esc => {
+                                    picker.set(false);
+                                    let rf = Frame::Resize {
+                                        id: Uuid::new_v4().to_string(),
+                                        client: "attach".into(),
+                                        session: session_id.clone(),
+                                        cols: screen.cols,
+                                        rows: screen.rows,
+                                    };
+                                    send_frame(&mut stream, &rf).ok();
+                                }
+                                KeyCode::Up | KeyCode::Char('k') => {
+                                    let sel = picker_sel.get();
+                                    if sel > 0 {
+                                        picker_sel.set(sel - 1);
+                                    }
+                                }
+                                KeyCode::Down | KeyCode::Char('j') => {
+                                    let sel = picker_sel.get();
+                                    if sel + 1 < sessions_meta.len() {
+                                        picker_sel.set(sel + 1);
+                                    }
+                                }
+                                KeyCode::Enter => {
+                                    if let Some(target) =
+                                        sessions_meta.get(picker_sel.get()).map(|m| m.id.clone())
+                                    {
+                                        picker.set(false);
+                                        let rf = Frame::Resize {
+                                            id: Uuid::new_v4().to_string(),
+                                            client: "attach".into(),
+                                            session: session_id.clone(),
+                                            cols: screen.cols,
+                                            rows: screen.rows,
+                                        };
+                                        send_frame(&mut stream, &rf).ok();
+                                        let af = Frame::Attach {
+                                            id: Uuid::new_v4().to_string(),
+                                            client: "attach".into(),
+                                            session: target,
+                                            pane: None,
+                                        };
+                                        send_frame(&mut stream, &af).ok();
+                                        screen.reset_blank();
+                                        sent_resize.set(false);
+                                    }
+                                }
+                                _ => {}
+                            }
                             continue;
                         }
                         // tmux-style prefix handling: Ctrl-B opens the
@@ -1138,9 +1227,20 @@ fn cmd_attach(ref_: &str) {
                                     send_frame(&mut stream, &f).ok();
                                     continue;
                                 }
-                                // s → session picker overlay
+                                // s → toggle the docked session sidebar
                                 KeyCode::Char('s') => {
                                     picker.set(!picker.get());
+                                    let sb = if picker.get() { SIDEBAR_W } else { 0 };
+                                    let rf = Frame::Resize {
+                                        id: Uuid::new_v4().to_string(),
+                                        client: "attach".into(),
+                                        session: session_id.clone(),
+                                        cols: screen.cols.saturating_sub(sb),
+                                        rows: screen.rows,
+                                    };
+                                    send_frame(&mut stream, &rf).ok();
+                                    picker_sel.set(0);
+                                    refresh_sessions(&mut stream);
                                     continue;
                                 }
                                 // Ctrl+arrows → resize the focused pane's split

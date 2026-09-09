@@ -630,8 +630,18 @@ Rust edition 2024, stable toolchain (matches forge: rustc 1.98).
   traversal order rotated, swap-back restored the original geometry.
   Test lesson: polling snapshots on a shared socket returns stale
   frames (updates + old snapshots queue ahead); fresh-connection
-  snapshots read clean. Not done: session-tree sidebar (flat picker
-  remains), windows.
+  snapshots read clean.
+- **M4.2 — session sidebar (2026-09-09)**: the M2.7 picker overlay is
+  now a **docked-left sidebar** (prefix `s`, 26 cols, full height)
+  showing every session with a pane tree under the current one (green
+  `>` on the active pane). Modal keys while open: `j/k`/arrows move,
+  enter attaches (closes + re-resizes), `esc`/`q` closes. Opening
+  shrinks the session by 26 columns (Resize → daemon reflows every
+  pane), closing restores; `CEvent::Resize` and the initial resize
+  apply the same offset while open. Verified in a real PTY: tree
+  renders both sessions, j + enter switches to the other session
+  (marker echoes prove the attach), esc closes, client stays up.
+  Not done: windows.
 - **M3 — mobile app verified on device (2026-09-08)**: Expo Go on
   Android, end-to-end. Google OAuth through the system browser (the
   `exp://**` URI-allow-list entry is what makes the final redirect hop
