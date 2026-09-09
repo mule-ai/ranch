@@ -63,7 +63,7 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
   panesRef.current = panes;
 
   useEffect(() => {
-    relay.onFrame = (f: Frame) => {
+    const unlisten = relay.onFrame((f: Frame) => {
       switch (f.t) {
         case "HelloOk":
           setConn("online");
@@ -169,7 +169,7 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
           setConn(`error: ${f.message}`);
           break;
       }
-    };
+    });
     relay.onStatus = setConn;
     // hello + attach + resize, retried every 3s until the first
     // snapshot lands (the daemon may be mid-reconnect)
@@ -198,7 +198,7 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
       clearInterval(retryTimer);
       clearInterval(resyncTimer);
       relay.send({ t: "Detach", id: nextId(), client: "mobile" } as Frame);
-      relay.onFrame = () => {};
+      unlisten();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId]);
@@ -585,7 +585,7 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
         <View style={{ height: 0 }} />
       ) : (
         <View style={styles.keys}>
-          {["Enter", "Ctrl-C", "Ctrl-D", "Ctrl-L", "Tab", "Esc", "↑", "↓", "←", "→", "hist"].map((k) => (
+          {["←", "↑", "↓", "→", "Enter", "Esc", "Tab", "Ctrl-C", "Ctrl-D", "Ctrl-L", "hist"].map((k) => (
             <Pressable
               key={k}
               style={styles.key}
@@ -689,7 +689,8 @@ const styles = StyleSheet.create({
   toolOutFull: { color: "#8b8b96", fontSize: 11, fontFamily: "JetBrainsMono NF Mono" },
   chatInputRow: {
     flexDirection: "row", borderTopWidth: 1, borderTopColor: "#23232c",
-    padding: 8, gap: 8, alignItems: "flex-end",
+    padding: 8, paddingTop: 10, paddingBottom: 30, gap: 8,
+    alignItems: "flex-end",
   },
   chatInput: {
     flex: 1, backgroundColor: "#16161c", borderRadius: 10, color: "#f3f4f6",
@@ -707,7 +708,10 @@ const styles = StyleSheet.create({
     position: "absolute", opacity: 0.01, height: 1, width: 1,
     left: 0, bottom: 0,
   },
-  keys: { flexDirection: "row", gap: 6, paddingHorizontal: 8, paddingBottom: 28 },
+  keys: {
+    flexDirection: "row", flexWrap: "wrap", gap: 6,
+    paddingHorizontal: 8, paddingBottom: 28,
+  },
   key: { backgroundColor: "#1f2430", borderRadius: 6, paddingVertical: 6, paddingHorizontal: 10 },
   keyText: { color: "#9ca3af", fontSize: 12 },
   cursor: { backgroundColor: "#d1d5db", color: "#101014" },

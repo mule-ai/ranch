@@ -15,7 +15,7 @@
 
 use ranch_protocol::{encode_frame, ChatMsg, Frame};
 use std::io::{BufRead as _, Write as _};
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering, AtomicU64};
 use std::sync::mpsc::RecvError;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -84,6 +84,9 @@ struct WatchState {
     /// dedupes by sequence server-side too)
     last_seq: AtomicI64,
     stop: AtomicBool,
+    /// bumped on every "working" signal; delayed idle timers no-op if
+    /// the generation moved on (a new turn started)
+    turn_gen: AtomicU64,
 }
 
 /// Shared pipe writer (SSE threads + job thread all emit frames).
@@ -220,6 +223,7 @@ fn handle_event(state: &Arc<WatchState>, cfg: &ForgeConfig, w: &PipeWriter, name
             // a user row means the agent took the message; it works
             // until turn_ended. Clients show the working indicator.
             if msg.role == "user" {
+                state.turn_gen.fetch_add(1, Ordering::Relaxed);
                 write_agent_status(w, state.pane, "working");
             }
             write_frame(
@@ -234,8 +238,24 @@ fn handle_event(state: &Arc<WatchState>, cfg: &ForgeConfig, w: &PipeWriter, name
             );
         }
         "turn_ended" => {
-            // agent finished the turn — clear the working indicator
-            write_agent_status(w, state.pane, "idle");
+            // agent finished the turn — but the assistant's message rows
+            // typically land a beat AFTER turn_ended. Clear the working
+            // indicator on a short delay so clients show the reply with
+            // the indicator still up. A new turn bumps `turn_gen`, which
+            // cancels a stale timer.
+            let state = state.clone();
+            let w = w.clone();
+            let pane = state.pane;
+            let before = state.turn_gen.load(Ordering::Relaxed);
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(2500));
+                if state.stop.load(Ordering::Relaxed)
+                    || state.turn_gen.load(Ordering::Relaxed) != before
+                {
+                    return; // cancelled: a new turn started
+                }
+                write_agent_status(&w, pane, "idle");
+            });
         }
         "heartbeat" | "lagged" => {
             // lagged: forge already backfilled the missed rows as
@@ -285,7 +305,8 @@ pub fn spawn_worker(
                             forge_sid,
                             last_seq: AtomicI64::new(0),
                             stop: AtomicBool::new(false),
-                        });
+                            turn_gen: AtomicU64::new(0),
+            });
                         let t_cfg = ForgeConfig {
                             base: cfg.base.clone(),
                             key: cfg.key.clone(),

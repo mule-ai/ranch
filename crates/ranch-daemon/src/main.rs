@@ -1805,23 +1805,10 @@ fn main() {
             }
         }
 
-        // --- reap orphaned pane children (killed panes/sessions) ---
-        if !daemon.orphans.is_empty() {
-            let mut status: c_int = 0;
-            daemon.orphans.retain(|&pid| {
-                let w = unsafe { waitpid(pid, &mut status, WNOHANG) };
-                if w == pid {
-                    eprintln!("ranchd: reaped orphan child {pid}");
-                    return false; // reaped — drop
-                }
-                // ECHILD => already gone; WNOHANG 0 => still running; keep both
-                !(w == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD))
-            });
-        }
-
         // --- child liveness + tick: coalesce dirty panes into updates ---
         let mut updates: Vec<Frame> = Vec::new();
-        for (_sid, s) in daemon.sessions.iter_mut() {
+        let mut died: Vec<(Uuid, Uuid)> = Vec::new();
+        for (sid, s) in daemon.sessions.iter_mut() {
             let alive = s.panes.values().any(|pp| !pp.dead);
             for (pid, p) in s.panes.iter_mut() {
                 if !p.dead {
@@ -1830,6 +1817,7 @@ fn main() {
                     if w == p.child {
                         p.dead = true;
                         eprintln!("ranchd: pane {pid} ({}:{}) child exited", s.name, s.id);
+                        died.push((*sid, *pid));
                     }
                 }
                 if p.dirty && alive {
@@ -1900,6 +1888,55 @@ fn main() {
                     }
                 }
             }
+        }
+
+        // exited children close their pane (tmux semantics: shell exit
+        // = pane gone; last pane = session gone)
+        for (sid, pid) in died {
+            let Some(s) = daemon.sessions.get_mut(&sid) else { continue };
+            if let Some(p) = s.panes.remove(&pid) {
+                daemon.orphans.push(p.child);
+            }
+            let gone_last = s.remove_pane_everywhere(&pid.to_string());
+            s.apply_sizes();
+            if gone_last || s.panes.is_empty() {
+                eprintln!("ranchd: last pane exited, killing session {}", s.name);
+                daemon.sessions.remove(&sid);
+                daemon.write_state();
+                daemon.mirror(relay::RelayOut::DeleteSession { id: sid.to_string() });
+                let gone = Frame::Meta {
+                    session: sid.to_string(),
+                    pane: None,
+                    kind: "exited".into(),
+                    status: Some("session ended".into()),
+                };
+                let recipients: Vec<RawFd> = daemon.clients.iter().map(|(f, _)| *f).collect();
+                for rfd in recipients {
+                    if let Some(c) = daemon.clients.get_mut(&rfd) {
+                        if c.attach == Some(sid) {
+                            c.attach = None;
+                        }
+                        send_frame(c, &gone);
+                    }
+                }
+            } else {
+                daemon.write_state();
+                daemon.resnap(&sid);
+            }
+        }
+
+        // --- reap orphaned pane children (killed panes/sessions) ---
+        if !daemon.orphans.is_empty() {
+            let mut status: c_int = 0;
+            daemon.orphans.retain(|&pid| {
+                let w = unsafe { waitpid(pid, &mut status, WNOHANG) };
+                if w == pid {
+                    eprintln!("ranchd: reaped orphan child {pid}");
+                    return false; // reaped — drop
+                }
+                // ECHILD => already gone; WNOHANG 0 => still running; keep both
+                !(w == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD))
+            });
         }
 
         // --- shutdown ---

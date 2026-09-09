@@ -10,7 +10,13 @@ export type FrameHandler = (f: Frame) => void;
 export class Relay {
   channel: RealtimeChannel | null = null;
   machineId: string;
-  onFrame: FrameHandler = () => {};
+  /** frame listeners — screens subscribe/unsubscribe instead of
+   *  overwriting each other's handler (App list + Terminal) */
+  private listeners = new Set<FrameHandler>();
+  onFrame(handler: FrameHandler): () => void {
+    this.listeners.add(handler);
+    return () => this.listeners.delete(handler);
+  }
   /** fired every time the channel reaches SUBSCRIBED (initial + reconnects) */
   onReady: () => void = () => {};
   onStatus: (s: string) => void = () => {};
@@ -52,7 +58,7 @@ export class Relay {
           try {
             const assembled = JSON.parse(entry.parts.join("")) as Frame;
             if (assembled && typeof assembled === "object" && "t" in assembled) {
-              this.onFrame(assembled);
+              for (const h of this.listeners) h(assembled);
             }
           } catch {
             // torn batch — the seq-gap / re-attach path recovers
@@ -60,7 +66,7 @@ export class Relay {
         }
         return;
       }
-      this.onFrame(f);
+      for (const h of this.listeners) h(f);
     });
 
     this.onStatus("connecting…");

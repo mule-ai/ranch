@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useState, useRef} from "react";
 import { useFonts } from "expo-font";
 import {
   ActivityIndicator,
@@ -33,6 +33,12 @@ export default function App() {
   const [newName, setNewName] = useState("");
   // session kind for the create row: shell or forge (agent running pi)
   const [newKind, setNewKind] = useState<"shell" | "forge">("shell");
+  // refs mirror the states for the frame handler, whose effect never
+  // re-runs (deps: machine id only) — stale closure otherwise
+  const nameRef = useRef(newName);
+  nameRef.current = newName;
+  const kindRef = useRef(newKind);
+  kindRef.current = newKind;
   const [err, setErr] = useState("");
   // keyboard inset: edge-to-edge Android doesn't lift bottom inputs, so
   // pad the sessions screen by the measured keyboard height
@@ -68,6 +74,7 @@ export default function App() {
     if (!machine) return;
     let r: Relay | null = null;
     let retryTimer: ReturnType<typeof setInterval> | null = null;
+    let unlisten: (() => void) | null = null;
     (async () => {
       setSessions(null);
       setErr("");
@@ -83,7 +90,7 @@ export default function App() {
           if (!gotHello) hello();
         }, 3000);
       };
-      r.onFrame = (f: Frame) => {
+      unlisten = r.onFrame((f: Frame) => {
         switch (f.t) {
           case "HelloOk":
             gotHello = true;
@@ -97,7 +104,7 @@ export default function App() {
             // created via the sessions screen → attach to it
             setSessions((prev) => [
               ...(prev ?? []),
-              { id: f.session, name: newName || f.session.slice(0, 8), kind: newKind, active_pane: f.pane, panes: [f.pane] },
+              { id: f.session, name: nameRef.current || f.session.slice(0, 8), kind: kindRef.current, active_pane: f.pane, panes: [f.pane] },
             ]);
             setNewName("");
             break;
@@ -105,8 +112,7 @@ export default function App() {
             setErr(f.message);
             break;
         }
-      };
-      setRelay(r);
+      });
       try {
         await r.join();
       } catch (e: any) {
@@ -116,6 +122,7 @@ export default function App() {
       }
     })();
     return () => {
+      unlisten?.();
       if (retryTimer) clearInterval(retryTimer);
       r?.leave();
       setRelay(null);
