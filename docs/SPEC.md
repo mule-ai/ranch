@@ -652,7 +652,17 @@ Rust edition 2024, stable toolchain (matches forge: rustc 1.98).
   `FORGE_SESSIONS_DIR` (12-factor; was hardcoded /forge/sessions,
   CI-only with_base_path existed). Forge config rides daemon.toml:
   `forge_url`, `forge_api_key`, `forge_profile_id` (default first
-  profile). - **M8.3 — agents anchored to real directories (2026-09-09)**: forge
+  profile). - **M8.4 — non-fatal error feedback (2026-09-09)**: a failed agent
+  split (forge down) used to `die()` the whole attach client — "prefix
+  a doesn't work" with zero feedback. Now: attach-refusal errors
+  (before the first snapshot) stay fatal; every other daemon error
+  flashes in the status bar for 4s (⚠ message) and the TUI lives on.
+  Also: forge-api now runs as a systemd **user service**
+  (`~/.config/systemd/user/forge-api.service`, enabled — no more
+  nohup'd test instance; sessions dir moved to
+  `~/.local/state/forge/sessions`). Verified: forge down → flash +
+  survive; forge recovers → prefix-a succeeds in the same session.
+- **M8.3 — agents anchored to real directories (2026-09-09)**: forge
   (patch upstreamed, `944c890`) gains `POST /sessions {working_dir?}`
   (migration 014, durable column): anchored sessions run the agent
   directly in an existing directory — no per-session tree — and

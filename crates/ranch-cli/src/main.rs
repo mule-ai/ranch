@@ -722,6 +722,9 @@ fn cmd_attach(ref_: &str) {
     let mut cur_window = String::new();
     // draft line for the focused forge-chat pane (M8)
     let mut chat_input = String::new();
+    // transient error flash (status bar) — errors are feedback, not fatal
+    let err_flash: std::cell::Cell<Option<(std::time::Instant, String)>> =
+        std::cell::Cell::new(None);
     let mut decoder = Decoder::new();
     let mut buf = [0u8; 65536];
     let got_snapshot = std::cell::Cell::new(false);
@@ -887,9 +890,18 @@ fn cmd_attach(ref_: &str) {
                                 eprintln!("ranch: {s}");
                             }
                             Frame::Error { message, .. } => {
-                                restore();
-                                drop(term);
-                                die(&format!("attach failed: {message}"));
+                                // attach-refusal errors are fatal; request
+                                // errors (split/agent/etc.) just flash
+                                let attach_phase = !got_snapshot.get();
+                                if attach_phase {
+                                    restore();
+                                    drop(term);
+                                    die(&format!("attach failed: {message}"));
+                                }
+                                err_flash.set(Some((
+                                    std::time::Instant::now(),
+                                    message.clone(),
+                                )));
                             }
                             _ => {}
                         }
@@ -911,6 +923,14 @@ fn cmd_attach(ref_: &str) {
         let wins_ref = &windows;
         let curwin_ref = &cur_window;
         let chat_input_ref = chat_input.clone();
+        let flash_ref = &err_flash;
+        // expire old flashes (4s); Cell<Option<(Instant, String)>> is
+        // non-Copy so expiry works by take + conditional restore
+        if let Some((t, m)) = flash_ref.take() {
+            if t.elapsed() <= std::time::Duration::from_secs(4) {
+                flash_ref.set(Some((t, m)));
+            }
+        }
         let sess_id_ref = &session_id;
         let views_ref = &pane_views;
         let layout_ref = &layout;
@@ -1129,7 +1149,17 @@ fn cmd_attach(ref_: &str) {
                     }
                 }).collect::<Vec<_>>().join(" ");
                 let winlist = if winlist.is_empty() { String::new() } else { format!("  {winlist} ") };
-                let status = format!(" ranch  {nowix}{winlist} {panes_n} pane{} {} ",
+                let flash_txt = match flash_ref.take() {
+                    Some((t, m)) => {
+                        let keep = t.elapsed() <= std::time::Duration::from_secs(4);
+                        if keep {
+                            flash_ref.set(Some((t, m.clone())));
+                        }
+                        if keep { format!("  ⚠ {m} ") } else { String::new() }
+                    }
+                    None => String::new(),
+                };
+                let status = format!(" ranch  {nowix}{winlist} {panes_n} pane{} {}{flash_txt}",
                     if panes_n == 1 { "" } else { "s" }, pfx);
                 let bar_style = Style::default().add_modifier(Modifier::REVERSED);
                 let bar = Line::from(Span::styled(format!("{:^width$}", status, width = area.width as usize), bar_style));
