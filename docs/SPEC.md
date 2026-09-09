@@ -652,7 +652,17 @@ Rust edition 2024, stable toolchain (matches forge: rustc 1.98).
   `FORGE_SESSIONS_DIR` (12-factor; was hardcoded /forge/sessions,
   CI-only with_base_path existed). Forge config rides daemon.toml:
   `forge_url`, `forge_api_key`, `forge_profile_id` (default first
-  profile). - **M8.1 — SSE + tap-to-expand (2026-09-09)**: the forge worker now
+  profile). - **M8.2 — agent spawning everywhere (2026-09-09)**: `ranch agent
+  [name] [dir]` now auto-attaches when interactive (scripts keep
+  getting the id). Dashboard: `a` prompts for an agent name, creates
+  the forge session, attaches. In-session TUI: `prefix-a` splits the
+  focused pane with a NEW agent chat pane (PaneSplit gains optional
+  `kind`; chat pane focused immediately — watch the agent beside your
+  shell), and `:agent <name>` creates + attaches a full agent session
+  (the attach loop now follows SessionsAcks with an Attach, the same
+  flow as sidebar switching). Verified e2e: split → chat pane renders
+  → typed message reaches forge; :agent → create → switch → chat.
+- **M8.1 — SSE + tap-to-expand (2026-09-09)**: the forge worker now
   streams `GET /sessions/{id}/events?since=` (one SSE thread per
   watched forge session, shared pipe writer, reconnect with
   exponential backoff 1→5s; `since=` + a last_seq high-water mark

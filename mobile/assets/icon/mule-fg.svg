@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <g fill="#4ade80" stroke="#4ade80" stroke-width="28" stroke-linejoin="round" stroke-linecap="round">
+    <!-- ears: long, mule-tall, slight outward tilt -->
+    <ellipse cx="352" cy="330" rx="64" ry="168" transform="rotate(-14 352 330)"/>
+    <ellipse cx="672" cy="330" rx="64" ry="168" transform="rotate(14 672 330)"/>
+    <!-- head: broad crown tapering to a long muzzle -->
+    <path d="M 330 400
+             L 694 400
+             L 676 560
+             Q 664 700 560 780
+             L 464 780
+             Q 360 700 348 560
+             Z"/>
+  </g>
+  <!-- ranch nod: muzzle slot reads as a terminal block cursor -->
+  <rect x="432" y="600" width="160" height="130" rx="18" fill="#0a0a0e"/>
+  <rect x="464" y="632" width="96" height="66" rx="10" fill="#4ade80"/>
+</svg>

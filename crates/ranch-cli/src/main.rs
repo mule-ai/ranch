@@ -116,7 +116,7 @@ fn frame_matches(f: &Frame, tag: &str) -> bool {
 // ---------- commands ----------
 
 fn cmd_new(name: Option<String>, kind: Option<String>, cwd: Option<String>) {
-    one_shot(
+    let f = one_shot(
         |req_id| Frame::SessionsCreate {
             req_id: req_id.to_string(),
             name,
@@ -125,11 +125,19 @@ fn cmd_new(name: Option<String>, kind: Option<String>, cwd: Option<String>) {
         },
         "ack",
         |f| match f {
-            Frame::SessionsAck { session, pane, .. } => println!("session {session} pane {pane}"),
             Frame::Error { message, .. } => eprintln!("error: {message}"),
             _ => {}
         },
     );
+    // interactive use: drop straight into the new session; scripts
+    // (non-tty) keep getting the id printed
+    if let Frame::SessionsAck { session, .. } = f {
+        if libc_isatty() {
+            cmd_attach(&session);
+            return;
+        }
+        println!("session {session}");
+    }
 }
 
 fn cmd_ls() {
@@ -214,6 +222,7 @@ fn cmd_split(ref_: &str) {
             session: ref_.to_string(),
             pane: String::new(),
             dir: 0,
+            kind: None,
         },
         "ack",
         |f| match f {
@@ -506,7 +515,7 @@ fn cmd_dashboard() -> Option<String> {
             }
             lines.push(Line::raw(""));
             lines.push(Line::raw(
-                " enter: attach   c: new   n: new (named)   k: kill   r: rename   q: quit",
+                " enter: attach   c: new   n: new (named)   a: new agent   k: kill   r: rename   q: quit",
             ));
             if !status_ref.is_empty() {
                 lines.push(Line::from(Span::styled(
@@ -517,6 +526,7 @@ fn cmd_dashboard() -> Option<String> {
             if let Some(kind) = input_ref {
                 let label = match kind {
                     "new" => "new session name (empty = auto): ",
+                    "agent" => "agent name (runs pi via forge): ",
                     _ => "rename to: ",
                 };
                 lines.push(Line::from(Span::styled(
@@ -556,6 +566,18 @@ fn cmd_dashboard() -> Option<String> {
                                     req_id: Uuid::new_v4().to_string(),
                                     name: if text.is_empty() { None } else { Some(text) },
                                     kind: None,
+                                    cwd: None,
+                                };
+                                send_frame(&mut stream, &f).ok();
+                                input = None;
+                                input_text.clear();
+                                // SessionsAck handler attaches
+                            }
+                            "agent" => {
+                                let f = Frame::SessionsCreate {
+                                    req_id: Uuid::new_v4().to_string(),
+                                    name: if text.is_empty() { None } else { Some(text) },
+                                    kind: Some("forge".into()),
                                     cwd: None,
                                 };
                                 send_frame(&mut stream, &f).ok();
@@ -615,6 +637,10 @@ fn cmd_dashboard() -> Option<String> {
                 }
                 KeyCode::Char('n') => {
                     input = Some("new");
+                    input_text.clear();
+                }
+                KeyCode::Char('a') => {
+                    input = Some("agent");
                     input_text.clear();
                 }
                 KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -742,6 +768,19 @@ fn cmd_attach(ref_: &str) {
                                 *session_list.borrow_mut() =
                                     sessions.iter().map(|s| s.id.clone()).collect();
                                 sessions_meta.clone_from(&sessions);
+                            }
+                            Frame::SessionsAck { session: new_sess, .. } => {
+                                // a create from this client (prompt :agent)
+                                // — follow the ack into the new session
+                                let af = Frame::Attach {
+                                    id: Uuid::new_v4().to_string(),
+                                    client: "attach".into(),
+                                    session: new_sess.clone(),
+                                    pane: None,
+                                };
+                                send_frame(&mut stream, &af).ok();
+                                screen.reset_blank();
+                                sent_resize.set(false);
                             }
                             Frame::Snapshot {
                                 session,
@@ -1334,6 +1373,7 @@ fn cmd_attach(ref_: &str) {
                                         session: session_id.clone(),
                                         pane: active_pane.clone(),
                                         dir: if key.code == KeyCode::Char('%') { 1 } else { 0 },
+                                        kind: None,
                                     };
                                     send_frame(&mut stream, &f).ok();
                                     continue;
@@ -1422,6 +1462,19 @@ fn cmd_attach(ref_: &str) {
                                     }
                                     continue;
                                 }
+                                // a → agent split: chat pane bound to a new
+                                // forge session, focused immediately
+                                KeyCode::Char('a') => {
+                                    let f = Frame::PaneSplit {
+                                        req_id: Uuid::new_v4().to_string(),
+                                        session: session_id.clone(),
+                                        pane: active_pane.clone(),
+                                        dir: 1,
+                                        kind: Some("forge".into()),
+                                    };
+                                    send_frame(&mut stream, &f).ok();
+                                    continue;
+                                }
                                 // { / } → swap focused pane with previous / next
                                 // pane in layout order (tmux swap-pane semantics)
                                 KeyCode::Char('{') | KeyCode::Char('}') => {
@@ -1501,7 +1554,19 @@ fn cmd_attach(ref_: &str) {
                                                 }
                                             }
                                             Prompt::Command => {
-                                                // minimal: :kill, :detach
+                                                // minimal: :agent <name>, :kill, :detach
+                                                if let Some(rest) = prompt_input.trim().strip_prefix("agent") {
+                                                    let name = rest.trim().to_string();
+                                                    let f = Frame::SessionsCreate {
+                                                        req_id: Uuid::new_v4().to_string(),
+                                                        name: if name.is_empty() { None } else { Some(name) },
+                                                        kind: Some("forge".into()),
+                                                        cwd: None,
+                                                    };
+                                                    send_frame(&mut stream, &f).ok();
+                                                    prompt_input.clear();
+                                                    continue;
+                                                }
                                                 match prompt_input.trim() {
                                                     "kill" | "kill-session" => {
                                                         let f = Frame::SessionsKill {

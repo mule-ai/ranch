@@ -151,6 +151,10 @@ pub enum Frame {
         pane: String,
         /// 0 = horizontal (side-by-side), 1 = vertical (stacked)
         dir: u8,
+        /// absent/"shell" = PTY pane; "forge" = chat pane bound to a
+        /// NEW forge session (agent split, M8)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<String>,
     },
     /// Client -> daemon: resize the split containing `pane`. The daemon
     /// adjusts the split ratio of the smallest enclosing split that has

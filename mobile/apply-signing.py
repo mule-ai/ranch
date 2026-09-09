@@ -6,6 +6,9 @@ import pathlib, sys
 
 g = pathlib.Path(__file__).parent / "android/app/build.gradle"
 s = g.read_text()
+if "signingConfigs.release" in s:
+    print("signing config already applied")
+    sys.exit(0)
 
 old = """    signingConfigs {
         debug {"""

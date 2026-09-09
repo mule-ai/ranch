@@ -1283,6 +1283,7 @@ impl Daemon {
                 session,
                 pane,
                 dir,
+                kind,
             } => {
                 // Real split: replace the target leaf with a split node,
                 // spawn the new pane, then re-apply sizes (sibling shrinks).
@@ -1291,11 +1292,46 @@ impl Daemon {
                     None => return,
                 };
                 let dir = *dir.min(&1); // 0 = top/bottom, 1 = left/right
+                let kind = kind.clone().unwrap_or_else(|| "shell".into());
                 let new_pane = self.sessions.get_mut(&sid).and_then(|s| {
                     let target = match Uuid::parse_str(pane) {
                         Ok(p) if s.panes.contains_key(&p) => p,
                         _ => s.active,
                     };
+                    // agent split: chat pane bound to a fresh forge session
+                    if kind == "forge" {
+                        let fcfg = forge::load_forge_config();
+                        let forge_sid = match fcfg
+                            .as_ref()
+                            .map(|c| forge::create_forge_session(c, "agent pane"))
+                            .unwrap_or(Err("forge not configured".into()))
+                        {
+                            Ok(id) => id,
+                            Err(e) => {
+                                eprintln!("ranchd: agent split failed: {e}");
+                                if let Some(c) = self.clients.get_mut(&from) {
+                                    send_frame(c, &Frame::Error {
+                                        req_id: Some(req_id.clone()),
+                                        message: e,
+                                    });
+                                }
+                                return None;
+                            }
+                        };
+                        let pid = Uuid::new_v4();
+                        s.chats.insert(
+                            pid,
+                            ChatPane { forge_sid, cols: 80, rows: 24, chat: vec![] },
+                        );
+                        s.win_mut().split_leaf(&target.to_string(), &pid.to_string(), dir);
+                        s.active = pid;
+                        s.apply_sizes();
+                        if let Some(tx) = &self.forge_tx {
+                            let _ = tx.send(forge::ForgeJob::Watch { pane: pid, forge_sid });
+                        }
+                        eprintln!("ranchd: agent split: chat pane {pid} -> forge {forge_sid}");
+                        return Some(pid);
+                    }
                     match spawn_pane(s, "shell", None) {
                         Ok(pid) => {
                             s.win_mut().split_leaf(&target.to_string(), &pid.to_string(), dir);
