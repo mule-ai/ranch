@@ -49,6 +49,8 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
   const [geom, setGeom] = useState({ cols: 80, rows: 24 });
   const geomRef = useRef(geom);
   geomRef.current = geom;
+  const lastWidth = useRef(0);
+  const kbAuto = useRef(false);
   // predictive local echo: chars sent to the PTY that have not been
   // confirmed by an authoritative Update yet, rendered dimmed at the
   // cursor so typing feels instant despite the relay round trip
@@ -83,7 +85,12 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
           setLayout(f.layout);
           setActivePane(f.active_pane);
           setConn("online");
-          openKeyboard();
+          // open the keyboard once on attach — re-snapshots (resize,
+          // re-attach) must NOT toggle it or the keyboard thrashes
+          if (!kbAuto.current) {
+            kbAuto.current = true;
+            openKeyboard();
+          }
           break;
         }
         case "Update": {
@@ -257,9 +264,16 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
         onLayout={(e) => {
           const w = e.nativeEvent.layout.width;
           const h = e.nativeEvent.layout.height;
+          // the Android keyboard resizes the window (adjustResize), so
+          // height changes here are usually just the keyboard toggling —
+          // resizing the PTY for that would reflow the terminal AND
+          // re-snapshot, which thrashes the keyboard. Track width only
+          // (covers rotation and initial measure).
+          if (w === lastWidth.current) return;
+          lastWidth.current = w;
           const cols = Math.max(20, Math.floor(w / (FONT_SIZE * 0.6)) - 1);
           const rows = Math.max(10, Math.floor(h / LINE_HEIGHT) - 1);
-          if (cols !== geom.cols || rows !== geom.rows) {
+          if (cols !== geomRef.current.cols || rows !== geomRef.current.rows) {
             setGeom({ cols, rows });
             // resize the daemon PTY to the device
             relay.send({
