@@ -60,7 +60,14 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
         case "Snapshot": {
           if (f.session !== sessionId) return;
           const m = new Map<string, PaneSnap>();
-          for (const p of f.panes) m.set(p.id, p);
+          for (const p0 of f.panes) {
+            // pad to the pane's full row height — the daemon trims
+            // trailing blank rows, but row updates address absolute
+            // rows and must always land
+            const pad = [...p0.lines];
+            while (pad.length < p0.rows) pad.push("");
+            m.set(p0.id, { ...p0, lines: pad });
+          }
           setPanes(m);
           setLayout(f.layout);
           setActivePane(f.active_pane);
@@ -74,7 +81,8 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
           if (!cur) return;
           const lines = cur.lines.slice();
           for (const [y, text] of f.rows_upd) {
-            if (y < lines.length) lines[y] = text;
+            while (lines.length <= y) lines.push("");
+            lines[y] = text;
           }
           const next = new Map(panesRef.current);
           next.set(f.pane, { ...cur, lines, cursor: f.cursor ?? cur.cursor });
@@ -141,8 +149,7 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
     if (text === " ") return; // reset, no input
     const added = text.startsWith(" ") ? text.slice(1) : text;
     setCapture(" "); // re-arm the sentinel
-    const normalized = added.replace(/\n/g, "\r");
-    send(normalized);
+    send(added.replace(/\n/g, "\r"));
     const printable = added.replace(/[\n\r]/g, "");
     if (printable !== "") {
       setPred((pr) => {
@@ -261,18 +268,16 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
       <TextInput
         ref={inputRef}
         style={styles.hiddenInput}
-        multiline
         value={capture}
         onChangeText={onType}
         onSubmitEditing={() => {
+          // Enter = run the command
           send("\r");
           setPred(null);
-          // visible-password keyboards treat Enter as DONE and dismiss
-          // the IME even with blurOnSubmit=false — yank focus straight
-          // back so the keyboard stays up
+          setCapture(" ");
           requestAnimationFrame(() => inputRef.current?.focus());
         }}
-        keyboardType="visible-password"
+        returnKeyType="send"
         autoCapitalize="none"
         autoCorrect={false}
         autoComplete="off"
