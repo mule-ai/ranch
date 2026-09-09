@@ -113,6 +113,7 @@ export default function App() {
             break;
         }
       });
+      setRelay(r);
       try {
         await r.join();
       } catch (e: any) {
