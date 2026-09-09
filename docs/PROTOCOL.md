@@ -109,6 +109,12 @@ per app install for mobile so reconnects are stable).
   keeps ≥ 4 cells. Daemon re-snapshots on change.
 - **`sessions.pane-kill`** `{session, pane}` — removes the leaf and
   promotes its sibling subtree.
+- **`sessions.pane-swap`** `{session, a, b}` — the two panes' rectangles
+  trade places in the split tree; each pane keeps its own PTY/VT state
+  (shell, running programs). Both PTYs are `SIGWINCH`ed to their new
+  geometry and the daemon re-snapshots. Desktop binding: prefix `{` /
+  `}` swaps the focused pane with the previous/next pane in layout
+  traversal order (wraps).
 - **`sessions.select`** `{session, pane}` — sets the session's active
   pane (used when attaching without a pane, and for UI)
 - **`mule.run`** `{workflow_id, params?}` → spawns/streams a workflow

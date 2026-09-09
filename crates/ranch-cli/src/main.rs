@@ -1211,6 +1211,32 @@ fn cmd_attach(ref_: &str) {
                                     }
                                     continue;
                                 }
+                                // { / } → swap focused pane with previous / next
+                                // pane in layout order (tmux swap-pane semantics)
+                                KeyCode::Char('{') | KeyCode::Char('}') => {
+                                    if let Some(ly) = &layout {
+                                        let order = ranch_protocol::leaf_order(ly);
+                                        if order.len() > 1 {
+                                            if let Some(cur) =
+                                                order.iter().position(|p| *p == active_pane)
+                                            {
+                                                let other = if key.code == KeyCode::Char('{') {
+                                                    order[(cur + order.len() - 1) % order.len()]
+                                                        .clone()
+                                                } else {
+                                                    order[(cur + 1) % order.len()].clone()
+                                                };
+                                                let f = Frame::PaneSwap {
+                                                    session: session_id.clone(),
+                                                    a: active_pane.clone(),
+                                                    b: other,
+                                                };
+                                                send_frame(&mut stream, &f).ok();
+                                            }
+                                        }
+                                    }
+                                    continue;
+                                }
                                 // x → kill current pane
                                 KeyCode::Char('x') => {
                                     let f = Frame::PaneKill {

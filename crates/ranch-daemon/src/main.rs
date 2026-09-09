@@ -182,6 +182,36 @@ impl Session {
         first_leaf(&self.layout)
     }
 
+    /// Swap the pane ids at the leaves holding `a` and `b`: the two
+    /// rectangles trade places while each pane keeps its own PTY/VT
+    /// state. Returns true when both leaves were found. Done as three
+    /// rename passes through a unique sentinel so the walk can never
+    /// confuse the two leaves mid-swap.
+    fn swap_leaves(&mut self, a: &str, b: &str) -> bool {
+        if a == b || a.is_empty() || b.is_empty() {
+            return false;
+        }
+        fn rename(l: &mut Layout, from: &str, to: &str) -> bool {
+            match l {
+                Layout::Leaf { pane } if pane == from => {
+                    *pane = to.to_string();
+                    true
+                }
+                Layout::Split { a, b, .. } => rename(a, from, to) || rename(b, from, to),
+                _ => false,
+            }
+        }
+        let sentinel = Uuid::new_v4().to_string();
+        if !rename(&mut self.layout, a, &sentinel) {
+            return false;
+        }
+        if !rename(&mut self.layout, b, a) {
+            rename(&mut self.layout, &sentinel, a); // restore on failure
+            return false;
+        }
+        rename(&mut self.layout, &sentinel, b)
+    }
+
     /// Compute each pane's (cols, rows) by walking the split tree.
     /// dir 1 = vertical split (left/right, pct to a), dir 0 = horizontal
     /// (top/bottom, pct to a).
@@ -987,6 +1017,22 @@ impl Daemon {
                     s.apply_sizes();
                 });
                 if did.is_some() {
+                    self.resnap(&sid);
+                }
+            }
+            Frame::PaneSwap { session, a, b } => {
+                let sid = match self.resolve_session(session).map(|s| s.id) {
+                    Some(s) => s,
+                    None => return,
+                };
+                let did = self.sessions.get_mut(&sid).map(|s| {
+                    let ok = s.swap_leaves(a, b);
+                    if ok {
+                        s.apply_sizes();
+                    }
+                    ok
+                });
+                if did.unwrap_or(false) {
                     self.resnap(&sid);
                 }
             }

@@ -615,8 +615,23 @@ Rust edition 2024, stable toolchain (matches forge: rustc 1.98).
   PTY-driven TUI tests confirm side-by-side render, focus movement,
   input routing, resize (pct 50→48→54), pane kill (3→2 panes); relay
   tests confirm remote clients can split and drive both panes through
-  Supabase Realtime. Not done (moved out of scope): session-tree
-  sidebar (flat picker remains), pane swap, windows.
+  Supabase Realtime.
+- **M4.1 — pane swap (2026-09-09)**: tmux `prefix {` / `}` lands.
+  Protocol gains `PaneSwap {session, a, b}`; the daemon swaps the two
+  leaves' pane ids via a three-rename pass through a fresh-uuid
+  sentinel (no ambiguity mid-walk), resizes both PTYs to their new
+  rectangles (`apply_sizes` → `TIOCSWINSZ` → SIGWINCH), and
+  re-snapshots. Panes keep their own PTY/VT state — running programs,
+  shell history, cwd all follow the pane, only the rectangle trades.
+  CLI computes prev/next in layout traversal order via the new
+  `leaf_order()` helper in ranch-protocol (wraps at the ends).
+  Verified e2e over the unix socket: asymmetric 52/28 split, swap,
+  geometry traded exactly, shell markers stayed with their panes,
+  traversal order rotated, swap-back restored the original geometry.
+  Test lesson: polling snapshots on a shared socket returns stale
+  frames (updates + old snapshots queue ahead); fresh-connection
+  snapshots read clean. Not done: session-tree sidebar (flat picker
+  remains), windows.
 - **M3 — mobile app verified on device (2026-09-08)**: Expo Go on
   Android, end-to-end. Google OAuth through the system browser (the
   `exp://**` URI-allow-list entry is what makes the final redirect hop

@@ -151,6 +151,14 @@ pub enum Frame {
         session: String,
         pane: String,
     },
+    /// Client -> daemon: swap the positions of two panes in the layout
+    /// tree. Each pane keeps its own PTY/VT state; only the rectangles
+    /// trade places. The daemon resizes both PTYs to their new geometry.
+    PaneSwap {
+        session: String,
+        a: String,
+        b: String,
+    },
     /// Out-of-band status (no screen change).
     Meta {
         session: String,
@@ -243,6 +251,23 @@ pub enum Layout {
 
 fn default_pct() -> u8 {
     50
+}
+
+/// Pane ids in layout traversal order (depth-first, left/top first).
+/// Clients use this for tmux-style prev/next-pane operations.
+pub fn leaf_order(l: &Layout) -> Vec<String> {
+    let mut out = Vec::new();
+    fn walk(l: &Layout, out: &mut Vec<String>) {
+        match l {
+            Layout::Leaf { pane } => out.push(pane.clone()),
+            Layout::Split { a, b, .. } => {
+                walk(a, out);
+                walk(b, out);
+            }
+        }
+    }
+    walk(l, &mut out);
+    out
 }
 
 // ---------- base64 (no external deps for the spike-grade path) ----------
