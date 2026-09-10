@@ -119,8 +119,9 @@ impl LocalPi {
                                             .join("")
                                     })
                                     .unwrap_or_default();
-                                if !text.is_empty() {
-                                    emit_chat(&pipe, t_pane, "assistant", &text);
+                                let trimmed = text.trim();
+                                if !trimmed.is_empty() {
+                                    emit_chat(&pipe, t_pane, "assistant", trimmed);
                                 }
                             }
                         }

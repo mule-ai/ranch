@@ -114,6 +114,7 @@ fn to_chat_msg(r: &serde_json::Value) -> Option<ChatMsg> {
         .get("content")
         .and_then(|c| c.as_str())
         .unwrap_or("")
+        .trim()
         .to_string();
     let tool_name = r.get("tool_name").and_then(|t| t.as_str()).map(String::from);
     let tool_call_id = r.get("tool_call_id").and_then(|t| t.as_str()).map(String::from);
@@ -130,7 +131,7 @@ fn to_chat_msg(r: &serde_json::Value) -> Option<ChatMsg> {
     let duration_ms = r.get("duration_ms").and_then(|d| d.as_i64());
     let created_at = r.get("created_at").and_then(|c| c.as_str()).map(String::from);
     // skip empty rows (e.g. assistant rows that only carried tool_input)
-    if text.is_empty() && tool_name.is_none() && tool_call_id.is_none() {
+    if text.is_empty() && tool_name.is_none() {
         return None;
     }
     Some(ChatMsg {
