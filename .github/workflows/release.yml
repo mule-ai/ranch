@@ -46,9 +46,9 @@ jobs:
           RANCH_ZIG: ${{ github.workspace }}/.tools/zig/zig
           CC_x86_64_unknown_linux_musl: ${{ github.workspace }}/tools/zig-cc
         run: |
-          file_target=target/x86_64-unknown-linux-musl/release/ranch
           cargo build --release --target x86_64-unknown-linux-musl
-          file "$file_target" | grep -q "statically linked"
+          file target/x86_64-unknown-linux-musl/release/ranch
+          file target/x86_64-unknown-linux-musl/release/ranch | grep -qE "statically linked|static-pie"
       - name: Smoke test (host target)
         run: |
           cargo build --release
