@@ -117,6 +117,33 @@ limit (~28 KB payload), concurrent-connection allowances on the chosen
 tier, and end-to-end latency. Mitigations: protocol chunking (§6),
 seq-gap re-sync, and coalesced (droppable) frames.
 
+### 2.6 Mobile editor options (M10 research, 2026-09-10)
+
+Goal: the best code-editor + markdown-review experience achievable on an
+Android phone inside our thin-client model (files on the daemon's
+machine, phone over the relay).
+
+Component landscape (npm/GitHub, checked 2026-09-10):
+
+| option | status | verdict |
+|---|---|---|
+| `react-native-codemirror` / `react-native-codemirror6` | not on npm | — |
+| `react-native-coder` | not on npm | — |
+| `@rivascva/react-native-code-editor` (85★) | last published 2022-05 | stale |
+| `react-native-codeditor` (WebView + CodeMirror) | pushed 2026-05, 35★ | native WebView; Android IME-through-webview is clunky; adds native surface to our APK build |
+| `workspace-sh/react-native-source-editor` | 0★, native (STTextView/…) | native module; overkill |
+| `react-native-syntax-highlighter` | v2.1.0, 2023-09 | plausible for a highlight *overlay* later; untested on RN 0.86/React 19 — defer |
+| `react-native-markdown-display` | 2023, markdown-it-based | too old for RN 0.86 |
+| `react-native-render-html` | 2023, big dep tree | too old, too heavy |
+| `marked` (v18) | 2026-09, pure JS, zero peer deps | **use it** — token API → custom RN renderer |
+
+Decision: no third-party editor component. MVP editor = multiline
+monospace `TextInput` (JetBrains Mono Nerd Font Mono already bundled)
+over the daemon's `FileRead`/`FileWrite` frames; markdown review =
+`marked` tokens rendered to plain RN views. Phase 2 adds a pure-JS
+syntax-highlight overlay (the react-native-coder pattern) if we can
+validate it on RN 0.86; phase 3 adds inotify `file-changed` metas.
+
 ## 3. Goals & non-goals (MVP)
 
 ### Goals
@@ -816,7 +843,8 @@ Rust edition 2024, stable toolchain (matches forge: rustc 1.98).
   attached session returns to the dashboard (tmux-chooser behavior).
   Auto-created sessions get short names (s0, s1, …). Non-TTY
   invocations still print usage.
-- **M4 — forge + mule first-class**: forge listing/status/attach
+- **M4 — forge + mule first-class**: forge listing/status/attach (§7); mule listing + run-into-pane (§8). Acceptance: start a forge session locally, watch it from the phone; run a mule workflow into a pane and watch it live.
+- **M10 — mobile editor: files + markdown (2026-09-10)**: the phone becomes a light IDE for files on the machine. Design: files live on the daemon's machine; the daemon is the file server and the phone a thin client — same architecture as terminal emulation (server owns state, clients render). Protocol: `FileRead`/`FileReadOk`, `FileWrite`/`FileWriteOk` (mtime check → conflict error instead of silent clobber); `DirListOk` gains `files` (regular files only, hidden names excluded — mirrors the dir filter). Mobile: new Editor screen — directory browser (reuses `DirList`, now lists files), editor view (multiline monospace `TextInput` in the already-bundled JetBrains Mono), dirty dot + Save, and for `.md`/`.mdx` a Review tab rendering `marked` (v18, pure JS, zero peer deps) tokens to RN views. **MVP ships plain text — no syntax highlighting** (research §2.6: no maintained RN code-editor component; pure-JS highlight overlay is phase 2). **Phases:** 1 (MVP): browse/open/edit/save + markdown review; 2: pure-JS syntax-highlight overlay (react-native-coder pattern) validated on RN 0.86; 3: inotify `file-changed` metas + conflict toasts. **Acceptance:** from the phone, browse to a file, edit, save — disk has the new content; a `.md` file renders; an external edit that moves mtime between read and save returns an error, not a clobber.
   (§7); mule listing + run-into-pane (§8). Acceptance: start a forge
   session locally, watch it from the phone; run a mule workflow into a
   pane and watch it live.

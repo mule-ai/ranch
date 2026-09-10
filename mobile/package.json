@@ -10,6 +10,7 @@
     "expo-font": "~57.0.3",
     "expo-status-bar": "~57.0.1",
     "expo-web-browser": "^57.0.2",
+    "marked": "^18.0.12",
     "react": "19.2.3",
     "react-native": "0.86.3",
     "react-native-url-polyfill": "^4.0.0"

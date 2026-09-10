@@ -146,6 +146,28 @@ per app install for mobile so reconnects are stable).
 - **`error`** — `{"of": "<frame id>", "message": "..."}` for any failed
   request.
 
+### Files (M10 — mobile editor)
+
+The daemon is the file server; clients (mobile/CLI) are thin editors.
+
+- **`DirList`** `{req_id, path?}` → **`DirListOk`** `{req_id, path,
+  parent?, dirs[], files[]}` — list a directory (default `$HOME`).
+  `dirs` = subdirectories, `files` = regular files; both sorted; hidden
+  entries excluded (same filter as `dirs`).
+- **`FileRead`** `{req_id, path}` → **`FileReadOk`** `{req_id, path,
+  content, mtime, size}` — read a file as UTF-8. `mtime` is a unix
+  timestamp; clients store it and pass it to `FileWrite` for conflict
+  detection. Errors (no such file, not a regular file, unreadable, or
+  size > `FILE_MAX_BYTES` (256 KiB)) → `error`.
+- **`FileWrite`** `{req_id, path, content, mtime?}` → **`FileWriteOk`**
+  `{req_id, path, mtime}` — atomically write the file (write to a temp
+  file in the same dir, then `rename`). If `mtime` is supplied and the
+  on-disk mtime no longer matches, the daemon replies `error` with
+  `message` starting `file changed on disk` and does **not** clobber.
+  A missing/nil `mtime` skips the check (first-save or client unaware).
+  Parent directory must exist; creating files is in scope, creating new
+  directories is not (MVP).
+
 ### Sync
 
 - **`resync`** — client → daemon, sent when a `seq` gap is detected on

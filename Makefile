@@ -30,7 +30,7 @@ build: $(VT_LIB)
 $(VT_LIB): vendor/ghostty $(ZIG_DIR)/zig
 	@echo "building libghostty-vt (pinned $(GHOSTTY_PIN))…"
 	cd vendor/ghostty/example/c-vt-stream && \
-	  PATH="$$PWD/../../$(ZIG_DIR):$$PATH" zig build
+	  PATH="$(CURDIR)/$(ZIG_DIR):$$PATH" zig build
 	mkdir -p vendor/lib
 	cp vendor/ghostty/example/c-vt-stream/.zig-cache/o/*/libghostty-vt.so $(VT_LIB)
 	ln -sf libghostty-vt.so vendor/lib/libghostty-vt.so.0
