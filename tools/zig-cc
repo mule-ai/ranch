@@ -1,0 +1,14 @@
+#!/bin/sh
+# zig-cc wrapper: rust target triples -> zig triples.
+# zig 0.16 dropped the "unknown" vendor segment in target triples
+# (x86_64-unknown-linux-musl -> x86_64-linux-musl). Used as CC for
+# musl cargo builds (ring's build script needs a C compiler).
+args=""
+for a in "$@"; do
+  case "$a" in
+    *-unknown-linux-musl) args="$args ${a/-unknown-linux-musl/-linux-musl}" ;;
+    *) args="$args $a" ;;
+  esac
+done
+ZIG="${RANCH_ZIG:-$HOME/src/ranch/.tools/zig/zig}"
+exec "$ZIG" cc $args

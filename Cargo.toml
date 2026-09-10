@@ -3,8 +3,7 @@ resolver = "2"
 members = [
     "crates/ranch-protocol",
     "crates/ranch-vt",
-    "crates/ranch-daemon",
-    "crates/ranch-cli",
+    "crates/ranch",
 ]
 
 [profile.release]

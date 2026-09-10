@@ -18,9 +18,6 @@
 //! - when ~/.config/ranch/daemon.toml exists, a relay thread bridges the
 //!   same frames to the machine's Supabase Realtime channel (relay.rs)
 
-mod forge;
-mod pilocal;
-mod relay;
 
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{Read, Write};
@@ -2883,10 +2880,23 @@ extern "C" fn on_signal(_sig: c_int) {
     RUNNING.store(0, Ordering::SeqCst);
 }
 
-fn main() {
+pub(super) use crate::{forge, pilocal, relay};
+
+pub fn run_daemon() {
+    let args: Vec<String> = std::env::args().collect();
+    run_daemon_with_args(args);
+}
+
+pub fn run_daemon_with_args(args: Vec<String>) {
     // hot-upgrade inherit path: the previous generation exec'd us with a
     // manifest; adopt its sessions/panes/pi-children and run the same loop
-    let args: Vec<String> = std::env::args().collect();
+    // (when invoked as `ranch daemon`, the subcommand sits at args[1] and
+    // the real flags start at args[2] — normalize so --inherit is args[1])
+    let args: Vec<String> = if args.len() >= 2 && args[1] == "daemon" {
+        [args[0].clone()].into_iter().chain(args.into_iter().skip(2)).collect()
+    } else {
+        args
+    };
     if args.len() >= 3 && args[1] == "--inherit" {
         // --listen-fd=N: reuse the previous generation's listening socket
         // (bind would fail with EADDRINUSE — the inherited fd still holds it)

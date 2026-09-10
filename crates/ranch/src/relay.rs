@@ -25,7 +25,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
-use crate::clog;
+use crate::daemon::{clog, civil_from_unix};
 
 // ---------- config ----------
 
@@ -100,6 +100,11 @@ pub fn make_pipes() -> Result<((RawFd, std::fs::File), (RawFd, std::fs::File)), 
     }
     let (daemon_r, daemon_w) = pipe()?; // remote frames -> main loop
     let (relay_r, relay_w) = pipe()?; // main loop frames -> thread -> WS
+    // The relay thread does raw reads on relay_r in its backoff drain
+    // loop (WouldBlock -> sleep). These must not block: an empty pipe
+    // with a blocking read hangs the thread forever (seen live: relay
+    // died silently, machine showed offline).
+    set_nonblocking(relay_r)?;
     Ok(((daemon_r, daemon_w), (relay_r, relay_w)))
 }
 
@@ -181,13 +186,14 @@ fn now_iso() -> String {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
     let secs = d.as_secs();
-    let (y, mo, da, h, mi, s) = crate::civil_from_unix(secs as i64);
+    let (y, mo, da, h, mi, s) = civil_from_unix(secs as i64);
     format!("{y:04}-{mo:02}-{da:02}T{h:02}:{mi:02}:{s:02}Z")
 }
 
 fn login(cfg: &RelayConfig) -> Result<TokenSession, String> {
     let url = format!("{}/auth/v1/token?grant_type=password", cfg.supabase_url);
-    let mut resp = ureq::post(&url)
+    let mut resp = http_agent()
+        .post(&url)
         .header("apikey", &cfg.anon_key)
         .send_json(serde_json::json!({
             "email": cfg.machine_email,
@@ -207,7 +213,8 @@ fn refresh_login(cfg: &RelayConfig, refresh_token: &str) -> Result<TokenSession,
         "{}/auth/v1/token?grant_type=refresh_token",
         cfg.supabase_url
     );
-    let mut resp = ureq::post(&url)
+    let mut resp = http_agent()
+        .post(&url)
         .header("apikey", &cfg.anon_key)
         .send_json(serde_json::json!({ "refresh_token": refresh_token }))
         .map_err(|e| format!("http: {e}"))?;
@@ -252,7 +259,8 @@ fn heartbeat(cfg: &RelayConfig, jwt: &str) -> Result<(), String> {
         "{}/rest/v1/machines_info?id=eq.{}",
         cfg.supabase_url, cfg.machine_id
     );
-    ureq::patch(&url)
+    http_agent()
+        .patch(&url)
         .header("apikey", &cfg.anon_key)
         .header("Authorization", &format!("Bearer {jwt}"))
         .send_json(serde_json::json!({ "last_seen_at": now_iso() }))
@@ -271,7 +279,8 @@ fn mirror_upsert(cfg: &RelayConfig, jwt: &str, op: &RelayOut) {
         ),
         RelayOut::DeleteSession { id } => {
             let url = format!("{}/rest/v1/sessions?id=eq.{id}", cfg.supabase_url);
-            match ureq::delete(&url)
+            match http_agent()
+                .delete(&url)
                 .header("apikey", &cfg.anon_key)
                 .header("Authorization", &format!("Bearer {jwt}"))
                 .call()
@@ -282,7 +291,8 @@ fn mirror_upsert(cfg: &RelayConfig, jwt: &str, op: &RelayOut) {
             return;
         }
     };
-    match ureq::post(&url)
+    match http_agent()
+        .post(&url)
         .header("apikey", &cfg.anon_key)
         .header("Authorization", &format!("Bearer {jwt}"))
         .header("Prefer", "resolution=merge-duplicates")
@@ -291,6 +301,16 @@ fn mirror_upsert(cfg: &RelayConfig, jwt: &str, op: &RelayOut) {
         Ok(_) => {}
         Err(e) => clog(&format!("relay: mirror upsert failed: {e}")),
     }
+}
+
+// Shared HTTP agent: bounded timeouts so a dead network can't hang the
+// relay thread (a connect with no timeout stalls until the OS gives up,
+// and a read on a zombie connection stalls forever).
+fn http_agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(15)))
+        .build()
+        .new_agent()
 }
 
 // ---------- websocket session ----------

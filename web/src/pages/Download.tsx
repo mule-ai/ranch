@@ -44,11 +44,12 @@ cd ranch && make setup && make install`}</pre>
           </div>
 
           <div className="card">
-            <h2>Linux x86_64 binaries</h2>
+            <h2>Linux x86_64 binary</h2>
             <p className="dim">
-              <code>ranch</code> (CLI + TUI) and <code>ranch-daemon</code>.
-              Unpack and go — <code>make service</code> still wires systemd
-              for you from source.
+              One static binary — <code>ranch</code> (CLI + TUI + daemon).
+              No runtime deps; drop it in <code>~/.local/bin</code> and go.
+              <code>ln -s ranch ranchd</code> (or <code>ranch daemon</code>)
+              runs the daemon.
             </p>
             <a className="btn btn-primary" href={rel.linux} download>
               Download tarball
@@ -65,13 +66,13 @@ cd ranch && make setup && make install`}</pre>
         <pre>{`git clone https://github.com/mule-ai/ranch
 cd ranch
 make setup        # one-time: Zig + ghostty + libghostty-vt
-make install      # ~/.local/bin/{ranch,ranch-daemon}
+make install      # ~/.local/bin/ranch (+ ranchd symlink)
 make service      # systemd user unit (optional)
 
 ranch upgrade     # later: hot-upgrade the running daemon, zero downtime`}</pre>
         <p className="dim">
-          Needs Rust (stable), Zig 0.16, JDK 17 + the Android SDK only if
-          building the APK locally.
+          Needs Rust (stable) + Zig 0.16; JDK 17 + the Android SDK only
+          if building the APK locally.
         </p>
       </div>
 

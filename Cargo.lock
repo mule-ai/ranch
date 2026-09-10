@@ -756,31 +756,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
-name = "ranch-cli"
+name = "ranch"
 version = "0.1.0"
 dependencies = [
  "ansi-to-tui",
  "crossterm",
  "libc",
  "ranch-protocol",
+ "ranch-vt",
  "ratatui",
  "rpassword",
  "serde",
  "serde_json",
  "sha2",
- "ureq",
- "uuid",
-]
-
-[[package]]
-name = "ranch-daemon"
-version = "0.1.0"
-dependencies = [
- "libc",
- "ranch-protocol",
- "ranch-vt",
- "serde",
- "serde_json",
  "tungstenite",
  "ureq",
  "uuid",

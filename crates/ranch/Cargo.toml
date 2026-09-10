@@ -1,17 +1,23 @@
 [package]
-name = "ranch-cli"
+name = "ranch"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "ranch"
+path = "src/main.rs"
+
 [dependencies]
 ranch-protocol = { path = "../ranch-protocol" }
+ranch-vt = { path = "../ranch-vt" }
+libc = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-libc = { workspace = true }
 uuid = { version = "1", features = ["v4"] }
+tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+ureq = { version = "3", default-features = false, features = ["rustls", "json"] }
 crossterm = "0.28"
 ratatui = "0.29"
-ureq = { version = "3", default-features = false, features = ["rustls", "json"] }
 sha2 = "0.10"
 rpassword = "7"
 ansi-to-tui = "7"

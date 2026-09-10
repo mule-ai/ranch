@@ -2934,7 +2934,7 @@ fn libc_isatty() -> bool {
     unsafe { libc::isatty(1) == 1 }
 }
 
-fn main() {
+pub fn main_client() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
         // TTY → interactive session manager; otherwise print usage.

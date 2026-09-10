@@ -29,30 +29,35 @@ jobs:
           curl -Lo /tmp/zig.tar.xz https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz
           tar xf /tmp/zig.tar.xz -C .tools
           mv .tools/zig-x86_64-linux-0.16.0 .tools/zig
-      - name: Build libghostty-vt
+      - name: Build static libghostty-vt (musl)
         run: |
           git clone --depth 1 https://github.com/ghostty-org/ghostty vendor/ghostty
           cd vendor/ghostty && git fetch --depth 1 origin 82232ecde55405559dec29c5466cb9e39938cb41 && git checkout 82232ecde55405559dec29c5466cb9e39938cb41
-          cd example/c-vt-stream && PATH="${{ github.workspace }}/.tools/zig:$PATH" zig build
+          PATH="$GITHUB_WORKSPACE/.tools/zig:$PATH" zig build -Demit-lib-vt=true -Dtarget=x86_64-linux-musl -Dcpu=baseline
           mkdir -p $GITHUB_WORKSPACE/vendor/lib
-          cp .zig-cache/o/*/libghostty-vt.so $GITHUB_WORKSPACE/vendor/lib/
-          ln -sf libghostty-vt.so $GITHUB_WORKSPACE/vendor/lib/libghostty-vt.so.0
+          cp zig-out/lib/libghostty-vt.a $GITHUB_WORKSPACE/vendor/lib/
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
       - uses: Swatinem/rust-cache@v2
-      - name: Build release binaries
-        run: cargo build --release
-      - name: Smoke test
-        run: cargo test --release -p ranch-protocol -p ranch-daemon
+      - name: Build static binary
         env:
-          # test binaries need libghostty-vt.so.0 on the loader path
-          LD_LIBRARY_PATH: ${{ github.workspace }}/vendor/lib
+          # tools/zig-cc maps rust's musl triple to zig's; make build uses it as CC
+          RANCH_ZIG: ${{ github.workspace }}/.tools/zig/zig
+          CC_x86_64_unknown_linux_musl: ${{ github.workspace }}/tools/zig-cc
+        run: |
+          file_target=target/x86_64-unknown-linux-musl/release/ranch
+          cargo build --release --target x86_64-unknown-linux-musl
+          file "$file_target" | grep -q "statically linked"
+      - name: Smoke test (host target)
+        run: |
+          cargo build --release
+          cargo test --release -p ranch-protocol
       - name: Stage
         run: |
           mkdir -p stage/ranch-linux-x86_64
-          cp target/release/ranch-cli stage/ranch-linux-x86_64/ranch
-          cp target/release/ranch-daemon stage/ranch-linux-x86_64/ranch-daemon
-          cp vendor/lib/libghostty-vt.so stage/ranch-linux-x86_64/
-          ln -sf libghostty-vt.so stage/ranch-linux-x86_64/libghostty-vt.so.0
+          cp target/x86_64-unknown-linux-musl/release/ranch stage/ranch-linux-x86_64/ranch
+          ln -sf ranch stage/ranch-linux-x86_64/ranchd
           cp -r systemd stage/ranch-linux-x86_64/
           cp README.md stage/ranch-linux-x86_64/
           tar czf ranch-linux-x86_64.tar.gz -C stage ranch-linux-x86_64

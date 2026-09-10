@@ -18,13 +18,14 @@ sync when behavior changes.
 - `crates/ranch-vt/` — hand-rolled FFI wrapper around `libghostty-vt`
   (pinned ghostty source). Server-side terminal emulation, one VT per
   pane. `build.rs` links against `vendor/lib/libghostty-vt.so`.
-- `crates/ranch-daemon/` — `ranchd`: PTY manager, one ghostty-vt per
-  pane, 30 ms coalescing tick, session/window/pane registry,
-  `state.json`, local unix-socket JSON-lines server, relay thread
-  (`relay.rs`), Forge worker (`forge.rs`), local `pi --mode rpc`
-  harness (`pilocal.rs`).
-- `crates/ranch-cli/` — `ranch`: CLI + attach TUI (ratatui + crossterm,
-  key encoding via ghostty-vt). Plain `ranch` in a TTY opens the
+  The daemon side: PTY manager, one ghostty-vt per pane, 30 ms
+  coalescing tick, session/window/pane registry, `state.json`, local
+  unix-socket JSON-lines server, relay thread, Forge worker, local
+  `pi --mode rpc` harness.
+- `crates/ranch/` — the single binary: `main.rs` (dispatch: client vs
+  daemon via argv0/subcommand), `client.rs` (CLI + attach TUI: ratatui +
+  crossterm, key encoding via ghostty-vt), `daemon.rs`/`forge.rs`/
+  `pilocal.rs`/`relay.rs` (ranchd). Plain `ranch` in a TTY opens the
   interactive session manager/dashboard.
 - `mobile/` — Expo/React Native app, **Android only**. See
   `mobile/AGENTS.md` (and the versioned Expo v57 docs) before touching
@@ -38,10 +39,15 @@ sync when behavior changes.
 
 ## Build & run
 
-- `make build` — release build; auto-builds `libghostty-vt.so` if missing
-  (needs Zig 0.16 + pinned ghostty commit `82232ec...`). Binaries:
-  `target/release/{ranch-cli,ranch-daemon}`.
-- `make install` — copies to `~/.local/bin/{ranch,ranch-daemon}`.
+- **Single binary.** `ranch` is the client AND the daemon — the daemon
+  runs via `ranch daemon`, a `ranchd` argv0 symlink, or `--daemon`.
+  It is statically linked (musl + the static `libghostty-vt.a` archive
+  built from the pinned ghostty source — needs Zig 0.16). The shared
+  lib path (`vendor/lib/libghostty-vt.so`) is the glibc fallback only.
+- `make build` — static binary at
+  `target/x86_64-unknown-linux-musl/release/ranch` (~21 MB, zero
+  runtime deps).
+- `make install` — copies to `~/.local/bin/ranch` + `ranchd` symlink.
 - `make service` — installs + starts the `ranchd` systemd user unit.
 - `make run` — run the daemon in the foreground.
 - `make test` — `cargo test`. `make lint` — `cargo clippy --all-targets`.
@@ -115,8 +121,9 @@ Rust workspace: edition 2024, stable toolchain (rustc 1.98 era).
 ## Conventions
 
 - CLI: `ranch <new|agent|pi|resume|ls|attach|kill|rename|split|switch|upgrade|
-  register|login|config|machines|cloud> [args]`; plain `ranch` in a TTY
-  opens the dashboard. Inside attach, `Ctrl-B` is the tmux-style prefix.
+  daemon|register|login|config|machines|cloud> [args]`; `ranchd` argv0 =
+  daemon. Plain `ranch` in a TTY opens the dashboard. Inside attach,
+  `Ctrl-B` is the tmux-style prefix.
 - tmux semantics are deliberate: `&`/`k` = window-kill, session-level kill
   is `:kill-session` / dashboard / phone long-press.
 - Config: `~/.config/ranch/daemon.toml` (0600: relay machine key, forge
