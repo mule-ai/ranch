@@ -17,6 +17,7 @@ import { Frame, ForgeSessionInfo, SessionMeta, nextId } from "./lib/frames";
 import { LoginScreen, EmailFallback } from "./screens/Login";
 import { MachinesScreen } from "./screens/Machines";
 import { TerminalScreen } from "./screens/Terminal";
+import { EditorScreen } from "./screens/Editor";
 
 type Machine = { id: string; name: string };
 
@@ -30,6 +31,12 @@ export default function App() {
   const [relay, setRelay] = useState<Relay | null>(null);
   const [sessions, setSessions] = useState<SessionMeta[] | null>(null);
   const [attached, setAttached] = useState<SessionMeta | null>(null);
+  // M10: file editor (browse/read/write files on this machine)
+  const [editing, setEditing] = useState(false);
+  // hot daemon upgrade in flight (button shows progress, err shows result)
+  const [upgrading, setUpgrading] = useState(false);
+  const upgradingRef = useRef(false);
+  upgradingRef.current = upgrading;
   const [newName, setNewName] = useState("");
   // session kind for the create row: shell or forge (agent running pi)
   const [newKind, setNewKind] = useState<"shell" | "forge" | "pi">("shell");
@@ -115,6 +122,8 @@ export default function App() {
               retryTimer = null;
             }
             setSessions(f.sessions);
+            // hot upgrade: the daemon is back with the new binary
+            setUpgrading(false);
             break;
           case "SessionsAck":
             // created via the sessions screen → attach to it
@@ -195,6 +204,10 @@ export default function App() {
     return <MachinesScreen onPick={(m) => setMachine(m)} />;
   }
 
+  if (editing && relay) {
+    return <EditorScreen relay={relay} onExit={() => setEditing(false)} />;
+  }
+
   if (!attached) {
     return (
       <View style={[s.wrap, { paddingBottom: kbHeight }]}>
@@ -203,7 +216,42 @@ export default function App() {
             <Text style={s.back}>‹ machines</Text>
           </Pressable>
           <Text style={s.title}>{machine.name}</Text>
-          <View style={{ width: 70 }} />
+          <View style={{ flexDirection: "row", alignItems: "center" }}>
+            <Pressable
+              onPress={() =>
+                Alert.alert(
+                  "hot upgrade",
+                  "restart the daemon in place? Sessions and agent panes are kept alive (zero downtime).",
+                  [
+                    { text: "cancel", style: "cancel" },
+                    {
+                      text: "upgrade",
+                      onPress: () => {
+                        setUpgrading(true);
+                        relay?.send({ t: "Upgrade" } as Frame);
+                        // if the daemon doesn't come back in 30s, surface it
+                        setTimeout(() => {
+                          if (upgradingRef.current) {
+                            setUpgrading(false);
+                            setErr("daemon did not come back after upgrade — try refresh");
+                          }
+                        }, 30000);
+                      },
+                    },
+                  ]
+                )
+              }
+              hitSlop={8}
+              disabled={upgrading}
+            >
+              <Text style={[s.back, upgrading && { color: "#6b7280" }]}>
+                {upgrading ? "upgrading…" : "upgrade"}
+              </Text>
+            </Pressable>
+            <Pressable onPress={() => setEditing(true)} hitSlop={8}>
+              <Text style={s.back}>files</Text>
+            </Pressable>
+          </View>
         </View>
         {err !== "" && <Text style={s.err}>{err}</Text>}
         {sessions === null ? (
