@@ -1,8 +1,6 @@
-// The live client: pick a machine → list sessions → attach to a live
-// terminal in the browser. Same frames, same relay, same SGR rendering
-// model as the mobile app — DOM instead of RN views, and the browser
-// itself captures the keyboard (focus a hidden input? no: the pane
-// div is focusable and listens for keydown directly).
+// The live client: login → machine picker → sessions (full management:
+// create shell/agent/pi, rename, kill, dir picker, forge resume, hot
+// upgrade) → terminal (split panes, keys, scrollback, agent chat).
 import { useEffect, useMemo, useRef, useState, useCallback } from "react";
 import { Relay } from "../lib/relay";
 import {
@@ -54,18 +52,8 @@ export function WebApp() {
     return <p className="dim center">…</p>;
   if (!authed) return <Login onSignedIn={() => setAuthed(true)} />;
   if (!machine)
-    return (
-      <MachinePicker
-        onPick={setMachine}
-        onSignOut={() => supabase.auth.signOut()}
-      />
-    );
-  return (
-    <SessionsScreen
-      machine={machine}
-      onBack={() => setMachine(null)}
-    />
-  );
+    return <MachinePicker onPick={setMachine} onSignOut={() => supabase.auth.signOut()} />;
+  return <MachineClient machine={machine} onBack={() => setMachine(null)} />;
 }
 
 function MachinePicker({
@@ -106,10 +94,7 @@ function MachinePicker({
       )}
       {machines?.map((m) => (
         <button key={m.id} className="machrow" onClick={() => onPick(m)}>
-          <span
-            className="dot"
-            style={{ background: online(m) ? "#4ade80" : "#6b7280" }}
-          />
+          <span className="dot" style={{ background: online(m) ? "#4ade80" : "#6b7280" }} />
           <span className="machname">{m.name}</span>
           <span className="dim">
             {online(m)
@@ -126,12 +111,15 @@ function MachinePicker({
   );
 }
 
-function SessionsScreen({ machine, onBack }: { machine: Machine; onBack: () => void }) {
+function MachineClient({ machine, onBack }: { machine: Machine; onBack: () => void }) {
   const [relay, setRelay] = useState<Relay | null>(null);
   const [sessions, setSessions] = useState<SessionMeta[] | null>(null);
   const [attached, setAttached] = useState<SessionMeta | null>(null);
   const [conn, setConn] = useState("connecting…");
   const [err, setErr] = useState("");
+  const [upgrading, setUpgrading] = useState(false);
+  const upgradingRef = useRef(false);
+  upgradingRef.current = upgrading;
 
   useEffect(() => {
     let r: Relay | null = null;
@@ -158,6 +146,8 @@ function SessionsScreen({ machine, onBack }: { machine: Machine; onBack: () => v
             if (retryTimer) { clearInterval(retryTimer); retryTimer = null; }
             setSessions(f.sessions);
             setConn("online");
+            // hot upgrade: daemon is back with the new binary
+            setUpgrading(false);
             break;
           case "Error":
             setErr(f.message);
@@ -183,6 +173,17 @@ function SessionsScreen({ machine, onBack }: { machine: Machine; onBack: () => v
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [machine.id]);
 
+  const hotUpgrade = () => {
+    setUpgrading(true);
+    relay?.send({ t: "Upgrade" } as Frame);
+    setTimeout(() => {
+      if (upgradingRef.current) {
+        setUpgrading(false);
+        setErr("daemon did not come back after upgrade — refresh the page");
+      }
+    }, 30000);
+  };
+
   if (attached && relay)
     return (
       <Terminal
@@ -197,22 +198,242 @@ function SessionsScreen({ machine, onBack }: { machine: Machine; onBack: () => v
 
   return (
     <div className="page narrow">
-      <p>
+      <p className="rowline">
         <button className="linkbtn" onClick={onBack}>‹ machines</button>
         <span className="title-inline">{machine.name}</span>
         <span className="conn-badge">{conn}</span>
       </p>
       {err !== "" && <p className="err">{err}</p>}
+
       {sessions === null && <p className="dim">loading sessions…</p>}
-      {sessions?.length === 0 && <p className="dim">No sessions. Create one on the machine.</p>}
+      {sessions !== null && sessions.length === 0 && (
+        <p className="dim">No sessions. Create one below.</p>
+      )}
       {sessions?.map((s) => (
-        <button key={s.id} className="machrow" onClick={() => setAttached(s)}>
-          <span className="machname">{s.name}</span>
-          <span className="dim">
-            {s.kind} · {s.panes.length} pane{s.panes.length === 1 ? "" : "s"}
-          </span>
-        </button>
+        <SessionRow
+          key={s.id}
+          session={s}
+          relay={relay}
+          onAttach={() => setAttached(s)}
+          onKilled={() => setSessions((prev) => (prev ?? []).filter((x) => x.id !== s.id))}
+          onRenamed={(name) =>
+            setSessions((prev) => (prev ?? []).map((x) => (x.id === s.id ? { ...x, name } : x)))
+          }
+        />
       ))}
+
+      <CreateRow relay={relay} />
+      <div className="btnrow" style={{ marginTop: 24 }}>
+        <button className="btn btn-ghost" onClick={hotUpgrade} disabled={upgrading || !relay}>
+          {upgrading ? "upgrading…" : "upgrade daemon"}
+        </button>
+        <button className="btn btn-ghost danger" onClick={() => supabase.auth.signOut()}>
+          Sign out
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function SessionRow({
+  session,
+  relay,
+  onAttach,
+  onKilled,
+  onRenamed,
+}: {
+  session: SessionMeta;
+  relay: Relay | null;
+  onAttach: () => void;
+  onKilled: () => void;
+  onRenamed: (name: string) => void;
+}) {
+  const [menu, setMenu] = useState(false);
+  const [renaming, setRenaming] = useState(false);
+  const [text, setText] = useState(session.name);
+
+  return (
+    <div className="sessionrow">
+      {renaming ? (
+        <form
+          className="renameform"
+          onSubmit={(e) => {
+            e.preventDefault();
+            const name = text.trim() || session.name;
+            relay?.send({ t: "SessionsRename", session: session.id, name } as Frame);
+            onRenamed(name);
+            setRenaming(false);
+          }}
+        >
+          <input autoFocus value={text} onChange={(e) => setText(e.target.value)} onBlur={() => setRenaming(false)} />
+          <button type="submit" className="btn btn-ghost">rename</button>
+        </form>
+      ) : (
+        <>
+          <button className="sessionmain" onClick={onAttach}>
+            <span className="machname">{session.name}</span>
+            <span className="dim">
+              {session.kind} · {session.panes.length} pane{session.panes.length === 1 ? "" : "s"}
+            </span>
+          </button>
+          <button className="iconbtn" title="session menu" onClick={() => setMenu(!menu)}>
+            ⋯
+          </button>
+        </>
+      )}
+      {menu && (
+        <div className="menu">
+          <button onClick={() => { setRenaming(true); setText(session.name); setMenu(false); }}>
+            rename
+          </button>
+          <button
+            className="danger"
+            onClick={() => {
+              relay?.send({ t: "SessionsKill", session: session.id } as Frame);
+              onKilled();
+              setMenu(false);
+            }}
+          >
+            kill session
+          </button>
+          <button onClick={() => setMenu(false)}>cancel</button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function CreateRow({ relay }: { relay: Relay | null }) {
+  const [name, setName] = useState("");
+  const [kind, setKind] = useState<"shell" | "forge" | "pi">("shell");
+  const [piDir, setPiDir] = useState<string | null>(null);
+  const [dirBrowse, setDirBrowse] = useState<{ path: string; parent: string | null; dirs: string[] } | null>(null);
+  const [resumeList, setResumeList] = useState<{ id: string; title: string; updated: string; ended?: string | null }[] | null>(null);
+  const dirReqRef = useRef<string | null>(null);
+  const resumeReqRef = useRef<string | null>(null);
+
+  // frame listener for DirListOk / ForgeListOk
+  useEffect(() => {
+    if (!relay) return;
+    const un = relay.onFrame((f: Frame) => {
+      if (f.t === "DirListOk" && f.req_id === dirReqRef.current) {
+        dirReqRef.current = null;
+        setDirBrowse({ path: f.path, parent: f.parent ?? null, dirs: f.dirs });
+      } else if (f.t === "ForgeListOk" && f.req_id === resumeReqRef.current) {
+        resumeReqRef.current = null;
+        setResumeList(f.sessions);
+      }
+    });
+    return un;
+  }, [relay]);
+
+  const browseDir = (path?: string) => {
+    if (!relay) return;
+    const rid = nextId();
+    dirReqRef.current = rid;
+    relay.send({ t: "DirList", id: nextId(), client: "web", req_id: rid, path } as Frame);
+  };
+
+  const create = () => {
+    relay?.send({
+      t: "SessionsCreate", req_id: nextId(), name: name || undefined,
+      kind,
+      cwd: kind === "pi" ? (piDir ?? undefined) : undefined,
+    } as Frame);
+  };
+
+  return (
+    <div className="createrow">
+      <div className="kindrow">
+        {(["shell", "forge", "pi"] as const).map((k) => (
+          <button key={k} className={"chip" + (kind === k ? " chip-on" : "")} onClick={() => setKind(k)}>
+            {k === "forge" ? "agent" : k}
+          </button>
+        ))}
+        <button
+          className="chip"
+          onClick={() => {
+            if (!relay) return;
+            const rid = nextId();
+            resumeReqRef.current = rid;
+            relay.send({ t: "ForgeList", id: nextId(), client: "web", req_id: rid } as Frame);
+          }}
+        >
+          resume…
+        </button>
+      </div>
+
+      {kind === "pi" && (
+        <button className="chip chip-wide" onClick={() => browseDir(piDir ?? undefined)}>
+          dir: {piDir ?? "$HOME"}
+        </button>
+      )}
+
+      {dirBrowse !== null && (
+        <div className="sheet">
+          <b className="dim" style={{ fontSize: "0.8rem" }}>{dirBrowse.path}</b>
+          {dirBrowse.dirs.map((d) => (
+            <button key={d} className="machrow" onClick={() => browseDir(dirBrowse.path + "/" + d)}>
+              <span className="machname">{d}/</span>
+            </button>
+          ))}
+          {dirBrowse.dirs.length === 0 && <p className="dim">no subdirectories</p>}
+          <div className="kindrow">
+            {dirBrowse.parent !== null && (
+              <button className="chip" onClick={() => browseDir(dirBrowse.parent ?? undefined)}>up…</button>
+            )}
+            <button className="chip chip-on" onClick={() => { setPiDir(dirBrowse.path); setDirBrowse(null); }}>
+              use this dir
+            </button>
+            <button className="chip" onClick={() => setDirBrowse(null)}>cancel</button>
+          </div>
+        </div>
+      )}
+
+      {resumeList !== null && (
+        <div className="sheet">
+          <b>forge sessions</b>
+          {resumeList.map((item) => (
+            <button
+              key={item.id}
+              className="machrow"
+              onClick={() => {
+                setResumeList(null);
+                relay?.send({
+                  t: "SessionsCreate", req_id: nextId(), kind: "forge",
+                  forge_session: item.id,
+                } as Frame);
+              }}
+            >
+              <span className="machname">{item.title || item.id.slice(0, 8)}</span>
+              <span className="dim">
+                {item.ended ? "ended" : "active"} · {item.updated?.slice(0, 16).replace("T", " ") ?? ""}
+              </span>
+            </button>
+          ))}
+          {resumeList.length === 0 && <p className="dim">nothing to resume</p>}
+          <button className="chip" onClick={() => setResumeList(null)}>close</button>
+        </div>
+      )}
+
+      <div className="createrow-inner">
+        <input
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && create()}
+          placeholder={
+            kind === "forge"
+              ? "agent name (lab forge)"
+              : kind === "pi"
+                ? "local pi name (optional)"
+                : "new session name (optional)"
+          }
+          autoCapitalize="none"
+        />
+        <button className={"btn btn-primary" + (kind === "forge" ? " btn-agent" : "")} onClick={create}>
+          {kind === "forge" ? "agent" : "new"}
+        </button>
+      </div>
     </div>
   );
 }
@@ -239,7 +460,6 @@ function Terminal({
   const lastSeq = useRef<Map<string, number>>(new Map());
   const panesRef = useRef(panes);
   panesRef.current = panes;
-  // chat pane (agent) support: same bubble view as mobile
   const [chatDraft, setChatDraft] = useState("");
   const chatScrollRef = useRef<HTMLDivElement | null>(null);
   const [history, setHistory] = useState<string[] | null>(null);
@@ -341,7 +561,6 @@ function Terminal({
     const resyncTimer = setInterval(() => {
       relay.send({ t: "Attach", id: nextId(), client: "web", session: sessionId } as Frame);
     }, 15000);
-    // focus the terminal so typing works without a click on desktop
     setTimeout(() => focusRef.current?.focus(), 100);
     return () => {
       clearInterval(retryTimer);
@@ -352,7 +571,6 @@ function Terminal({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId]);
 
-  // track container size → cols/rows → PTY resize
   useEffect(() => {
     const el = wrapRef.current;
     if (!el) return;
@@ -381,8 +599,6 @@ function Terminal({
     } as Frame);
   };
 
-  // browser captures real keys — map the common control ones, pass the
-  // rest through as text
   const onKey = (e: React.KeyboardEvent) => {
     const k = e.key;
     let data: string | null = null;
@@ -425,6 +641,44 @@ function Terminal({
         <button className="linkbtn" onClick={onExit}>‹ back</button>
         <span className="title-inline">{session.name}</span>
         <span className="conn-badge">{conn}</span>
+        <span className="spacer" />
+        {/* pane management: split / kill on the focused pane */}
+        <button
+          className="keybtn"
+          title="split right"
+          onClick={() =>
+            relay.send({
+              t: "PaneSplit", req_id: nextId(), session: sessionId, pane: activePane, dir: 1,
+            } as Frame)
+          }
+        >
+          split ⫞
+        </button>
+        <button
+          className="keybtn"
+          title="kill pane"
+          disabled={panes.size < 2}
+          onClick={() => {
+            if (panes.size < 2) return;
+            relay.send({ t: "PaneKill", session: sessionId, pane: activePane } as Frame);
+          }}
+        >
+          kill pane
+        </button>
+        {panes.size > 1 &&
+          [...panes.keys()].map((p, i) => (
+            <button
+              key={p}
+              className={"keybtn" + (p === activePane ? " keybtn-on" : "")}
+              onClick={() => {
+                setActivePane(p);
+                focusRef.current?.focus();
+                relay.send({ t: "SessionsSelect", session: sessionId, pane: p } as Frame);
+              }}
+            >
+              {i + 1}
+            </button>
+          ))}
       </div>
 
       {chatMode ? (
@@ -491,12 +745,7 @@ function Terminal({
               <p className="dim">waiting for snapshot… ({conn})</p>
             </div>
           )}
-          <div
-            ref={focusRef}
-            tabIndex={0}
-            className="term-focus"
-            onKeyDown={onKey}
-          />
+          <div ref={focusRef} tabIndex={0} className="term-focus" onKeyDown={onKey} />
         </div>
       )}
 

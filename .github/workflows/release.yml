@@ -129,12 +129,13 @@ jobs:
             "sha256_linux": "$SHA_LINUX"
           }
           EOF
-          # publish: push files to the ranch-dist repo's main branch
+          # publish: fresh git repo -> force push to ranch-dist main
           git config --global user.email "ci@ranch.local"
           git config --global user.name "ranch CI"
-          REPO="https://x-access-token:$GH_TOKEN@github.com/$DIST_REPO.git"
-          find . -maxdepth 1 ! -name out ! -name . -exec mv {} out/ \;
+          mkdir out
+          mv ranch-linux-x86_64.tar.gz ranch-linux-x86_64.tar.gz.sha256 ranch.apk ranch.apk.sha256 versions.json out/
           cd out
+          git init -b main
           git add -A
-          git commit -m "release $VERSION" || echo "no changes"
-          git push -f -u "$REPO" main
+          git commit -m "release $VERSION"
+          git push -f "https://x-access-token:$GH_TOKEN@github.com/$DIST_REPO.git" main
