@@ -34,8 +34,8 @@ jobs:
           git clone --depth 1 https://github.com/ghostty-org/ghostty vendor/ghostty
           cd vendor/ghostty && git fetch --depth 1 origin 82232ecde55405559dec29c5466cb9e39938cb41 && git checkout 82232ecde55405559dec29c5466cb9e39938cb41
           cd example/c-vt-stream && PATH="${{ github.workspace }}/.tools/zig:$PATH" zig build
-          mkdir -p ../../lib
-          cp .zig-cache/o/*/libghostty-vt.so ../../lib/
+          mkdir -p $GITHUB_WORKSPACE/vendor/lib
+          cp .zig-cache/o/*/libghostty-vt.so $GITHUB_WORKSPACE/vendor/lib/
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build release binaries
