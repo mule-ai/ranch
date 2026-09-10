@@ -133,8 +133,7 @@ jobs:
           git config --global user.email "ci@ranch.local"
           git config --global user.name "ranch CI"
           REPO="https://x-access-token:$GH_TOKEN@github.com/$DIST_REPO.git"
-          git init -b main out
-          cp dist/* out/
+          find . -maxdepth 1 ! -name out ! -name . -exec mv {} out/ \;
           cd out
           git add -A
           git commit -m "release $VERSION" || echo "no changes"
