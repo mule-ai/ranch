@@ -152,6 +152,51 @@ pub enum Frame {
         parent: Option<String>,
         /// subdirectory names, sorted
         dirs: Vec<String>,
+        /// regular file names, sorted (M10: editor file picker)
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        files: Vec<String>,
+    },
+    /// Client -> daemon: read a file's text content (M10 editor).
+    FileRead {
+        id: String,
+        client: String,
+        /// echoed back in FileReadOk so clients match the reply
+        req_id: String,
+        path: String,
+    },
+    /// Daemon -> client: a file's contents.
+    FileReadOk {
+        id: String,
+        req_id: String,
+        path: String,
+        /// UTF-8 file contents
+        content: String,
+        /// last-modified unix timestamp (seconds); used for conflict detection
+        mtime: i64,
+        /// size in bytes
+        size: u64,
+    },
+    /// Client -> daemon: write a file's text content (M10 editor).
+    /// Atomic write (temp + rename). `mtime` (if present) must match the
+    /// on-disk value or the write is refused (no silent clobber).
+    FileWrite {
+        id: String,
+        client: String,
+        /// echoed back in FileWriteOk so clients match the reply
+        req_id: String,
+        path: String,
+        content: String,
+        /// last-modified ts the client read with; None = skip conflict check
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mtime: Option<i64>,
+    },
+    /// Daemon -> client: a file was written successfully.
+    FileWriteOk {
+        id: String,
+        req_id: String,
+        path: String,
+        /// new last-modified unix timestamp (seconds)
+        mtime: i64,
     },
     /// Client -> daemon: list resumable forge sessions.
     ForgeList {
@@ -681,8 +726,13 @@ mod tests {
                 lines: vec![big; 24],
                 seq: 7,
                 cursor: None,
+                kind: None,
+                chat: None,
+                forge_session: None,
             }],
             meta: vec![],
+            windows: vec![],
+            window: None,
         };
         // Serialize everything into one byte blob, feed byte-by-byte.
         let blob: String = encode_frame(&f, "c9").join("\n");
@@ -701,6 +751,57 @@ mod tests {
         let enc = b64_encode(&data);
         let dec = b64_decode(&enc).unwrap();
         assert_eq!(dec, data);
+    }
+
+    #[test]
+    fn roundtrip_file_frames() {
+        let read = Frame::FileRead {
+            id: "i1".into(),
+            client: "c".into(),
+            req_id: "r1".into(),
+            path: "/home/j/notes.md".into(),
+        };
+        let read_ok = Frame::FileReadOk {
+            id: "i2".into(),
+            req_id: "r1".into(),
+            path: "/home/j/notes.md".into(),
+            content: "# hi\n".into(),
+            mtime: 1757500000,
+            size: 7,
+        };
+        let write = Frame::FileWrite {
+            id: "i3".into(),
+            client: "c".into(),
+            req_id: "r2".into(),
+            path: "/home/j/notes.md".into(),
+            content: "# hi there\n".into(),
+            mtime: Some(1757500000),
+        };
+        let write_ok = Frame::FileWriteOk {
+            id: "i4".into(),
+            req_id: "r2".into(),
+            path: "/home/j/notes.md".into(),
+            mtime: 1757500001,
+        };
+        // optional mtime must deserialize as None when absent (back-compat)
+        let json =
+            r#"{"t":"FileWrite","id":"i","client":"c","req_id":"r","path":"/x","content":""}"#;
+        let parsed: Frame = serde_json::from_str(json).unwrap();
+        match parsed {
+            Frame::FileWrite { mtime, .. } => assert!(mtime.is_none()),
+            _ => panic!("wrong variant"),
+        }
+        for f in [read, read_ok, write, write_ok] {
+            let lines = encode_frame(&f, "c1");
+            let mut payload = String::new();
+            for l in &lines {
+                payload.push_str(l);
+                payload.push('\n');
+            }
+            let mut d = Decoder::new();
+            let got = d.feed(payload.as_bytes());
+            assert_eq!(got, vec![f]);
+        }
     }
 
     #[test]

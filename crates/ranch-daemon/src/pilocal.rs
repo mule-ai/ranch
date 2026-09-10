@@ -32,6 +32,11 @@ fn next_seq() -> i64 {
     SEQ.fetch_add(1, Ordering::Relaxed) as i64
 }
 
+/// Set by the reader thread when pi's session file is captured — the
+/// daemon's poll loop watches this and re-persists state.json so the
+/// recorded pi_session_file stays current for restore.
+pub static STATE_DIRTY: AtomicBool = AtomicBool::new(false);
+
 /// One local pi agent: the child process + its bookkeeping.
 pub struct LocalPi {
     pub pane: Uuid,
@@ -39,6 +44,10 @@ pub struct LocalPi {
     child: Mutex<Option<Child>>,
     stdin: Option<std::process::ChildStdin>,
     stop: Arc<AtomicBool>,
+    /// pi's own session file, captured from the `get_state` response so a
+    /// respawned pi can `switch_session` back into the same conversation
+    /// (session persistence across daemon restarts).
+    pub session_file: Arc<Mutex<Option<String>>>,
 }
 
 impl LocalPi {
@@ -71,14 +80,20 @@ impl LocalPi {
             .ok_or_else(|| "pi stdout capture failed".to_string())?;
 
         let stop = Arc::new(AtomicBool::new(false));
+        let session_file = Arc::new(Mutex::new(None::<String>));
         let lp = Arc::new(LocalPi {
             pane,
             cwd: cwd.to_string(),
             child: Mutex::new(Some(child)),
             stdin: Some(stdin),
             stop: stop.clone(),
+            session_file: session_file.clone(),
         });
         panes.insert(pane, lp.clone());
+
+        // ask pi for its session file path (response is captured below);
+        // harmless if it arrives before/after the first prompt
+        let _ = lp.send_rpc(&serde_json::json!({"type": "get_state"}));
 
         // reader thread: pi events -> chat frames
         let t_pane = pane;
@@ -95,6 +110,23 @@ impl LocalPi {
                 };
                 let ev = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
                 match ev {
+                    // capture pi's session file path (get_state response) so
+                    // a later daemon restart can switch_session back into
+                    // this very conversation
+                    "response" => {
+                        if v.get("command").and_then(|c| c.as_str()) == Some("get_state") {
+                            if let Some(sf) = v
+                                .pointer("/data/sessionFile")
+                                .and_then(|s| s.as_str())
+                            {
+                                eprintln!("ranchd: local pi {t_pane} session file: {sf}");
+                                if let Ok(mut g) = session_file.lock() {
+                                    *g = Some(sf.to_string());
+                                    STATE_DIRTY.store(true, Ordering::Relaxed);
+                                }
+                            }
+                        }
+                    }
                     "message_end" => {
                         // assistant replies land here with full content
                         if let Some(msg) = v.get("message") {
@@ -162,6 +194,30 @@ impl LocalPi {
             eprintln!("ranchd: local pi pane {t_pane} exited");
         });
         Ok(())
+    }
+
+    /// Send a raw RPC command to pi's stdin (used for `get_state` after
+    /// spawn and `switch_session` on restore). Writes are serialized via
+    /// the stdin mutex-free handle — single-threaded RPC use is fine here.
+    pub fn send_rpc(&self, cmd: &serde_json::Value) -> Result<(), String> {
+        let stdin = self
+            .stdin
+            .as_ref()
+            .ok_or_else(|| "pi stdin already taken".to_string())?;
+        let mut s = stdin;
+        let line = cmd.to_string();
+        s.write_all(line.as_bytes())
+            .and_then(|_| s.write_all(b"\n"))
+            .and_then(|_| s.flush())
+            .map_err(|e| format!("pi stdin: {e}"))
+    }
+
+    /// Switch pi to a previously-recorded session file (restore path).
+    pub fn switch_session(&self, path: &str) -> Result<(), String> {
+        self.send_rpc(&serde_json::json!({
+            "type": "switch_session",
+            "sessionPath": path,
+        }))
     }
 
     /// Send a user prompt: write the RPC prompt to pi's stdin first,
