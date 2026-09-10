@@ -1,107 +1,139 @@
-# Ranch
+# ranch 🤠
 
-A personal terminal multiplexer with a cloud relay: long-lived terminal
-sessions on your machine, reachable from a local terminal (Linux-first),
-a mobile app, and — by design — from anywhere later.
+A personal terminal multiplexer with a cloud relay. Long-lived sessions
+on your own machine — reachable from your terminal, your phone, or any
+browser.
+
+![ranch web app](docs/screenshot-web-landing.png)
 
 Sessions keep running while you're away. Reconnect from any device and
-pick up exactly where you left off. tmux-style multiplexing is the core
-(a tmux *replacement*, not a companion); **Forge** agent sessions and
-**Mule** workflows are first-class pane types.
+pick up exactly where you left off — including agent conversations.
+tmux-style multiplexing is the core (a tmux *replacement*, not a
+companion), and agent sessions (Forge, pi) are
+first-class pane types that render as conversations, not raw terminal
+dumps.
 
-## Status
+## Install
 
-**Working today** (tested):
+**Linux x86_64** — one static binary, no runtime dependencies:
 
-- **Local multiplexing core** — `ranchd` daemon owns sessions/panes
-  (PTY + server-side terminal emulation via libghostty-vt); `ranch`
-  CLI attaches, renders, and sends input over a local unix socket.
-  Sessions survive client disconnect; resize reflows; scrollback
-  (heuristic ring, 2000 lines).
-- **tmux keybindings** — `Ctrl-B` prefix: `d` detach, `n`/`p` session
-  nav, `o`/`l` pane cycle, `c` new session, `&` kill session,
-  `%`/`"` split, `x` kill pane, `s` session picker, `,` rename,
-  `:` command prompt, `Ctrl-B Ctrl-B` literal passthrough.
-  `Ctrl-C` goes to the shell like any other key.
-- **Cloud relay (Supabase)** — private Realtime channel per machine,
-  RLS-gated to the owner + the machine itself. Frames flow
-  machine ⇄ cloud ⇄ remote client; session mirror + heartbeat let any
-  device list machines/sessions even while the machine is offline.
-  Local clients never touch the cloud (verified: zero frames leave the
-  machine for local-only activity).
-- **Multi-user identity** — Google OAuth sign-in (Supabase Auth) with
-  browser PKCE flow (`ranch login`); self-serve machine registration
-  (`ranch register`, no admin credentials on devices); multiple
-  daemons per account; `ranch machines` / `ranch cloud` to list
-  devices and sessions.
-- **Packaging** — `make install` puts binaries in `~/.local/bin`;
-  `make service` installs/starts a systemd user unit for the daemon.
+```sh
+curl -fsSL https://raw.githubusercontent.com/mule-ai/ranch-dist/main/ranch-linux-x86_64.tar.gz | tar xz
+cd ranch-linux-x86_64
+install ranch ~/.local/bin/ranch
+ln -sf ranch ~/.local/bin/ranchd
+```
 
-**Not yet** (the actual multiplexing UI):
+Or grab the tarball / signed **Android APK** from
+[**Releases**](https://github.com/mule-ai/ranch/releases/latest) or the
+[download page](https://mule-ai.github.io/ranch/#/download).
 
-- Split panes are protocol-level only — the daemon tracks split trees,
-  but the attach TUI still renders one full-screen pane at a time.
-  Next: real split rendering, then a session-tree sidebar so `ranch`
-  feels like one app over all machines/sessions.
-- Mobile app (M3), Forge/Mule first-class panes (M4).
-- Seq-gap auto-resync is protocol-supported; not yet client-wired.
+<details>
+<summary>Build from source</summary>
+
+```sh
+git clone https://github.com/mule-ai/ranch && cd ranch
+make setup        # one-time: Zig 0.16 + pinned ghostty (for libghostty-vt)
+make install      # ~/.local/bin/ranch (+ ranchd symlink)
+make service      # systemd user unit for the daemon (optional)
+```
+
+Requires Rust (stable) + Zig 0.16; JDK 17 + the Android SDK only for
+building the APK locally.
+
+</details>
 
 ## Quick start
 
 ```sh
-make install          # builds + installs to ~/.local/bin
 ranch login           # Google sign-in (once per device)
-ranch register        # on a daemon host: register with your account
-make service          # install + start the ranchd systemd user unit
-ranch                 # interactive session manager: list/create/attach/kill
-ranch new work        # or straight to the point: create + `ranch attach work`
-ranch machines        # list your machines (any device)
+ranch register        # on a daemon host: register it with your account
+ranch daemon          # run the daemon (or the systemd unit from `make service`)
+ranch                 # interactive session manager
+ranch new work        # create a session + attach
+ranch machines        # list your machines (from any device)
 ranch cloud           # list sessions across machines
 ```
 
-Inside `ranch` (dashboard) or `attach`: `Ctrl-B` is the tmux-style
-prefix — `%`/`"` split, arrows move focus, Ctrl-arrows resize,
-`d` detaches. Sessions keep running while detached.
+Then open [the web app](https://mule-ai.github.io/ranch/#/app) or the
+Android app: same sessions, same machines, live terminal, from anywhere.
 
-Keys inside `attach`: see `Ctrl-B` table above; the status bar flashes
-`[prefix]` when the next key is a command.
+`Ctrl-B` inside `ranch` is the tmux-style prefix: `%`/`"` split, arrows
+move focus, `Ctrl`-arrows resize, `d` detaches, `c`/`s`/`,`,`&` manage
+sessions. Sessions keep running while detached — and while your laptop
+is closed.
 
-## Layout
+## How it fits together
 
 ```
-ranch/
-├── Makefile            # build / install / service
-├── docs/
-│   ├── SPEC.md         # research, architecture, milestones (M0–M4)
-│   └── PROTOCOL.md     # wire protocol (daemon ⇄ clients ⇄ relay)
-├── crates/             # Rust workspace: protocol, daemon, cli, vt
-├── supabase/migrations # schema + RLS (incl. self-serve register RPC)
-├── tools/relay-test.mjs# raw Realtime test client
-├── systemd/ranchd.service
-└── mobile/             # Expo app (M3, not started)
+ local TUI ─┐                                      ┌─ phone (Expo)
+ browser ───┼─ Supabase Realtime ── ranch daemon ──┼─ PTY panes (libghostty-vt)
+ ranch CLI ─┘    (RLS-gated relay)                └─ agent children (pi, forge)
 ```
+
+- **One binary** — `ranch` is the CLI/TUI *and* the daemon (`ranch
+  daemon`, the `ranchd` symlink, or `--daemon`). Fully statically
+  linked (musl + the ghostty VT engine compiled to a static archive):
+  ~21 MB, zero runtime deps.
+- **The daemon owns everything** — one server-side terminal emulator
+  per pane, 30 ms coalesced output, sessions/panes/layout in
+  `state.json`.
+- **Sessions survive (almost) everything.** Two tiers:
+  - *Tier 1* — daemon restart kills panes? `state.json` rebuilds
+    sessions, panes, and agent conversations from disk on boot.
+  - *Tier 2* — `ranch upgrade` hot-upgrades the daemon in place: it
+    re-execs itself with `--inherit`, passing every PTY/agent/listener
+    fd through the exec. Same PID, children never notice, zero dead
+    panes.
+- **Cloud relay** — a private Supabase Realtime channel per machine,
+  RLS-gated to the owner + the machine itself. Terminal frames flow
+  machine ⇄ cloud ⇄ remote client; heartbeats power the online
+  indicator. Local clients never touch the cloud.
+- **Multi-device identity** — Google OAuth sign-in; self-serve machine
+  registration (`ranch register`, no admin credentials on devices);
+  any number of daemons per account.
+
+## Security model
+
+- Machine identity is a dedicated Supabase Auth user per machine; its
+  key is shown once at `ranch register` and stored `0600` on the host.
+- Row Level Security everywhere: owners see only their own machines
+  and sessions; realtime channels are joinable only by the owning user
+  and the machine itself.
+- The relay relays opaque frames — the cloud never sees terminal
+  contents in plaintext at rest (frames live in-transit only).
+
+## Development
+
+```
+crates/ranch         the binary: client (client.rs) + daemon (daemon.rs)
+crates/ranch-protocol  wire protocol (same frames on socket + relay)
+crates/ranch-vt        server-side terminal emulation (libghostty-vt)
+web/               Vite + React web app (GitHub Pages)
+mobile/            Expo Android app
+supabase/migrations  schema + RLS policies
+docs/SPEC.md       architecture, milestones M0–M4 + completion notes
+docs/PROTOCOL.md   frame reference
+```
+
+```sh
+make build         # static release binary
+make test          # cargo test
+npm --prefix web run dev
+```
+
+## Status
+
+Working and tested: local multiplexing core (PTY + server-side
+emulation, scrollback, resize reflow, tmux keys), attach TUI with split
+panes, cloud relay + multi-device apps, agent panes (pi) with chat
+bubbles, Tier-1 session restore, Tier-2 zero-downtime hot upgrades,
+CI-published static binaries + signed APK.
+
+In flight: Forge agent sessions end-to-end, mule workflow panes (M10).
 
 ## Docs
 
-- `docs/SPEC.md` — architecture, security model, milestones M0–M4 with
-  detailed completion notes (M0/M1 ✅, M2/M2.5/M2.6 ✅)
-- `docs/PROTOCOL.md` — frame reference; same frames on the unix socket
-  and the relay
-
-## Mobile (Android, M3)
-
-`mobile/` is an Expo (React Native) app — Android only. Sign in with
-Google (or password for dev), pick a machine, list/create sessions,
-attach, and type into a live pane over the Supabase Realtime relay.
-
-```sh
-cd mobile
-npm install
-npm start          # Expo dev server (Expo Go, or `npx expo run:android` for a dev build)
-```
-
-- Google sign-in works in Expo Go (the Supabase URI allow-list
-  includes `exp://**`); `dev.ranch.app://callback` covers future
-  dev-client/standalone builds. A password fallback exists for dev.
-- The pane renderer computes screen rectangles from the same
-  `Layout` split tree as the desktop client; updates stream per-pane.
+- [docs/SPEC.md](docs/SPEC.md) — research, architecture, milestone notes
+- [docs/PROTOCOL.md](docs/PROTOCOL.md) — the wire protocol
+- [Website](https://mule-ai.github.io/ranch/) · [Web app](https://mule-ai.github.io/ranch/#/app)

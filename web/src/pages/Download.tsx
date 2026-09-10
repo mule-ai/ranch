@@ -34,7 +34,7 @@ cd ranch && make setup && make install`}</pre>
         <>
           <div className="card">
             <h2>Android app</h2>
-            <p className="dim">v{rel.version} · built {rel.built.slice(0, 10)}</p>
+            <p className="dim">{rel.version === "main" ? "nightly" : `v${rel.version}`} · built {rel.built.slice(0, 10)}</p>
             <a className="btn btn-primary" href={distFile(rel.apk)} download>
               Download APK
             </a>
