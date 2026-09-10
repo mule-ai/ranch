@@ -149,6 +149,15 @@ function MachineClient({ machine, onBack }: { machine: Machine; onBack: () => vo
             // hot upgrade: daemon is back with the new binary
             setUpgrading(false);
             break;
+          case "SessionsAck":
+            // a session was created → re-pull the list so it shows up
+            hello();
+            break;
+          case "Meta":
+            // broadcast when a session is killed from elsewhere
+            // (dashboard/CLI/another client) — refresh the list
+            if (f.kind === "exited") hello();
+            break;
           case "Error":
             setErr(f.message);
             break;
@@ -462,6 +471,10 @@ function Terminal({
   panesRef.current = panes;
   const [chatDraft, setChatDraft] = useState("");
   const chatScrollRef = useRef<HTMLDivElement | null>(null);
+  // sticky-bottom chat: auto-follow new messages only while the user is
+  // at the bottom; if they've scrolled up, leave the view alone until
+  // they scroll back to the bottom
+  const chatAtBottomRef = useRef(true);
   const [history, setHistory] = useState<string[] | null>(null);
 
   useEffect(() => {
@@ -634,6 +647,18 @@ function Terminal({
   const activeSnap = activePane ? panes.get(activePane) : undefined;
   const chatMode = activeSnap?.kind === "forge-chat";
   const chatMsgs = activeSnap?.chat ?? [];
+  // sticky-bottom chat: auto-follow new messages only while the user is
+  // at the bottom; if they've scrolled up, leave the view alone until
+  // they scroll back to the bottom
+  useEffect(() => {
+    const el = chatScrollRef.current;
+    if (el && chatAtBottomRef.current) el.scrollTop = el.scrollHeight;
+  });
+  // switching to a different chat pane re-arms bottom-follow so the new
+  // conversation opens at the newest message
+  useEffect(() => {
+    chatAtBottomRef.current = true;
+  }, [activePane]);
 
   return (
     <div className="term-page">
@@ -683,7 +708,15 @@ function Terminal({
 
       {chatMode ? (
         <div className="chat-wrap">
-          <div className="chat-list" ref={chatScrollRef}>
+          <div
+            className="chat-list"
+            ref={chatScrollRef}
+            onScroll={(e) => {
+              const el = e.currentTarget;
+              chatAtBottomRef.current =
+                el.scrollHeight - el.scrollTop - el.clientHeight < 24;
+            }}
+          >
             {chatMsgs
               .filter((m: ChatMsg) => m.role === "tool" || m.text?.trim() !== "")
               .map((m, i) =>
@@ -712,6 +745,7 @@ function Terminal({
                     t: "ChatSend", id: nextId(), client: "web",
                     session: sessionId, pane: activePane, text: chatDraft.trim(),
                   } as Frame);
+                  chatAtBottomRef.current = true; // our own send ⇒ follow
                   setChatDraft("");
                 }
               }}
