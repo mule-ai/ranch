@@ -134,7 +134,31 @@ fn run(
             }
             Err(e) => {
                 clog(&format!("relay: session error: {e} — reconnecting in {backoff}s"));
-                std::thread::sleep(Duration::from_secs(backoff));
+                // Keep draining the daemon->relay pipe during backoff:
+                // the daemon's main loop writes frames into it with a
+                // BLOCKING write_all. If nobody reads while we sleep,
+                // the pipe fills (64 KiB) and the whole daemon freezes —
+                // every client, local ones included.
+                let drain_until = std::time::Instant::now() + Duration::from_secs(backoff);
+                let mut scratch = [0u8; 8192];
+                while std::time::Instant::now() < drain_until {
+                    match unsafe {
+                        libc::read(to_relay_r, scratch.as_mut_ptr() as *mut _, scratch.len())
+                    } {
+                        n if n > 0 => continue,
+                        n if n < 0 => {
+                            let err = std::io::Error::last_os_error();
+                            if err.kind() == std::io::ErrorKind::Interrupted
+                                || err.kind() == std::io::ErrorKind::WouldBlock
+                            {
+                                std::thread::sleep(Duration::from_millis(50));
+                            } else {
+                                break;
+                            }
+                        }
+                        _ => break, // pipe closed; reconnect below will error out
+                    }
+                }
                 backoff = (backoff * 2).min(60);
             }
         }
@@ -537,10 +561,26 @@ fn ws_send(
     text: &str,
 ) -> Result<(), String> {
     use tungstenite::Message;
+    // The socket fd is NON-BLOCKING (the poll loop above depends on that),
+    // so a large frame that outruns the network surfaces as EAGAIN/WouldBlock
+    // on write/flush. That is NOT fatal — previously it tore down the whole
+    // session and backed off up to 60s, which stalled every remote client
+    // (the daemon->relay pipe filled and blocked the main loop). Instead,
+    // wait briefly for writability and retry until the buffer accepts.
     ws.write(Message::Text(text.into()))
         .map_err(|e| format!("ws send: {e}"))?;
-    ws.flush().map_err(|e| format!("ws flush: {e}"))?;
-    Ok(())
+    loop {
+        match ws.flush() {
+            Ok(()) => return Ok(()),
+            Err(tungstenite::Error::Io(ref e))
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::Interrupted =>
+            {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => return Err(format!("ws flush: {e}")),
+        }
+    }
 }
 
 /// Put the socket fd into non-blocking mode so ws.read() surfaces

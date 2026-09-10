@@ -1,5 +1,6 @@
 import { useEffect, useState, useCallback, useRef } from "react";
 import {
+  ActivityIndicator,
   Keyboard,
   Pressable,
   ScrollView,
@@ -538,7 +539,10 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
           );
         })}
         {rects.length === 0 && (
-          <Text style={styles.dim}>waiting for snapshot…</Text>
+          <View style={{ alignItems: "center", marginTop: 32, gap: 10 }}>
+            <ActivityIndicator color="#4ade80" />
+            <Text style={styles.dim}>waiting for snapshot… ({conn})</Text>
+          </View>
         )}
       </View>
       )}
