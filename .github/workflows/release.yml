@@ -36,6 +36,7 @@ jobs:
           cd example/c-vt-stream && PATH="${{ github.workspace }}/.tools/zig:$PATH" zig build
           mkdir -p $GITHUB_WORKSPACE/vendor/lib
           cp .zig-cache/o/*/libghostty-vt.so $GITHUB_WORKSPACE/vendor/lib/
+          ln -sf libghostty-vt.so $GITHUB_WORKSPACE/vendor/lib/libghostty-vt.so.0
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build release binaries
@@ -51,6 +52,7 @@ jobs:
           cp target/release/ranch-cli stage/ranch-linux-x86_64/ranch
           cp target/release/ranch-daemon stage/ranch-linux-x86_64/ranch-daemon
           cp vendor/lib/libghostty-vt.so stage/ranch-linux-x86_64/
+          ln -sf libghostty-vt.so stage/ranch-linux-x86_64/libghostty-vt.so.0
           cp -r systemd stage/ranch-linux-x86_64/
           cp README.md stage/ranch-linux-x86_64/
           tar czf ranch-linux-x86_64.tar.gz -C stage ranch-linux-x86_64
