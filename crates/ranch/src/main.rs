@@ -6,11 +6,13 @@ mod relay;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    // daemon entry: `ranch daemon` (subcommand), `ranchd` argv[0], or --daemon
+    // daemon entry: `ranch daemon` (subcommand), `ranchd` argv[0], --daemon,
+    // or the hot-upgrade inherit flags (exec passes /proc/self/exe — the
+    // REAL binary path, argv0 "ranch" — so the flags must dispatch here)
     let argv0 = args.first().and_then(|a| a.rsplit('/').next()).unwrap_or("ranch");
     if argv0 == "ranchd"
         || args.get(1).map(|a| a == "daemon").unwrap_or(false)
-        || args.iter().any(|a| a == "--daemon")
+        || args.iter().any(|a| a == "--daemon" || a == "--inherit" || a == "--listen-fd")
     {
         // drop the `daemon` subcommand arg before handing off
         let is_sub = args.get(1).map(|a| a == "daemon").unwrap_or(false);

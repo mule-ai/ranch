@@ -988,6 +988,15 @@ impl Daemon {
     /// by the inheriting instance.
     fn hot_upgrade(&mut self) -> Result<(), String> {
         let exe = std::fs::read_link("/proc/self/exe").map_err(|e| format!("self exe: {e}"))?;
+        // `make install` replaces the binary file; the running daemon's
+        // /proc/self/exe then points at a deleted inode and execvp gives
+        // ENOENT. Strip the " (deleted)” suffix so we exec the NEW binary
+        // from disk (which is exactly what a hot upgrade wants).
+        let exe_str = exe.to_string_lossy();
+        let exe: std::path::PathBuf = exe_str
+            .strip_suffix(" (deleted)")
+            .map(std::path::PathBuf::from)
+            .unwrap_or(exe);
         let manifest_path = self.state_path.with_extension("manifest.json");
 
         let mut fds = serde_json::json!({ "panes": {}, "pi": [] });
@@ -1028,13 +1037,19 @@ impl Daemon {
         // pass the listening socket through too — the inheriting daemon
         // must NOT re-bind (the inherited listener still holds the path)
         let inherited_listener = fd_inherit(self.listener.as_raw_fd());
-        // leak the listener so it isn't closed before exec (exec never
-        // returns; Drop must not run)
+        // Leak the original listener so its fd isn't closed before exec
+        // (exec never returns on success; Drop must not run). Swap in a
+        // dummy owned listener for the struct — but keep the REAL listen
+        // fd around: if execvp fails we must restore it, otherwise the
+        // daemon polls a dummy fd (stdin) and spins at 100% CPU with a
+        // dead listener (seen live).
+        let real_listener_fd = self.listener.as_raw_fd();
+        let real_listener_dup = fd_inherit(real_listener_fd); // CLOEXEC-cleared dup
         std::mem::forget(std::mem::replace(
             &mut self.listener,
-            // SAFETY: raw fd 0 (stdin) — dummy placeholder; exec replaces
-            // the process image before this is ever used again. FromRawFd
-            // for UnixListener comes via std::os::unix::net.
+            // SAFETY: dummy placeholder; on the success path exec replaces
+            // the process image before this is ever used. FromRawFd for
+            // UnixListener comes via std::os::unix::net.
             unsafe { <std::os::unix::net::UnixListener as std::os::fd::FromRawFd>::from_raw_fd(0) },
         ));
         let exe_c = std::ffi::CString::new(exe.as_os_str().as_encoded_bytes())
@@ -1052,6 +1067,11 @@ impl Daemon {
             std::ptr::null(),
         ];
         unsafe { libc::execvp(exe_c.as_ptr(), argv.as_ptr()) };
+        // exec failed — restore the real listener from the CLOEXEC-cleared
+        // dup and resume serving (self.listener now owns the dup)
+        self.listener = unsafe {
+            <std::os::unix::net::UnixListener as std::os::fd::FromRawFd>::from_raw_fd(real_listener_dup)
+        };
         Err(format!(
             "execvp failed: {}",
             std::io::Error::last_os_error()
