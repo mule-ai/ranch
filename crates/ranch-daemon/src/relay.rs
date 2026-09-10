@@ -75,7 +75,11 @@ fn parse_config(text: &str) -> RelayConfig {
 #[derive(Debug)]
 pub enum RelayOut {
     /// Upsert a session row (create or rename).
-    UpsertSession { id: String, name: String, kind: String },
+    UpsertSession {
+        id: String,
+        name: String,
+        kind: String,
+    },
     /// Remove a session row (kill).
     DeleteSession { id: String },
 }
@@ -133,7 +137,9 @@ fn run(
                 backoff = 1;
             }
             Err(e) => {
-                clog(&format!("relay: session error: {e} — reconnecting in {backoff}s"));
+                clog(&format!(
+                    "relay: session error: {e} — reconnecting in {backoff}s"
+                ));
                 // Keep draining the daemon->relay pipe during backoff:
                 // the daemon's main loop writes frames into it with a
                 // BLOCKING write_all. If nobody reads while we sleep,
@@ -171,17 +177,16 @@ fn run(
 // ---------- supabase REST ----------
 
 fn now_iso() -> String {
-    let d = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let d = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
     let secs = d.as_secs();
     let (y, mo, da, h, mi, s) = crate::civil_from_unix(secs as i64);
     format!("{y:04}-{mo:02}-{da:02}T{h:02}:{mi:02}:{s:02}Z")
 }
 
 fn login(cfg: &RelayConfig) -> Result<TokenSession, String> {
-    let url = format!(
-        "{}/auth/v1/token?grant_type=password",
-        cfg.supabase_url
-    );
+    let url = format!("{}/auth/v1/token?grant_type=password", cfg.supabase_url);
     let mut resp = ureq::post(&url)
         .header("apikey", &cfg.anon_key)
         .send_json(serde_json::json!({
@@ -189,7 +194,10 @@ fn login(cfg: &RelayConfig) -> Result<TokenSession, String> {
             "password": cfg.machine_key,
         }))
         .map_err(|e| format!("http: {e}"))?;
-    let body: Value = resp.body_mut().read_json().map_err(|e| format!("body: {e}"))?;
+    let body: Value = resp
+        .body_mut()
+        .read_json()
+        .map_err(|e| format!("body: {e}"))?;
     token_session_from(body)
 }
 
@@ -203,7 +211,10 @@ fn refresh_login(cfg: &RelayConfig, refresh_token: &str) -> Result<TokenSession,
         .header("apikey", &cfg.anon_key)
         .send_json(serde_json::json!({ "refresh_token": refresh_token }))
         .map_err(|e| format!("http: {e}"))?;
-    let body: Value = resp.body_mut().read_json().map_err(|e| format!("body: {e}"))?;
+    let body: Value = resp
+        .body_mut()
+        .read_json()
+        .map_err(|e| format!("body: {e}"))?;
     token_session_from(body)
 }
 
@@ -218,7 +229,10 @@ fn token_session_from(body: Value) -> Result<TokenSession, String> {
         .and_then(|v| v.as_str())
         .ok_or_else(|| format!("no refresh_token in login response: {body}"))?
         .to_string();
-    let expires_in = body.get("expires_in").and_then(|v| v.as_u64()).unwrap_or(3600);
+    let expires_in = body
+        .get("expires_in")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(3600);
     Ok(TokenSession {
         access_token: access,
         refresh_token: refresh,
@@ -304,8 +318,7 @@ fn ws_session(
             .replacen("http://", "ws://", 1),
         cfg.anon_key
     );
-    let (mut ws, _resp) =
-        tungstenite::connect(&ws_url).map_err(|e| format!("ws connect: {e}"))?;
+    let (mut ws, _resp) = tungstenite::connect(&ws_url).map_err(|e| format!("ws connect: {e}"))?;
     clog(&format!("relay: connected, joining {topic}"));
 
     // join the private channel; the machine JWT rides in the join payload
@@ -350,8 +363,16 @@ fn ws_session(
     loop {
         // poll both the socket and the daemon->relay pipe
         let mut fds = [
-            libc::pollfd { fd: ws_fd, events: libc::POLLIN, revents: 0 },
-            libc::pollfd { fd: to_relay_r, events: libc::POLLIN, revents: 0 },
+            libc::pollfd {
+                fd: ws_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: to_relay_r,
+                events: libc::POLLIN,
+                revents: 0,
+            },
         ];
         let timeout: i32 = 1000; // 1s tick for timers
         let n = unsafe { libc::poll(fds.as_mut_ptr(), 2, timeout) };
@@ -368,15 +389,30 @@ fn ws_session(
             loop {
                 match ws.read() {
                     Ok(Message::Text(text)) => {
-                        handle_ws_text(topic, &text, to_daemon_w, &mut ws, &mut join_ok, &mut last_server_seen)?;
+                        handle_ws_text(
+                            topic,
+                            &text,
+                            to_daemon_w,
+                            &mut ws,
+                            &mut join_ok,
+                            &mut last_server_seen,
+                        )?;
                     }
                     Ok(Message::Binary(b)) => {
                         if let Ok(text) = String::from_utf8(b.to_vec()) {
-                            handle_ws_text(topic, &text, to_daemon_w, &mut ws, &mut join_ok, &mut last_server_seen)?;
+                            handle_ws_text(
+                                topic,
+                                &text,
+                                to_daemon_w,
+                                &mut ws,
+                                &mut join_ok,
+                                &mut last_server_seen,
+                            )?;
                         }
                     }
                     Ok(Message::Ping(p)) => {
-                        ws.send(Message::Pong(p)).map_err(|e| format!("pong: {e}"))?;
+                        ws.send(Message::Pong(p))
+                            .map_err(|e| format!("pong: {e}"))?;
                     }
                     Ok(Message::Pong(_)) => {}
                     Ok(Message::Close(f)) => {
@@ -400,9 +436,7 @@ fn ws_session(
 
         // --- daemon frames to broadcast ---
         if fds[1].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
-            let r = unsafe {
-                libc::read(to_relay_r, buf.as_mut_ptr() as *mut _, buf.len())
-            };
+            let r = unsafe { libc::read(to_relay_r, buf.as_mut_ptr() as *mut _, buf.len()) };
             if r < 0 {
                 let err = std::io::Error::last_os_error();
                 if err.kind() != std::io::ErrorKind::Interrupted {

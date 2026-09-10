@@ -20,15 +20,15 @@ use crossterm::event::{
 };
 use crossterm::execute;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, size, EnterAlternateScreen, LeaveAlternateScreen,
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode, size,
 };
+use ratatui::Frame as RFrame;
+use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use ratatui::Frame as RFrame;
-use ratatui::Terminal;
 use uuid::Uuid;
 
 use ranch_protocol::{Decoder, Frame};
@@ -76,7 +76,11 @@ fn hello(stream: &mut UnixStream, client: &str) {
 }
 
 /// Connect, hello, send one command, wait for the matching response, return it.
-fn one_shot<F: FnOnce(&str) -> Frame>(send: F, expect: &str, on_resp: impl FnOnce(&Frame)) -> Frame {
+fn one_shot<F: FnOnce(&str) -> Frame>(
+    send: F,
+    expect: &str,
+    on_resp: impl FnOnce(&Frame),
+) -> Frame {
     let mut stream = connect();
     hello(&mut stream, "cli");
     let req_id = Uuid::new_v4().to_string();
@@ -165,7 +169,10 @@ fn cmd_resume(query: Option<String>) {
             Ok(n) => n,
         };
         for f in decoder.feed(&buf[..n]) {
-            if let Frame::ForgeListOk { req_id, sessions, .. } = f {
+            if let Frame::ForgeListOk {
+                req_id, sessions, ..
+            } = f
+            {
                 if req_id == rid.as_str() {
                     found = Some(sessions.clone());
                     break;
@@ -187,9 +194,7 @@ fn cmd_resume(query: Option<String>) {
             let ql = q.to_lowercase();
             let hits: Vec<_> = sessions
                 .iter()
-                .filter(|f| {
-                    f.title.to_lowercase().contains(&ql) || f.id.starts_with(&ql)
-                })
+                .filter(|f| f.title.to_lowercase().contains(&ql) || f.id.starts_with(&ql))
                 .collect();
             if hits.is_empty() {
                 die(&format!("no forge session matches {q:?}"));
@@ -251,7 +256,10 @@ fn cmd_ls() {
             die("daemon closed the connection");
         }
         for f in decoder.feed(&buf[..n]) {
-            if let Frame::HelloOk { machine, sessions, .. } = f {
+            if let Frame::HelloOk {
+                machine, sessions, ..
+            } = f
+            {
                 println!("machine: {machine}");
                 if sessions.is_empty() {
                     println!("(no sessions)");
@@ -288,6 +296,61 @@ fn cmd_kill(ref_: &str) {
             _ => {}
         },
     );
+}
+
+/// Hot upgrade: ask the daemon to exec the same binary in place — all
+/// sessions, panes, and agent children survive (zero pane death).
+fn cmd_upgrade() {
+    let mut stream = connect();
+    hello(&mut stream, "cli");
+    let f = Frame::Upgrade {};
+    send_frame(&mut stream, &f);
+    use std::io::Read as _;
+    let mut decoder = Decoder::new();
+    let mut buf = [0u8; 65536];
+    // the daemon execs away without replying on success — just wait for
+    // the socket to drop, then verify it's back
+    let mut upgraded = false;
+    for _ in 0..100 {
+        match stream.read(&mut buf) {
+            Ok(0) => {
+                upgraded = true;
+                break;
+            }
+            Ok(n) => {
+                for frame in decoder.feed(&buf[..n]) {
+                    if let Frame::Error { message, .. } = frame {
+                        eprintln!("error: {message}");
+                        return;
+                    }
+                }
+            }
+            Err(_) => {
+                upgraded = true;
+                break;
+            }
+        }
+    }
+    if upgraded {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        if hello_check() {
+            println!("hot upgrade complete — sessions kept alive");
+        } else {
+            eprintln!("daemon did not come back");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn hello_check() -> bool {
+    match std::panic::catch_unwind(|| {
+        let mut stream = connect();
+        hello(&mut stream, "cli");
+        true
+    }) {
+        Ok(v) => v,
+        Err(_) => false,
+    }
 }
 
 fn cmd_rename(ref_: &str, new_name: &str) {
@@ -423,7 +486,13 @@ impl PaneView {
     fn apply_agent_status(&mut self, status: &str) {
         self.agent_busy = status == "working";
     }
-    fn apply_update(&mut self, cols: u16, rows: u16, rows_upd: &[(u16, String)], cursor: &Option<ranch_protocol::Cursor>) {
+    fn apply_update(
+        &mut self,
+        cols: u16,
+        rows: u16,
+        rows_upd: &[(u16, String)],
+        cursor: &Option<ranch_protocol::Cursor>,
+    ) {
         self.cols = cols;
         self.rows = rows;
         self.lines.resize(rows as usize, String::new());
@@ -546,8 +615,8 @@ fn cmd_dashboard() -> Option<String> {
     // Some(kind) while an inline input is active: "new" | "rename"
     let mut input: Option<&'static str> = None;
     let mut input_text = String::new();
-    let mut term = Terminal::new(CrosstermBackend::new(std::io::stdout()))
-        .expect("failed to init terminal");
+    let mut term =
+        Terminal::new(CrosstermBackend::new(std::io::stdout())).expect("failed to init terminal");
 
     loop {
         // drain socket
@@ -678,7 +747,7 @@ fn cmd_dashboard() -> Option<String> {
                                     kind: None,
                                     cwd: None,
                                     forge_session: None,
-};
+                                };
                                 send_frame(&mut stream, &f).ok();
                                 input = None;
                                 input_text.clear();
@@ -691,7 +760,7 @@ fn cmd_dashboard() -> Option<String> {
                                     kind: Some("forge".into()),
                                     cwd: None,
                                     forge_session: None,
-};
+                                };
                                 send_frame(&mut stream, &f).ok();
                                 input = None;
                                 input_text.clear();
@@ -727,7 +796,9 @@ fn cmd_dashboard() -> Option<String> {
                     drop(term);
                     return None;
                 }
-                KeyCode::Up | KeyCode::Char('k') if !matches!(key.modifiers, KeyModifiers::CONTROL) => {
+                KeyCode::Up | KeyCode::Char('k')
+                    if !matches!(key.modifiers, KeyModifiers::CONTROL) =>
+                {
                     if sel > 0 {
                         sel -= 1;
                     }
@@ -744,7 +815,7 @@ fn cmd_dashboard() -> Option<String> {
                         kind: None,
                         cwd: None,
                         forge_session: None,
-};
+                    };
                     send_frame(&mut stream, &f).ok();
                     // SessionsAck handler attaches
                 }
@@ -762,7 +833,9 @@ fn cmd_dashboard() -> Option<String> {
                     // kill the selected session (x OR Ctrl-K — plain k is
                     // vim-nav up, do not shadow it)
                     if let Some(s) = sessions.get(sel) {
-                        let f = Frame::SessionsKill { session: s.id.clone() };
+                        let f = Frame::SessionsKill {
+                            session: s.id.clone(),
+                        };
                         send_frame(&mut stream, &f).ok();
                         refresh_sessions(&mut stream);
                     }
@@ -770,14 +843,18 @@ fn cmd_dashboard() -> Option<String> {
                 KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     // Ctrl-D on the dashboard: kill too (documented as k? use x)
                     if let Some(s) = sessions.get(sel) {
-                        let f = Frame::SessionsKill { session: s.id.clone() };
+                        let f = Frame::SessionsKill {
+                            session: s.id.clone(),
+                        };
                         send_frame(&mut stream, &f).ok();
                         refresh_sessions(&mut stream);
                     }
                 }
                 KeyCode::Char('x') => {
                     if let Some(s) = sessions.get(sel) {
-                        let f = Frame::SessionsKill { session: s.id.clone() };
+                        let f = Frame::SessionsKill {
+                            session: s.id.clone(),
+                        };
                         send_frame(&mut stream, &f).ok();
                         status = format!("killed {}", s.name);
                         refresh_sessions(&mut stream);
@@ -822,8 +899,8 @@ fn cmd_attach(ref_: &str) {
     // TUI setup
     execute!(std::io::stdout(), EnterAlternateScreen).ok();
     enable_raw_mode().ok();
-    let mut term = Terminal::new(CrosstermBackend::new(std::io::stdout()))
-        .expect("failed to init terminal");
+    let mut term =
+        Terminal::new(CrosstermBackend::new(std::io::stdout())).expect("failed to init terminal");
 
     let mut screen = Screen::reset(80, 24);
     let mut session_id = String::new();
@@ -866,7 +943,10 @@ fn cmd_attach(ref_: &str) {
         std::rc::Rc::new(std::cell::RefCell::new(vec![]));
     let _ = &resume_sel;
     #[derive(Clone, Copy, PartialEq)]
-    enum Prompt { RenameWindow, Command }
+    enum Prompt {
+        RenameWindow,
+        Command,
+    }
     let prompt = std::cell::Cell::new(None::<Prompt>);
     let mut prompt_input = String::new();
     let mut sessions_meta: Vec<ranch_protocol::SessionMeta> = vec![];
@@ -897,7 +977,9 @@ fn cmd_attach(ref_: &str) {
                                     sessions.iter().map(|s| s.id.clone()).collect();
                                 sessions_meta.clone_from(&sessions);
                             }
-                            Frame::SessionsAck { session: new_sess, .. } => {
+                            Frame::SessionsAck {
+                                session: new_sess, ..
+                            } => {
                                 // a create from this client (prompt :agent)
                                 // — follow the ack into the new session
                                 let af = Frame::Attach {
@@ -963,14 +1045,25 @@ fn cmd_attach(ref_: &str) {
                                     sent_resize.set(true);
                                 }
                             }
-                            Frame::Chat { session: csess, pane: cpane, msgs, reset, .. } => {
+                            Frame::Chat {
+                                session: csess,
+                                pane: cpane,
+                                msgs,
+                                reset,
+                                ..
+                            } => {
                                 if csess == session_id {
                                     if let Some(pv) = pane_views.get_mut(&cpane) {
                                         pv.apply_chat(&msgs, reset);
                                     }
                                 }
                             }
-                            Frame::Meta { session: msess, pane: mpane, kind: mkind, status: mstat } => {
+                            Frame::Meta {
+                                session: msess,
+                                pane: mpane,
+                                kind: mkind,
+                                status: mstat,
+                            } => {
                                 if msess == session_id && mkind == "agent" {
                                     if let (Some(pv), Some(status)) = (
                                         pane_views.get_mut(mpane.as_deref().unwrap_or("")),
@@ -996,7 +1089,6 @@ fn cmd_attach(ref_: &str) {
                                 if usess == session_id {
                                     if let Some(pv) = pane_views.get_mut(&upane) {
                                         pv.apply_update(cols, rows, &rows_upd, &cursor);
-
                                     }
                                     if upane == active_pane {
                                         screen.cols = cols;
@@ -1022,7 +1114,9 @@ fn cmd_attach(ref_: &str) {
                                     }
                                 }
                             }
-                            Frame::ForgeListOk { req_id, sessions, .. } => {
+                            Frame::ForgeListOk {
+                                req_id, sessions, ..
+                            } => {
                                 let matches_req =
                                     resume_pending.borrow().as_deref() == Some(req_id.as_str());
                                 if matches_req {
@@ -1042,10 +1136,7 @@ fn cmd_attach(ref_: &str) {
                                     drop(term);
                                     die(&format!("attach failed: {message}"));
                                 }
-                                err_flash.set(Some((
-                                    std::time::Instant::now(),
-                                    message.clone(),
-                                )));
+                                err_flash.set(Some((std::time::Instant::now(), message.clone())));
                             }
                             _ => {}
                         }
@@ -1087,7 +1178,14 @@ fn cmd_attach(ref_: &str) {
             // Compute pane rects from the layout tree (50/50 splits).
             let mut rects: Vec<(String, Rect)> = Vec::new();
             if let Some(ly) = layout_ref {
-                fn walk(l: &ranch_protocol::Layout, x: u16, y: u16, w: u16, h: u16, out: &mut Vec<(String, Rect)>) {
+                fn walk(
+                    l: &ranch_protocol::Layout,
+                    x: u16,
+                    y: u16,
+                    w: u16,
+                    h: u16,
+                    out: &mut Vec<(String, Rect)>,
+                ) {
                     match l {
                         ranch_protocol::Layout::Leaf { pane } => {
                             out.push((pane.clone(), Rect::new(x, y, w.max(1), h.max(1))));
@@ -1108,7 +1206,11 @@ fn cmd_attach(ref_: &str) {
                         },
                     }
                 }
-                let x0 = if picker_now { SIDEBAR_W.min(term_area.width) } else { 0 };
+                let x0 = if picker_now {
+                    SIDEBAR_W.min(term_area.width)
+                } else {
+                    0
+                };
                 let w0 = term_area.width.saturating_sub(x0);
                 walk(ly, x0, 0, w0, term_area.height, &mut rects);
             }
@@ -1139,8 +1241,7 @@ fn cmd_attach(ref_: &str) {
                         let agent_style = Style::default()
                             .fg(ratatui::style::Color::Rgb(230, 232, 240))
                             .bg(ratatui::style::Color::Rgb(34, 34, 42));
-                        let dim = Style::default()
-                            .fg(ratatui::style::Color::Rgb(110, 114, 126));
+                        let dim = Style::default().fg(ratatui::style::Color::Rgb(110, 114, 126));
                         let mut li: Vec<Line> = Vec::new();
                         li.push(Line::from(Span::raw("")));
                         for m in &pv.chat {
@@ -1155,11 +1256,12 @@ fn cmd_attach(ref_: &str) {
                                     // right-aligned green bubble
                                     let inner = user_w.saturating_sub(2);
                                     for chunk in wrap(&m.text, inner) {
-                                        let bw = chunk.chars().count() + 2 + if ts.is_empty() { 0 } else { 6 };
+                                        let bw = chunk.chars().count()
+                                            + 2
+                                            + if ts.is_empty() { 0 } else { 6 };
                                         let lead = w.saturating_sub(bw + 1);
                                         let mut spans = vec![Span::raw(" ".repeat(lead))];
-                                        spans.push(Span::styled(
-                                            format!(" {chunk} "), user_style));
+                                        spans.push(Span::styled(format!(" {chunk} "), user_style));
                                         if !ts.is_empty() {
                                             spans.push(Span::styled(format!(" {ts}"), dim));
                                         }
@@ -1172,8 +1274,7 @@ fn cmd_attach(ref_: &str) {
                                         (Some(n), None) => n.clone(),
                                         _ => "tool".into(),
                                     };
-                                    li.push(Line::from(Span::styled(
-                                        format!("   ⚙ {label}"), dim)));
+                                    li.push(Line::from(Span::styled(format!("   ⚙ {label}"), dim)));
                                 }
                                 _ => {
                                     // left-aligned dark bubble
@@ -1227,29 +1328,46 @@ fn cmd_attach(ref_: &str) {
                                 Span::raw("")
                             };
                             rows.push(Line::from(Span::styled(
-                                format!("╭{}╮", "─".repeat(inner_w - 1)), border)));
+                                format!("╭{}╮", "─".repeat(inner_w - 1)),
+                                border,
+                            )));
                             let shown: String = label.chars().take(inner_w - 3).collect();
                             rows.push(Line::from(vec![
                                 Span::styled("│", border),
-                                Span::styled(format!(" {shown}"), if input_row.is_empty() {
-                                    dim
-                                } else {
-                                    Style::default().fg(ratatui::style::Color::Rgb(230, 232, 240))
-                                }),
-                                Span::styled("▊ ", if focused {
-                                    Style::default().fg(ratatui::style::Color::Green)
-                                } else {
-                                    dim
-                                }),
-                                Span::styled(format!("{}│", " ".repeat(
-                                    inner_w.saturating_sub(shown.chars().count() + 3))), border),
+                                Span::styled(
+                                    format!(" {shown}"),
+                                    if input_row.is_empty() {
+                                        dim
+                                    } else {
+                                        Style::default()
+                                            .fg(ratatui::style::Color::Rgb(230, 232, 240))
+                                    },
+                                ),
+                                Span::styled(
+                                    "▊ ",
+                                    if focused {
+                                        Style::default().fg(ratatui::style::Color::Green)
+                                    } else {
+                                        dim
+                                    },
+                                ),
+                                Span::styled(
+                                    format!(
+                                        "{}│",
+                                        " ".repeat(
+                                            inner_w.saturating_sub(shown.chars().count() + 3)
+                                        )
+                                    ),
+                                    border,
+                                ),
                             ]));
                             let _ = title;
                             rows.push(Line::from(Span::styled(
-                                format!("╰{}╯", "─".repeat(inner_w - 1)), border)));
+                                format!("╰{}╯", "─".repeat(inner_w - 1)),
+                                border,
+                            )));
                         } else {
-                            rows.push(Line::from(Span::styled(
-                                format!("❯ {input_row}▊"), border)));
+                            rows.push(Line::from(Span::styled(format!("❯ {input_row}▊"), border)));
                         }
                         f.render_widget(ratatui::widgets::Paragraph::new(rows), r);
                         return;
@@ -1260,7 +1378,12 @@ fn cmd_attach(ref_: &str) {
                         let (x, y, v) = pv.cursor.unwrap_or((0, 0, false));
                         (&pv.lines, x, y, v)
                     }
-                    None => (&screen_ref.lines, screen_ref.cursor.0, screen_ref.cursor.1, false),
+                    None => (
+                        &screen_ref.lines,
+                        screen_ref.cursor.0,
+                        screen_ref.cursor.1,
+                        false,
+                    ),
                 };
                 let mut li: Vec<Line> = Vec::with_capacity(r.height as usize);
                 for row in 0..r.height as usize {
@@ -1343,12 +1466,7 @@ fn cmd_attach(ref_: &str) {
                 // multi-pane: 1-cell gutters around each rect, focused pane bordered
                 for (pid, r) in &rects {
                     let focused = pid == active_ref;
-                    let inner = Rect::new(
-                        r.x + 1,
-                        r.y,
-                        r.width.saturating_sub(2).max(1),
-                        r.height,
-                    );
+                    let inner = Rect::new(r.x + 1, r.y, r.width.saturating_sub(2).max(1), r.height);
                     draw_pane(f, pid, inner, focused);
                     // left/right gutter bars: bright for focused
                     let bar_style = if focused {
@@ -1376,33 +1494,58 @@ fn cmd_attach(ref_: &str) {
                     .find(|s| s.id == *sess_id_ref)
                     .map(|s| s.name.clone())
                     .unwrap_or_else(|| {
-                        if sess_id_ref.is_empty() { "(attaching…)".into() } else { sess_id_ref.clone() }
+                        if sess_id_ref.is_empty() {
+                            "(attaching…)".into()
+                        } else {
+                            sess_id_ref.clone()
+                        }
                     });
                 let pfx = if prefix_now { "[prefix]" } else { "" };
-                let winlist = wins_ref.iter().enumerate().map(|(i, w)| {
-                    if w.id == *curwin_ref {
-                        format!("{}:{}*", i, w.name)
-                    } else {
-                        format!("{}:{}", i, w.name)
-                    }
-                }).collect::<Vec<_>>().join(" ");
-                let winlist = if winlist.is_empty() { String::new() } else { format!("  {winlist} ") };
+                let winlist = wins_ref
+                    .iter()
+                    .enumerate()
+                    .map(|(i, w)| {
+                        if w.id == *curwin_ref {
+                            format!("{}:{}*", i, w.name)
+                        } else {
+                            format!("{}:{}", i, w.name)
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let winlist = if winlist.is_empty() {
+                    String::new()
+                } else {
+                    format!("  {winlist} ")
+                };
                 let flash_txt = match flash_ref.take() {
                     Some((t, m)) => {
                         let keep = t.elapsed() <= std::time::Duration::from_secs(4);
                         if keep {
                             flash_ref.set(Some((t, m.clone())));
                         }
-                        if keep { format!("  ⚠ {m} ") } else { String::new() }
+                        if keep {
+                            format!("  ⚠ {m} ")
+                        } else {
+                            String::new()
+                        }
                     }
                     None => String::new(),
                 };
-                let status = format!(" ranch  {nowix}{winlist} {panes_n} pane{} {}{flash_txt}",
-                    if panes_n == 1 { "" } else { "s" }, pfx);
+                let status = format!(
+                    " ranch  {nowix}{winlist} {panes_n} pane{} {}{flash_txt}",
+                    if panes_n == 1 { "" } else { "s" },
+                    pfx
+                );
                 let bar_style = Style::default().add_modifier(Modifier::REVERSED);
-                let bar = Line::from(Span::styled(format!("{:^width$}", status, width = area.width as usize), bar_style));
-                f.render_widget(Paragraph::new(vec![bar]),
-                    Rect::new(0, area.height - 1, area.width, 1));
+                let bar = Line::from(Span::styled(
+                    format!("{:^width$}", status, width = area.width as usize),
+                    bar_style,
+                ));
+                f.render_widget(
+                    Paragraph::new(vec![bar]),
+                    Rect::new(0, area.height - 1, area.width, 1),
+                );
             }
 
             // docked session sidebar (prefix-s): sessions with their pane
@@ -1446,7 +1589,12 @@ fn cmd_attach(ref_: &str) {
                 f.render_widget(block, Rect::new(0, 0, sbw, term_area.height));
                 f.render_widget(
                     Paragraph::new(items),
-                    Rect::new(1, 1, sbw.saturating_sub(2), term_area.height.saturating_sub(2)),
+                    Rect::new(
+                        1,
+                        1,
+                        sbw.saturating_sub(2),
+                        term_area.height.saturating_sub(2),
+                    ),
                 );
             }
 
@@ -1456,10 +1604,7 @@ fn cmd_attach(ref_: &str) {
                 let mx = (term_area.width.saturating_sub(mw)) / 2;
                 let my = (term_area.height.saturating_sub(mh)) / 2;
                 let marea = Rect::new(mx, my, mw, mh);
-                f.render_widget(
-                    ratatui::widgets::Clear,
-                    marea,
-                );
+                f.render_widget(ratatui::widgets::Clear, marea);
                 let block = ratatui::widgets::Block::bordered()
                     .title(" resume forge session ")
                     .border_style(Style::default().fg(ratatui::style::Color::Green));
@@ -1483,10 +1628,7 @@ fn cmd_attach(ref_: &str) {
                         } else {
                             fs.title.clone()
                         };
-                        Line::from(Span::styled(
-                            format!("{mark} {:.52}", title),
-                            style,
-                        ))
+                        Line::from(Span::styled(format!("{mark} {:.52}", title), style))
                     })
                     .collect();
                 f.render_widget(
@@ -1503,9 +1645,12 @@ fn cmd_attach(ref_: &str) {
                 };
                 let pl = Line::from(Span::styled(
                     format!("{label}{}\u{2588}", prompt_input.clone()),
-                    Style::default().add_modifier(Modifier::REVERSED)));
-                f.render_widget(Paragraph::new(vec![pl]),
-                    Rect::new(0, area.height.saturating_sub(2), area.width, 1));
+                    Style::default().add_modifier(Modifier::REVERSED),
+                ));
+                f.render_widget(
+                    Paragraph::new(vec![pl]),
+                    Rect::new(0, area.height.saturating_sub(2), area.width, 1),
+                );
             }
         });
 
@@ -1664,7 +1809,11 @@ fn cmd_attach(ref_: &str) {
                                 KeyCode::Char('n') | KeyCode::Char('p') => {
                                     let f = Frame::WindowNext {
                                         session: session_id.clone(),
-                                        delta: if key.code == KeyCode::Char('n') { 1 } else { -1 },
+                                        delta: if key.code == KeyCode::Char('n') {
+                                            1
+                                        } else {
+                                            -1
+                                        },
                                     };
                                     send_frame(&mut stream, &f).ok();
                                     continue;
@@ -1782,21 +1931,40 @@ fn cmd_attach(ref_: &str) {
                                             vec![];
                                         fn walk2(
                                             l: &ranch_protocol::Layout,
-                                            x: u16, y: u16, w: u16, h: u16,
+                                            x: u16,
+                                            y: u16,
+                                            w: u16,
+                                            h: u16,
                                             out: &mut Vec<(String, ratatui::layout::Rect)>,
                                         ) {
                                             match l {
-                                                ranch_protocol::Layout::Leaf { pane } => out
-                                                    .push((pane.clone(), ratatui::layout::Rect::new(x, y, w.max(1), h.max(1)))),
-                                                ranch_protocol::Layout::Split { dir, a, b, pct } => match dir {
+                                                ranch_protocol::Layout::Leaf { pane } => {
+                                                    out.push((
+                                                        pane.clone(),
+                                                        ratatui::layout::Rect::new(
+                                                            x,
+                                                            y,
+                                                            w.max(1),
+                                                            h.max(1),
+                                                        ),
+                                                    ))
+                                                }
+                                                ranch_protocol::Layout::Split {
+                                                    dir,
+                                                    a,
+                                                    b,
+                                                    pct,
+                                                } => match dir {
                                                     1 => {
-                                                        let lw = ((w as u32 * *pct as u32 / 100) as u16)
+                                                        let lw = ((w as u32 * *pct as u32 / 100)
+                                                            as u16)
                                                             .clamp(1, w.saturating_sub(1).max(1));
                                                         walk2(a, x, y, lw, h, out);
                                                         walk2(b, x + lw, y, w - lw, h, out);
                                                     }
                                                     _ => {
-                                                        let th = ((h as u32 * *pct as u32 / 100) as u16)
+                                                        let th = ((h as u32 * *pct as u32 / 100)
+                                                            as u16)
                                                             .clamp(1, h.saturating_sub(1).max(1));
                                                         walk2(a, x, y, w, th, out);
                                                         walk2(b, x, y + th, w, h - th, out);
@@ -1805,7 +1973,8 @@ fn cmd_attach(ref_: &str) {
                                             }
                                         }
                                         walk2(ly, 0, 0, cols, rows.saturating_sub(1), &mut rects);
-                                        if let Some(next) = neighbor_pane(&rects, &active_pane, dir) {
+                                        if let Some(next) = neighbor_pane(&rects, &active_pane, dir)
+                                        {
                                             let f = Frame::SessionsSelect {
                                                 session: session_id.clone(),
                                                 pane: next,
@@ -1910,7 +2079,9 @@ fn cmd_attach(ref_: &str) {
                                     if let Some(kind) = prompt.take() {
                                         match kind {
                                             Prompt::RenameWindow => {
-                                                if !prompt_input.is_empty() && !cur_window.is_empty() {
+                                                if !prompt_input.is_empty()
+                                                    && !cur_window.is_empty()
+                                                {
                                                     let f = Frame::WindowRename {
                                                         session: session_id.clone(),
                                                         window: cur_window.clone(),
@@ -1951,15 +2122,21 @@ fn cmd_attach(ref_: &str) {
                                                     prompt_input.clear();
                                                     continue;
                                                 }
-                                                if let Some(rest) = prompt_input.trim().strip_prefix("agent") {
+                                                if let Some(rest) =
+                                                    prompt_input.trim().strip_prefix("agent")
+                                                {
                                                     let name = rest.trim().to_string();
                                                     let f = Frame::SessionsCreate {
                                                         req_id: Uuid::new_v4().to_string(),
-                                                        name: if name.is_empty() { None } else { Some(name) },
+                                                        name: if name.is_empty() {
+                                                            None
+                                                        } else {
+                                                            Some(name)
+                                                        },
                                                         kind: Some("forge".into()),
                                                         cwd: None,
                                                         forge_session: None,
-};
+                                                    };
                                                     send_frame(&mut stream, &f).ok();
                                                     prompt_input.clear();
                                                     continue;
@@ -2016,7 +2193,9 @@ fn cmd_attach(ref_: &str) {
                                 KeyCode::Backspace => {
                                     chat_input.pop();
                                 }
-                                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                KeyCode::Char('c')
+                                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                {
                                     chat_input.clear();
                                 }
                                 KeyCode::Esc => {
@@ -2099,10 +2278,7 @@ impl CloudCfg {
         }
         if let Ok(text) = std::fs::read_to_string(Self::path()) {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                if let (Some(u), Some(k)) = (
-                    v["supabase_url"].as_str(),
-                    v["anon_key"].as_str(),
-                ) {
+                if let (Some(u), Some(k)) = (v["supabase_url"].as_str(), v["anon_key"].as_str()) {
                     return CloudCfg {
                         supabase_url: u.to_string(),
                         anon_key: k.to_string(),
@@ -2117,10 +2293,15 @@ impl CloudCfg {
         if let Some(d) = p.parent() {
             std::fs::create_dir_all(d).map_err(|e| e.to_string())?;
         }
-        std::fs::write(&p, serde_json::json!({
-            "supabase_url": self.supabase_url,
-            "anon_key": self.anon_key,
-        }).to_string()).map_err(|e| e.to_string())
+        std::fs::write(
+            &p,
+            serde_json::json!({
+                "supabase_url": self.supabase_url,
+                "anon_key": self.anon_key,
+            })
+            .to_string(),
+        )
+        .map_err(|e| e.to_string())
     }
 }
 
@@ -2149,13 +2330,18 @@ impl UserSession {
         if let Some(d) = p.parent() {
             std::fs::create_dir_all(d).map_err(|e| e.to_string())?;
         }
-        std::fs::write(&p, serde_json::json!({
-            "access_token": self.access_token,
-            "refresh_token": self.refresh_token,
-            "expires_at": self.expires_at,
-            "user_id": self.user_id,
-            "email": self.email,
-        }).to_string()).map_err(|e| e.to_string())?;
+        std::fs::write(
+            &p,
+            serde_json::json!({
+                "access_token": self.access_token,
+                "refresh_token": self.refresh_token,
+                "expires_at": self.expires_at,
+                "user_id": self.user_id,
+                "email": self.email,
+            })
+            .to_string(),
+        )
+        .map_err(|e| e.to_string())?;
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).ok();
         Ok(())
@@ -2163,7 +2349,8 @@ impl UserSession {
     fn valid(&self) -> bool {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs()).unwrap_or(0);
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         now + 60 < self.expires_at
     }
 }
@@ -2195,7 +2382,10 @@ fn http_json(
     let mut resp = resp.map_err(|e| format!("{method} {url}: {e}"))?;
     let status = resp.status().as_u16();
     let mut text = String::new();
-    resp.body_mut().as_reader().read_to_string(&mut text).map_err(|e| e.to_string())?;
+    resp.body_mut()
+        .as_reader()
+        .read_to_string(&mut text)
+        .map_err(|e| e.to_string())?;
     let v = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
     Ok((status, v))
 }
@@ -2213,8 +2403,12 @@ fn b64url_decode(s: &str) -> Option<Vec<u8>> {
         let v3 = ch.get(3).copied().and_then(val).unwrap_or(0);
         let n = (v0 << 18) | (v1 << 12) | (v2 << 6) | v3;
         out.push((n >> 16) as u8);
-        if ch.len() > 2 { out.push((n >> 8) as u8); }
-        if ch.len() > 3 { out.push(n as u8); }
+        if ch.len() > 2 {
+            out.push((n >> 8) as u8);
+        }
+        if ch.len() > 3 {
+            out.push(n as u8);
+        }
     }
     Some(out)
 }
@@ -2238,12 +2432,16 @@ fn cmd_login(email: Option<String>) {
         // email/password fallback: works before Google OAuth is configured
         // and on headless machines.
         Some(e) => {
-            let password = rpassword::prompt_password("password: ").unwrap_or_else(|e| die(&format!("login: {e}")));
+            let password = rpassword::prompt_password("password: ")
+                .unwrap_or_else(|e| die(&format!("login: {e}")));
             let email = e;
             let (status, body) = match http_json(
                 "POST",
                 &format!("{}/auth/v1/token?grant_type=password", cfg.supabase_url),
-                &[("apikey", &cfg.anon_key), ("Content-Type", "application/json")],
+                &[
+                    ("apikey", &cfg.anon_key),
+                    ("Content-Type", "application/json"),
+                ],
                 Some(serde_json::json!({ "email": email, "password": password })),
             ) {
                 Ok(r) => r,
@@ -2254,17 +2452,33 @@ fn cmd_login(email: Option<String>) {
             }
             let claims = jwt_claims(body["access_token"].as_str().unwrap_or_default());
             UserSession {
-                access_token: body["access_token"].as_str().unwrap_or_default().to_string(),
-                refresh_token: body["refresh_token"].as_str().unwrap_or_default().to_string(),
+                access_token: body["access_token"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+                refresh_token: body["refresh_token"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
                 expires_at: body["expires_at"].as_u64().unwrap_or(0),
-                user_id: claims.as_ref().and_then(|c| c["sub"].as_str()).unwrap_or_default().to_string(),
-                email: claims.as_ref().and_then(|c| c["email"].as_str()).unwrap_or_default().to_string(),
+                user_id: claims
+                    .as_ref()
+                    .and_then(|c| c["sub"].as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                email: claims
+                    .as_ref()
+                    .and_then(|c| c["email"].as_str())
+                    .unwrap_or_default()
+                    .to_string(),
             }
         }
         // default: Google OAuth via the browser (PKCE + localhost callback)
         None => oauth_login(&cfg),
     };
-    session.save().unwrap_or_else(|e| die(&format!("login: save session: {e}")));
+    session
+        .save()
+        .unwrap_or_else(|e| die(&format!("login: save session: {e}")));
     println!("logged in as {} ({})", session.email, session.user_id);
 }
 
@@ -2292,7 +2506,10 @@ fn oauth_login(cfg: &CloudCfg) -> UserSession {
     let (status, body) = match http_json(
         "POST",
         &format!("{}/auth/v1/token?grant_type=pkce", cfg.supabase_url),
-        &[("apikey", &cfg.anon_key), ("Content-Type", "application/json")],
+        &[
+            ("apikey", &cfg.anon_key),
+            ("Content-Type", "application/json"),
+        ],
         Some(serde_json::json!({
             "auth_code": code,
             "code_verifier": verifier,
@@ -2306,11 +2523,25 @@ fn oauth_login(cfg: &CloudCfg) -> UserSession {
     }
     let claims = jwt_claims(body["access_token"].as_str().unwrap_or_default());
     UserSession {
-        access_token: body["access_token"].as_str().unwrap_or_default().to_string(),
-        refresh_token: body["refresh_token"].as_str().unwrap_or_default().to_string(),
+        access_token: body["access_token"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
+        refresh_token: body["refresh_token"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
         expires_at: body["expires_at"].as_u64().unwrap_or(0),
-        user_id: claims.as_ref().and_then(|c| c["sub"].as_str()).unwrap_or_default().to_string(),
-        email: claims.as_ref().and_then(|c| c["email"].as_str()).unwrap_or_default().to_string(),
+        user_id: claims
+            .as_ref()
+            .and_then(|c| c["sub"].as_str())
+            .unwrap_or_default()
+            .to_string(),
+        email: claims
+            .as_ref()
+            .and_then(|c| c["email"].as_str())
+            .unwrap_or_default()
+            .to_string(),
     }
 }
 
@@ -2325,15 +2556,28 @@ fn ensure_session(cfg: &CloudCfg) -> UserSession {
     }
     let (status, body) = http_json(
         "POST",
-        &format!("{}/auth/v1/token?grant_type=refresh_token", cfg.supabase_url),
-        &[("apikey", &cfg.anon_key), ("Content-Type", "application/json")],
+        &format!(
+            "{}/auth/v1/token?grant_type=refresh_token",
+            cfg.supabase_url
+        ),
+        &[
+            ("apikey", &cfg.anon_key),
+            ("Content-Type", "application/json"),
+        ],
         Some(serde_json::json!({ "refresh_token": s.refresh_token })),
-    ).unwrap_or_else(|e| die(&format!("refresh session: {e}")));
+    )
+    .unwrap_or_else(|e| die(&format!("refresh session: {e}")));
     if status != 200 {
         die(&format!("session expired ({}), run `ranch login`", status));
     }
-    s.access_token = body["access_token"].as_str().unwrap_or_default().to_string();
-    s.refresh_token = body["refresh_token"].as_str().unwrap_or_default().to_string();
+    s.access_token = body["access_token"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    s.refresh_token = body["refresh_token"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
     s.expires_at = body["expires_at"].as_u64().unwrap_or(0);
     s.save().ok();
     s
@@ -2345,15 +2589,24 @@ fn cmd_machines() {
     let s = ensure_session(&cfg);
     let (status, body) = http_json(
         "GET",
-        &format!("{}/rest/v1/machines_info?select=id,name,last_seen_at&order=name", cfg.supabase_url),
-        &[("apikey", &cfg.anon_key), ("Authorization", &format!("Bearer {}", s.access_token))],
+        &format!(
+            "{}/rest/v1/machines_info?select=id,name,last_seen_at&order=name",
+            cfg.supabase_url
+        ),
+        &[
+            ("apikey", &cfg.anon_key),
+            ("Authorization", &format!("Bearer {}", s.access_token)),
+        ],
         None,
-    ).unwrap_or_else(|e| die(&format!("machines: {e}")));
+    )
+    .unwrap_or_else(|e| die(&format!("machines: {e}")));
     if status != 200 {
         die(&format!("machines: {body}"));
     }
     let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     let list = body.as_array().cloned().unwrap_or_default();
     if list.is_empty() {
         println!("no machines registered — run `ranch register <name>` on a machine");
@@ -2365,9 +2618,17 @@ fn cmd_machines() {
         let last = m["last_seen_at"].as_str().unwrap_or("");
         let online = last.contains("T") && {
             // cheap staleness check: parse ISO ts to unix secs
-            epoch_from_iso(last).map(|t| now.saturating_sub(t) < 90).unwrap_or(false)
+            epoch_from_iso(last)
+                .map(|t| now.saturating_sub(t) < 90)
+                .unwrap_or(false)
         };
-        println!("  {}{}  {}  {}", if online { "●" } else { "○" }, name, id, last);
+        println!(
+            "  {}{}  {}  {}",
+            if online { "●" } else { "○" },
+            name,
+            id,
+            last
+        );
     }
 }
 
@@ -2385,16 +2646,28 @@ fn cmd_cloud_sessions(machine: Option<String>) {
             cfg.supabase_url, m
         );
     }
-    let (status, body) = http_json("GET", &url,
-        &[("apikey", &cfg.anon_key), ("Authorization", &format!("Bearer {}", s.access_token))],
+    let (status, body) = http_json(
+        "GET",
+        &url,
+        &[
+            ("apikey", &cfg.anon_key),
+            ("Authorization", &format!("Bearer {}", s.access_token)),
+        ],
         None,
-    ).unwrap_or_else(|e| die(&format!("sessions: {e}")));
+    )
+    .unwrap_or_else(|e| die(&format!("sessions: {e}")));
     if status != 200 {
         die(&format!("sessions: {body}"));
     }
     for row in body.as_array().cloned().unwrap_or_default() {
         let mname = row["machines_info"]["name"].as_str().unwrap_or("?");
-        println!("  {}@{}  {}  {}", row["name"].as_str().unwrap_or("?"), mname, row["kind"].as_str().unwrap_or("shell"), row["id"].as_str().unwrap_or("?"));
+        println!(
+            "  {}@{}  {}  {}",
+            row["name"].as_str().unwrap_or("?"),
+            mname,
+            row["kind"].as_str().unwrap_or("shell"),
+            row["id"].as_str().unwrap_or("?")
+        );
     }
 }
 
@@ -2405,7 +2678,13 @@ fn epoch_from_iso(ts: &str) -> Option<u64> {
     let y: i64 = dp.next()?.parse().ok()?;
     let mo: i64 = dp.next()?.parse().ok()?;
     let da: i64 = dp.next()?.parse().ok()?;
-    let tp = time.trim_end_matches('Z').split('+').next()?.split('-').next()?.to_string();
+    let tp = time
+        .trim_end_matches('Z')
+        .split('+')
+        .next()?
+        .split('-')
+        .next()?
+        .to_string();
     let mut hp = tp.split(':');
     let h: i64 = hp.next()?.parse().ok()?;
     let mi: i64 = hp.next()?.parse().ok()?;
@@ -2430,7 +2709,9 @@ fn gen_pkce_verifier() -> String {
     if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
         let _ = f.read_exact(&mut buf);
     }
-    buf.iter().map(|&b| ALPHA[b as usize % ALPHA.len()] as char).collect()
+    buf.iter()
+        .map(|&b| ALPHA[b as usize % ALPHA.len()] as char)
+        .collect()
 }
 
 fn pkce_challenge(verifier: &str) -> String {
@@ -2449,8 +2730,16 @@ fn b64url_encode(data: &[u8]) -> String {
         let n = (b0 << 16) | (b1 << 8) | b2;
         out.push(B[(n >> 18) as usize & 63] as char);
         out.push(B[(n >> 12) as usize & 63] as char);
-        out.push(if ch.len() > 1 { B[(n >> 6) as usize & 63] as char } else { '=' });
-        out.push(if ch.len() > 2 { B[n as usize & 63] as char } else { '=' });
+        out.push(if ch.len() > 1 {
+            B[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if ch.len() > 2 {
+            B[n as usize & 63] as char
+        } else {
+            '='
+        });
     }
     out.trim_end_matches('=').to_string()
 }
@@ -2459,7 +2748,9 @@ fn urlencode(s: &str) -> String {
     let mut out = String::new();
     for b in s.bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
             _ => out.push_str(&format!("%{b:02X}")),
         }
     }
@@ -2474,7 +2765,9 @@ fn open_browser(url: &str) {
             return;
         }
     }
-    let _ = std::process::Command::new("xdg-open").arg(url).status()
+    let _ = std::process::Command::new("xdg-open")
+        .arg(url)
+        .status()
         .or_else(|_| std::process::Command::new("open").arg(url).status());
 }
 
@@ -2497,7 +2790,9 @@ fn listen_for_code(port: u16, timeout_secs: u64) -> Option<String> {
                 let n = stream.read(&mut buf).unwrap_or(0);
                 let req = String::from_utf8_lossy(&buf[..n]);
                 // GET /callback?code=… HTTP/1.1
-                let code = req.split_whitespace().nth(1)
+                let code = req
+                    .split_whitespace()
+                    .nth(1)
                     .and_then(|path| path.split('?').nth(1))
                     .and_then(|q| q.split('&').find(|kv| kv.starts_with("code=")))
                     .map(|kv| kv[5..].to_string());
@@ -2533,8 +2828,14 @@ fn urldecode(s: &str) -> String {
                     i += 1;
                 }
             }
-            b'+' => { out.push(b' '); i += 1; }
-            b => { out.push(b); i += 1; }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
         }
     }
     String::from_utf8_lossy(&out).into_owned()
@@ -2576,11 +2877,14 @@ fn cmd_register(name: Option<String>) {
             ("Content-Type", "application/json"),
         ],
         Some(serde_json::json!({ "p_name": name })),
-    ).unwrap_or_else(|e| die(&format!("register: {e}")));
+    )
+    .unwrap_or_else(|e| die(&format!("register: {e}")));
     if status != 200 {
         die(&format!("register: RPC failed ({status}): {body}"));
     }
-    let row = body.as_array().and_then(|a| a.first().cloned())
+    let row = body
+        .as_array()
+        .and_then(|a| a.first().cloned())
         .unwrap_or_else(|| die(&format!("register: unexpected RPC response: {body}")));
     let machine_id = row["machine_id"].as_str().unwrap_or_default().to_string();
     let machine_key = row["machine_key"].as_str().unwrap_or_default().to_string();
@@ -2643,13 +2947,16 @@ fn main() {
             }
             return;
         }
-        eprintln!("usage: ranch <new|agent|ls|attach|kill|rename|split|switch|register|login|machines|cloud> [args]");
+        eprintln!(
+            "usage: ranch <new|agent|ls|attach|kill|rename|split|switch|register|login|machines|cloud> [args]"
+        );
         eprintln!("  agent [name] [dir]   new agent session (runs pi in dir)");
         eprintln!("  (run plain `ranch` in a terminal for the interactive session manager)");
         eprintln!("  socket: {}", socket_path().display());
         std::process::exit(2);
     }
     match args[0].as_str() {
+        "upgrade" => cmd_upgrade(),
         "register" => cmd_register(args.get(1).cloned()),
         "login" => cmd_login(args.get(1).cloned()),
         "config" => match (args.get(1), args.get(2)) {
@@ -2661,11 +2968,9 @@ fn main() {
         "new" => cmd_new(args.get(1).cloned(), None, None),
         // ranch pi [dir] — agent pane backed by a LOCAL pi --mode rpc
         "pi" => {
-            let cwd = args
-                .get(1)
-                .cloned()
-                .map(Ok)
-                .unwrap_or_else(|| std::env::current_dir().map(|p| p.to_string_lossy().into_owned()));
+            let cwd = args.get(1).cloned().map(Ok).unwrap_or_else(|| {
+                std::env::current_dir().map(|p| p.to_string_lossy().into_owned())
+            });
             let cwd = match cwd {
                 Ok(c) => Some(c),
                 Err(e) => {
@@ -2681,11 +2986,9 @@ fn main() {
         "agent" => {
             // default dir: the shell's cwd — `cd project && ranch agent`
             // anchors the agent to the project
-            let cwd = args
-                .get(2)
-                .cloned()
-                .map(Ok)
-                .unwrap_or_else(|| std::env::current_dir().map(|p| p.to_string_lossy().into_owned()));
+            let cwd = args.get(2).cloned().map(Ok).unwrap_or_else(|| {
+                std::env::current_dir().map(|p| p.to_string_lossy().into_owned())
+            });
             let cwd = match cwd {
                 Ok(c) => Some(c),
                 Err(e) => {

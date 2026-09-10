@@ -13,11 +13,11 @@
 //! returns it; X-API-Key header). `forge_profile_id` is optional —
 //! the first profile is used when absent.
 
-use ranch_protocol::{encode_frame, ChatMsg, Frame};
+use ranch_protocol::{ChatMsg, Frame, encode_frame};
 use std::io::{BufRead as _, Write as _};
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering, AtomicU64};
-use std::sync::mpsc::RecvError;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::mpsc;
+use std::sync::mpsc::RecvError;
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
@@ -32,10 +32,9 @@ pub fn load_forge_config() -> Option<ForgeConfig> {
     // forge config rides in daemon.toml (same file as the relay);
     // forge keys are optional — integration is off when absent
     let home = std::env::var("HOME").ok()?;
-    let text = std::fs::read_to_string(
-        std::path::PathBuf::from(home).join(".config/ranch/daemon.toml"),
-    )
-    .ok()?;
+    let text =
+        std::fs::read_to_string(std::path::PathBuf::from(home).join(".config/ranch/daemon.toml"))
+            .ok()?;
     let get = |key: &str| -> String {
         for line in text.lines() {
             let line = line.trim();
@@ -54,13 +53,21 @@ pub fn load_forge_config() -> Option<ForgeConfig> {
     }
     let base = {
         let b = get("forge_url");
-        if b.is_empty() { "http://127.0.0.1:8080".to_string() } else { b }
+        if b.is_empty() {
+            "http://127.0.0.1:8080".to_string()
+        } else {
+            b
+        }
     };
     let profile = get("forge_profile_id");
     Some(ForgeConfig {
         base,
         key,
-        profile: if profile.is_empty() { None } else { Some(profile) },
+        profile: if profile.is_empty() {
+            None
+        } else {
+            Some(profile)
+        },
     })
 }
 
@@ -71,7 +78,11 @@ pub enum ForgeJob {
     /// Stop streaming (pane killed).
     Unwatch { pane: Uuid },
     /// POST a user message (spawns/wakes pi inside forge).
-    Send { pane: Uuid, forge_sid: Uuid, text: String },
+    Send {
+        pane: Uuid,
+        forge_sid: Uuid,
+        text: String,
+    },
     /// List resumable forge sessions (GET /sessions).
     List { req_id: String },
 }
@@ -116,8 +127,14 @@ fn to_chat_msg(r: &serde_json::Value) -> Option<ChatMsg> {
         .unwrap_or("")
         .trim()
         .to_string();
-    let tool_name = r.get("tool_name").and_then(|t| t.as_str()).map(String::from);
-    let tool_call_id = r.get("tool_call_id").and_then(|t| t.as_str()).map(String::from);
+    let tool_name = r
+        .get("tool_name")
+        .and_then(|t| t.as_str())
+        .map(String::from);
+    let tool_call_id = r
+        .get("tool_call_id")
+        .and_then(|t| t.as_str())
+        .map(String::from);
     let tool_output = r.get("tool_output").and_then(|t| {
         if t.is_null() {
             None
@@ -129,7 +146,10 @@ fn to_chat_msg(r: &serde_json::Value) -> Option<ChatMsg> {
         }
     });
     let duration_ms = r.get("duration_ms").and_then(|d| d.as_i64());
-    let created_at = r.get("created_at").and_then(|c| c.as_str()).map(String::from);
+    let created_at = r
+        .get("created_at")
+        .and_then(|c| c.as_str())
+        .map(String::from);
     // skip empty rows (e.g. assistant rows that only carried tool_input)
     if text.is_empty() && tool_name.is_none() {
         return None;
@@ -213,10 +233,18 @@ fn run_sse(state: Arc<WatchState>, cfg: ForgeConfig, w: PipeWriter) {
     }
 }
 
-fn handle_event(state: &Arc<WatchState>, cfg: &ForgeConfig, w: &PipeWriter, name: &str, data: &str) {
+fn handle_event(
+    state: &Arc<WatchState>,
+    cfg: &ForgeConfig,
+    w: &PipeWriter,
+    name: &str,
+    data: &str,
+) {
     match name {
         "message" => {
-            let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else { return };
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else {
+                return;
+            };
             let Some(msg) = to_chat_msg(&v) else { return };
             let last = state.last_seq.load(Ordering::Relaxed);
             if msg.seq <= last {
@@ -283,11 +311,7 @@ fn write_agent_status(w: &PipeWriter, pane: Uuid, status: &str) {
 }
 
 /// Job thread: watches registry + blocking POSTs for sends.
-pub fn spawn_worker(
-    cfg: ForgeConfig,
-    pipe_w: std::fs::File,
-    rx: mpsc::Receiver<ForgeJob>,
-) {
+pub fn spawn_worker(cfg: ForgeConfig, pipe_w: std::fs::File, rx: mpsc::Receiver<ForgeJob>) {
     let pipe: PipeWriter = Arc::new(Mutex::new(pipe_w));
     std::thread::spawn(move || {
         let mut threads: Vec<(Uuid, Arc<WatchState>)> = Vec::new();
@@ -309,7 +333,7 @@ pub fn spawn_worker(
                             last_seq: AtomicI64::new(0),
                             stop: AtomicBool::new(false),
                             turn_gen: AtomicU64::new(0),
-            });
+                        });
                         let t_cfg = ForgeConfig {
                             base: cfg.base.clone(),
                             key: cfg.key.clone(),
@@ -328,7 +352,11 @@ pub fn spawn_worker(
                             st.stop.store(true, Ordering::Relaxed);
                         }
                     }
-                    ForgeJob::Send { pane, forge_sid, text } => {
+                    ForgeJob::Send {
+                        pane,
+                        forge_sid,
+                        text,
+                    } => {
                         let _ = http_post_message(&cfg, forge_sid, &text);
                         // the working indicator starts as soon as the
                         // POST is accepted; rows land via the SSE stream
@@ -454,7 +482,11 @@ fn http_json(
 /// `working_dir` anchors the agent to an existing directory (forge
 /// migration 014) — e.g. the terminal pane's cwd for agent splits.
 /// Returns the forge session uuid.
-pub fn create_forge_session(cfg: &ForgeConfig, title: &str, working_dir: Option<&str>) -> Result<Uuid, String> {
+pub fn create_forge_session(
+    cfg: &ForgeConfig,
+    title: &str,
+    working_dir: Option<&str>,
+) -> Result<Uuid, String> {
     // profile: configured or the first one
     let profile_id = match &cfg.profile {
         Some(p) => p.clone(),

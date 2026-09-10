@@ -148,8 +148,9 @@ impl Vt {
             return Err(format!("ghostty_terminal_new failed: rc={rc}"));
         }
         let mut fmt: *mut c_void = ptr::null_mut();
-        let rc =
-            unsafe { ghostty_formatter_terminal_new(ptr::null(), &mut fmt, h, Self::formatter_opts()) };
+        let rc = unsafe {
+            ghostty_formatter_terminal_new(ptr::null(), &mut fmt, h, Self::formatter_opts())
+        };
         if rc != 0 || fmt.is_null() {
             unsafe { ghostty_terminal_free(h) };
             return Err(format!("ghostty_formatter_terminal_new failed: rc={rc}"));
@@ -200,9 +201,8 @@ impl Vt {
     pub fn screen(&self) -> Vec<String> {
         let mut buf: *mut u8 = ptr::null_mut();
         let mut len: usize = 0;
-        let rc = unsafe {
-            ghostty_formatter_format_alloc(self.fmt, ptr::null(), &mut buf, &mut len)
-        };
+        let rc =
+            unsafe { ghostty_formatter_format_alloc(self.fmt, ptr::null(), &mut buf, &mut len) };
         if rc != 0 || buf.is_null() {
             if std::env::var("RANCH_VT_DEBUG").is_ok() {
                 eprintln!("vt: format_alloc failed rc={rc} buf_null={}", buf.is_null());
@@ -221,7 +221,11 @@ impl Vt {
         let rows = rows as usize;
         let mut lines: Vec<String> = s.lines().map(|l| l.to_string()).collect();
         if std::env::var("RANCH_VT_DEBUG").is_ok() {
-            eprintln!("vt: format ok raw={} lines={} rows={rows}", s.len(), lines.len());
+            eprintln!(
+                "vt: format ok raw={} lines={} rows={rows}",
+                s.len(),
+                lines.len()
+            );
         }
         if lines.len() > rows {
             lines.drain(..lines.len() - rows);
@@ -235,10 +239,8 @@ impl Vt {
         let mut y: u16 = 0;
         let mut visible: bool = true;
         unsafe {
-            let _ =
-                ghostty_terminal_get(self.h, DATA_CURSOR_X, &mut x as *mut u16 as *mut c_void);
-            let _ =
-                ghostty_terminal_get(self.h, DATA_CURSOR_Y, &mut y as *mut u16 as *mut c_void);
+            let _ = ghostty_terminal_get(self.h, DATA_CURSOR_X, &mut x as *mut u16 as *mut c_void);
+            let _ = ghostty_terminal_get(self.h, DATA_CURSOR_Y, &mut y as *mut u16 as *mut c_void);
             let _ = ghostty_terminal_get(
                 self.h,
                 DATA_CURSOR_VISIBLE,
@@ -255,9 +257,8 @@ impl Vt {
         self.pin_bottom();
         let mut buf: *mut u8 = ptr::null_mut();
         let mut len: usize = 0;
-        let rc = unsafe {
-            ghostty_formatter_format_alloc(self.fmt, ptr::null(), &mut buf, &mut len)
-        };
+        let rc =
+            unsafe { ghostty_formatter_format_alloc(self.fmt, ptr::null(), &mut buf, &mut len) };
         if rc != 0 || buf.is_null() {
             return Vec::new();
         }
@@ -303,9 +304,17 @@ impl Vt {
     pub fn scrollbar(&self) -> (u64, u64, u64) {
         // Mirror of GhosttyTerminalScrollbar { total, offset, len }
         #[repr(C)]
-        struct Scrollbar { total: u64, offset: u64, len: u64 }
+        struct Scrollbar {
+            total: u64,
+            offset: u64,
+            len: u64,
+        }
         const DATA_SCROLLBAR: i32 = 9;
-        let mut sb = Scrollbar { total: 0, offset: 0, len: 0 };
+        let mut sb = Scrollbar {
+            total: 0,
+            offset: 0,
+            len: 0,
+        };
         unsafe {
             let _ = ghostty_terminal_get(
                 self.h,
@@ -321,10 +330,8 @@ impl Vt {
         let mut cols: u16 = 0;
         let mut rows: u16 = 0;
         unsafe {
-            let _ =
-                ghostty_terminal_get(self.h, DATA_COLS, &mut cols as *mut u16 as *mut c_void);
-            let _ =
-                ghostty_terminal_get(self.h, DATA_ROWS, &mut rows as *mut u16 as *mut c_void);
+            let _ = ghostty_terminal_get(self.h, DATA_COLS, &mut cols as *mut u16 as *mut c_void);
+            let _ = ghostty_terminal_get(self.h, DATA_ROWS, &mut rows as *mut u16 as *mut c_void);
         }
         (cols, rows)
     }
@@ -361,7 +368,10 @@ mod tests {
             joined.contains("LINE20"),
             "screen should show the newest line; got:\n{joined}"
         );
-        assert!(!joined.contains("LINE14"), "scrolled-off lines must not leak; got:\n{joined}");
+        assert!(
+            !joined.contains("LINE14"),
+            "scrolled-off lines must not leak; got:\n{joined}"
+        );
         assert_eq!(screen.len(), 6, "screen() must return exactly `rows` lines");
     }
 
@@ -410,7 +420,10 @@ mod tests {
         eprintln!("replay has LINE30: {}", joined.contains("LINE30"));
         let (t, o, l) = vt.scrollbar();
         eprintln!("replay scrollbar: total={t} offset={o} len={l}");
-        assert!(joined.contains("LINE30"), "formatter must follow the viewport; got:\n{joined}");
+        assert!(
+            joined.contains("LINE30"),
+            "formatter must follow the viewport; got:\n{joined}"
+        );
     }
 
     /// Replay with the daemon's exact batch boundaries + interleaved
@@ -437,7 +450,10 @@ mod tests {
         eprintln!("batched has LINE30: {}", joined.contains("LINE30"));
         let (t, o, l) = vt.scrollbar();
         eprintln!("batched scrollbar: total={t} offset={o} len={l}");
-        assert!(joined.contains("LINE30"), "formatter must follow; got:\n{joined}");
+        assert!(
+            joined.contains("LINE30"),
+            "formatter must follow; got:\n{joined}"
+        );
     }
 
     /// Prove scroll_viewport works: pin to TOP must move the viewport
@@ -448,9 +464,17 @@ mod tests {
         for i in 1..=20 {
             vt.write(format!("LINE{i}\r\n").as_bytes());
         }
-        assert_eq!(vt.scrollbar(), (21, 15, 6), "write() pins viewport to bottom");
+        assert_eq!(
+            vt.scrollbar(),
+            (21, 15, 6),
+            "write() pins viewport to bottom"
+        );
         unsafe {
-            let behavior = ScrollViewport { tag: 0, _pad: 0, value: [0; 2] }; // TOP
+            let behavior = ScrollViewport {
+                tag: 0,
+                _pad: 0,
+                value: [0; 2],
+            }; // TOP
             ghostty_terminal_scroll_viewport(vt.h, behavior);
         }
         assert_eq!(vt.scrollbar(), (21, 0, 6), "TOP pin must move offset to 0");
@@ -506,7 +530,11 @@ mod alt_tests {
         vt.write(b"second line\r\n");
         let screen = vt.screen();
         eprintln!("alt screen: {:?}", screen);
-        assert!(screen.iter().any(|l| l.contains("ALT SCREEN TOP")), "alt screen content must render; got {:?}", screen);
+        assert!(
+            screen.iter().any(|l| l.contains("ALT SCREEN TOP")),
+            "alt screen content must render; got {:?}",
+            screen
+        );
     }
 
     #[test]
@@ -534,7 +562,10 @@ mod vt_format_tests {
         vt.write(b"\x1b[32mGREEN\x1b[0m\r\n");
         let out = vt.screen();
         eprintln!("VT OUTPUT: {:?}", out);
-        assert!(out[0].contains("\u{1b}[1m") || out[0].contains("RED"), "styled rows expected");
+        assert!(
+            out[0].contains("\u{1b}[1m") || out[0].contains("RED"),
+            "styled rows expected"
+        );
         assert!(out[0].contains("plain"));
     }
 }

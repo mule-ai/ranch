@@ -224,6 +224,9 @@ pub enum Frame {
     SessionsKill {
         session: String,
     },
+    /// Client -> daemon: hot-upgrade in place — exec the same binary with
+    /// --inherit, passing all PTY/pi fds through (zero pane death).
+    Upgrade {},
     SessionsSelect {
         session: String,
         pane: String,
@@ -445,7 +448,9 @@ pub struct Cursor {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "k")]
 pub enum Layout {
-    Leaf { pane: String },
+    Leaf {
+        pane: String,
+    },
     Split {
         dir: u8,
         a: Box<Layout>,
@@ -491,8 +496,16 @@ pub fn b64_encode(data: &[u8]) -> String {
         let n = (b0 << 16) | (b1 << 8) | b2;
         out.push(B64[(n >> 18) as usize & 63] as char);
         out.push(B64[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 { B64[(n >> 6) as usize & 63] as char } else { '=' });
-        out.push(if chunk.len() > 2 { B64[n as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            B64[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            B64[n as usize & 63] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -513,8 +526,16 @@ pub fn b64_decode(s: &str) -> Option<Vec<u8>> {
     for i in (0..s.len()).step_by(4) {
         let a = b64_val(s[i])?;
         let b = b64_val(s[i + 1])?;
-        let c = if s[i + 2] == b'=' { 0 } else { b64_val(s[i + 2])? };
-        let d = if s[i + 3] == b'=' { 0 } else { b64_val(s[i + 3])? };
+        let c = if s[i + 2] == b'=' {
+            0
+        } else {
+            b64_val(s[i + 2])?
+        };
+        let d = if s[i + 3] == b'=' {
+            0
+        } else {
+            b64_val(s[i + 3])?
+        };
         let n = (a << 18) | (b << 12) | (c << 6) | d;
         out.push((n >> 16) as u8);
         if s[i + 2] != b'=' {
@@ -565,7 +586,10 @@ pub struct Decoder {
 
 impl Decoder {
     pub fn new() -> Self {
-        Self { buf: Vec::new(), pending: HashMap::new() }
+        Self {
+            buf: Vec::new(),
+            pending: HashMap::new(),
+        }
     }
 
     /// Feed a chunk of bytes; returns any complete frames decoded from it.
@@ -591,11 +615,17 @@ impl Decoder {
     /// If `f` is the last chunk of a pending frame, reassemble and return it.
     fn maybe_complete(&mut self, f: &Frame) -> Option<Frame> {
         match f {
-            Frame::Chunk { chunk_id, i, n, data } => {
+            Frame::Chunk {
+                chunk_id,
+                i,
+                n,
+                data,
+            } => {
                 let complete = {
-                    let entry = self.pending.entry(chunk_id.clone()).or_insert_with(|| {
-                        (*n, vec![None; *n as usize])
-                    });
+                    let entry = self
+                        .pending
+                        .entry(chunk_id.clone())
+                        .or_insert_with(|| (*n, vec![None; *n as usize]));
                     let slots = &mut entry.1;
                     if (*i as usize) < slots.len() && slots[*i as usize].is_none() {
                         slots[*i as usize] = Some(data.clone());
@@ -603,9 +633,12 @@ impl Decoder {
                     slots.iter().all(|s| s.is_some())
                 };
                 if complete {
-                    let joined: String = self.pending
+                    let joined: String = self
+                        .pending
                         .get(chunk_id)
-                        .map(|(_, slots)| slots.iter().map(|s| s.as_deref().unwrap_or("")).collect())
+                        .map(|(_, slots)| {
+                            slots.iter().map(|s| s.as_deref().unwrap_or("")).collect()
+                        })
                         .unwrap_or_default();
                     self.pending.remove(chunk_id);
                     serde_json::from_str::<Frame>(&joined).ok()
@@ -807,7 +840,9 @@ mod tests {
     #[test]
     fn decoder_handles_interleaved_lines() {
         let f1 = Frame::Hb;
-        let f2 = Frame::SessionsKill { session: "s".into() };
+        let f2 = Frame::SessionsKill {
+            session: "s".into(),
+        };
         let mut payload = String::new();
         payload.push_str(&serde_json::to_string(&f1).unwrap());
         payload.push('\n');

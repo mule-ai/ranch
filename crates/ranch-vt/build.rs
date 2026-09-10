@@ -9,8 +9,7 @@ fn main() {
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
             // Default: <workspace>/vendor/lib
-            PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap())
-                .join("../../vendor/lib")
+            PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join("../../vendor/lib")
         });
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
     println!("cargo:rustc-link-lib=dylib=ghostty-vt");
