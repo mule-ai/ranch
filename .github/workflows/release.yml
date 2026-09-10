@@ -1,0 +1,137 @@
+# Build release artifacts and publish them to the ranch-dist repo,
+# which the website links to. Runs on version tags (v*) and manually.
+#
+# Required secrets:
+#   DIST_TOKEN — a PAT (fine-grained: contents rw on mule-ai/ranch-dist)
+#   RANCH_KEYSTORE — base64 of the release keystore (or use local path
+#     below if self-hosted); APK signing is skipped if unset (unsigned APK)
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  DIST_REPO: mule-ai/ranch-dist
+
+jobs:
+  binaries:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Zig
+        run: |
+          mkdir -p .tools
+          curl -Lo /tmp/zig.tar.xz https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz
+          tar xf /tmp/zig.tar.xz -C .tools
+          mv .tools/zig-x86_64-linux-0.16.0 .tools/zig
+      - name: Build libghostty-vt
+        run: |
+          git clone --depth 1 https://github.com/ghostty-org/ghostty vendor/ghostty
+          cd vendor/ghostty && git fetch --depth 1 origin 82232ecde55405559dec29c5466cb9e39938cb41 && git checkout 82232ecde55405559dec29c5466cb9e39938cb41
+          cd example/c-vt-stream && PATH="$PWD/../../.tools/zig:$PATH" zig build
+          mkdir -p ../../lib
+          cp .zig-cache/o/*/libghostty-vt.so ../../lib/
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release binaries
+        run: cargo build --release
+      - name: Smoke test
+        run: cargo test --release -p ranch-protocol -p ranch-daemon
+      - name: Stage
+        run: |
+          mkdir -p stage/ranch-linux-x86_64
+          cp target/release/ranch-cli stage/ranch-linux-x86_64/ranch
+          cp target/release/ranch-daemon stage/ranch-linux-x86_64/ranch-daemon
+          cp vendor/lib/libghostty-vt.so stage/ranch-linux-x86_64/
+          cp -r systemd stage/ranch-linux-x86_64/
+          cp README.md stage/ranch-linux-x86_64/
+          tar czf ranch-linux-x86_64.tar.gz -C stage ranch-linux-x86_64
+          sha256sum ranch-linux-x86_64.tar.gz | awk '{print $1}' > ranch-linux-x86_64.tar.gz.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-binaries
+          path: |
+            ranch-linux-x86_64.tar.gz
+            ranch-linux-x86_64.tar.gz.sha256
+
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: android-actions/setup-android@v3
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Decode signing keystore
+        if: env.RANCH_KEYSTORE_B64 != ''
+        env:
+          RANCH_KEYSTORE_B64: ${{ secrets.RANCH_KEYSTORE }}
+        run: |
+          mkdir -p ~/.local/android-keystore
+          echo "$RANCH_KEYSTORE_B64" | base64 -d > ~/.local/android-keystore/ranch.keystore
+      - name: Build APK
+        working-directory: mobile
+        run: |
+          npm install
+          npx expo prebuild --platform android --no-install
+          python3 apply-signing.py
+          cd android && ./gradlew assembleRelease
+      - name: Stage
+        run: |
+          cp mobile/android/app/build/outputs/apk/release/app-release.apk ranch.apk
+          sha256sum ranch.apk | awk '{print $1}' > ranch.apk.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-apk
+          path: |
+            ranch.apk
+            ranch.apk.sha256
+
+  publish:
+    needs: [binaries, apk]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+      - name: Publish to ranch-dist
+        env:
+          GH_TOKEN: ${{ secrets.DIST_TOKEN }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          [ "$VERSION" = "main" ] || VERSION="${VERSION:-$(date +%Y%m%d)}"
+          # normalize names for the website's versions.json
+          SHA_LINUX=$(cat linux-binaries/ranch-linux-x86_64.tar.gz.sha256 2>/dev/null || echo "")
+          SHA_APK=$(cat android-apk/ranch.apk.sha256 2>/dev/null || echo "")
+          DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          mkdir -p dist && cd dist
+          cp ../linux-binaries/ranch-linux-x86_64.tar.gz* .
+          cp ../android-apk/ranch.apk* .
+          cat > versions.json <<EOF
+          {
+            "version": "$VERSION",
+            "built": "$DATE",
+            "apk": "ranch.apk",
+            "linux": "ranch-linux-x86_64.tar.gz",
+            "sha256_apk": "$SHA_APK",
+            "sha256_linux": "$SHA_LINUX"
+          }
+          EOF
+          # publish: push files to the ranch-dist repo's main branch
+          git config --global user.email "ci@ranch.local"
+          git config --global user.name "ranch CI"
+          REPO="https://x-access-token:$GH_TOKEN@github.com/$DIST_REPO.git"
+          if git ls-remote "$REPO" main &>/dev/null; then
+            git clone --depth 1 "$REPO" out && cp dist/* out/ && cd out
+          else
+            git init -b main out && cp dist/* out/ && cd out
+          fi
+          git add -A && git commit -m "release $VERSION" || echo "no changes"
+          git push -u origin main

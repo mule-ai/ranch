@@ -1,0 +1,44 @@
+# Build the web app and deploy it to GitHub Pages.
+# Pages is configured with build_type=workflow (via API) so this owns it.
+name: web
+
+on:
+  push:
+    branches: [main, master]
+    paths: ["web/**", ".github/workflows/web.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Build site
+        working-directory: web
+        run: |
+          npm ci
+          npm run build
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: web/dist
+      - name: Deploy to Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
