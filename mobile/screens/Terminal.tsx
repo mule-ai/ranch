@@ -339,9 +339,11 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
             onContentSizeChange={(_, h) => chatScrollRef.current?.scrollToEnd({ animated: false })}
             ref={chatScrollRef}
           >
-            {chatMsgs.map((m, i) => (
-              <ChatBubble key={i} msg={m} />
-            ))}
+            {chatMsgs
+              .filter((m) => !(m.role !== "tool" && !m.text?.trim()))
+              .map((m, i) => (
+                <ChatBubble key={i} msg={m} />
+              ))}
             {chatMsgs.length === 0 && (
               <Text style={styles.dim}>say something to the agent…</Text>
             )}
