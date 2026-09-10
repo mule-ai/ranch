@@ -4,11 +4,16 @@
 export type Release = {
   version: string;
   built: string; // ISO date
-  apk: string; // url
-  linux: string; // url
+  apk: string; // file name in the dist repo
+  linux: string; // file name
   sha256_apk?: string;
   sha256_linux?: string;
 };
+
+// absolute download URL for a dist file (raw.githubusercontent serves
+// CORS-friendly, so direct <a href> works)
+export const distFile = (name: string) =>
+  `https://raw.githubusercontent.com/mule-ai/ranch-dist/main/${name}`;
 
 export const DIST_URL =
   "https://raw.githubusercontent.com/mule-ai/ranch-dist/main/versions.json";

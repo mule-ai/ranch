@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Link } from "../lib/router";
-import { Release, fetchLatest } from "../lib/releases";
+import { Release, fetchLatest, distFile } from "../lib/releases";
 
 export function Download() {
   const [rel, setRel] = useState<Release | null | "loading">("loading");
@@ -35,7 +35,7 @@ cd ranch && make setup && make install`}</pre>
           <div className="card">
             <h2>Android app</h2>
             <p className="dim">v{rel.version} · built {rel.built.slice(0, 10)}</p>
-            <a className="btn btn-primary" href={rel.apk} download>
+            <a className="btn btn-primary" href={distFile(rel.apk)} download>
               Download APK
             </a>
             {rel.sha256_apk && (
@@ -51,7 +51,7 @@ cd ranch && make setup && make install`}</pre>
               <code>ln -s ranch ranchd</code> (or <code>ranch daemon</code>)
               runs the daemon.
             </p>
-            <a className="btn btn-primary" href={rel.linux} download>
+            <a className="btn btn-primary" href={distFile(rel.linux)} download>
               Download tarball
             </a>
             {rel.sha256_linux && (
@@ -59,6 +59,30 @@ cd ranch && make setup && make install`}</pre>
             )}
           </div>
         </>
+      )}
+
+      {rel && rel !== "loading" && (
+        <div className="card">
+          <h2>Install (Linux)</h2>
+          <pre>{`tar xzf ranch-linux-x86_64.tar.gz
+cd ranch-linux-x86_64
+mkdir -p ~/.local/bin
+install ranch ~/.local/bin/ranch
+ln -sf ranch ~/.local/bin/ranchd`}</pre>
+          <p className="dim">
+            Then sign in and register this machine as a daemon host:
+          </p>
+          <pre>{`ranch login          # Google sign-in (once per device)
+ranch register       # register with your ranch account
+ranch daemon         # or: make service / run ranchd under systemd`}</pre>
+          <p className="dim">
+            The daemon keeps every session's panes alive — leave it running.
+            <code>ranch</code> (in a TTY) opens the interactive dashboard;
+            the Android app and{" "}
+            <a href="https://mule-ai.github.io/ranch/#/app">this site's web app</a>{" "}
+            reach the same sessions through the cloud relay.
+          </p>
+        </div>
       )}
 
       <div className="card">
