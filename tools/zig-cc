@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 # zig-cc wrapper: rust target triples -> zig triples.
 # zig 0.16 dropped the "unknown" vendor segment in target triples
 # (x86_64-unknown-linux-musl -> x86_64-linux-musl). Used as CC for
