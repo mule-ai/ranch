@@ -159,30 +159,30 @@ jobs:
             binary (`ranch` = CLI + TUI + daemon; zero runtime deps).
             Install:
 
-              ```sh
-              tar xzf ranch-linux-x86_64.tar.gz
-              cd ranch-linux-x86_64
-              install ranch ~/.local/bin/ranch
-              ln -sf ranch ~/.local/bin/ranchd
-              ```
+          ```sh
+          tar xzf ranch-linux-x86_64.tar.gz
+          cd ranch-linux-x86_64
+          install ranch ~/.local/bin/ranch
+          ln -sf ranch ~/.local/bin/ranchd
+          ```
 
           - **`ranch.apk`** — Android app. Enable "install unknown apps"
-            for your browser, then install. Requires Android 8+.
+            for your browser, then install.
 
           ## Sign-in
 
           `ranch login` (Google), then `ranch register` on a daemon host,
           then run the daemon: `ranch daemon` — or the systemd unit from
-          the tarball. Pick this machine in the [web app](https://mule-ai.github.io/ranch/#/app)
-          or the Android app.
+          the tarball. Pick this machine in the
+          [web app](https://mule-ai.github.io/ranch/#/app) or the Android app.
 
           ## SHA256
 
           See the `.sha256` files; verify with `sha256sum -c`.
           EON
           )
-          gh release create "$TAG" --title "$TITLE" --notes "$NOTES" --target main 2>/dev/null || gh release delete "$TAG" -y
-          gh release upload "$TAG" \
+          gh release create "$TAG" --repo mule-ai/ranch --title "$TITLE" --notes "$NOTES" --target "$GITHUB_SHA" || true
+          gh release upload "$TAG" --repo mule-ai/ranch \
             linux-binaries/ranch-linux-x86_64.tar.gz \
             linux-binaries/ranch-linux-x86_64.tar.gz.sha256 \
             android-apk/ranch.apk \
