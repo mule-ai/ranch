@@ -133,10 +133,9 @@ jobs:
           git config --global user.email "ci@ranch.local"
           git config --global user.name "ranch CI"
           REPO="https://x-access-token:$GH_TOKEN@github.com/$DIST_REPO.git"
-          if git ls-remote "$REPO" main &>/dev/null; then
-            git clone --depth 1 "$REPO" out && cp dist/* out/ && cd out
-          else
-            git init -b main out && cp dist/* out/ && cd out
-          fi
-          git add -A && git commit -m "release $VERSION" || echo "no changes"
-          git push -u origin main
+          git init -b main out
+          cp dist/* out/
+          cd out
+          git add -A
+          git commit -m "release $VERSION" || echo "no changes"
+          git push -f -u "$REPO" main
