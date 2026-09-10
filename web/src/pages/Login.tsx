@@ -13,9 +13,12 @@ export function Login({ onSignedIn }: { onSignedIn: () => void }) {
     setErr("");
     setBusy(true);
     try {
+      // Plain origin+pathname (no hash): Supabase appends ?code=… to this
+      // on the way back, and a trailing fragment would garble it. The
+      // app re-routes to #/app once the session is detected.
       const { error } = await supabase.auth.signInWithOAuth({
         provider: "google",
-        options: { redirectTo: window.location.origin + window.location.pathname + "#/app" },
+        options: { redirectTo: window.location.origin + window.location.pathname },
       });
       if (error) throw error;
       // browser navigates away; nothing else to do
