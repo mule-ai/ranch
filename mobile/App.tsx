@@ -13,7 +13,7 @@ import {
 } from "react-native";
 import { supabase } from "./lib/supabase";
 import { Relay } from "./lib/relay";
-import { Frame, SessionMeta, nextId } from "./lib/frames";
+import { Frame, ForgeSessionInfo, SessionMeta, nextId } from "./lib/frames";
 import { LoginScreen, EmailFallback } from "./screens/Login";
 import { MachinesScreen } from "./screens/Machines";
 import { TerminalScreen } from "./screens/Terminal";
@@ -32,13 +32,16 @@ export default function App() {
   const [attached, setAttached] = useState<SessionMeta | null>(null);
   const [newName, setNewName] = useState("");
   // session kind for the create row: shell or forge (agent running pi)
-  const [newKind, setNewKind] = useState<"shell" | "forge">("shell");
+  const [newKind, setNewKind] = useState<"shell" | "forge" | "pi">("shell");
+  // forge session picker (resume); null = closed
+  const [resumeList, setResumeList] = useState<ForgeSessionInfo[] | null>(null);
   // refs mirror the states for the frame handler, whose effect never
   // re-runs (deps: machine id only) — stale closure otherwise
   const nameRef = useRef(newName);
   nameRef.current = newName;
   const kindRef = useRef(newKind);
   kindRef.current = newKind;
+  const resumeReqRef = useRef<string | null>(null);
   const [err, setErr] = useState("");
   // keyboard inset: edge-to-edge Android doesn't lift bottom inputs, so
   // pad the sessions screen by the measured keyboard height
@@ -107,6 +110,12 @@ export default function App() {
               { id: f.session, name: nameRef.current || f.session.slice(0, 8), kind: kindRef.current, active_pane: f.pane, panes: [f.pane] },
             ]);
             setNewName("");
+            break;
+          case "ForgeListOk":
+            if (f.req_id === resumeReqRef.current) {
+              resumeReqRef.current = null;
+              setResumeList(f.sessions);
+            }
             break;
           case "Error":
             setErr(f.message);
@@ -212,25 +221,75 @@ export default function App() {
             )}
           />
         )}
+        {resumeList !== null && (
+          <View style={[s.resumeSheet]}>
+            <Text style={s.rowTitle}>forge sessions</Text>
+            <FlatList
+              data={resumeList}
+              keyExtractor={(item) => item.id}
+              style={{ maxHeight: 320 }}
+              renderItem={({ item }) => (
+                <Pressable
+                  style={s.row}
+                  onPress={() => {
+                    setResumeList(null);
+                    relay?.send({
+                      t: "SessionsCreate", req_id: nextId(), kind: "forge",
+                      forge_session: item.id,
+                    } as Frame);
+                  }}
+                >
+                  <Text style={s.rowTitle} numberOfLines={1}>
+                    {item.title || item.id.slice(0, 8)}
+                  </Text>
+                  <Text style={s.dim}>
+                    {item.ended ? "ended" : "active"} ·{" "}
+                    {item.updated ? item.updated.slice(0, 16).replace("T", " ") : ""}
+                  </Text>
+                </Pressable>
+              )}
+              ListEmptyComponent={<Text style={s.dim}>nothing to resume</Text>}
+            />
+            <Pressable style={s.kindChip} onPress={() => setResumeList(null)}>
+              <Text style={s.kindText}>close</Text>
+            </Pressable>
+          </View>
+        )}
         <View style={s.kindRow}>
-          {(["shell", "forge"] as const).map((k) => (
+          {(["shell", "forge", "pi"] as const).map((k) => (
             <Pressable
               key={k}
               style={[s.kindChip, newKind === k && s.kindChipOn]}
               onPress={() => setNewKind(k)}
             >
               <Text style={[s.kindText, newKind === k && s.kindTextOn]}>
-                {k === "forge" ? "agent" : "shell"}
+                {k === "forge" ? "agent" : k}
               </Text>
             </Pressable>
           ))}
+          <Pressable
+            style={s.kindChip}
+            onPress={() => {
+              const rid = nextId();
+              resumeReqRef.current = rid;
+              relay?.send({ t: "ForgeList", id: nextId(), client: "mobile", req_id: rid } as Frame);
+            }}
+          >
+            <Text style={s.kindText}>resume…</Text>
+          </Pressable>
         </View>
         <View style={s.newRow}>
           <TextInput
             style={s.input}
             value={newName}
             onChangeText={setNewName}
-            placeholder={newKind === "forge" ? "agent name (runs pi)" : "new session name (optional)"}
+            placeholder={
+              newKind === "forge"
+                ? "agent name (lab forge)"
+                : newKind === "pi"
+                  ? "local pi name (optional)"
+                  : "new session name (optional)"
+            }
             placeholderTextColor="#4b5563"
             autoCapitalize="none"
           />
@@ -271,6 +330,10 @@ const s = StyleSheet.create({
   dim: { color: "#6b7280", fontSize: 13 },
   err: { color: "#f87171", marginBottom: 8 },
   newRow: { flexDirection: "row", gap: 8, paddingBottom: 30, paddingTop: 8 },
+  resumeSheet: {
+    backgroundColor: "#16161c", borderRadius: 12, padding: 10,
+    borderWidth: 1, borderColor: "#2a2a34", maxHeight: 420,
+  },
   kindRow: { flexDirection: "row", gap: 8, paddingBottom: 4 },
   kindChip: {
     borderWidth: 1, borderColor: "#374151", borderRadius: 999,
