@@ -978,6 +978,10 @@ fn cmd_attach(ref_: &str) {
                                     ) {
                                         pv.apply_agent_status(status);
                                     }
+                                } else if mkind != "agent" {
+                                    if let Some(st) = mstat {
+                                        eprintln!("ranch: {st}");
+                                    }
                                 }
                             }
                             Frame::Update {
@@ -1027,24 +1031,6 @@ fn cmd_attach(ref_: &str) {
                                     resume_items.borrow_mut().extend(sessions);
                                     resume_sel.set(0);
                                     resume_open.set(true);
-                                }
-                            }
-                            Frame::Meta {
-                                session: msess,
-                                pane: mpane,
-                                kind: mkind,
-                                status: Some(s),
-                                ..
-                            } => {
-                                if msess == session_id && mkind == "agent" {
-                                    if let (Some(pv), Some(status)) = (
-                                        pane_views.get_mut(mpane.as_deref().unwrap_or("")),
-                                        Some(s.as_str()),
-                                    ) {
-                                        pv.apply_agent_status(status);
-                                    }
-                                } else if mkind != "agent" {
-                                    eprintln!("ranch: {s}");
                                 }
                             }
                             Frame::Error { message, .. } => {
@@ -1949,10 +1935,11 @@ fn cmd_attach(ref_: &str) {
                                                     prompt_input.clear();
                                                     continue;
                                                 }
-                                                if let Some(rest) =
-                                                    prompt_input.trim().strip_prefix("pi")
+                                                if prompt_input.trim() == "pi"
+                                                    || prompt_input.trim().starts_with("pi ")
                                                 {
-                                                    let dir = rest.trim().to_string();
+                                                    // (no dir arg: the split anchors
+                                                    // to the focused pane's cwd)
                                                     let f = Frame::PaneSplit {
                                                         req_id: Uuid::new_v4().to_string(),
                                                         session: session_id.clone(),

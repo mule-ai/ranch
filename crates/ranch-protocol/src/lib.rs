@@ -133,6 +133,26 @@ pub enum Frame {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         forge_session: Option<String>,
     },
+    /// Client -> daemon: list directories at `path` (None = $HOME).
+    /// Local-machine filesystem access for mobile dir pickers.
+    DirList {
+        id: String,
+        client: String,
+        req_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+    },
+    /// Daemon -> client: directory listing.
+    DirListOk {
+        id: String,
+        req_id: String,
+        /// the resolved absolute path
+        path: String,
+        /// parent dir, when there is one (up-navigation)
+        parent: Option<String>,
+        /// subdirectory names, sorted
+        dirs: Vec<String>,
+    },
     /// Client -> daemon: list resumable forge sessions.
     ForgeList {
         id: String,

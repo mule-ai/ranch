@@ -908,6 +908,43 @@ impl Daemon {
             // everyone attached to the session (pipe client has no
             // attach; the frame carries the session in `session` —
             // the worker leaves it blank, so resolve from the pane)
+            // client -> daemon: local directory listing (cheap, sync)
+            Frame::DirList { req_id, path, .. } => {
+                let base = path
+                    .clone()
+                    .filter(|p| !p.is_empty())
+                    .unwrap_or_else(|| std::env::var("HOME").unwrap_or_default());
+                let (dirs, parent) = match std::fs::read_dir(&base) {
+                    Ok(rd) => {
+                        let mut ds: Vec<String> = rd
+                            .flatten()
+                            .filter(|e| {
+                                e.file_type().map(|t| t.is_dir()).unwrap_or(false)
+                                    && !e.file_name().to_string_lossy().starts_with('.')
+                            })
+                            .map(|e| e.file_name().to_string_lossy().to_string())
+                            .collect();
+                        ds.sort();
+                        let parent = std::path::Path::new(&base)
+                            .parent()
+                            .map(|p| p.to_string_lossy().to_string());
+                        (ds, parent)
+                    }
+                    Err(e) => {
+                        eprintln!("ranchd: dir list {base}: {e}");
+                        (Vec::new(), None)
+                    }
+                };
+                if let Some(c) = self.clients.get_mut(&from) {
+                    send_frame(c, &Frame::DirListOk {
+                        id: String::new(),
+                        req_id: req_id.clone(),
+                        path: base,
+                        parent,
+                        dirs,
+                    });
+                }
+            }
             // client -> forge: list resumable sessions (blocking HTTP
             // on the worker thread)
             Frame::ForgeList { req_id, .. } => {

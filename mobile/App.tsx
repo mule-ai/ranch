@@ -35,6 +35,12 @@ export default function App() {
   const [newKind, setNewKind] = useState<"shell" | "forge" | "pi">("shell");
   // forge session picker (resume); null = closed
   const [resumeList, setResumeList] = useState<ForgeSessionInfo[] | null>(null);
+  // local-pi working dir (null = daemon default $HOME)
+  const [piDir, setPiDir] = useState<string | null>(null);
+  // directory browser sheet for picking piDir
+  const [dirBrowse, setDirBrowse] = useState<
+    { path: string; parent: string | null; dirs: string[] } | null
+  >(null);
   // refs mirror the states for the frame handler, whose effect never
   // re-runs (deps: machine id only) — stale closure otherwise
   const nameRef = useRef(newName);
@@ -42,6 +48,13 @@ export default function App() {
   const kindRef = useRef(newKind);
   kindRef.current = newKind;
   const resumeReqRef = useRef<string | null>(null);
+  const dirReqRef = useRef<string | null>(null);
+  const browseDir = (r: Relay | null, path?: string) => {
+    if (!r) return;
+    const rid = nextId();
+    dirReqRef.current = rid;
+    r.send({ t: "DirList", id: nextId(), client: "mobile", req_id: rid, path } as Frame);
+  };
   const [err, setErr] = useState("");
   // keyboard inset: edge-to-edge Android doesn't lift bottom inputs, so
   // pad the sessions screen by the measured keyboard height
@@ -115,6 +128,16 @@ export default function App() {
             if (f.req_id === resumeReqRef.current) {
               resumeReqRef.current = null;
               setResumeList(f.sessions);
+            }
+            break;
+          case "DirListOk":
+            if (f.req_id === dirReqRef.current) {
+              dirReqRef.current = null;
+              setDirBrowse({
+                path: f.path,
+                parent: f.parent ?? null,
+                dirs: f.dirs,
+              });
             }
             break;
           case "Error":
@@ -279,6 +302,61 @@ export default function App() {
           </Pressable>
         </View>
         <View style={s.newRow}>
+          {newKind === "pi" && (
+            <View style={s.kindRow}>
+              <Pressable
+                style={[s.kindChip, s.dirChip]}
+                onPress={() => browseDir(relay, piDir ?? undefined)}
+              >
+                <Text style={s.kindText} numberOfLines={1}>
+                  dir: {piDir ?? "$HOME"}
+                </Text>
+              </Pressable>
+            </View>
+          )}
+          {dirBrowse !== null && (
+            <View style={s.resumeSheet}>
+              <Text style={s.rowTitle} numberOfLines={1}>
+                {dirBrowse.path}
+              </Text>
+              <FlatList
+                data={dirBrowse.dirs}
+                keyExtractor={(item) => item}
+                style={{ maxHeight: 300 }}
+                renderItem={({ item }) => (
+                  <Pressable
+                    style={s.row}
+                    onPress={() => browseDir(relay, dirBrowse.path + "/" + item)}
+                  >
+                    <Text style={s.rowTitle}>{item}/</Text>
+                  </Pressable>
+                )}
+                ListEmptyComponent={<Text style={s.dim}>no subdirectories</Text>}
+              />
+              <View style={s.kindRow}>
+                {dirBrowse.parent !== null && (
+                  <Pressable
+                    style={s.kindChip}
+                    onPress={() => browseDir(relay, dirBrowse.parent ?? undefined)}
+                  >
+                    <Text style={s.kindText}>up…</Text>
+                  </Pressable>
+                )}
+                <Pressable
+                  style={[s.kindChip, s.kindChipOn]}
+                  onPress={() => {
+                    setPiDir(dirBrowse.path);
+                    setDirBrowse(null);
+                  }}
+                >
+                  <Text style={[s.kindText, s.kindTextOn]}>use this dir</Text>
+                </Pressable>
+                <Pressable style={s.kindChip} onPress={() => setDirBrowse(null)}>
+                  <Text style={s.kindText}>cancel</Text>
+                </Pressable>
+              </View>
+            </View>
+          )}
           <TextInput
             style={s.input}
             value={newName}
@@ -295,7 +373,13 @@ export default function App() {
           />
           <Pressable
             style={[s.sendBtn, newKind === "forge" && s.sendBtnAgent]}
-            onPress={() => relay?.send({ t: "SessionsCreate", req_id: nextId(), name: newName || undefined, kind: newKind } as Frame)}
+            onPress={() =>
+              relay?.send({
+                t: "SessionsCreate", req_id: nextId(), name: newName || undefined,
+                kind: newKind,
+                cwd: newKind === "pi" ? (piDir ?? undefined) : undefined,
+              } as Frame)
+            }
           >
             <Text style={s.btnText}>{newKind === "forge" ? "agent" : "new"}</Text>
           </Pressable>
@@ -330,6 +414,7 @@ const s = StyleSheet.create({
   dim: { color: "#6b7280", fontSize: 13 },
   err: { color: "#f87171", marginBottom: 8 },
   newRow: { flexDirection: "row", gap: 8, paddingBottom: 30, paddingTop: 8 },
+  dirChip: { flex: 1, alignItems: "flex-start" },
   resumeSheet: {
     backgroundColor: "#16161c", borderRadius: 12, padding: 10,
     borderWidth: 1, borderColor: "#2a2a34", maxHeight: 420,

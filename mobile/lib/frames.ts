@@ -90,6 +90,8 @@ export type Frame =
   | { t: "Scrollback"; id: string; client: string; session: string; pane: string; offset: number; lines: string[] }
   | { t: "SessionsCreate"; req_id: string; name?: string; kind?: "shell" | "forge" | "pi"; cwd?: string; forge_session?: string }
   | { t: "ForgeList"; id: string; client: string; req_id: string }
+  | { t: "DirList"; id: string; client: string; req_id: string; path?: string }
+  | { t: "DirListOk"; id: string; req_id: string; path: string; parent?: string | null; dirs: string[] }
   | { t: "ForgeListOk"; id: string; req_id: string; sessions: ForgeSessionInfo[] }
   | { t: "ChatSend"; id: string; client: string; session: string; pane: string; text: string }
   | { t: "Chat"; id: string; session: string; pane: string; msgs: ChatMsg[]; reset?: boolean }
