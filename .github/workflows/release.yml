@@ -42,6 +42,9 @@ jobs:
         run: cargo build --release
       - name: Smoke test
         run: cargo test --release -p ranch-protocol -p ranch-daemon
+        env:
+          # test binaries need libghostty-vt.so.0 on the loader path
+          LD_LIBRARY_PATH: ${{ github.workspace }}/vendor/lib
       - name: Stage
         run: |
           mkdir -p stage/ranch-linux-x86_64
