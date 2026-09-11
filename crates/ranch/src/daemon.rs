@@ -1676,8 +1676,29 @@ impl Daemon {
     fn handle_frame(&mut self, from: RawFd, frame: &Frame) {
         match frame {
             // hot upgrade: exec the same binary with --inherit — all
-            // PTY/pi fds ride through the exec (never returns on success)
+            // PTY/pi fds ride through the exec (never returns on success).
+            // Relay clients are denied: hot upgrade lets the holder of a
+            // machine key replace the running daemon binary, which a
+            // shared/public account (e.g. the ranch demo) must not be able
+            // to do. Only direct (unix-socket) clients may upgrade.
             Frame::Upgrade {} => {
+                let relayed = self
+                    .clients
+                    .get(&from)
+                    .is_some_and(|c| c.name == "relay");
+                if relayed {
+                    eprintln!("ranchd: upgrade denied: relay clients may not hot-upgrade");
+                    if let Some(c) = self.clients.get_mut(&from) {
+                        send_frame(
+                            c,
+                            &Frame::Error {
+                                req_id: None,
+                                message: "upgrade denied: remote clients may not hot-upgrade the daemon".into(),
+                            },
+                        );
+                    }
+                    return;
+                }
                 eprintln!("ranchd: hot upgrade requested (client {from})");
                 if let Err(e) = self.hot_upgrade() {
                     eprintln!("ranchd: hot upgrade failed: {e}");

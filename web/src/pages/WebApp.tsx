@@ -247,9 +247,13 @@ function MachineClient({ machine, onBack }: { machine: Machine; onBack: () => vo
 
       <CreateRow relay={relay} />
       <div className="btnrow" style={{ marginTop: 24 }}>
-        <button className="btn btn-ghost" onClick={hotUpgrade} disabled={upgrading || !relay}>
-          {upgrading ? "upgrading…" : "upgrade daemon"}
-        </button>
+        {/* demo build: hot upgrade is denied server-side for relay clients,
+            so don't offer the button to public demo visitors */}
+        {!demoAvailable && (
+          <button className="btn btn-ghost" onClick={hotUpgrade} disabled={upgrading || !relay}>
+            {upgrading ? "upgrading…" : "upgrade daemon"}
+          </button>
+        )}
         <button className="btn btn-ghost danger" onClick={() => supabase.auth.signOut()}>
           Sign out
         </button>
