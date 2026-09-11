@@ -32,6 +32,11 @@ jobs:
           cache-dependency-path: web/package-lock.json
       - name: Build site
         working-directory: web
+        env:
+          # public demo account — the hosted demo signs visitors in as this
+          # user; it only owns the public demo machine (see ct/ranch-demo)
+          VITE_DEMO_EMAIL: ranch-demo@jbutler.dev
+          VITE_DEMO_PASSWORD: ranch-demo-2026
         run: |
           npm ci
           npm run build
