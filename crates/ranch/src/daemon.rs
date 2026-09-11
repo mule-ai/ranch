@@ -718,9 +718,19 @@ fn spawn_pane(session: &mut Session, pane_kind: &str, cwd: Option<&str>) -> Resu
                 1,
             );
             // agent sessions run `pi` via a login shell (so the mise
-            // shim PATH from the user profile applies); shells run bare
+            // shim PATH from the user profile applies); shells run bare.
+            // CString: execvp takes a C string, and `String::as_ptr()` is
+            // not NUL-terminated (UB: first spawn may read a lucky byte,
+            // later ones read past the allocation).
             let shell = default_shell();
-            let shell_c = shell.as_ptr();
+            let shell_c = match std::ffi::CString::new(shell.clone()) {
+                Ok(c) => c,
+                Err(_) => {
+                    eprintln!("ranchd: SHELL contains NUL; cannot spawn pane");
+                    std::process::exit(1);
+                }
+            };
+            let shell_p: *const u8 = shell_c.as_ptr() as *const u8;
             if pane_kind == "forge" {
                 let dir = cwd.map(std::path::PathBuf::from).unwrap_or_else(home_dir);
                 let d_c =
@@ -730,11 +740,15 @@ fn spawn_pane(session: &mut Session, pane_kind: &str, cwd: Option<&str>) -> Resu
                 }
                 let arg = b"exec pi\0";
                 let argv: [*const u8; 4] =
-                    [shell_c, b"-lc\0".as_ptr(), arg.as_ptr(), std::ptr::null()];
-                execvp(shell_c, argv.as_ptr());
+                    [shell_p, b"-lc\0".as_ptr(), arg.as_ptr(), std::ptr::null()];
+                if unsafe { execvp(shell_p, argv.as_ptr()) } != 0 {
+                    eprintln!("ranchd: execvp {shell:?} failed: {:?}", std::io::Error::last_os_error());
+                }
             } else {
-                let argv: [*const u8; 2] = [shell_c, std::ptr::null()];
-                execvp(shell_c, argv.as_ptr());
+                let argv: [*const u8; 2] = [shell_p, std::ptr::null()];
+                if unsafe { execvp(shell_p, argv.as_ptr()) } != 0 {
+                    eprintln!("ranchd: execvp {shell:?} failed: {:?}", std::io::Error::last_os_error());
+                }
             }
             std::process::exit(1);
         }
@@ -3389,7 +3403,12 @@ fn run(daemon: Daemon) {
                     let w = unsafe { waitpid(p.child, &mut status, WNOHANG) };
                     if w == p.child {
                         p.dead = true;
-                        eprintln!("ranchd: pane {pid} ({}:{}) child exited", s.name, s.id);
+                        let detail = if status & 0x130 == 0x130 {
+                            format!("exit {}", (status >> 8) & 0xff)
+                        } else {
+                            format!("signal {}", (status & 0x7f) + 1)
+                        };
+                        eprintln!("ranchd: pane {pid} ({}:{}) child exited ({})", s.name, s.id, detail);
                         died.push((*sid, *pid));
                     }
                 }
