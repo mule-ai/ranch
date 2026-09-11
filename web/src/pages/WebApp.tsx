@@ -332,10 +332,11 @@ function SessionRow({
 
 function CreateRow({ relay }: { relay: Relay | null }) {
   const [name, setName] = useState("");
-  // Demo build: no forge on the demo machine — the agent is a local no-tools
-  // pi pane; the only other kind is the qjs sandbox shell.
+  // Demo build: the agent is forge-backed (tools run in the forge-public
+  // sandbox); pi is offered as a local no-tools fallback. Sandbox is the
+  // qjs shell.
   const kinds = demoAvailable
-    ? (["shell", "pi"] as const)
+    ? (["shell", "forge", "pi"] as const)
     : (["shell", "forge", "pi"] as const);
   const [kind, setKind] = useState<(typeof kinds)[number]>("shell");
   const [piDir, setPiDir] = useState<string | null>(null);
@@ -379,7 +380,7 @@ function CreateRow({ relay }: { relay: Relay | null }) {
       <div className="kindrow">
         {(kinds as readonly string[]).map((k) => (
           <button key={k} className={"chip" + (kind === k ? " chip-on" : "")} onClick={() => setKind(k as (typeof kinds)[number])}>
-            {k === "forge" ? "agent" : k === "pi" ? (demoAvailable ? "agent" : "pi") : k}
+            {k === "forge" ? "agent (forge)" : k === "pi" ? (demoAvailable ? "agent (pi)" : "pi") : k}
           </button>
         ))}
         {!demoAvailable && (

@@ -16,7 +16,7 @@ export function Landing() {
     setDemoBusy(true);
     try {
       await signInDemo();
-      window.location.href = "/app";
+      window.location.hash = "/app"; // hash nav — plain /app 404s on Pages
     } catch (e: any) {
       setDemoErr(e.message ?? "demo sign-in failed");
       setDemoBusy(false);
