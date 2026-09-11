@@ -130,6 +130,9 @@ struct ChatPane {
     cols: u16,
     rows: u16,
     chat: Vec<ChatMsg>,
+    /// active-model display name, when known (filled by `meta
+    /// kind="model"` broadcasts; surfaced in `PaneSnap.model`)
+    model: Option<String>,
     /// working dir (local-pi panes: where the rpc child was spawned;
     /// recorded so restore can respawn in the same place)
     cwd: Option<String>,
@@ -501,6 +504,10 @@ struct Client {
     /// Session currently attached; None = not attached.
     attach: Option<Uuid>,
     scrollback_mode: bool,
+    /// Editor file watches (M10 ph3): path -> last seen mtime, seeded by
+    /// FileRead/FileWriteOk. The tick loop stats these and pushes
+    /// FileChanged when the file moves on disk under the client.
+    file_watches: BTreeMap<String, i64>,
 }
 
 struct Daemon {
@@ -706,8 +713,8 @@ fn spawn_pane(session: &mut Session, pane_kind: &str, cwd: Option<&str>) -> Resu
             }
             libc::close(amaster);
             libc::setenv(
-                b"TERM\0".as_ptr() as *const i8,
-                b"xterm-256color\0".as_ptr() as *const i8,
+                b"TERM\0".as_ptr() as *const libc::c_char,
+                b"xterm-256color\0".as_ptr() as *const libc::c_char,
                 1,
             );
             // agent sessions run `pi` via a login shell (so the mise
@@ -782,6 +789,7 @@ fn snapshot_session(s: &Session) -> Option<Frame> {
             kind: Some("pty".into()),
             chat: None,
             forge_session: None,
+            model: None,
         };
         if *pid == s.active {
             active_seq = p.seq;
@@ -800,6 +808,7 @@ fn snapshot_session(s: &Session) -> Option<Frame> {
             kind: Some("forge-chat".into()),
             chat: Some(cp.chat.clone()),
             forge_session: Some(cp.forge_sid.to_string()),
+            model: cp.model.clone(),
         });
     }
     Some(Frame::Snapshot {
@@ -873,6 +882,7 @@ impl Daemon {
                         name: "relay".into(),
                         attach: None,
                         scrollback_mode: false,
+                        file_watches: BTreeMap::new(),
                     });
                     mirror_tx = Some(tx);
                 }
@@ -929,6 +939,7 @@ impl Daemon {
                         name: "forge".into(),
                         attach: None,
                         scrollback_mode: false,
+                        file_watches: BTreeMap::new(),
                     };
                     if let Some(rfd) = fclient.relay_in.as_ref().map(|f| f.as_raw_fd()) {
                         daemon.clients.insert(rfd, fclient);
@@ -1246,6 +1257,7 @@ impl Daemon {
                             cols: 80,
                             rows: 24,
                             chat: vec![],
+                            model: None,
                             cwd: cwd.clone(),
                         },
                     );
@@ -1415,6 +1427,7 @@ impl Daemon {
                             cols: 80,
                             rows: 24,
                             chat: vec![],
+                            model: None,
                             cwd: cwd.clone(),
                         },
                     );
@@ -1430,6 +1443,7 @@ impl Daemon {
                             Some(pipe_w) => pilocal::LocalPi::spawn(
                                 pid,
                                 &dir,
+                                pilocal::no_tools_configured(),
                                 pipe_w.clone(),
                                 &mut self.pi_agents,
                             ),
@@ -1700,6 +1714,135 @@ impl Daemon {
                     }
                 }
             }
+            // client -> agent: list the models a chat pane can run on
+            Frame::ModelList { pane, req_id, .. } => {
+                let Ok(pid) = Uuid::parse_str(pane) else {
+                    return;
+                };
+                let backing = self.sessions.iter().find_map(|(_, s)| {
+                    s.chats.get(&pid).map(|cp| cp.forge_sid)
+                });
+                match backing {
+                    Some(fsid) if fsid.is_nil() => {
+                        // local pi pane: ask the rpc child (the reader
+                        // thread answers with ModelListOk)
+                        match self.pi_agents.get(&pid) {
+                            Some(lp) => {
+                                if let Err(e) = lp.request_model_list(req_id) {
+                                    eprintln!("ranchd: pi model list failed: {e}");
+                                }
+                            }
+                            None => {
+                                if let Some(c) = self.clients.get_mut(&from) {
+                                    send_frame(
+                                        c,
+                                        &Frame::Error {
+                                            req_id: Some(req_id.clone()),
+                                            message: format!("no agent for pane {pane}"),
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Some(forge_sid) => {
+                        if let Some(tx) = &self.forge_tx {
+                            let _ = tx.send(forge::ForgeJob::ModelList {
+                                pane: pid,
+                                forge_sid,
+                                req_id: req_id.clone(),
+                            });
+                        }
+                    }
+                    None => {
+                        if let Some(c) = self.clients.get_mut(&from) {
+                            send_frame(
+                                c,
+                                &Frame::Error {
+                                    req_id: Some(req_id.clone()),
+                                    message: format!("not a chat pane: {pane}"),
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+            // client -> agent: switch a chat pane's model. Success is
+            // confirmed out-of-band (`meta kind="model"`); sync failures
+            // answer with `error { req_id }`.
+            Frame::ModelSet {
+                session,
+                pane,
+                provider,
+                model,
+                req_id,
+                ..
+            } => {
+                let sid = match self.resolve_session(session).map(|s| s.id) {
+                    Some(s) => s,
+                    None => return,
+                };
+                let Ok(pid) = Uuid::parse_str(pane) else {
+                    return;
+                };
+                let backing = self
+                    .sessions
+                    .get(&sid)
+                    .and_then(|s| s.chats.get(&pid))
+                    .map(|cp| cp.forge_sid);
+                match backing {
+                    Some(fs) => {
+                        if fs.is_nil() {
+                            match self.pi_agents.get(&pid) {
+                                Some(lp) => {
+                                    if let Err(e) = lp.set_model(provider, model, req_id) {
+                                        eprintln!("ranchd: pi set_model failed: {e}");
+                                        if let Some(c) = self.clients.get_mut(&from) {
+                                            send_frame(
+                                                c,
+                                                &Frame::Error {
+                                                    req_id: Some(req_id.clone()),
+                                                    message: e,
+                                                },
+                                            );
+                                        }
+                                    }
+                                }
+                                None => {
+                                    if let Some(c) = self.clients.get_mut(&from) {
+                                        send_frame(
+                                            c,
+                                            &Frame::Error {
+                                                req_id: Some(req_id.clone()),
+                                                message: format!("no agent for pane {pane}"),
+                                            },
+                                        );
+                                    }
+                                }
+                            }
+                        } else if let Some(tx) = &self.forge_tx {
+                            let _ = tx.send(forge::ForgeJob::ModelSet {
+                                pane: pid,
+                                forge_sid: fs,
+                                req_id: req_id.clone(),
+                                provider: provider.clone(),
+                                model: model.clone(),
+                            });
+                        }
+                    }
+                    None => {
+                        if let Some(c) = self.clients.get_mut(&from) {
+                            send_frame(
+                                c,
+                                &Frame::Error {
+                                    req_id: Some(req_id.clone()),
+                                    message: format!("not a chat pane: {pane}"),
+                                },
+                            );
+                        }
+                    }
+                }
+            }
             // forge worker -> clients: broadcast new chat rows to
             // everyone attached to the session (pipe client has no
             // attach; the frame carries the session in `session` —
@@ -1793,6 +1936,9 @@ impl Daemon {
                             .map(|d| d.as_secs() as i64)
                             .unwrap_or(0);
                         if let Some(c) = self.clients.get_mut(&from) {
+                            // M10 ph3: auto-watch for external edits;
+                            // baseline = the mtime we just read
+                            c.file_watches.insert(path.clone(), mtime);
                             send_frame(
                                 c,
                                 &Frame::FileReadOk {
@@ -1878,6 +2024,10 @@ impl Daemon {
                                 .map(|d| d.as_secs() as i64)
                                 .unwrap_or(0);
                             if let Some(c) = self.clients.get_mut(&from) {
+                                // our own write moved the mtime; refresh
+                                // the watch baseline so the tick doesn't
+                                // push a spurious FileChanged
+                                c.file_watches.insert(path.clone(), mtime);
                                 send_frame(
                                     c,
                                     &Frame::FileWriteOk {
@@ -1925,7 +2075,7 @@ impl Daemon {
                 pane,
                 kind,
                 status,
-            } if session.is_empty() && kind == "agent" => {
+            } if session.is_empty() && (kind == "agent" || kind == "model") => {
                 let pid = Uuid::parse_str(pane.as_deref().unwrap_or("")).ok();
                 let found = pid.and_then(|pid| {
                     self.sessions
@@ -1933,6 +2083,17 @@ impl Daemon {
                         .find_map(|(sid, s)| s.chats.contains_key(&pid).then_some((*sid, pid)))
                 });
                 if let Some((sid, pid)) = found {
+                    // model frames double as the pane cache update so
+                    // re-snapshots carry the current model
+                    if kind == "model" {
+                        if let Some(st) = status {
+                            if let Some(s) = self.sessions.get_mut(&sid) {
+                                if let Some(cp) = s.chats.get_mut(&pid) {
+                                    cp.model = Some(st.clone());
+                                }
+                            }
+                        }
+                    }
                     let out = Frame::Meta {
                         session: sid.to_string(),
                         pane: Some(pid.to_string()),
@@ -1998,6 +2159,41 @@ impl Daemon {
                 }
                 return;
             }
+            // pi reader / forge worker -> clients: model catalog for a
+            // chat pane. Stamp the pane's model in the cache, then
+            // broadcast (clients match on req_id).
+            Frame::ModelListOk { pane, current, .. } => {
+                if let Some(pid) = Uuid::parse_str(pane).ok() {
+                    let found = self.sessions.iter().find_map(|(sid, s)| {
+                        s.chats.contains_key(&pid).then_some((*sid, pid))
+                    });
+                    if let (Some((sid, pid)), Some(cur)) = (found, current) {
+                        if let Some(s) = self.sessions.get_mut(&sid) {
+                            if let Some(cp) = s.chats.get_mut(&pid) {
+                                cp.model = Some(cur.name.clone());
+                            }
+                        }
+                    }
+                }
+                let recipients: Vec<RawFd> = self.clients.keys().copied().collect();
+                for rfd in recipients {
+                    if let Some(c) = self.clients.get_mut(&rfd) {
+                        send_frame(c, frame);
+                    }
+                }
+                return;
+            }
+            // forge worker -> clients: a request error carrying a req_id
+            // (e.g. a failed forge model switch); clients match on req_id
+            Frame::Error { req_id: Some(_), .. } => {
+                let recipients: Vec<RawFd> = self.clients.keys().copied().collect();
+                for rfd in recipients {
+                    if let Some(c) = self.clients.get_mut(&rfd) {
+                        send_frame(c, frame);
+                    }
+                }
+                return;
+            }
             // forge worker -> clients: the session list reply is not
             // pane-addressable; broadcast (clients match on req_id)
             Frame::ForgeListOk { .. } => {
@@ -2013,7 +2209,13 @@ impl Daemon {
         }
         match frame {
             Frame::Hello { id, client, .. } => {
-                eprintln!("ranchd: hello from {client} ({id})");
+                // Log only when a client first hellos (or reconnects under
+                // a new id): the dashboard re-hellos on an interval to
+                // refresh the session list and would otherwise spam the log.
+                let prev = self.clients.get(&from).map(|c| c.name.clone());
+                if prev.as_deref() != Some(client.as_str()) {
+                    eprintln!("ranchd: hello from {client} ({id})");
+                }
                 let sessions = self.session_meta();
                 if let Some(c) = self.clients.get_mut(&from) {
                     c.name = client.clone();
@@ -2258,6 +2460,7 @@ impl Daemon {
                                     cols: 80,
                                     rows: 24,
                                     chat: vec![],
+                                    model: None,
                                     cwd: cwd.clone(),
                                 },
                             );
@@ -2275,6 +2478,7 @@ impl Daemon {
                                         if let Err(e) = pilocal::LocalPi::spawn(
                                             pid,
                                             &dir,
+                                            pilocal::no_tools_configured(),
                                             pipe_w.clone(),
                                             &mut self.pi_agents,
                                         ) {
@@ -2501,6 +2705,7 @@ impl Daemon {
                                     if let Err(e) = pilocal::LocalPi::spawn(
                                         pid,
                                         &dir_str,
+                                        pilocal::no_tools_configured(),
                                         pipe_w.clone(),
                                         &mut self.pi_agents,
                                     ) {
@@ -2529,6 +2734,7 @@ impl Daemon {
                                     cols: 80,
                                     rows: 24,
                                     chat: vec![],
+                                    model: None,
                                     cwd: None,
                                 },
                             );
@@ -2578,6 +2784,7 @@ impl Daemon {
                                 cols: 80,
                                 rows: 24,
                                 chat: vec![],
+                                model: None,
                                 cwd: None,
                             },
                         );
@@ -2955,6 +3162,9 @@ pub fn run_daemon_with_args(args: Vec<String>) {
 
 fn run(daemon: Daemon) {
     let mut daemon = daemon;
+    // editor file-watch poll cadence (M10 ph3): stat the watched files
+    // every ~2 s (66 x 30 ms ticks)
+    let mut fw_tick: u32 = 0;
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
         sa.sa_sigaction = on_signal as *const () as usize;
@@ -3033,6 +3243,7 @@ fn run(daemon: Daemon) {
                         name: format!("cli-{fd}"),
                         attach: None,
                         scrollback_mode: false,
+                        file_watches: BTreeMap::new(),
                     },
                 );
             }
@@ -3096,6 +3307,47 @@ fn run(daemon: Daemon) {
         // --- process frames ---
         for (fd, frame) in frame_queue {
             daemon.handle_frame(fd, &frame);
+        }
+
+        // --- file watches: external edits to open editor files (M10 ph3).
+        // Cheap metadata stats on a handful of files; a changed mtime
+        // pushes FileChanged to the watching client (baseline refreshes
+        // on FileRead/FileWriteOk so our own saves stay quiet). ---
+        fw_tick = fw_tick.wrapping_add(1);
+        if fw_tick.wrapping_rem(66) == 0 {
+            for c in daemon.clients.values_mut() {
+                if c.file_watches.is_empty() {
+                    continue;
+                }
+                let mut notes: Vec<(String, i64)> = Vec::new();
+                let mut drop: Vec<String> = Vec::new();
+                for (path, last) in c.file_watches.iter_mut() {
+                    match std::fs::metadata(path) {
+                        Ok(m) => {
+                            let cur = m
+                                .modified()
+                                .ok()
+                                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                                .map(|d| d.as_secs() as i64)
+                                .unwrap_or(0);
+                            if cur != *last {
+                                *last = cur;
+                                notes.push((path.clone(), cur));
+                            }
+                        }
+                        Err(_) => drop.push(path.clone()), // file gone
+                    }
+                }
+                for p in drop {
+                    c.file_watches.remove(&p);
+                }
+                for (path, mtime) in notes {
+                    send_frame(
+                        c,
+                        &Frame::FileChanged { path, mtime },
+                    );
+                }
+            }
         }
 
         // --- pty reads ---

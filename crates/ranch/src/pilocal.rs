@@ -25,7 +25,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use ranch_protocol::{ChatMsg, Frame};
+use ranch_protocol::{ChatMsg, Frame, ModelChoice};
 use uuid::Uuid;
 
 use crate::forge::PipeWriter;
@@ -36,6 +36,40 @@ use crate::forge::PipeWriter;
 static SEQ: AtomicU64 = AtomicU64::new(1);
 fn next_seq() -> i64 {
     SEQ.fetch_add(1, Ordering::Relaxed) as i64
+}
+
+/// Epoch ms -> UTC "YYYY-MM-DDTHH:MM:SSZ" (the `created_at` format the
+/// clients expect; they slice HH:MM out of [11..16]).
+fn iso_utc_ms(ms: i64) -> String {
+    let secs = ms.div_euclid(1000);
+    let days = secs.div_euclid(86400);
+    let sod = secs.rem_euclid(86400);
+    // civil calendar (Howard Hinnant's days-from-civil inverse)
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (yoe * 365 + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let yy = if m <= 2 { y + 1 } else { y };
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        yy, m, d, sod / 3600, (sod % 3600) / 60, sod % 60
+    )
+}
+
+/// Wall-clock `created_at` for a row emitted right now. This is the
+/// moment the agent sent it locally (the RPC event just arrived), not
+/// when any client observed it.
+fn now_iso() -> String {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    iso_utc_ms(ms)
 }
 
 /// Set by the reader thread when pi's session file is captured — the
@@ -67,6 +101,44 @@ pub struct LocalPi {
     /// respawned pi can `switch_session` back into the same conversation
     /// (session persistence across daemon restarts).
     pub session_file: Arc<Mutex<Option<String>>>,
+    /// The pi model currently active in this child, captured from the
+    /// `get_state` / `set_model` responses. Displayed in chat-pane UIs.
+    model: Arc<Mutex<Option<ModelChoice>>>,
+    /// req_id of an in-flight `get_available_models`; the reader thread
+    /// echoes it back in the `ModelListOk` it emits.
+    model_list_req: Arc<Mutex<Option<String>>>,
+    /// req_id of an in-flight `set_model`; echoed in the `error` frame
+    /// when the switch fails.
+    model_set_req: Arc<Mutex<Option<String>>>,
+}
+
+/// `pi_no_tools = "true"` in ~/.config/ranch/daemon.toml disables all
+/// agent tools for locally-backed panes (public-demo hardening: the
+/// agent can chat but must not touch the file system or spawn
+/// processes — same posture as mule's `no_tools` config).
+pub fn no_tools_configured() -> bool {
+    let home = match std::env::var("HOME") {
+        Ok(h) => h,
+        Err(_) => return false,
+    };
+    let text = match std::fs::read_to_string(std::path::PathBuf::from(home).join(".config/ranch/daemon.toml")) {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+    for line in text.lines() {
+        let line = line.trim();
+        // exact key: `pi_no_tools = "true"` (flat daemon.toml format)
+        let rest = match line.strip_prefix("pi_no_tools") {
+            Some(r) => r.trim_start(),
+            None => continue,
+        };
+        if rest.is_empty() || !rest.starts_with('=') {
+            continue; // e.g. `pi_no_tools_foo`
+        }
+        let v = rest[1..].trim().trim_matches('"');
+        return v.eq_ignore_ascii_case("true");
+    }
+    false
 }
 
 impl LocalPi {
@@ -77,12 +149,16 @@ impl LocalPi {
     pub fn spawn(
         pane: Uuid,
         cwd: &str,
+        no_tools: bool,
         pipe: PipeWriter,
         panes: &mut BTreeMap<Uuid, Arc<LocalPi>>,
     ) -> Result<(), String> {
-        let mut child = Command::new("pi")
-            .arg("--mode")
-            .arg("rpc")
+        let mut child = Command::new("pi");
+        child.arg("--mode").arg("rpc");
+        if no_tools {
+            child.arg("--no-tools");
+        }
+        let mut child = child
             .current_dir(cwd)
             .stdout(Stdio::piped())
             .stdin(Stdio::piped())
@@ -110,12 +186,16 @@ impl LocalPi {
             raw_fds: (Some(stdin_fd), Some(stdout_fd)),
             stop: Arc::new(AtomicBool::new(false)),
             session_file: Arc::new(Mutex::new(None)),
+            model: Arc::new(Mutex::new(None)),
+            model_list_req: Arc::new(Mutex::new(None)),
+            model_set_req: Arc::new(Mutex::new(None)),
         });
         panes.insert(pane, lp.clone());
         lp.start_reader(pipe);
 
-        // ask pi for its session file path (response is captured in the
-        // reader); harmless if it arrives before/after the first prompt
+        // ask pi for its session file path + current model (responses
+        // are captured in the reader); harmless if they arrive before/
+        // after the first prompt
         let _ = lp.send_rpc(&serde_json::json!({"type": "get_state"}));
         Ok(())
     }
@@ -181,10 +261,13 @@ impl LocalPi {
             raw_fds: (Some(stdin_fd), Some(stdout_fd)),
             stop: Arc::new(AtomicBool::new(false)),
             session_file: Arc::new(Mutex::new(None)),
+            model: Arc::new(Mutex::new(None)),
+            model_list_req: Arc::new(Mutex::new(None)),
+            model_set_req: Arc::new(Mutex::new(None)),
         });
         panes.insert(pane, lp.clone());
         lp.start_reader(pipe);
-        // re-capture the session file AND resync the conversation rows
+        // re-capture the session file + model AND resync the conversation rows
         // (the inheriting daemon's chat buffer starts empty)
         let _ = lp.send_rpc(&serde_json::json!({"type": "get_state"}));
         let _ = lp.send_rpc(&serde_json::json!({"type": "get_messages"}));
@@ -202,8 +285,13 @@ impl LocalPi {
         let t_pane = self.pane;
         let session_file = self.session_file.clone();
         let stop = self.stop.clone();
+        let model = self.model.clone();
+        let model_list_req = self.model_list_req.clone();
+        let model_set_req = self.model_set_req.clone();
         std::thread::spawn(move || {
-            run_pi_reader(dup, t_pane, session_file, stop, pipe);
+            run_pi_reader(
+                dup, t_pane, session_file, stop, model, model_list_req, model_set_req, pipe,
+            );
         });
     }
 
@@ -222,6 +310,30 @@ impl LocalPi {
             .and_then(|_| s.write_all(b"\n"))
             .and_then(|_| s.flush())
             .map_err(|e| format!("pi stdin: {e}"))
+    }
+
+    /// Current model display name (None when unknown).
+    pub fn model_display(&self) -> Option<String> {
+        self.model.lock().ok()?.clone().map(|m| m.name)
+    }
+
+    /// Ask pi for its configured model list; the reader thread emits a
+    /// `ModelListOk` (echoing `req_id`) when the response arrives.
+    pub fn request_model_list(&self, req_id: &str) -> Result<(), String> {
+        *self.model_list_req.lock().unwrap() = Some(req_id.to_string());
+        self.send_rpc(&serde_json::json!({"type": "get_available_models"}))
+    }
+
+    /// Switch the active model. The `set_model` response (reader thread)
+    /// confirms with `meta kind="model"` or an `error` frame echoing
+    /// `req_id`.
+    pub fn set_model(&self, provider: &str, model: &str, req_id: &str) -> Result<(), String> {
+        *self.model_set_req.lock().unwrap() = Some(req_id.to_string());
+        self.send_rpc(&serde_json::json!({
+            "type": "set_model",
+            "provider": provider,
+            "modelId": model,
+        }))
     }
 
     /// Switch pi to a previously-recorded session file (restore path).
@@ -250,7 +362,7 @@ impl LocalPi {
             .map_err(|e| format!("pi stdin: {e}"))?;
         // rows AFTER the write succeeded (a failed write emits the
         // error row + clears the indicator instead)
-        emit_chat(pipe, self.pane, "user", text);
+        emit_chat(pipe, self.pane, "user", text, now_iso());
         write_status(pipe, "working");
         Ok(())
     }
@@ -283,6 +395,9 @@ fn run_pi_reader(
     t_pane: Uuid,
     session_file: Arc<Mutex<Option<String>>>,
     stop: Arc<AtomicBool>,
+    model: Arc<Mutex<Option<ModelChoice>>>,
+    model_list_req: Arc<Mutex<Option<String>>>,
+    model_set_req: Arc<Mutex<Option<String>>>,
     pipe: PipeWriter,
 ) {
     let reader = BufReader::new(stdout);
@@ -309,16 +424,104 @@ fn run_pi_reader(
                             STATE_DIRTY.store(true, Ordering::Relaxed);
                         }
                     }
+                    // capture the active model and tell clients what the
+                    // pane is running (meta kind="model" display name)
+                    let m = v.pointer("/data/model")
+                        .filter(|m| !m.is_null())
+                        .and_then(parse_model);
+                    if let Some(m) = &m {
+                        if let Ok(mut g) = model.lock() {
+                            *g = Some(m.clone());
+                        }
+                        write_model_status(&pipe, t_pane, &m.name);
+                    }
+                } else if v.get("command").and_then(|c| c.as_str()) == Some("get_available_models") {
+                    // model picker request: echo the catalog back (the
+                    // pane's own model was last captured via get_state /
+                    // set_model)
+                    let req_id = model_list_req.lock().ok().and_then(|mut g| g.take()).unwrap_or_default();
+                    let mut models = Vec::new();
+                    if let Some(arr) = v.pointer("/data/models").and_then(|m| m.as_array()) {
+                        for m in arr {
+                            if let Some(mc) = parse_model(m) {
+                                models.push(mc);
+                            }
+                        }
+                    }
+                    let current = model.lock().ok().and_then(|g| g.clone());
+                    write_frame(
+                        &pipe,
+                        &Frame::ModelListOk {
+                            id: String::new(),
+                            req_id,
+                            pane: t_pane.to_string(),
+                            current,
+                            models,
+                        },
+                    );
+                } else if v.get("command").and_then(|c| c.as_str()) == Some("set_model") {
+                    let success = v.get("success").and_then(|s| s.as_bool()).unwrap_or(false);
+                    if success {
+                        if let Some(m) = v.pointer("/data").and_then(parse_model) {
+                            if let Ok(mut g) = model.lock() {
+                                *g = Some(m.clone());
+                            }
+                            write_model_status(&pipe, t_pane, &m.name);
+                        }
+                    } else {
+                        let msg = v
+                            .get("error")
+                            .and_then(|e| e.as_str())
+                            .unwrap_or("model switch failed")
+                            .to_string();
+                        eprintln!("ranchd: local pi {t_pane} set_model failed: {msg}");
+                        let req_id = model_set_req.lock().ok().and_then(|mut g| g.take());
+                        write_frame(
+                            &pipe,
+                            &Frame::Error {
+                                req_id,
+                                message: format!("model switch failed: {msg}"),
+                            },
+                        );
+                        write_status(&pipe, "idle");
+                    }
                 } else if v.get("command").and_then(|c| c.as_str()) == Some("get_messages") {
                     // hot-upgrade resync: rebuild the pane's chat rows from
                     // pi's own persisted conversation (the inheriting
-                    // daemon's row buffer starts empty)
-                    let mut rows: Vec<(String, String)> = Vec::new(); // (role, text)
-                    let mut tools: Vec<(String, String)> = Vec::new(); // (toolName, output)
-                    if let Some(msgs) = v.pointer("/data/messages").and_then(|m| m.as_array()) {
-                        for m in msgs {
+                    // daemon's row buffer starts empty). Rows are emitted in
+                    // conversation order — text and tool rows interleaved as
+                    // pi recorded them, NOT all-text-then-all-tools.
+                    let mut msgs: Vec<ChatMsg> = Vec::new();
+                    // toolCall id -> row index, so a toolResult row attaches
+                    // its output to the right tool row instead of piling on
+                    // at the end
+                    let mut tool_rows: Vec<(String, usize)> = Vec::new(); // (call_id, msg idx)
+                    if let Some(arr) = v.pointer("/data/messages").and_then(|m| m.as_array()) {
+                        for m in arr {
                             let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("");
                             let c = m.get("content");
+                            // pi records the agent's own send time (epoch ms)
+                            let ts = m
+                                .get("timestamp")
+                                .and_then(|t| t.as_i64())
+                                .map(iso_utc_ms);
+                            let push = |msgs: &mut Vec<ChatMsg>,
+                                            role: &str,
+                                            text: String,
+                                            tool_name: Option<String>,
+                                            tool_output: Option<String>|
+                            {
+                                msgs.push(ChatMsg {
+                                    seq: next_seq(),
+                                    role: role.to_string(),
+                                    text,
+                                    tool_name,
+                                    tool_call_id: None,
+                                    tool_output,
+                                    duration_ms: None,
+                                    created_at: ts.clone(),
+                                });
+                            };
                             match role {
                                 "user" => {
                                     let t = match c {
@@ -336,7 +539,7 @@ fn run_pi_reader(
                                     };
                                     let t = t.trim().to_string();
                                     if !t.is_empty() {
-                                        rows.push(("user".into(), t));
+                                        push(&mut msgs, "user", t, None, None);
                                     }
                                 }
                                 "assistant" => {
@@ -349,10 +552,13 @@ fn run_pi_reader(
                                                     {
                                                         let t = t.trim();
                                                         if !t.is_empty() {
-                                                            rows.push((
-                                                                "assistant".into(),
+                                                            push(
+                                                                &mut msgs,
+                                                                "assistant",
                                                                 t.to_string(),
-                                                            ));
+                                                                None,
+                                                                None,
+                                                            );
                                                         }
                                                     }
                                                 }
@@ -360,8 +566,23 @@ fn run_pi_reader(
                                                     let name = blk
                                                         .get("name")
                                                         .and_then(|n| n.as_str())
-                                                        .unwrap_or("tool");
-                                                    tools.push((name.to_string(), String::new()));
+                                                        .unwrap_or("tool")
+                                                        .to_string();
+                                                    let call_id = blk
+                                                        .get("id")
+                                                        .and_then(|i| i.as_str())
+                                                        .map(String::from);
+                                                    let idx = msgs.len();
+                                                    push(
+                                                        &mut msgs,
+                                                        "tool",
+                                                        String::new(),
+                                                        Some(name),
+                                                        None,
+                                                    );
+                                                    if let Some(id) = call_id {
+                                                        tool_rows.push((id, idx));
+                                                    }
                                                 }
                                                 _ => {}
                                             }
@@ -381,40 +602,41 @@ fn run_pi_reader(
                                             .join(""),
                                         _ => String::new(),
                                     };
-                                    if let Some(t) = tools.last_mut() {
-                                        t.1 = out;
+                                    // fill the output into the matching tool
+                                    // row (by call id), else the last
+                                    // unfinished tool row; else fall back to a
+                                    // standalone tool row
+                                    let call_id = m
+                                        .get("toolCallId")
+                                        .or_else(|| m.get("tool_call_id"))
+                                        .and_then(|i| i.as_str())
+                                        .map(String::from);
+                                    let idx = call_id.as_deref().and_then(|cid| {
+                                        tool_rows
+                                            .iter()
+                                            .rev()
+                                            .find(|(k, _)| k == cid)
+                                            .map(|(_, i)| *i)
+                                    });
+                                    if let Some(idx) = idx {
+                                        if msgs[idx].tool_output.is_none() {
+                                            msgs[idx].tool_output = Some(out);
+                                        }
+                                    } else {
+                                        let name = m
+                                            .get("toolName")
+                                            .or_else(|| m.get("tool_name"))
+                                            .and_then(|n| n.as_str())
+                                            .unwrap_or("tool")
+                                            .to_string();
+                                        push(&mut msgs, "tool", String::new(), Some(name), Some(out));
                                     }
                                 }
                                 _ => {}
                             }
                         }
                     }
-                    if !rows.is_empty() || !tools.is_empty() {
-                        let mut msgs: Vec<ChatMsg> = Vec::new();
-                        for (role, text) in rows {
-                            msgs.push(ChatMsg {
-                                seq: next_seq(),
-                                role,
-                                text,
-                                tool_name: None,
-                                tool_call_id: None,
-                                tool_output: None,
-                                duration_ms: None,
-                                created_at: None,
-                            });
-                        }
-                        for (name, out) in tools {
-                            msgs.push(ChatMsg {
-                                seq: next_seq(),
-                                role: "tool".into(),
-                                text: String::new(),
-                                tool_name: Some(name),
-                                tool_call_id: None,
-                                tool_output: Some(out),
-                                duration_ms: None,
-                                created_at: None,
-                            });
-                        }
+                    if !msgs.is_empty() {
                         eprintln!(
                             "ranchd: local pi {t_pane} resync: {} rows from get_messages",
                             msgs.len()
@@ -456,7 +678,14 @@ fn run_pi_reader(
                             .unwrap_or_default();
                         let trimmed = text.trim();
                         if !trimmed.is_empty() {
-                            emit_chat(&pipe, t_pane, "assistant", trimmed);
+                            // stamp with the agent's own timestamp when
+                            // it carried one, else the arrival moment
+                            let ts = msg
+                                .get("timestamp")
+                                .and_then(|t| t.as_i64())
+                                .map(iso_utc_ms)
+                                .unwrap_or_else(now_iso);
+                            emit_chat(&pipe, t_pane, "assistant", trimmed, ts);
                         }
                     }
                 }
@@ -473,7 +702,7 @@ fn run_pi_reader(
                 if let Some((name, started)) = pending_tool.take() {
                     let dur = started.elapsed().as_millis() as i64;
                     let out = v.get("result").map(|r| r.to_string()).unwrap_or_default();
-                    emit_tool(&pipe, t_pane, &name, dur, &out);
+                    emit_tool(&pipe, t_pane, &name, dur, &out, now_iso());
                 }
             }
             "turn_end" | "agent_end" => {
@@ -484,7 +713,7 @@ fn run_pi_reader(
                     .get("message")
                     .and_then(|m| m.as_str())
                     .unwrap_or("pi error");
-                emit_chat(&pipe, t_pane, "assistant", &format!("⚠ {msg}"));
+                emit_chat(&pipe, t_pane, "assistant", &format!("⚠ {msg}"), now_iso());
                 write_status(&pipe, "idle");
             }
             _ => {}
@@ -494,7 +723,7 @@ fn run_pi_reader(
     eprintln!("ranchd: local pi pane {t_pane} exited");
 }
 
-fn emit_chat(pipe: &PipeWriter, pane: Uuid, role: &str, text: &str) {
+fn emit_chat(pipe: &PipeWriter, pane: Uuid, role: &str, text: &str, created_at: String) {
     write_frame(
         pipe,
         &Frame::Chat {
@@ -509,14 +738,14 @@ fn emit_chat(pipe: &PipeWriter, pane: Uuid, role: &str, text: &str) {
                 tool_call_id: None,
                 tool_output: None,
                 duration_ms: None,
-                created_at: None,
+                created_at: Some(created_at),
             }],
             reset: false,
         },
     );
 }
 
-fn emit_tool(pipe: &PipeWriter, pane: Uuid, name: &str, dur_ms: i64, out: &str) {
+fn emit_tool(pipe: &PipeWriter, pane: Uuid, name: &str, dur_ms: i64, out: &str, created_at: String) {
     write_frame(
         pipe,
         &Frame::Chat {
@@ -531,9 +760,41 @@ fn emit_tool(pipe: &PipeWriter, pane: Uuid, name: &str, dur_ms: i64, out: &str) 
                 tool_call_id: None,
                 tool_output: Some(out.to_string()),
                 duration_ms: Some(dur_ms),
-                created_at: None,
+                created_at: Some(created_at),
             }],
             reset: false,
+        },
+    );
+}
+
+/// Parse a pi RPC `Model` object into a `ModelChoice` (name falls
+/// back to the model id).
+fn parse_model(m: &serde_json::Value) -> Option<ModelChoice> {
+    let id = m.get("id")?.as_str()?.to_string();
+    let name = m
+        .get("name")
+        .and_then(|n| n.as_str())
+        .filter(|n| !n.is_empty())
+        .map(String::from)
+        .unwrap_or_else(|| id.clone());
+    let provider = m
+        .get("provider")
+        .and_then(|p| p.as_str())
+        .unwrap_or("")
+        .to_string();
+    Some(ModelChoice { provider, id, name })
+}
+
+/// Out-of-band "the pane's model is now X" (kind="model"; the daemon's
+/// pre-match stamps the session and broadcasts).
+fn write_model_status(pipe: &PipeWriter, pane: Uuid, display: &str) {
+    write_frame(
+        pipe,
+        &Frame::Meta {
+            session: String::new(),
+            pane: Some(pane.to_string()),
+            kind: "model".into(),
+            status: Some(display.to_string()),
         },
     );
 }

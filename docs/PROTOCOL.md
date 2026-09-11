@@ -167,6 +167,13 @@ The daemon is the file server; clients (mobile/CLI) are thin editors.
   A missing/nil `mtime` skips the check (first-save or client unaware).
   Parent directory must exist; creating files is in scope, creating new
   directories is not (MVP).
+- **`FileChanged`** `{path, mtime}` — daemon → client push (M10 phase 3).
+  The daemon auto-watches every file a client reads (`FileReadOk` seeds
+  the watch, `FileWriteOk` refreshes its baseline so the client's own
+  saves are quiet) and stats the watched set every ~2 s on its tick loop.
+  A changed on-disk mtime is pushed to *that* client only; clients with
+  the file open surface a conflict (reload vs keep local) instead of
+  discovering the clobber risk only at save time.
 
 ### Sync
 

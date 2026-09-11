@@ -1,0 +1,22 @@
+#!/bin/sh
+# Final-link wrapper for the aarch64-unknown-linux-musl cross build
+# (make build-aarch64), used as CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER.
+#
+# rustc's default linker is the host cc/ld, which can't link aarch64
+# objects; zig cross-links instead. Two things rustc adds must be
+# dropped before hand-off:
+#   * -Wl,--fix-cortex-a53-843419 — aarch64 erratum workaround rustc
+#     injects; zig's linker rejects the unknown option
+#   * rustc's self-contained crt*.o start/stop files — zig provides its
+#     own musl start files for this target, and mixing the two sets
+#     gives duplicate _start/_start_c.
+rest=""
+for a in "$@"; do
+  case "$a" in
+    *--fix-cortex-a53-843419*) ;;
+    */self-contained/crt*.o) ;;
+    *) rest="$rest $a";;
+  esac
+done
+ZIG="${RANCH_ZIG:-$HOME/src/ranch/.tools/zig/zig}"
+exec "$ZIG" cc -target aarch64-linux-musl -static $rest

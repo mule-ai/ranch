@@ -96,6 +96,7 @@ export type Frame =
   | { t: "FileReadOk"; id: string; req_id: string; path: string; content: string; mtime: number; size: number }
   | { t: "FileWrite"; id: string; client: string; req_id: string; path: string; content: string; mtime?: number | null }
   | { t: "FileWriteOk"; id: string; req_id: string; path: string; mtime: number }
+  | { t: "FileChanged"; path: string; mtime: number }
   | { t: "ForgeListOk"; id: string; req_id: string; sessions: ForgeSessionInfo[] }
   | { t: "ChatSend"; id: string; client: string; session: string; pane: string; text: string }
   | { t: "Chat"; id: string; session: string; pane: string; msgs: ChatMsg[]; reset?: boolean }

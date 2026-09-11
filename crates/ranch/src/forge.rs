@@ -13,7 +13,7 @@
 //! returns it; X-API-Key header). `forge_profile_id` is optional —
 //! the first profile is used when absent.
 
-use ranch_protocol::{ChatMsg, Frame, encode_frame};
+use ranch_protocol::{ChatMsg, Frame, ModelChoice, encode_frame};
 use std::io::{BufRead as _, Write as _};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::mpsc;
@@ -85,6 +85,16 @@ pub enum ForgeJob {
     },
     /// List resumable forge sessions (GET /sessions).
     List { req_id: String },
+    /// Model catalog + effective model for a chat pane's forge session.
+    ModelList { pane: Uuid, forge_sid: Uuid, req_id: String },
+    /// Switch the session's model (PATCH /sessions/:id model switcher).
+    ModelSet {
+        pane: Uuid,
+        forge_sid: Uuid,
+        req_id: String,
+        provider: String,
+        model: String,
+    },
 }
 
 /// Shared per-watch state: the SSE thread owns one; the job thread
@@ -341,6 +351,19 @@ pub fn spawn_worker(cfg: ForgeConfig, pipe_w: std::fs::File, rx: mpsc::Receiver<
                         };
                         let t_pipe = pipe.clone();
                         let t_state = st.clone();
+                        // current model (effective = override ?? profile) —
+                        // report it so the chat-pane UI can show it
+                        if let Some(cur) = effective_model(&t_cfg, forge_sid) {
+                            write_frame(
+                                &t_pipe,
+                                &Frame::Meta {
+                                    session: String::new(),
+                                    pane: Some(pane.to_string()),
+                                    kind: "model".into(),
+                                    status: Some(cur.name),
+                                },
+                            );
+                        }
                         std::thread::spawn(move || {
                             run_sse(t_state, t_cfg, t_pipe);
                         });
@@ -432,6 +455,62 @@ pub fn spawn_worker(cfg: ForgeConfig, pipe_w: std::fs::File, rx: mpsc::Receiver<
                             }
                         }
                     },
+                    ForgeJob::ModelList {
+                        pane,
+                        forge_sid,
+                        req_id,
+                    } => {
+                        let (models, names) = fetch_catalog(&cfg);
+                        let current = effective_model_from(&cfg, forge_sid, &names);
+                        write_frame(
+                            &pipe,
+                            &Frame::ModelListOk {
+                                id: String::new(),
+                                req_id,
+                                pane: pane.to_string(),
+                                current,
+                                models,
+                            },
+                        );
+                    }
+                    ForgeJob::ModelSet {
+                        pane,
+                        forge_sid,
+                        req_id,
+                        provider,
+                        model,
+                    } => {
+                        let display = catalog_name(&cfg, &provider, &model);
+                        match http_json(
+                            &cfg,
+                            "PATCH",
+                            &format!("/sessions/{forge_sid}"),
+                            Some(&serde_json::json!({
+                                "provider": provider,
+                                "model": model,
+                            })),
+                        ) {
+                            Ok(_) => write_frame(
+                                &pipe,
+                                &Frame::Meta {
+                                    session: String::new(),
+                                    pane: Some(pane.to_string()),
+                                    kind: "model".into(),
+                                    status: Some(display),
+                                },
+                            ),
+                            Err(e) => {
+                                eprintln!("ranchd: forge model switch failed: {e}");
+                                write_frame(
+                                    &pipe,
+                                    &Frame::Error {
+                                        req_id: Some(req_id),
+                                        message: format!("model switch failed: {e}"),
+                                    },
+                                );
+                            }
+                        }
+                    }
                 },
                 Err(mpsc::RecvError) => return,
             }
@@ -466,6 +545,9 @@ fn http_json(
         ("POST", b) => ureq::post(&url)
             .header("X-API-Key", &cfg.key)
             .send_json(b.cloned().unwrap_or(serde_json::Value::Null)),
+        ("PATCH", b) => ureq::patch(&url)
+            .header("X-API-Key", &cfg.key)
+            .send_json(b.cloned().unwrap_or(serde_json::Value::Null)),
         _ => return Err(format!("forge: unsupported method {method}")),
     };
     let mut res = sent.map_err(|e| format!("forge {method} {path}: {e}"))?;
@@ -476,6 +558,106 @@ fn http_json(
         .read_to_string(&mut text)
         .map_err(|e| format!("forge read {path}: {e}"))?;
     serde_json::from_str(&text).map_err(|e| format!("forge decode {path}: {e}"))
+}
+
+/// Fetch pi's `models.json` catalog via forge's
+/// `GET /v1/models/catalog` (secrets already stripped). Returns the
+/// flattened model list plus a (provider, id) -> name lookup map.
+fn fetch_catalog(
+    cfg: &ForgeConfig,
+) -> (Vec<ModelChoice>, std::collections::HashMap<(String, String), String>) {
+    let mut models = Vec::new();
+    let mut names: std::collections::HashMap<(String, String), String> =
+        std::collections::HashMap::new();
+    let v = match http_json(cfg, "GET", "/v1/models/catalog", None) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("ranchd: forge catalog fetch failed: {e}");
+            return (models, names);
+        }
+    };
+    if let Some(providers) = v.get("providers").and_then(|p| p.as_object()) {
+        for (prov, pc) in providers {
+            if let Some(arr) = pc.get("models").and_then(|m| m.as_array()) {
+                for m in arr {
+                    let Some(id) = m.get("id").and_then(|x| x.as_str()) else {
+                        continue;
+                    };
+                    let name = m
+                        .get("name")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or(id)
+                        .to_string();
+                    let (prov_s, id_s) = (prov.clone(), id.to_string());
+                    names.insert((prov_s.clone(), id_s.clone()), name.clone());
+                    models.push(ModelChoice {
+                        provider: prov_s,
+                        id: id_s,
+                        name,
+                    });
+                }
+            }
+        }
+    }
+    (models, names)
+}
+
+/// Friendly display name for (provider, model id) from the catalog,
+/// falling back to the raw id.
+fn catalog_name(cfg: &ForgeConfig, provider: &str, id: &str) -> String {
+    let (_, names) = fetch_catalog(cfg);
+    names
+        .get(&(provider.to_string(), id.to_string()))
+        .cloned()
+        .unwrap_or_else(|| id.to_string())
+}
+
+/// Effective model of a forge session: `override_model ?? profile.model`
+/// (forge's model-switcher semantics). None when the session/profile
+/// can't be read (e.g. forge not up).
+fn effective_model(cfg: &ForgeConfig, sid: Uuid) -> Option<ModelChoice> {
+    let (_models, names) = fetch_catalog(cfg);
+    effective_model_from(cfg, sid, &names)
+}
+
+fn effective_model_from(
+    cfg: &ForgeConfig,
+    sid: Uuid,
+    names: &std::collections::HashMap<(String, String), String>,
+) -> Option<ModelChoice> {
+    let s = http_json(cfg, "GET", &format!("/sessions/{sid}"), None)
+        .ok()
+        .and_then(|v| v.get("session").cloned())?;
+    let ov_prov = s.get("override_provider").and_then(|x| x.as_str());
+    let ov_mod = s.get("override_model").and_then(|x| x.as_str());
+    let (prov, id) = match (ov_prov, ov_mod) {
+        (Some(p), Some(m)) => (p.to_string(), m.to_string()),
+        _ => {
+            let pid = s.get("profile_id")?.as_str()?;
+            let prof = http_json(cfg, "GET", &format!("/profiles/{pid}"), None)
+                .ok()
+                .and_then(|v| v.get("profile").cloned())?;
+            (
+                prof.get("provider")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                prof.get("model")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            )
+        }
+    };
+    let name = names
+        .get(&(prov.clone(), id.clone()))
+        .cloned()
+        .unwrap_or_else(|| id.clone());
+    Some(ModelChoice {
+        provider: prov,
+        id,
+        name,
+    })
 }
 
 /// Create a forge session (sync, localhost — called from the main loop).

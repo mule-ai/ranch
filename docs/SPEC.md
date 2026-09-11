@@ -276,7 +276,9 @@ frames both ways with
   list/metadata/status and for spawning agent panes.
 
 Config: `~/.config/ranch/daemon.toml` (machine name, relay url +
-machine key, forge/mule endpoints, coalescing tick, scrollback lines).
+machine key, forge/mule endpoints, coalescing tick, scrollback lines,
+`pi_no_tools = "true"` → local pi agent panes spawn `pi --mode rpc
+--no-tools` (M11 demo, pure chat, no shell/file tools)).
 
 ### 4.3 Cloud relay (Supabase)
 
@@ -689,6 +691,26 @@ Rust edition 2024, stable toolchain (matches forge: rustc 1.98).
   affordance — "killing doesn't work" was partly that, partly
   prefix-& now being WINDOW-kill (tmux semantics, M5): whole-session
   kill is `:kill-session` / the dashboard / the phone long-press).
+- **M11 — public demo (2026-09-11)**: the ranch demo on the lab
+  (mini, ALC). A dedicated Supabase account
+  (`ranch-demo@jbutler.dev`) owns a single `ranch-demo` machine
+  (ALC image `ct/ranch-demo/`: NixOS, ranchd from a cross-built
+  static aarch64 binary — `make build-aarch64`, pi 0.85.1 via npm
+  pinned in the flake, `SHELL=qjs` so shell panes ARE the sandbox:
+  QuickJS has no fs/net/process builtins, so "restricted, no
+  network" needs no firewall). `daemon.toml` sets `pi_no_tools =
+  "true"` → local `pi` agent panes spawn `pi --mode rpc --no-tools`
+  (`pilocal::no_tools_configured()` reads it) — pure chat through the
+  single-slot gate on vram, same Laguna path as mule-public/
+  forge-public. Public surface: `ranch.jbutler.dev` (Cloudflare tunnel
+  on mini → static host `services/public/ranch-demo`, :8336) serves
+  the web SPA built with `VITE_DEMO_EMAIL`/`VITE_DEMO_PASSWORD` —
+  `lib/demo.ts` shows a "Try the live demo" button that signs the
+  visitor in as the demo account; demo mode hides forge/resume and
+  offers only sandbox (qjs) + agent (no-tools pi). Daily 04:00
+  timer re-creates the `sandbox` session. No nftables on the ALC:
+  it's on private vmnet NAT (no inbound) and its only meaningful
+  egress is the Supabase relay + the gate.
 - **M9 — resume + local-pi agent panes (2026-09-09)**:
   `:resume` in the TUI (and `ranch resume [query]`) lists the lab
   forge's sessions (`forge-list`/`forge-list-ok` proxy frames) in a
@@ -845,6 +867,27 @@ Rust edition 2024, stable toolchain (matches forge: rustc 1.98).
   invocations still print usage.
 - **M4 — forge + mule first-class**: forge listing/status/attach (§7); mule listing + run-into-pane (§8). Acceptance: start a forge session locally, watch it from the phone; run a mule workflow into a pane and watch it live.
 - **M10 — mobile editor: files + markdown (2026-09-10)**: the phone becomes a light IDE for files on the machine. Design: files live on the daemon's machine; the daemon is the file server and the phone a thin client — same architecture as terminal emulation (server owns state, clients render). Protocol: `FileRead`/`FileReadOk`, `FileWrite`/`FileWriteOk` (mtime check → conflict error instead of silent clobber); `DirListOk` gains `files` (regular files only, hidden names excluded — mirrors the dir filter). Mobile: new Editor screen — directory browser (reuses `DirList`, now lists files), editor view (multiline monospace `TextInput` in the already-bundled JetBrains Mono), dirty dot + Save, and for `.md`/`.mdx` a Review tab rendering `marked` (v18, pure JS, zero peer deps) tokens to RN views. **MVP ships plain text — no syntax highlighting** (research §2.6: no maintained RN code-editor component; pure-JS highlight overlay is phase 2). **Phases:** 1 (MVP): browse/open/edit/save + markdown review; 2: pure-JS syntax-highlight overlay (react-native-coder pattern) validated on RN 0.86; 3: inotify `file-changed` metas + conflict toasts. **Acceptance:** from the phone, browse to a file, edit, save — disk has the new content; a `.md` file renders; an external edit that moves mtime between read and save returns an error, not a clobber.
+- **CLI/TUI polish (2026-09-10)**: two client-side fixes, no protocol
+  change. (1) The agent chat prompt field in the attach TUI is now
+  multiline: `Ctrl-J` (or Shift+Enter, when the terminal reports it)
+  inserts a newline; plain Enter sends. Long drafts wrap inside the
+  input box, which grows up to 8 rows and scrolls to the tail (cursor
+  is always at the input end); the old single-line box also had an
+  overflow bug when text filled the full width. (2) The dashboard
+  (plain `ranch`) previously got the session list only from the
+  initial `Hello`; it now re-hellos every second so sessions created
+  elsewhere (phone, another terminal, `ranch new`) appear without
+  re-attaching. The daemon logs `hello` only when the client name
+  changes to keep the per-second refresh quiet.
+- **M10 phase 3 — file-change push + conflict UI (2026-09-10)**: the
+  daemon auto-watches every file a client reads in the editor and stats
+  the watched set on its tick loop (~2 s cadence; mtime polling instead
+  of inotify — no new deps, watch set is tiny). `FileReadOk` seeds the
+  watch, `FileWriteOk` refreshes its baseline so the client's own saves
+  never trigger a push; a changed on-disk mtime sends a `FileChanged`
+  frame to that client only. Mobile editor: clean file → silent
+  refresh; dirty file → amber "changed on disk" banner with reload /
+  keep-mine (save still enforces the mtime conflict check).
   (§7); mule listing + run-into-pane (§8). Acceptance: start a forge
   session locally, watch it from the phone; run a mule workflow into a
   pane and watch it live.

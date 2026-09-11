@@ -198,6 +198,15 @@ pub enum Frame {
         /// new last-modified unix timestamp (seconds)
         mtime: i64,
     },
+    /// Daemon -> client: a watched file changed on disk (M10 phase 3).
+    /// The daemon auto-watches every file a client reads (FileRead) and
+    /// refreshes the baseline on FileWriteOk; this is the push so the
+    /// editor can surface a conflict immediately instead of only at save.
+    /// `mtime` is the new last-modified unix timestamp (0 = file gone).
+    FileChanged {
+        path: String,
+        mtime: i64,
+    },
     /// Client -> daemon: list resumable forge sessions.
     ForgeList {
         id: String,
@@ -316,7 +325,43 @@ pub enum Frame {
         #[serde(default)]
         reset: bool,
     },
+    /// Client -> daemon: list the agent models available to a chat pane
+    /// plus the currently active one (pi: `get_available_models` +
+    /// `get_state`; forge: the model catalog + session overrides).
+    ModelList {
+        id: String,
+        client: String,
+        /// chat pane id (uuid)
+        pane: String,
+        /// echoed back in `ModelListOk` so clients match the reply
+        req_id: String,
+    },
+    /// Daemon -> client: model catalog for a chat pane. `current` is the
+    /// active model (or None if unknown/legacy).
+    ModelListOk {
+        id: String,
+        req_id: String,
+        pane: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        current: Option<ModelChoice>,
+        models: Vec<ModelChoice>,
+    },
+    /// Client -> daemon: switch the agent model of a chat pane.
+    /// Success is confirmed out-of-band as `meta { kind: "model" }`
+    /// with the new model's display name; failure → `error { req_id }`.
+    ModelSet {
+        id: String,
+        client: String,
+        session: String,
+        pane: String,
+        provider: String,
+        model: String,
+        /// echoed back on the `error` frame when the switch fails
+        req_id: String,
+    },
     /// Out-of-band status (no screen change).
+    /// `kind` values: `"agent"` (working/idle), `"model"` (chat pane's
+    /// active model reported or changed; `status` = display name).
     Meta {
         session: String,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -433,6 +478,21 @@ pub struct PaneSnap {
     /// For forge-chat panes: the forge session uuid this pane is bound to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forge_session: Option<String>,
+    /// For chat panes: display name of the agent's active model
+    /// (filled when the daemon knows: pi `get_state`, forge
+    /// session/profile lookup, or after a model switch).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+/// One selectable agent model (pi `models.json` entry or forge
+/// catalog row). `id` is the model identifier; `name` is the
+/// human-friendly display name (falls back to `id`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ModelChoice {
+    pub provider: String,
+    pub id: String,
+    pub name: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
@@ -762,6 +822,7 @@ mod tests {
                 kind: None,
                 chat: None,
                 forge_session: None,
+                model: None,
             }],
             meta: vec![],
             windows: vec![],
@@ -816,6 +877,10 @@ mod tests {
             path: "/home/j/notes.md".into(),
             mtime: 1757500001,
         };
+        let changed = Frame::FileChanged {
+            path: "/home/j/notes.md".into(),
+            mtime: 1757500002,
+        };
         // optional mtime must deserialize as None when absent (back-compat)
         let json =
             r#"{"t":"FileWrite","id":"i","client":"c","req_id":"r","path":"/x","content":""}"#;
@@ -824,7 +889,7 @@ mod tests {
             Frame::FileWrite { mtime, .. } => assert!(mtime.is_none()),
             _ => panic!("wrong variant"),
         }
-        for f in [read, read_ok, write, write_ok] {
+        for f in [read, read_ok, write, write_ok, changed] {
             let lines = encode_frame(&f, "c1");
             let mut payload = String::new();
             for l in &lines {

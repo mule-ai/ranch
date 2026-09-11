@@ -251,6 +251,9 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
   const [chatDraft, setChatDraft] = useState("");
   const chatRef = useRef<TextInput | null>(null);
   const chatScrollRef = useRef<ScrollView | null>(null);
+  // sticky-bottom chat: only auto-follow when the user is at the bottom;
+  // leave them where they are when they've scrolled up
+  const chatAtBottomRef = useRef(true);
 
   // blinking cursor
   useEffect(() => {
@@ -318,6 +321,11 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
   const activeSnap = activePane ? panes.get(activePane) : undefined;
   const chatMode = activeSnap?.kind === "forge-chat";
   const chatMsgs = activeSnap?.chat ?? [];
+  // switching panes/sessions re-arms bottom-follow so the new
+  // conversation opens at the newest message
+  useEffect(() => {
+    chatAtBottomRef.current = true;
+  }, [activePane, sessionId]);
 
   return (
     <View style={[styles.flex, { paddingBottom: kbHeight }]}>
@@ -337,7 +345,16 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
         <View style={styles.chatWrap}>
           <ScrollView
             contentContainerStyle={styles.chatList}
-            onContentSizeChange={(_, h) => chatScrollRef.current?.scrollToEnd({ animated: false })}
+            onContentSizeChange={(_, h) => {
+              if (chatAtBottomRef.current)
+                chatScrollRef.current?.scrollToEnd({ animated: false });
+            }}
+            onScroll={(e) => {
+              const { contentOffset, contentSize, layoutMeasurement } = e.nativeEvent;
+              chatAtBottomRef.current =
+                contentSize.height - contentOffset.y - layoutMeasurement.height < 24;
+            }}
+            scrollEventThrottle={16}
             ref={chatScrollRef}
           >
             {chatMsgs
@@ -369,6 +386,7 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
               onPress={() => {
                 const text = chatDraft.trim();
                 if (!text || !activePane) return;
+                chatAtBottomRef.current = true; // our own send ⇒ follow
                 relay.send({
                   t: "ChatSend", id: nextId(), client: "mobile",
                   session: sessionId, pane: activePane, text,
@@ -626,6 +644,8 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
 function ChatBubble({ msg }: { msg: ChatMsg }) {
   const isUser = msg.role === "user";
   const isTool = msg.role === "tool";
+  // HH:MM from the agent-side UTC timestamp ("YYYY-MM-DDTHH:MM:SSZ")
+  const ts = msg.created_at && msg.created_at.length >= 16 ? msg.created_at.slice(11, 16) : null;
   // tool rows: collapsed to one line, tap to expand the full output
   const [open, setOpen] = useState(false);
   if (isTool) {
@@ -638,7 +658,7 @@ function ChatBubble({ msg }: { msg: ChatMsg }) {
         disabled={!msg.tool_output}
       >
         <Text style={styles.toolText}>
-          ⚙ {label}{dur}{msg.tool_output ? (open ? " ▲" : " ▼") : ""}
+          ⚙ {label}{dur}{ts ? ` · ${ts}` : ""}{msg.tool_output ? (open ? " ▲" : " ▼") : ""}
         </Text>
         {msg.tool_output ? (
           open ? (
@@ -655,6 +675,9 @@ function ChatBubble({ msg }: { msg: ChatMsg }) {
   return (
     <View style={[styles.bubble, isUser ? styles.bubbleUser : styles.bubbleAgent]}>
       <Text style={[styles.bubbleText, isUser && { color: "#052e16" }]}>{msg.text}</Text>
+      {ts ? (
+        <Text style={[styles.bubbleTs, { color: isUser ? "#052e16" : "#9ca3af" }]}>{ts}</Text>
+      ) : null}
     </View>
   );
 }
@@ -683,6 +706,7 @@ const styles = StyleSheet.create({
   bubbleUser: { alignSelf: "flex-end", backgroundColor: "#22c55e" },
   bubbleAgent: { alignSelf: "flex-start", backgroundColor: "#1e1e26", borderWidth: 1, borderColor: "#2c2c36" },
   bubbleText: { color: "#e5e7eb", fontSize: 14, lineHeight: 19 },
+  bubbleTs: { fontSize: 10, marginTop: 3, opacity: 0.7 },
   toolRow: {
     alignSelf: "flex-start", backgroundColor: "#14141a", borderRadius: 8,
     paddingHorizontal: 10, paddingVertical: 6, borderWidth: 1,

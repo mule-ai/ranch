@@ -342,19 +342,22 @@ fn ws_session(
     clog(&format!("relay: connected, joining {topic}"));
 
     // join the private channel; the machine JWT rides in the join payload
-    let join = serde_json::json!({
-        "topic": topic,
-        "event": "phx_join",
-        "ref": "join",
-        "payload": {
-            "config": { "broadcast": {}, "presence": {}, "postgres_changes": [], "private": true },
-            "access_token": jwt,
-        },
-    });
-    // re-joinable: token refreshes re-join (a bare access_token event
-    // does not recover a channel the server has dropped)
-    let join_frame = join.to_string();
-    ws_send(&mut ws, &join_frame)?;
+    // NB: the frame must be (re)built with the CURRENT jwt — a refreshed
+    // re-join carrying the old (expired) token is rejected by RLS and the
+    // channel dies silently (remote clients then stop getting frames).
+    let build_join = |jwt: &str| -> String {
+        serde_json::json!({
+            "topic": topic,
+            "event": "phx_join",
+            "ref": "join",
+            "payload": {
+                "config": { "broadcast": {}, "presence": {}, "postgres_changes": [], "private": true },
+                "access_token": jwt,
+            },
+        })
+        .to_string()
+    };
+    ws_send(&mut ws, &build_join(&jwt))?;
 
     use std::os::fd::AsRawFd as _;
     let ws_fd = match ws.get_ref() {
@@ -510,8 +513,8 @@ fn ws_session(
                     ws_send(&mut ws, &msg.to_string())?;
                     // re-join: the server may have dropped the channel
                     // since the last token; the access_token event alone
-                    // does not re-establish it
-                    ws_send(&mut ws, &join_frame)?;
+                    // does not re-establish it. Fresh frame, fresh token.
+                    ws_send(&mut ws, &build_join(&jwt))?;
                     clog("relay: access token refreshed");
                 }
                 Err(e) => {

@@ -25,6 +25,14 @@ MUSL_TARGET := x86_64-unknown-linux-musl
 VT_STATIC := vendor/lib/libghostty-vt.a
 STATIC_BIN := target/$(MUSL_TARGET)/release/ranch
 
+# Cross target for the aarch64 lab demo ALC (mini). The static VT
+# archive goes in its OWN dir so build.rs (RANCH_VT_LIB_DIR) picks the
+# right one per target — vendor/lib/ stays the x86_64 archive.
+CROSS_TARGET := aarch64-unknown-linux-musl
+CROSS_VT_DIR := vendor/lib-aarch64
+CROSS_VT_STATIC := $(CROSS_VT_DIR)/libghostty-vt.a
+CROSS_BIN := target/$(CROSS_TARGET)/release/ranch
+
 # zig's cc wrapper: rust triple -> zig triple (zig 0.16 dropped 'unknown')
 ZIG_CC := $(CURDIR)/.tools/zig-cc
 
@@ -51,6 +59,32 @@ $(VT_STATIC): vendor/ghostty $(ZIG_DIR)/zig
 	mkdir -p vendor/lib
 	cp vendor/ghostty/zig-out/lib/libghostty-vt.a $(VT_STATIC)
 	@echo "built $(VT_STATIC)"
+
+# --- aarch64 cross build (lab demo ALC on mini) ---------------------------
+
+.PHONY: build-aarch64
+build-aarch64: $(CROSS_BIN)
+	@echo "binary: $(CROSS_BIN) (static, aarch64)"
+
+$(CROSS_BIN): $(CROSS_VT_STATIC) $(ZIG_DIR)/zig crates/ranch-vt/build.rs
+	@command -v rustup >/dev/null && rustup target add $(CROSS_TARGET) >/dev/null 2>&1 || true
+	@# Final link goes through tools/zig-link-aarch64 (zig cc -static for
+	@# aarch64-linux-musl): it strips rustc's aarch64 erratum flag and
+	@# rustc's self-contained crt*.o so zig's own start files are used.
+	env CC_$(CROSS_TARGET)=$(CURDIR)/tools/zig-cc \
+		CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=$(CURDIR)/tools/zig-link-aarch64 \
+		RANCH_VT_LIB_DIR=$(CURDIR)/$(CROSS_VT_DIR) \
+		cargo build --release --target $(CROSS_TARGET)
+	@file $(CROSS_BIN) | grep -q "statically linked" || \
+	  { echo "WARNING: cross binary is not statically linked"; }
+
+$(CROSS_VT_STATIC): vendor/ghostty $(ZIG_DIR)/zig
+	@echo "building libghostty-vt STATIC archive aarch64 (pinned $(GHOSTTY_PIN))…"
+	cd vendor/ghostty && \
+	  PATH="$(CURDIR)/$(ZIG_DIR):$$PATH" zig build -Demit-lib-vt=true -Dtarget=aarch64-linux-musl -Dcpu=baseline
+	mkdir -p $(CROSS_VT_DIR)
+	cp vendor/ghostty/zig-out/lib/libghostty-vt.a $(CROSS_VT_STATIC)
+	@echo "built $(CROSS_VT_STATIC)"
 
 # shared lib (fallback for `ranch-vt` builds without the archive; also
 # used by the smoke `make run` path on glibc)
@@ -132,7 +166,8 @@ clean:
 .PHONY: help
 help:
 	@echo "make setup    — one-time: zig + ghostty + static libghostty-vt (via build)"
-	@echo "make build    — static binary (musl + static libghostty-vt)"
+	@echo "make build         — static x86_64 binary (musl + static libghostty-vt)"
+	@echo "make build-aarch64 — static aarch64 binary for the lab demo ALC (mini)"
 	@echo "make install  — copy to ~/.local/bin/ranch (+ ranchd symlink)"
 	@echo "make service  — install + start the ranchd systemd user unit"
 	@echo "make run      — foreground daemon"

@@ -44,11 +44,23 @@ export function EditorScreen({ relay, onExit }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  // path of a file that changed on disk while the draft was dirty
+  const [externChanged, setExternChanged] = useState<string | null>(null);
 
   // req_id matching so replies land in the right handler
   const dirReqRef = useRef<string | null>(null);
   const readReqRef = useRef<string | null>(null);
   const writeReqRef = useRef<string | null>(null);
+  // live mirrors so the frame handler (subscribed once per relay) never
+  // sees first-render closures
+  const draftRef = useRef("");
+  const openFileRef = useRef<OpenFile | null>(null);
+  useEffect(() => {
+    draftRef.current = draft;
+  }, [draft]);
+  useEffect(() => {
+    openFileRef.current = openFile;
+  }, [openFile]);
 
   const loadDir = (path?: string) => {
     if (!path && !browse) path = undefined;
@@ -98,9 +110,17 @@ export function EditorScreen({ relay, onExit }: Props) {
       setOpenFile(null);
       setView("edit");
       setError(null);
+      setExternChanged(null);
     } else {
       onExit();
     }
+  };
+
+  const openFileFromPath = (path: string) => {
+    const rid = nextId();
+    readReqRef.current = rid;
+    setError(null);
+    relay.send({ t: "FileRead", id: nextId(), client: "mobile", req_id: rid, path } as Frame);
   };
 
   const kbHeight = useKbHeight();
@@ -129,12 +149,25 @@ export function EditorScreen({ relay, onExit }: Props) {
             writeReqRef.current = null;
             setSaving(false);
             setOpenFile((of) =>
-              of ? { ...of, original: draft, mtime: f.mtime } : of
+              of ? { ...of, original: draftRef.current, mtime: f.mtime } : of
             );
             setSaved(true);
             setTimeout(() => setSaved(false), 2000);
           }
           break;
+        case "FileChanged": {
+          const of = openFileRef.current;
+          if (of && of.path === f.path) {
+            if (draftRef.current === of.original) {
+              // no local edits: refresh silently (also updates mtime)
+              openFileFromPath(f.path);
+            } else {
+              // local edits: surface a conflict banner, don't touch the draft
+              setExternChanged(f.path);
+            }
+          }
+          break;
+        }
         case "Error":
           if (f.req_id === dirReqRef.current) {
             dirReqRef.current = null;
@@ -149,16 +182,14 @@ export function EditorScreen({ relay, onExit }: Props) {
             setSaving(false);
             setError(f.message);
             // conflict: prompt reload
-            if (f.message.startsWith("file changed on disk") && openFile) {
+            if (f.message.startsWith("file changed on disk") && openFileRef.current) {
+              const p = openFileRef.current.path;
               Alert.alert(
                 "File changed on disk",
                 "Someone else saved this file since you opened it.",
                 [
                   { text: "Cancel", style: "cancel" },
-                  {
-                    text: "Reload",
-                    onPress: () => openFileFromPath(openFile.path),
-                  },
+                  { text: "Reload", onPress: () => openFileFromPath(p) },
                 ]
               );
             }
@@ -181,13 +212,6 @@ export function EditorScreen({ relay, onExit }: Props) {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [relay]);
-
-  const openFileFromPath = (path: string) => {
-    const rid = nextId();
-    readReqRef.current = rid;
-    setError(null);
-    relay.send({ t: "FileRead", id: nextId(), client: "mobile", req_id: rid, path } as Frame);
-  };
 
   const dirty = openFile ? draft !== openFile.original : false;
   const showMarkdownTabs = openFile && isMarkdown(openFile.path);
@@ -221,6 +245,20 @@ export function EditorScreen({ relay, onExit }: Props) {
           <Pressable onPress={() => setError(null)} hitSlop={8}>
             <Text style={styles.errClose}>✕</Text>
           </Pressable>
+        </View>
+      )}
+
+      {externChanged !== null && openFile && externChanged === openFile.path && (
+        <View style={styles.warnBanner}>
+          <Text style={styles.warnText}>changed on disk — reload?</Text>
+          <View style={styles.warnBtns}>
+            <Pressable onPress={() => openFileFromPath(externChanged)} hitSlop={8}>
+              <Text style={styles.warnReload}>reload</Text>
+            </Pressable>
+            <Pressable onPress={() => setExternChanged(null)} hitSlop={8}>
+              <Text style={styles.warnDismiss}>keep mine</Text>
+            </Pressable>
+          </View>
         </View>
       )}
 
@@ -496,6 +534,15 @@ const styles = StyleSheet.create({
   },
   errText: { color: "#f87171", fontSize: 13, flex: 1 },
   errClose: { color: "#f87171", fontSize: 14 },
+  warnBanner: {
+    flexDirection: "row", alignItems: "center", justifyContent: "space-between",
+    backgroundColor: "rgba(245,158,11,0.12)", borderRadius: 8,
+    paddingHorizontal: 10, paddingVertical: 8, marginTop: 8, gap: 8,
+  },
+  warnText: { color: "#f59e0b", fontSize: 13, flex: 1 },
+  warnBtns: { flexDirection: "row", gap: 12 },
+  warnReload: { color: "#f59e0b", fontSize: 13, fontWeight: "700" },
+  warnDismiss: { color: "#9ca3af", fontSize: 13 },
   tabs: { flexDirection: "row", gap: 6, marginTop: 8 },
   tab: {
     borderWidth: 1, borderColor: "#374151", borderRadius: 999,

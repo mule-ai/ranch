@@ -450,6 +450,9 @@ struct PaneView {
     chat: Vec<ranch_protocol::ChatMsg>,
     /// agent working indicator (meta kind="agent" status)
     agent_busy: bool,
+    /// active agent model display name (chat panes; snapshot +
+    /// meta kind="model")
+    model: Option<String>,
 }
 
 impl PaneView {
@@ -465,6 +468,7 @@ impl PaneView {
         if let Some(chat) = &snap.chat {
             self.chat = chat.clone();
         }
+        self.model = snap.model.clone();
         // heuristic until the first meta arrives: a trailing user row
         // means the agent is on it
         self.agent_busy = self.chat.last().map(|m| m.role == "user").unwrap_or(false);
@@ -485,6 +489,10 @@ impl PaneView {
     /// Agent working indicator update (meta kind="agent").
     fn apply_agent_status(&mut self, status: &str) {
         self.agent_busy = status == "working";
+    }
+    /// Active model display name (meta kind="model").
+    fn apply_model(&mut self, name: &str) {
+        self.model = Some(name.to_string());
     }
     fn apply_update(
         &mut self,
@@ -617,6 +625,9 @@ fn cmd_dashboard() -> Option<String> {
     let mut input_text = String::new();
     let mut term =
         Terminal::new(CrosstermBackend::new(std::io::stdout())).expect("failed to init terminal");
+    // sessions can change from other clients (phone, another terminal);
+    // re-hello on an interval so the list stays fresh
+    let mut last_refresh = std::time::Instant::now();
 
     loop {
         // drain socket
@@ -650,6 +661,15 @@ fn cmd_dashboard() -> Option<String> {
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(_) => break,
             }
+        }
+
+        // the session list can change from other clients (phone, another
+        // terminal, `ranch new`): re-fetch it on an interval so the
+        // dashboard stays current without a protocol change (a fresh
+        // Hello returns the current list — same path as post-kill refresh)
+        if last_refresh.elapsed() >= std::time::Duration::from_secs(1) {
+            refresh_sessions(&mut stream);
+            last_refresh = std::time::Instant::now();
         }
 
         // draw
@@ -913,7 +933,8 @@ fn cmd_attach(ref_: &str) {
     // window stack (M5): entries in order + the active window's id
     let mut windows: Vec<ranch_protocol::WindowSnap> = vec![];
     let mut cur_window = String::new();
-    // draft line for the focused forge-chat pane (M8)
+    // draft for the focused forge-chat pane (M8) — can hold newlines
+    // (Ctrl-J / Shift+Enter), Enter sends
     let mut chat_input = String::new();
     // transient error flash (status bar) — errors are feedback, not fatal
     let err_flash: std::cell::Cell<Option<(std::time::Instant, String)>> =
@@ -942,6 +963,18 @@ fn cmd_attach(ref_: &str) {
     let resume_items: std::rc::Rc<std::cell::RefCell<Vec<ranch_protocol::ForgeSessionInfo>>> =
         std::rc::Rc::new(std::cell::RefCell::new(vec![]));
     let _ = &resume_sel;
+    // :model — agent-model picker (modal; j/k/enter/esc). Items land
+    // asynchronously via ModelListOk (matched on req_id).
+    let model_open = std::cell::Cell::new(false);
+    let model_sel = std::cell::Cell::new(0usize);
+    let model_pending: std::rc::Rc<std::cell::RefCell<Option<String>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(None));
+    let model_items: std::rc::Rc<std::cell::RefCell<Vec<ranch_protocol::ModelChoice>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(vec![]));
+    // req_id of the last model switch; matched against Error frames
+    let model_set_pending: std::rc::Rc<std::cell::RefCell<Option<String>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(None));
+    let _ = &model_sel;
     #[derive(Clone, Copy, PartialEq)]
     enum Prompt {
         RenameWindow,
@@ -1071,6 +1104,17 @@ fn cmd_attach(ref_: &str) {
                                     ) {
                                         pv.apply_agent_status(status);
                                     }
+                                } else if msess == session_id && mkind == "model" {
+                                    // the switch landed: track the model
+                                    // and drop the pending-set marker
+                                    if let Some(status) = mstat {
+                                        model_set_pending.borrow_mut().take();
+                                        if let Some(pv) = pane_views
+                                            .get_mut(mpane.as_deref().unwrap_or(""))
+                                        {
+                                            pv.apply_model(&status);
+                                        }
+                                    }
                                 } else if mkind != "agent" {
                                     if let Some(st) = mstat {
                                         eprintln!("ranch: {st}");
@@ -1127,16 +1171,51 @@ fn cmd_attach(ref_: &str) {
                                     resume_open.set(true);
                                 }
                             }
-                            Frame::Error { message, .. } => {
-                                // attach-refusal errors are fatal; request
-                                // errors (split/agent/etc.) just flash
+                            Frame::ModelListOk {
+                                req_id, pane, current, models, ..
+                            } => {
+                                let matches_req =
+                                    model_pending.borrow().as_deref() == Some(req_id.as_str());
+                                if matches_req {
+                                    *model_pending.borrow_mut() = None;
+                                    model_items.borrow_mut().clear();
+                                    model_items.borrow_mut().extend(models);
+                                    model_sel.set(0);
+                                    model_open.set(true);
+                                }
+                                // keep the pane's model label fresh either way
+                                if let Some(c) = current {
+                                    if let Some(pv) = pane_views.get_mut(&pane) {
+                                        pv.apply_model(&c.name);
+                                    }
+                                }
+                            }
+                            Frame::Error { req_id, message, .. } => {
+                                // request-scoped errors from the daemon's
+                                // worker threads carry a req_id; only
+                                // flash the ones we asked for (model list /
+                                // model set) so another client's failure
+                                // on the same machine doesn't pop here
+                                let mine = req_id.as_deref().is_some_and(|r| {
+                                    *model_set_pending.borrow() == Some(r.to_string())
+                                        || *model_pending.borrow() == Some(r.to_string())
+                                });
                                 let attach_phase = !got_snapshot.get();
                                 if attach_phase {
                                     restore();
                                     drop(term);
                                     die(&format!("attach failed: {message}"));
                                 }
-                                err_flash.set(Some((std::time::Instant::now(), message.clone())));
+                                if req_id.is_some() && !mine {
+                                    // request-scoped error we didn't ask for
+                                } else {
+                                    model_set_pending.borrow_mut().take();
+                                    model_pending.borrow_mut().take();
+                                    err_flash.set(Some((
+                                        std::time::Instant::now(),
+                                        message.clone(),
+                                    )));
+                                }
                             }
                             _ => {}
                         }
@@ -1243,7 +1322,17 @@ fn cmd_attach(ref_: &str) {
                             .bg(ratatui::style::Color::Rgb(34, 34, 42));
                         let dim = Style::default().fg(ratatui::style::Color::Rgb(110, 114, 126));
                         let mut li: Vec<Line> = Vec::new();
-                        li.push(Line::from(Span::raw("")));
+                        // header line: active agent model (:model switches)
+                        match &pv.model {
+                            Some(m) => li.push(Line::from(Span::styled(
+                                format!(" ◈ {m}  ·  :model to switch"),
+                                dim,
+                            ))),
+                            None => li.push(Line::from(Span::styled(
+                                " ◈ :model to pick a model".to_string(),
+                                dim.add_modifier(Modifier::DIM),
+                            ))),
+                        }
                         for m in &pv.chat {
                             let ts = m
                                 .created_at
@@ -1279,11 +1368,15 @@ fn cmd_attach(ref_: &str) {
                                 _ => {
                                     // left-aligned dark bubble
                                     let inner = agent_w.saturating_sub(2);
-                                    for chunk in wrap(&m.text, inner) {
-                                        li.push(Line::from(vec![
+                                    for (i, chunk) in wrap(&m.text, inner).into_iter().enumerate() {
+                                        let mut spans = vec![
                                             Span::raw(" "),
                                             Span::styled(format!(" {chunk} "), agent_style),
-                                        ]));
+                                        ];
+                                        if i == 0 && !ts.is_empty() {
+                                            spans.push(Span::styled(format!(" {ts}"), dim));
+                                        }
+                                        li.push(Line::from(spans));
                                     }
                                 }
                             }
@@ -1304,9 +1397,43 @@ fn cmd_attach(ref_: &str) {
                                 dim.add_modifier(Modifier::ITALIC),
                             )));
                         }
-                        // rounded input box pinned to the bottom
+                        // rounded input box pinned to the bottom; grows to
+                        // multiple rows for wrapped / explicit-newline
+                        // drafts, showing the tail (cursor is always at
+                        // the end of the input)
                         let input_row = chat_input_ref.clone();
-                        let bh = if r.height >= 6 { 3 } else { 1 };
+                        let inner_w = w.saturating_sub(2).max(1);
+                        // usable text width: "│ text▊ pad│" → inner_w - 3
+                        let text_w = inner_w.saturating_sub(3).max(1);
+                        let mut draft: Vec<String> = if input_row.is_empty() {
+                            wrap(
+                                "message the agent…  (⌃J newline, enter send)",
+                                text_w,
+                            )
+                        } else {
+                            let mut out = Vec::new();
+                            for part in input_row.split('\n') {
+                                if part.is_empty() {
+                                    out.push(String::new());
+                                } else {
+                                    for chunk in wrap(part, text_w) {
+                                        out.push(chunk);
+                                    }
+                                }
+                            }
+                            out
+                        };
+                        const MAX_INPUT_ROWS: usize = 8;
+                        let bh = if r.height >= 5 {
+                            (draft.len().min(MAX_INPUT_ROWS) + 2).max(3)
+                        } else {
+                            1
+                        };
+                        let visible = bh - 2;
+                        if draft.len() > visible {
+                            let start = draft.len() - visible;
+                            draft.drain(0..start);
+                        }
                         let keep = r.height as usize - bh;
                         let skip = li.len().saturating_sub(keep);
                         let mut rows: Vec<Line> = li.iter().skip(skip).cloned().collect();
@@ -1315,53 +1442,36 @@ fn cmd_attach(ref_: &str) {
                         } else {
                             dim
                         };
-                        if bh == 3 {
-                            let label = if input_row.is_empty() {
-                                "message the agent…".to_string()
+                        if bh >= 3 {
+                            let cursor_style = if focused {
+                                Style::default().fg(ratatui::style::Color::Green)
                             } else {
-                                input_row.clone()
+                                dim
                             };
-                            let inner_w = w.saturating_sub(2).max(1);
-                            let title = if input_row.is_empty() {
-                                Span::styled(" message the agent…", dim)
+                            let text_style = if input_row.is_empty() {
+                                dim
                             } else {
-                                Span::raw("")
+                                Style::default()
+                                    .fg(ratatui::style::Color::Rgb(230, 232, 240))
                             };
                             rows.push(Line::from(Span::styled(
                                 format!("╭{}╮", "─".repeat(inner_w - 1)),
                                 border,
                             )));
-                            let shown: String = label.chars().take(inner_w - 3).collect();
-                            rows.push(Line::from(vec![
-                                Span::styled("│", border),
-                                Span::styled(
-                                    format!(" {shown}"),
-                                    if input_row.is_empty() {
-                                        dim
-                                    } else {
-                                        Style::default()
-                                            .fg(ratatui::style::Color::Rgb(230, 232, 240))
-                                    },
-                                ),
-                                Span::styled(
-                                    "▊ ",
-                                    if focused {
-                                        Style::default().fg(ratatui::style::Color::Green)
-                                    } else {
-                                        dim
-                                    },
-                                ),
-                                Span::styled(
-                                    format!(
-                                        "{}│",
-                                        " ".repeat(
-                                            inner_w.saturating_sub(shown.chars().count() + 3)
-                                        )
-                                    ),
+                            for (i, chunk) in draft.iter().enumerate() {
+                                let last = i + 1 == draft.len();
+                                let mut spans = vec![Span::styled("│", border)];
+                                spans.push(Span::styled(format!(" {chunk}"), text_style));
+                                if last {
+                                    spans.push(Span::styled("▊", cursor_style));
+                                }
+                                let used = 2 + chunk.chars().count() + if last { 1 } else { 0 };
+                                spans.push(Span::styled(
+                                    format!("{}│", " ".repeat(inner_w.saturating_sub(used))),
                                     border,
-                                ),
-                            ]));
-                            let _ = title;
+                                ));
+                                rows.push(Line::from(spans));
+                            }
                             rows.push(Line::from(Span::styled(
                                 format!("╰{}╯", "─".repeat(inner_w - 1)),
                                 border,
@@ -1637,6 +1747,41 @@ fn cmd_attach(ref_: &str) {
                 );
             }
 
+            // :model modal — centered agent-model picker
+            if model_open.get() {
+                let n = model_items.borrow().len();
+                let mh = ((n + 4) as u16).min(term_area.height);
+                let (mw, _) = (64.min(term_area.width), mh);
+                let mx = (term_area.width.saturating_sub(mw)) / 2;
+                let my = (term_area.height.saturating_sub(mh)) / 2;
+                let marea = Rect::new(mx, my, mw, mh);
+                f.render_widget(ratatui::widgets::Clear, marea);
+                let block = ratatui::widgets::Block::bordered()
+                    .title(" agent model · enter switch · esc close ")
+                    .border_style(Style::default().fg(ratatui::style::Color::Green));
+                let inner = block.inner(marea);
+                f.render_widget(block, marea);
+                let items: Vec<Line> = model_items
+                    .borrow()
+                    .iter()
+                    .enumerate()
+                    .map(|(i, mc)| {
+                        let sel = i == model_sel.get();
+                        let mut style = Style::default();
+                        if sel {
+                            style = style.add_modifier(Modifier::REVERSED);
+                        }
+                        let mark = if sel { ">" } else { " " };
+                        let label = format!("{mark} {:<24} {}", mc.name, mc.id);
+                        Line::from(Span::styled(label, style))
+                    })
+                    .collect();
+                f.render_widget(
+                    Paragraph::new(items),
+                    Rect::new(inner.x, inner.y, inner.width, inner.height),
+                );
+            }
+
             // prompt line (rename / command)
             if let Some(kind) = prompt_now {
                 let label = match kind {
@@ -1707,6 +1852,49 @@ fn cmd_attach(ref_: &str) {
                                         };
                                         send_frame(&mut stream, &f).ok();
                                         // SessionsAck attaches
+                                    }
+                                }
+                                _ => {}
+                            }
+                            continue;
+                        }
+                        // :model modal: agent-model picker
+                        if model_open.get() {
+                            match key.code {
+                                KeyCode::Esc | KeyCode::Char('q') => {
+                                    model_open.set(false);
+                                }
+                                KeyCode::Up | KeyCode::Char('k') => {
+                                    let sel = model_sel.get();
+                                    if sel > 0 {
+                                        model_sel.set(sel - 1);
+                                    }
+                                }
+                                KeyCode::Down | KeyCode::Char('j') => {
+                                    let sel = model_sel.get();
+                                    if sel + 1 < model_items.borrow().len() {
+                                        model_sel.set(sel + 1);
+                                    }
+                                }
+                                KeyCode::Enter => {
+                                    let picked = model_items
+                                        .borrow()
+                                        .get(model_sel.get())
+                                        .cloned();
+                                    if let Some(mc) = picked {
+                                        model_open.set(false);
+                                        let rid = Uuid::new_v4().to_string();
+                                        *model_set_pending.borrow_mut() = Some(rid.clone());
+                                        let f = Frame::ModelSet {
+                                            id: Uuid::new_v4().to_string(),
+                                            client: "attach".into(),
+                                            session: session_id.clone(),
+                                            pane: active_pane.clone(),
+                                            provider: mc.provider,
+                                            model: mc.id,
+                                            req_id: rid,
+                                        };
+                                        send_frame(&mut stream, &f).ok();
                                     }
                                 }
                                 _ => {}
@@ -2122,6 +2310,32 @@ fn cmd_attach(ref_: &str) {
                                                     prompt_input.clear();
                                                     continue;
                                                 }
+                                                // :model — open the model picker for the
+                                                // focused agent (chat) pane
+                                                if prompt_input.trim() == "model" {
+                                                    let is_chat = pane_views
+                                                        .get(&active_pane)
+                                                        .is_some_and(|pv| pv.is_chat());
+                                                    if is_chat {
+                                                        let rid = Uuid::new_v4().to_string();
+                                                        *model_pending.borrow_mut() =
+                                                            Some(rid.clone());
+                                                        let f = Frame::ModelList {
+                                                            id: Uuid::new_v4().to_string(),
+                                                            client: "attach".into(),
+                                                            pane: active_pane.clone(),
+                                                            req_id: rid,
+                                                        };
+                                                        send_frame(&mut stream, &f).ok();
+                                                    } else {
+                                                        err_flash.set(Some((
+                                                            std::time::Instant::now(),
+                                                            "model: not an agent (chat) pane".into(),
+                                                        )));
+                                                    }
+                                                    prompt_input.clear();
+                                                    continue;
+                                                }
                                                 if let Some(rest) =
                                                     prompt_input.trim().strip_prefix("agent")
                                                 {
@@ -2176,6 +2390,13 @@ fn cmd_attach(ref_: &str) {
                             .unwrap_or(false)
                         {
                             match key.code {
+                                // Shift+Enter (or Ctrl+J) inserts a newline
+                                // into the draft; plain Enter sends
+                                KeyCode::Enter
+                                    if key.modifiers.contains(KeyModifiers::SHIFT) =>
+                                {
+                                    chat_input.push('\n');
+                                }
                                 KeyCode::Enter => {
                                     let text = chat_input.trim().to_string();
                                     if !text.is_empty() {
@@ -2192,6 +2413,13 @@ fn cmd_attach(ref_: &str) {
                                 }
                                 KeyCode::Backspace => {
                                     chat_input.pop();
+                                }
+                                // Ctrl+J: newline fallback for terminals
+                                // that can't distinguish Shift+Enter
+                                KeyCode::Char('j')
+                                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                {
+                                    chat_input.push('\n');
                                 }
                                 KeyCode::Char('c')
                                     if key.modifiers.contains(KeyModifiers::CONTROL) =>
