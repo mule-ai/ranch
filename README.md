@@ -6,8 +6,7 @@ browser.
 
 **[⚡ Try the live demo](https://mule-ai.github.io/ranch/#/app)** — no
 sign-up; one tap runs a sandboxed shell and an agent in a public demo
-instance. Or watch the [Sever & Resume
-demo](https://forge.jbutler.dev) on the forge side.
+instance.
 
 ![ranch web app](docs/screenshot-web-landing.png)
 
