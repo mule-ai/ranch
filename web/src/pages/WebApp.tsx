@@ -332,11 +332,13 @@ function SessionRow({
 
 function CreateRow({ relay }: { relay: Relay | null }) {
   const [name, setName] = useState("");
-  // Demo build: the agent is forge-backed (tools run in the forge-public
-  // sandbox); pi is offered as a local no-tools fallback. Sandbox is the
-  // qjs shell.
+  // Demo build: the agent is forge-backed with no tools (the demo API
+  // key is restricted server-side — profile CRUD, working_dir anchors,
+  // and tool execution are all denied). No local pi panes on the demo:
+  // the public shouldn't reach any code path but the sandboxed forge
+  // session tree.
   const kinds = demoAvailable
-    ? (["shell", "forge", "pi"] as const)
+    ? (["shell", "forge"] as const)
     : (["shell", "forge", "pi"] as const);
   const [kind, setKind] = useState<(typeof kinds)[number]>("shell");
   const [piDir, setPiDir] = useState<string | null>(null);
@@ -380,7 +382,7 @@ function CreateRow({ relay }: { relay: Relay | null }) {
       <div className="kindrow">
         {(kinds as readonly string[]).map((k) => (
           <button key={k} className={"chip" + (kind === k ? " chip-on" : "")} onClick={() => setKind(k as (typeof kinds)[number])}>
-            {k === "forge" ? "agent (forge)" : k === "pi" ? (demoAvailable ? "agent (pi)" : "pi") : k}
+            {k === "forge" ? "agent (forge)" : k === "pi" ? "pi" : k}
           </button>
         ))}
         {!demoAvailable && (

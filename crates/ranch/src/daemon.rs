@@ -565,6 +565,37 @@ fn default_shell() -> String {
     std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string())
 }
 
+/// `allow_local_pi = "false"` in ~/.config/ranch/daemon.toml disables
+/// kind=pi session creation (local pi agent panes). Public demo
+/// machines set this: the public must not reach any agent code path
+/// but the restricted-key forge chat pane. Default true (local pi is
+/// a normal feature on personal machines).
+fn local_pi_allowed() -> bool {
+    let home = match std::env::var("HOME") {
+        Ok(h) => h,
+        Err(_) => return true,
+    };
+    let text = match std::fs::read_to_string(
+        std::path::PathBuf::from(home).join(".config/ranch/daemon.toml"),
+    ) {
+        Ok(t) => t,
+        Err(_) => return true,
+    };
+    for line in text.lines() {
+        let line = line.trim();
+        let rest = match line.strip_prefix("allow_local_pi") {
+            Some(r) => r.trim_start(),
+            None => continue,
+        };
+        if rest.is_empty() || !rest.starts_with('=') {
+            continue; // e.g. `allow_local_pi_x`
+        }
+        let v = rest[1..].trim().trim_matches('"');
+        return !v.eq_ignore_ascii_case("false");
+    }
+    true
+}
+
 // SAFETY: takes ownership of a raw fd from pipe2; caller guarantees the
 // fd is not otherwise owned.
 fn fd_file(fd: RawFd) -> std::fs::File {
@@ -2424,6 +2455,23 @@ impl Daemon {
                 forge_session,
             } => {
                 let kind = kind.clone().unwrap_or_else(|| "shell".into());
+                // Local-pi kill switch: `allow_local_pi = "false"` in
+                // daemon.toml refuses kind=pi outright. Public demo
+                // machines set this — the public must not reach any
+                // code path but the sandboxed forge session tree (the
+                // demo's agent is a restricted-key forge chat pane).
+                if kind == "pi" && !local_pi_allowed() {
+                    if let Some(c) = self.clients.get_mut(&from) {
+                        send_frame(
+                            c,
+                            &Frame::Error {
+                                req_id: Some(req_id.clone()),
+                                message: "local pi agents are disabled on this machine".into(),
+                            },
+                        );
+                    }
+                    return;
+                }
                 if kind != "shell" && kind != "forge" && kind != "pi" {
                     if let Some(c) = self.clients.get_mut(&from) {
                         send_frame(
