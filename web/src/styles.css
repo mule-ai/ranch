@@ -179,6 +179,13 @@ footer { text-align: center; color: var(--dim); font-size: 0.85rem; padding: 24p
   opacity: 0.01; border: none; padding: 0; background: transparent;
   outline: none; caret-color: transparent; font-size: 16px; /* 16px = iOS won't zoom */
 }
+/* click/tap target over the whole terminal area — refocuses the
+   keystroke sink after the soft keyboard (or a stray click) blurs it.
+   Sits above the panes but is transparent to painted content. */
+.term-capture {
+  position: absolute; inset: 0; z-index: 5;
+  background: transparent;
+}
 .pane {
   position: absolute;
   border: 1px solid var(--border);

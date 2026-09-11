@@ -732,7 +732,7 @@ function Terminal({
               className={"keybtn" + (p === activePane ? " keybtn-on" : "")}
               onClick={() => {
                 setActivePane(p);
-                focusRef.current?.focus();
+                focusRef.current?.focus({ preventScroll: true });
                 relay.send({ t: "SessionsSelect", session: sessionId, pane: p } as Frame);
               }}
             >
@@ -804,7 +804,7 @@ function Terminal({
                 focused={r.pane === activePane}
                 onSelect={() => {
                   setActivePane(r.pane);
-                  focusRef.current?.focus();
+                  focusRef.current?.focus({ preventScroll: true });
                   relay.send({
                     t: "SessionsSelect", session: sessionId, pane: r.pane,
                   } as Frame);
@@ -817,6 +817,24 @@ function Terminal({
               <p className="dim">waiting for snapshot… ({conn})</p>
             </div>
           )}
+          {/* click/tap anywhere in the terminal area re-focuses the
+              keystroke sink: closing the soft keyboard blurs it, and
+              without this there's no way to get it back (on desktop
+              nothing re-focuses after clicking the output text) */}
+          <div
+            className="term-capture"
+            onTouchEnd={(e) => {
+              // iOS: focus() must run in the touch handler, before the
+              // synthetic mouse events fire, or the keyboard won't open
+              e.preventDefault();
+              focusRef.current?.focus({ preventScroll: true });
+            }}
+            onMouseDown={(e) => {
+              // prevent the mousedown from stealing focus to body
+              e.preventDefault();
+              focusRef.current?.focus({ preventScroll: true });
+            }}
+          />
           <input
             ref={focusRef}
             className="term-focus"
