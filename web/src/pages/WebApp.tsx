@@ -494,7 +494,10 @@ function Terminal({
   const geomRef = useRef(geom);
   geomRef.current = geom;
   const wrapRef = useRef<HTMLDivElement | null>(null);
-  const focusRef = useRef<HTMLDivElement | null>(null);
+  // Real (invisible) input, not a focus-div: mobile keyboards only pop
+  // up when a text field is focused — a div with tabIndex never brings
+  // up the soft keyboard, so the demo was read-only on phones.
+  const focusRef = useRef<HTMLInputElement | null>(null);
   const lastSeq = useRef<Map<string, number>>(new Map());
   const panesRef = useRef(panes);
   panesRef.current = panes;
@@ -643,6 +646,9 @@ function Terminal({
 
   const onKey = (e: React.KeyboardEvent) => {
     const k = e.key;
+    // printable chars must never linger in the sink field (the
+    // onChange path also clears, this covers desktop keydown-first)
+    if (k.length === 1 && focusRef.current) focusRef.current.value = "";
     let data: string | null = null;
     if (k === "Enter") data = "\r";
     else if (k === "Backspace") data = "\u007f";
@@ -811,7 +817,30 @@ function Terminal({
               <p className="dim">waiting for snapshot… ({conn})</p>
             </div>
           )}
-          <div ref={focusRef} tabIndex={0} className="term-focus" onKeyDown={onKey} />
+          <input
+            ref={focusRef}
+            className="term-focus"
+            // real input: brings up the soft keyboard on mobile;
+            // autocomplete attrs off, it's a terminal keystroke sink
+            type="text"
+            autoCapitalize="off"
+            autoComplete="off"
+            autoCorrect="off"
+            spellCheck={false}
+            aria-label="terminal input"
+            // keep the field empty — keys are handled + cleared below
+            value=""
+            onChange={() => {
+              // Android G-board style IMEs commit text without firing
+              // keydown; forward whatever landed and clear
+              const el = focusRef.current;
+              if (el && el.value) {
+                for (const ch of el.value) send(ch);
+                el.value = "";
+              }
+            }}
+            onKeyDown={onKey}
+          />
         </div>
       )}
 

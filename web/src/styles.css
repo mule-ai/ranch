@@ -165,7 +165,7 @@ footer { text-align: center; color: var(--dim); font-size: 0.85rem; padding: 24p
 .conn-badge { color: var(--dim); font-size: 0.8rem; margin-left: 10px; font-family: var(--mono); }
 
 /* terminal */
-.term-page { display: flex; flex-direction: column; height: 100vh; padding: 8px 10px; gap: 6px; }
+.term-page { display: flex; flex-direction: column; height: 100vh; height: 100dvh; /* dvh: shrinks with the mobile keyboard */ padding: 8px 10px; gap: 6px; }
 .term-header { display: flex; align-items: center; gap: 8px; }
 .term-wrap {
   position: relative; flex: 1; min-height: 0;
@@ -174,7 +174,11 @@ footer { text-align: center; color: var(--dim); font-size: 0.85rem; padding: 24p
   border-radius: 8px;
   overflow: hidden;
 }
-.term-focus { position: absolute; width: 1px; height: 1px; opacity: 0.01; top: 0; left: 0; outline: none; }
+.term-focus {
+  position: absolute; top: 0; left: 0; width: 1px; height: 1px;
+  opacity: 0.01; border: none; padding: 0; background: transparent;
+  outline: none; caret-color: transparent; font-size: 16px; /* 16px = iOS won't zoom */
+}
 .pane {
   position: absolute;
   border: 1px solid var(--border);
@@ -235,6 +239,37 @@ footer { text-align: center; color: var(--dim); font-size: 0.85rem; padding: 24p
 @media (max-width: 640px) {
   .hero h1 { font-size: 2.3rem; }
   .page { padding: 28px 14px 60px; }
+
+  /* --- terminal / app: phone-size treatment --- */
+  .term-page { padding: 6px 8px; gap: 8px; padding-bottom: max(6px, env(safe-area-inset-bottom)); }
+  .term-header { flex-wrap: wrap; row-gap: 4px; }
+  .term-header .title-inline { font-size: 0.95rem; flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .conn-badge { margin-left: 6px; font-size: 0.7rem; }
+
+  /* bigger touch targets everywhere */
+  .keybtn { padding: 10px 14px; font-size: 0.85rem; }
+  .keybtn::after { content: ""; } /* no-op; padding above is the fix */
+  .btn { padding: 13px 20px; font-size: 1rem; }
+  .machrow, .sessionmain { padding: 15px 16px; font-size: 1rem; }
+  .chip { padding: 8px 16px; font-size: 0.9rem; }
+  .linkbtn { padding: 10px 8px; font-size: 1rem; }
+
+  /* pane-number + split/kill row wraps under the title instead of crushing it */
+  .term-header .keybtn { flex-shrink: 0; }
+
+  /* chat: input stays thumb-height, bubbles breathe */
+  .chat-inputrow input { padding: 12px 14px; font-size: 1rem; }
+  .bubble { max-width: 92%; font-size: 0.95rem; }
+
+  /* create row: stack the input above the button */
+  .createrow-inner { flex-direction: column; }
+  .createrow-inner input { padding: 12px 14px; font-size: 1rem; }
+  .createrow-inner .btn { width: 100%; }
+
+  /* menus full-width-ish and tappable */
+  .menu { min-width: 200px; }
+  .menu button { padding: 14px 16px; font-size: 1rem; }
+  .iconbtn { padding: 12px 14px; font-size: 1.4rem; }
 }
 
 /* session management additions */
