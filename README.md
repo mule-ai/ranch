@@ -4,6 +4,11 @@ A personal terminal multiplexer with a cloud relay. Long-lived sessions
 on your own machine — reachable from your terminal, your phone, or any
 browser.
 
+**[⚡ Try the live demo](https://mule-ai.github.io/ranch/#/app)** — no
+sign-up; one tap runs a sandboxed shell and an agent in a public demo
+instance. Or watch the [Sever & Resume
+demo](https://forge.jbutler.dev) on the forge side.
+
 ![ranch web app](docs/screenshot-web-landing.png)
 
 Sessions keep running while you're away. Reconnect from any device and
@@ -44,6 +49,11 @@ building the APK locally.
 </details>
 
 ## Quick start
+
+> **No install needed to kick the tires:** the [live
+demo](https://mule-ai.github.io/ranch/#/app) signs you in to a shared
+demo machine — a QuickJS sandbox shell (no fs, no net) and a no-tools
+forge agent.
 
 ```sh
 ranch login           # Google sign-in (once per device)
@@ -134,6 +144,7 @@ In flight: Forge agent sessions end-to-end, mule workflow panes (M10).
 
 ## Docs
 
+- [⚡ Live demo](https://mule-ai.github.io/ranch/#/app) — sandbox shell + agent, no sign-up
 - [docs/SPEC.md](docs/SPEC.md) — research, architecture, milestone notes
 - [docs/PROTOCOL.md](docs/PROTOCOL.md) — the wire protocol
 - [Website](https://mule-ai.github.io/ranch/) · [Web app](https://mule-ai.github.io/ranch/#/app)
