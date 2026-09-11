@@ -1,5 +1,6 @@
 # Build release artifacts and publish them to the ranch-dist repo,
-# which the website links to. Runs on version tags (v*) and manually.
+# which the website links to. Runs on every push to main (nightly
+# releases tagged main-<short-sha>), on version tags (v*), and manually.
 #
 # Required secrets:
 #   DIST_TOKEN — a PAT (fine-grained: contents rw on mule-ai/ranch-dist)
@@ -9,6 +10,7 @@ name: release
 
 on:
   push:
+    branches: [main]
     tags: ["v*"]
   workflow_dispatch:
 
@@ -115,8 +117,12 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.DIST_TOKEN }}
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          [ "$VERSION" = "main" ] || VERSION="${VERSION:-$(date +%Y%m%d)}"
+          if [ "$GITHUB_REF" = "refs/heads/main" ]; then
+            VERSION="main-${GITHUB_SHA:0:7}"   # commit-stable, retry-safe
+          else
+            VERSION="${GITHUB_REF_NAME#v}"
+            [ "$VERSION" = "main" ] || VERSION="${VERSION:-$(date +%Y%m%d)}"
+          fi
           # normalize names for the website's versions.json
           SHA_LINUX=$(cat linux-binaries/ranch-linux-x86_64.tar.gz.sha256 2>/dev/null || echo "")
           SHA_APK=$(cat android-apk/ranch.apk.sha256 2>/dev/null || echo "")
@@ -148,8 +154,11 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          [ "$VERSION" = "main" ] && VERSION="nightly-$(date +%Y%m%d-%H%M)"
+          if [ "$GITHUB_REF" = "refs/heads/main" ]; then
+            VERSION="main-${GITHUB_SHA:0:7}"   # must match publish step
+          else
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
           TAG="v$VERSION"
           TITLE="ranch $VERSION"
           NOTES=$(cat <<'EON'
