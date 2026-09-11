@@ -77,9 +77,13 @@ export class Relay {
         15000
       );
       ch.subscribe((status) => {
+        // ANY status callback means the socket/channel is alive —
+        // touch() so the idle watchdog doesn't tear down a healthy
+        // but quiet connection (supabase-js's own heartbeat traffic
+        // doesn't flow through the broadcast listener).
+        this.touch();
         if (status === "SUBSCRIBED") {
           clearTimeout(timer);
-          this.lastInbound = Date.now();
           this.onStatus("online");
           this.onReady();
           resolve();

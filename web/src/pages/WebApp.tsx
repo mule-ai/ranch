@@ -147,8 +147,15 @@ function MachineClient({ machine, onBack }: { machine: Machine; onBack: () => vo
         }, 3000);
       };
       watchdog = setInterval(() => {
-        if (r && Date.now() - r.lastInboundAt() > 15000) {
-          r.ensureAlive(0); // 15s without ANY inbound frame -> force re-join
+        // 15s without ANY inbound frame/status → suspect a dead socket.
+        // ensureAlive(30000) compares against its own default window;
+        // the call only actually reconnects when the connection has
+        // truly been quiet past the threshold. (A previous version
+        // called ensureAlive(0), which reconnects unconditionally —
+        // every 5s forever whenever no broadcast happened to arrive,
+        // which looked like the page spazzing out on mobile.)
+        if (r && Date.now() - r.lastInboundAt() > 45000) {
+          r.ensureAlive(0);
         }
       }, 5000);
       unlisten = r.onFrame((f: Frame) => {
@@ -213,6 +220,12 @@ function MachineClient({ machine, onBack }: { machine: Machine; onBack: () => vo
         relay={relay}
         session={attached}
         onExit={() => {
+          setAttached(null);
+          relay.send({ t: "Hello", id: nextId(), client: "web" } as Frame);
+        }}
+        onKilled={() => {
+          // session ended under us — back to the list (the ⋯-menu kill
+          // path filters it there; this is the in-session kill button)
           setAttached(null);
           relay.send({ t: "Hello", id: nextId(), client: "web" } as Frame);
         }}
@@ -480,10 +493,12 @@ function Terminal({
   relay,
   session,
   onExit,
+  onKilled,
 }: {
   relay: Relay;
   session: SessionMeta;
   onExit: () => void;
+  onKilled: () => void;
 }) {
   const sessionId = session.id;
   const [panes, setPanes] = useState<Map<string, PaneSnap>>(new Map());
@@ -574,7 +589,12 @@ function Terminal({
           setHistory(f.lines);
           break;
         case "Meta":
-          if (f.kind === "exited") setConn("session ended");
+          if (f.kind === "exited" && f.session === sessionId) {
+            // the session died under us (killed from the list page,
+            // daily reset, another client) — leave the dead view
+            setConn("session ended");
+            onKilled();
+          }
           if (f.kind === "agent" && f.pane) {
             const cur = panesRef.current.get(f.pane);
             if (cur) {
@@ -702,6 +722,19 @@ function Terminal({
         <span className="title-inline">{session.name}</span>
         <span className="conn-badge">{conn}</span>
         <span className="spacer" />
+        {/* kill the whole session — the ⋯ menu on the list page only
+            works from there; inside the session there was no way to
+            end it (kill pane is disabled for single-pane sessions) */}
+        <button
+          className="keybtn keybtn-danger"
+          title="kill session"
+          onClick={() => {
+            relay.send({ t: "SessionsKill", session: sessionId } as Frame);
+            onKilled();
+          }}
+        >
+          kill session
+        </button>
         {/* pane management: split / kill on the focused pane */}
         <button
           className="keybtn"

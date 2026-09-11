@@ -341,3 +341,5 @@ footer { text-align: center; color: var(--dim); font-size: 0.85rem; padding: 24p
 .btn-agent { background: var(--purple); border-color: var(--purple); color: #fff; }
 .btn-agent:hover { background: #b96fff; border-color: #b96fff; }
 .keybtn-on { border-color: var(--accent); color: var(--accent); }
+.keybtn-danger { color: var(--danger); }
+.keybtn-danger:hover { border-color: var(--danger); background: rgba(248,113,113,0.08); }
