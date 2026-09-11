@@ -14,9 +14,15 @@ import {
 } from "../lib/frames";
 import { PaneView, Rect, FS, LH } from "../components/PaneView";
 import { supabase } from "../lib/supabase";
+import { demoAvailable } from "../lib/demo";
 import { Login } from "./Login";
 
 type Machine = { id: string; name: string; last_seen_at: string | null };
+
+// HH:MM from a UTC ISO timestamp ("YYYY-MM-DDTHH:MM:SSZ"); null if absent.
+function tsOf(s?: string) {
+  return s && s.length >= 16 ? s.slice(11, 16) : null;
+}
 
 function layoutRects(l: Layout, x: number, y: number, w: number, h: number): Rect[] {
   if (l.k === "Leaf") return [{ pane: l.pane, x, y, w, h }];
@@ -125,6 +131,7 @@ function MachineClient({ machine, onBack }: { machine: Machine; onBack: () => vo
     let r: Relay | null = null;
     let retryTimer: ReturnType<typeof setInterval> | null = null;
     let unlisten: (() => void) | null = null;
+    let watchdog: ReturnType<typeof setInterval> | null = null;
     (async () => {
       setSessions(null);
       setErr("");
@@ -139,7 +146,13 @@ function MachineClient({ machine, onBack }: { machine: Machine; onBack: () => vo
           if (!gotHello) hello();
         }, 3000);
       };
+      watchdog = setInterval(() => {
+        if (r && Date.now() - r.lastInboundAt() > 15000) {
+          r.ensureAlive(0); // 15s without ANY inbound frame -> force re-join
+        }
+      }, 5000);
       unlisten = r.onFrame((f: Frame) => {
+        r!.touch();
         switch (f.t) {
           case "HelloOk":
             gotHello = true;
@@ -175,6 +188,7 @@ function MachineClient({ machine, onBack }: { machine: Machine; onBack: () => vo
     return () => {
       unlisten?.();
       if (retryTimer) clearInterval(retryTimer);
+      if (watchdog) clearInterval(watchdog);
       r?.leave();
       setRelay(null);
       setSessions(null);
@@ -314,7 +328,12 @@ function SessionRow({
 
 function CreateRow({ relay }: { relay: Relay | null }) {
   const [name, setName] = useState("");
-  const [kind, setKind] = useState<"shell" | "forge" | "pi">("shell");
+  // Demo build: no forge on the demo machine — the agent is a local no-tools
+  // pi pane; the only other kind is the qjs sandbox shell.
+  const kinds = demoAvailable
+    ? (["shell", "pi"] as const)
+    : (["shell", "forge", "pi"] as const);
+  const [kind, setKind] = useState<(typeof kinds)[number]>("shell");
   const [piDir, setPiDir] = useState<string | null>(null);
   const [dirBrowse, setDirBrowse] = useState<{ path: string; parent: string | null; dirs: string[] } | null>(null);
   const [resumeList, setResumeList] = useState<{ id: string; title: string; updated: string; ended?: string | null }[] | null>(null);
@@ -354,22 +373,24 @@ function CreateRow({ relay }: { relay: Relay | null }) {
   return (
     <div className="createrow">
       <div className="kindrow">
-        {(["shell", "forge", "pi"] as const).map((k) => (
-          <button key={k} className={"chip" + (kind === k ? " chip-on" : "")} onClick={() => setKind(k)}>
-            {k === "forge" ? "agent" : k}
+        {(kinds as readonly string[]).map((k) => (
+          <button key={k} className={"chip" + (kind === k ? " chip-on" : "")} onClick={() => setKind(k as (typeof kinds)[number])}>
+            {k === "forge" ? "agent" : k === "pi" ? (demoAvailable ? "agent" : "pi") : k}
           </button>
         ))}
-        <button
-          className="chip"
-          onClick={() => {
-            if (!relay) return;
-            const rid = nextId();
-            resumeReqRef.current = rid;
-            relay.send({ t: "ForgeList", id: nextId(), client: "web", req_id: rid } as Frame);
-          }}
-        >
-          resume…
-        </button>
+        {!demoAvailable && (
+          <button
+            className="chip"
+            onClick={() => {
+              if (!relay) return;
+              const rid = nextId();
+              resumeReqRef.current = rid;
+              relay.send({ t: "ForgeList", id: nextId(), client: "web", req_id: rid } as Frame);
+            }}
+          >
+            resume…
+          </button>
+        )}
       </div>
 
       {kind === "pi" && (
@@ -431,16 +452,17 @@ function CreateRow({ relay }: { relay: Relay | null }) {
           onChange={(e) => setName(e.target.value)}
           onKeyDown={(e) => e.key === "Enter" && create()}
           placeholder={
-            kind === "forge"
-              ? "agent name (lab forge)"
-              : kind === "pi"
-                ? "local pi name (optional)"
-                : "new session name (optional)"
+            kind === "pi"
+              ? "agent name (local pi, no tools)"
+              : "new session name (optional)"
           }
           autoCapitalize="none"
         />
-        <button className={"btn btn-primary" + (kind === "forge" ? " btn-agent" : "")} onClick={create}>
-          {kind === "forge" ? "agent" : "new"}
+        <button
+          className={"btn btn-primary" + (kind !== "shell" ? " btn-agent" : "")}
+          onClick={create}
+        >
+          {kind === "shell" ? "new" : "agent"}
         </button>
       </div>
     </div>
@@ -722,12 +744,15 @@ function Terminal({
               .map((m, i) =>
                 m.role === "tool" ? (
                   <details key={i} className="toolrow">
-                    <summary>⚙ {m.tool_name || "tool"}{m.duration_ms != null ? ` · ${m.duration_ms}ms` : ""}</summary>
+                    <summary>⚙ {m.tool_name || "tool"}{m.duration_ms != null ? ` · ${m.duration_ms}ms` : ""}{tsOf(m.created_at) ? ` · ${tsOf(m.created_at)}` : ""}</summary>
                     {m.tool_output && <pre className="toolout">{m.tool_output}</pre>}
                   </details>
                 ) : (
                   <div key={i} className={"bubble " + (m.role === "user" ? "bubble-user" : "bubble-agent")}>
                     {m.text}
+                    {tsOf(m.created_at) && (
+                      <span className="bubble-ts">{tsOf(m.created_at)}</span>
+                    )}
                   </div>
                 )
               )}

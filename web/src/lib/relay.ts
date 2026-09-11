@@ -40,6 +40,7 @@ export class Relay {
     // supabase-js unwraps the phoenix payload; the daemon wraps frames as
     // {event:"frame", payload:<frame>}, so `payload` here IS the frame.
     ch.on("broadcast", { event: "frame" }, ({ payload }) => {
+      this.lastInbound = Date.now();
       const f = payload as Frame | undefined;
       if (!f || typeof f !== "object" || !("t" in f)) return;
       if (f.t === "Chunk") {
@@ -78,6 +79,7 @@ export class Relay {
       ch.subscribe((status) => {
         if (status === "SUBSCRIBED") {
           clearTimeout(timer);
+          this.lastInbound = Date.now();
           this.onStatus("online");
           this.onReady();
           resolve();
@@ -86,12 +88,53 @@ export class Relay {
           status === "TIMED_OUT" ||
           status === "CLOSED"
         ) {
-          // don't reject after the initial join — supabase-js resubscribes
-          // automatically; onReady fires again when it's back
+          // supabase-js is supposed to resubscribe on its own, but in
+          // practice a half-dead socket (laptop sleep, NAT timeout) can
+          // leave the channel erroring forever without a fresh join.
+          // Tear the channel down and re-join from scratch.
           this.onStatus("reconnecting…");
+          this.reconnectSoon();
         }
       });
     });
+  }
+
+  /** inbound frame watchdog state */
+  private lastInbound = Date.now();
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+
+  /** Tear down + re-join after a short delay (deduped). */
+  private reconnectSoon() {
+    if (this.reconnectTimer) return;
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      if (!this.channel) return;
+      try {
+        this.channel.unsubscribe();
+        supabase.removeChannel(this.channel);
+      } catch {
+        /* already gone */
+      }
+      this.channel = null;
+      this.join().catch(() => this.reconnectSoon());
+    }, 2000);
+  }
+
+  /** Force a reconnect if no frames (of any kind) arrived recently.
+   *  Screens call this when the UI looks stuck. */
+  ensureAlive(maxAgeMs = 30000) {
+    if (Date.now() - this.lastInbound < maxAgeMs) return;
+    this.lastInbound = Date.now();
+    this.reconnectSoon();
+  }
+
+  /** note inbound activity (any frame) so ensureAlive doesn't fire */
+  touch() {
+    this.lastInbound = Date.now();
+  }
+
+  lastInboundAt() {
+    return this.lastInbound;
   }
 
   send(f: Frame) {

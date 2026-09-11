@@ -1,0 +1,29 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><style>
+  body { margin:0; background:#16181d; font-family: ui-monospace, "JetBrains Mono", Menlo, monospace; }
+  #term { padding: 24px; width: fit-content; }
+  pre { margin:0; font-size: 15px; line-height: 1.25; }
+</style></head>
+<body><div id="term"><pre id="out"></pre></div>
+<script type="module">
+  import { parseSgrRow } from "./sgr.js";
+  const buf = await (await fetch("./capture.bin")).arrayBuffer();
+  const text = new TextDecoder().decode(buf);
+  // strip private-mode sequences the TUI emits (cursor hide etc.) — sgrToSpans handles SGR
+  const el = document.getElementById("out");
+  // simple render: split lines, each through sgrToSpans
+  for (const line of text.split("\n")) {
+    const div = document.createElement("div");
+    for (const span of parseSgrRow(line)) {
+      const s = document.createElement("span");
+      s.textContent = span.text;
+      if (span.fg) s.style.color = span.fg;
+      if (span.bg) s.style.background = span.bg;
+      if (span.bold) s.style.fontWeight = "700";
+      if (span.italic) s.style.fontStyle = "italic";
+      div.appendChild(s);
+    }
+    el.appendChild(div);
+  }
+  window.__rendered = true;
+</script></body></html>

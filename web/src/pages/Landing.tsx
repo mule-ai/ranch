@@ -1,12 +1,27 @@
 import { useEffect, useState } from "react";
 import { Link } from "../lib/router";
 import { Release, fetchLatest } from "../lib/releases";
+import { demoAvailable, signInDemo } from "../lib/demo";
 
 export function Landing() {
   const [rel, setRel] = useState<Release | null>(null);
+  const [demoBusy, setDemoBusy] = useState(false);
+  const [demoErr, setDemoErr] = useState("");
   useEffect(() => {
     fetchLatest().then(setRel);
   }, []);
+
+  const startDemo = async () => {
+    setDemoErr("");
+    setDemoBusy(true);
+    try {
+      await signInDemo();
+      window.location.href = "/app";
+    } catch (e: any) {
+      setDemoErr(e.message ?? "demo sign-in failed");
+      setDemoBusy(false);
+    }
+  };
 
   return (
     <div className="page">
@@ -21,7 +36,17 @@ export function Landing() {
         <div className="hero-actions">
           <Link to="/download" className="btn btn-primary">Download</Link>
           <Link to="/app" className="btn btn-ghost">Open web app →</Link>
+          {demoAvailable && (
+            <button
+              className="btn btn-ghost"
+              onClick={startDemo}
+              disabled={demoBusy}
+            >
+              {demoBusy ? "starting…" : "Try the live demo"}
+            </button>
+          )}
         </div>
+        {demoErr !== "" && <p className="err">{demoErr}</p>}
         <pre className="hero-term" aria-hidden>
 {`$ ranch new work
 ✓ session 'work' created (pane 1)
