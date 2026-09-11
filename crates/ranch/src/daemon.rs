@@ -930,47 +930,47 @@ impl Daemon {
             }
         }
 
-        // forge worker: chat-pane polling + sends on a dedicated thread
-        // (blocking HTTP must never stall the poll loop); results come
-        // back as frame lines on a pipe, read like any client below
-        let forge_tx = if let Some(fcfg) = forge::load_forge_config() {
-            // the forge worker gets its OWN pipe pair: worker frames ->
-            // daemon (daemon_r/daemon_w); the second pair is ignored
-            // (make_pipes always returns two)
-            match relay::make_pipes() {
-                Ok(((f_daemon_r, f_daemon_w), (_u1, _u2))) => {
-                    let (tx, rx) = std::sync::mpsc::channel();
-                    if let Ok(clone) = f_daemon_w.try_clone() {
-                        daemon.forge_pipe_w =
-                            Some(std::sync::Arc::new(std::sync::Mutex::new(clone)));
-                    }
-                    forge::spawn_worker(fcfg, f_daemon_w, rx);
-                    let fclient = Client {
-                        stream: None,
-                        relay_out: None,
-                        relay_in: Some(fd_file(f_daemon_r)),
-                        decoder: Decoder::new(),
-                        name: "forge".into(),
-                        attach: None,
-                        scrollback_mode: false,
-                        file_watches: BTreeMap::new(),
-                    };
-                    if let Some(rfd) = fclient.relay_in.as_ref().map(|f| f.as_raw_fd()) {
-                        daemon.clients.insert(rfd, fclient);
-                        eprintln!("ranchd: forge: worker started (pipe fd {rfd})");
-                    }
-                    Some(tx)
+        // agent frame pipe: the forge worker AND local-pi reader threads
+        // both write frames to this pipe; the poll loop reads them via the
+        // "forge" client below. The pipe must exist even when the forge
+        // API is not configured — local pi panes (kind "pi") use it too,
+        // and without it they are dead on arrival on forge-less daemons.
+        let forge_cfg = forge::load_forge_config();
+        match relay::make_pipes() {
+            Ok(((f_daemon_r, f_daemon_w), (_u1, _u2))) => {
+                if let Ok(clone) = f_daemon_w.try_clone() {
+                    daemon.forge_pipe_w =
+                        Some(std::sync::Arc::new(std::sync::Mutex::new(clone)));
                 }
-                Err(e) => {
-                    eprintln!("ranchd: forge: disabled: {e}");
-                    None
+                let fclient = Client {
+                    stream: None,
+                    relay_out: None,
+                    relay_in: Some(fd_file(f_daemon_r)),
+                    decoder: Decoder::new(),
+                    name: "forge".into(),
+                    attach: None,
+                    scrollback_mode: false,
+                    file_watches: BTreeMap::new(),
+                };
+                if let Some(rfd) = fclient.relay_in.as_ref().map(|f| f.as_raw_fd()) {
+                    daemon.clients.insert(rfd, fclient);
+                    eprintln!("ranchd: agent pipe ready (fd {rfd})");
+                }
+                if let Some(fcfg) = forge_cfg {
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    forge::spawn_worker(fcfg, f_daemon_w, rx);
+                    eprintln!("ranchd: forge: worker started");
+                    daemon.forge_tx = Some(tx);
+                } else {
+                    eprintln!("ranchd: forge: disabled (no forge_api_key in daemon.toml); agent pipe available for local pi panes");
+                    // f_daemon_w drops here; the clone in forge_pipe_w
+                    // keeps the pipe write side open for pi readers.
                 }
             }
-        } else {
-            eprintln!("ranchd: forge: disabled (no forge_api_key in daemon.toml)");
-            None
-        };
-        daemon.forge_tx = forge_tx;
+            Err(e) => {
+                eprintln!("ranchd: agent pipe init failed: {e} (pi panes will not work)");
+            }
+        }
         Ok(daemon)
     }
 
