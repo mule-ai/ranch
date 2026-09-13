@@ -871,6 +871,7 @@ fn snapshot_session(s: &Session) -> Option<Frame> {
             chat: None,
             forge_session: None,
             model: None,
+            cwd: pane_cwd(p.child).map(|p| p.to_string_lossy().into_owned()),
         };
         if *pid == s.active {
             active_seq = p.seq;
@@ -890,6 +891,7 @@ fn snapshot_session(s: &Session) -> Option<Frame> {
             chat: Some(cp.chat.clone()),
             forge_session: Some(cp.forge_sid.to_string()),
             model: cp.model.clone(),
+            cwd: None,
         });
     }
     Some(Frame::Snapshot {
