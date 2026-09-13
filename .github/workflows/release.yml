@@ -48,7 +48,9 @@ jobs:
           RANCH_ZIG: ${{ github.workspace }}/.tools/zig/zig
           CC_x86_64_unknown_linux_musl: ${{ github.workspace }}/tools/zig-cc
         run: |
-          cargo build --release --target x86_64-unknown-linux-musl
+          # baked into the binary; HelloOk reports it so clients can
+          # flag stale installs (same string as versions.json below)
+          RANCH_VERSION="main-${GITHUB_SHA:0:7}" cargo build --release --target x86_64-unknown-linux-musl
           file target/x86_64-unknown-linux-musl/release/ranch
           file target/x86_64-unknown-linux-musl/release/ranch | grep -qE "statically linked|static-pie"
       - name: Smoke test (host target)
@@ -93,6 +95,8 @@ jobs:
       - name: Build APK
         working-directory: mobile
         run: |
+          # update banner: compared with versions.json's version field
+          echo "EXPO_PUBLIC_APP_VERSION=main-${GITHUB_SHA:0:7}" >> "$GITHUB_ENV"
           npm install
           npx expo prebuild --platform android --no-install
           python3 apply-signing.py

@@ -6,6 +6,7 @@ import {
   BackHandler,
   FlatList,
   Keyboard,
+  Linking,
   Pressable,
   StyleSheet,
   Text,
@@ -13,6 +14,7 @@ import {
   View,
 } from "react-native";
 import { supabase } from "./lib/supabase";
+import { checkUpdate, type UpdateInfo } from "./lib/version";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { Relay } from "./lib/relay";
 import { Frame, ForgeSessionInfo, ProfileSummary, SessionMeta, nextId } from "./lib/frames";
@@ -106,6 +108,14 @@ export default function App() {
     return () => sub.remove();
   }, [attached, machine]);
 
+  // update banner: this APK vs the published release; and the daemon
+  // binary vs this APK (HelloOk.version)
+  const [update, setUpdate] = useState<UpdateInfo | null>(null);
+  const [daemonVersion, setDaemonVersion] = useState<string | null>(null);
+  useEffect(() => {
+    checkUpdate().then(setUpdate).catch(() => {});
+  }, []);
+
   // auth state
   useEffect(() => {
     supabase.auth.getSession().then(({ data }) => setAuthed(!!data.session));
@@ -163,6 +173,7 @@ export default function App() {
               retryTimer = null;
             }
             setSessions(f.sessions);
+            if (f.version) setDaemonVersion(f.version);
             // hot upgrade: the daemon is back with the new binary
             setUpgrading(false);
             break;
@@ -242,7 +253,27 @@ export default function App() {
   }
 
   if (!machine) {
-    return <MachinesScreen onPick={(m) => setMachine(m)} />;
+    return (
+      <View style={{ flex: 1 }}>
+        <MachinesScreen onPick={(m) => setMachine(m)} />
+        {update && (
+          <Text
+            style={{
+              color: "#f59e0b", backgroundColor: "rgba(245,158,11,0.12)",
+              padding: 10, fontSize: 13, textAlign: "center",
+            }}
+          >
+            update available —{" "}
+            <Text
+              style={{ color: "#f59e0b", fontWeight: "700" }}
+              onPress={() => Linking.openURL(update.apkUrl)}
+            >
+              download {update.latest}
+            </Text>
+          </Text>
+        )}
+      </View>
+    );
   }
 
   // Terminal is attached full-screen above the tab bar; everything else
@@ -313,6 +344,11 @@ export default function App() {
           <Text style={s.menu}>⋯</Text>
         </Pressable>
       </View>
+      {daemonVersion !== null && daemonVersion !== "dev" && update && daemonVersion !== update.latest && (
+        <Text style={s.updateNote}>
+          daemon runs {daemonVersion} — latest is {update.latest}; update the daemon ("ranch upgrade" or reinstall)
+        </Text>
+      )}
       {tab === "sessions" && (
         <>
           {err !== "" && <Text style={s.err}>{err}</Text>}
@@ -629,6 +665,7 @@ const s = StyleSheet.create({
   btnText: { color: "#fff", fontWeight: "700" },
   // header machine menu + bottom tab bar
   menu: { color: "#9ca3af", fontSize: 20, paddingHorizontal: 6, fontWeight: "700" },
+  updateNote: { color: "#f59e0b", fontSize: 12, paddingVertical: 4 },
   tabbar: {
     position: "absolute", bottom: 0, left: 0, right: 0,
     flexDirection: "row", backgroundColor: "#121218",

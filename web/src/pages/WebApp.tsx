@@ -15,6 +15,7 @@ import {
 import { PaneView, Rect, FS, LH } from "../components/PaneView";
 import { supabase } from "../lib/supabase";
 import { demoAvailable } from "../lib/demo";
+import { checkUpdate, type UpdateInfo } from "../lib/version";
 import { Login } from "./Login";
 import { AgentsPage } from "./AgentsPage";
 import { WorkflowsPage } from "./WorkflowsPage";
@@ -48,6 +49,11 @@ function layoutRects(l: Layout, x: number, y: number, w: number, h: number): Rec
 export function WebApp() {
   const [authed, setAuthed] = useState<boolean | null>(null);
   const [machine, setMachine] = useState<Machine | null>(null);
+  // update banner (stale client vs the published release)
+  const [update, setUpdate] = useState<UpdateInfo | null>(null);
+  useEffect(() => {
+    checkUpdate().then(setUpdate).catch(() => {});
+  }, []);
 
   useEffect(() => {
     supabase.auth.getSession().then(({ data }) => setAuthed(!!data.session));
@@ -62,8 +68,23 @@ export function WebApp() {
     return <p className="dim center">…</p>;
   if (!authed) return <Login onSignedIn={() => setAuthed(true)} />;
   if (!machine)
-    return <MachinePicker onPick={setMachine} onSignOut={() => supabase.auth.signOut()} />;
+    return (
+      <>
+        <MachinePicker onPick={setMachine} onSignOut={() => supabase.auth.signOut()} />
+        {update && <UpdateBanner update={update} />}
+      </>
+    );
   return <MachineClient machine={machine} onBack={() => setMachine(null)} />;
+}
+
+function UpdateBanner({ update, daemon }: { update: UpdateInfo; daemon?: string | null }) {
+  return (
+    <p className="err" style={{ background: "rgba(245,158,11,0.12)", color: "#f59e0b", margin: "8px 16px" }}>
+      update available: this build is older than {update.latest} —{" "}
+      <a href={update.apkUrl} style={{ color: "#f59e0b" }}>get the latest</a>
+      {daemon ? <> · daemon runs {daemon} (restart ranchd after updating)</> : null}
+    </p>
+  );
 }
 
 function MachinePicker({
@@ -123,6 +144,12 @@ function MachinePicker({
 
 function MachineClient({ machine, onBack }: { machine: Machine; onBack: () => void }) {
   const [relay, setRelay] = useState<Relay | null>(null);
+  // update banner (stale client vs the published release)
+  const [update, setUpdate] = useState<UpdateInfo | null>(null);
+  const [daemonVersion, setDaemonVersion] = useState<string | null>(null);
+  useEffect(() => {
+    checkUpdate().then(setUpdate).catch(() => {});
+  }, []);
   const [sessions, setSessions] = useState<SessionMeta[] | null>(null);
   // null = sessions view; "agents" / "workflows" = builder pages
   const [view, setView] = useState<null | "agents" | "workflows" | "triggers">(null);
@@ -173,6 +200,7 @@ function MachineClient({ machine, onBack }: { machine: Machine; onBack: () => vo
             if (retryTimer) { clearInterval(retryTimer); retryTimer = null; }
             setSessions(f.sessions);
             setConn("online");
+            if (f.version) setDaemonVersion(f.version);
             // hot upgrade: daemon is back with the new binary
             setUpgrading(false);
             break;
@@ -251,6 +279,7 @@ function MachineClient({ machine, onBack }: { machine: Machine; onBack: () => vo
         <span className="conn-badge">{conn}</span>
       </p>
       {err !== "" && <p className="err">{err}</p>}
+      {update && <UpdateBanner update={update} daemon={daemonVersion} />}
 
       {view === "agents" && (
         <AgentsPage

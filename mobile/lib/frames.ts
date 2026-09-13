@@ -163,7 +163,7 @@ export type PaneMeta = {
 
 export type Frame =
   | { t: "Hello"; id: string; client: string; caps?: string[] }
-  | { t: "HelloOk"; id: string; machine: string; sessions: SessionMeta[] }
+  | { t: "HelloOk"; id: string; machine: string; sessions: SessionMeta[]; version?: string | null }
   | { t: "Attach"; id: string; client: string; session: string; pane?: string }
   | { t: "Detach"; id: string; client: string }
   | {

@@ -29,6 +29,11 @@ pub enum Frame {
         id: String,
         machine: String,
         sessions: Vec<SessionMeta>,
+        /// daemon build version (git sha based, e.g. "main-82c0643";
+        /// "dev" for local builds). Clients compare with their own
+        /// version + the dist release index to surface update banners.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        version: Option<String>,
     },
     /// Client -> daemon: attach to a session (and optionally a pane).
     Attach {

@@ -38,6 +38,8 @@ jobs:
           VITE_DEMO_EMAIL: ranch-demo@jbutler.dev
           VITE_DEMO_PASSWORD: ranch-demo-2026
         run: |
+          # update banner: compared with versions.json's version field
+          echo "VITE_APP_VERSION=main-${GITHUB_SHA:0:7}" >> "$GITHUB_ENV"
           npm ci
           npm run build
       - name: Upload Pages artifact
