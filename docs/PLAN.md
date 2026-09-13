@@ -305,6 +305,12 @@ TriggerRun {trigger, req_id}/TriggerRunOk, TriggerFired {trigger, job}
 both fire without any client attached; dashboard shows last-run
 status; disabling stops firing.
 
+**Status**: implemented (2026-09-13). Cron + event + webhook kinds
+with catch-up; event hooks at agent-turn-ended, workflow-completed,
+file-change, and webhook arrival; registry persisted in state.json
+and mirrored to the `triggers` table. Live-verified: trigger CRUD
+over the socket, bad-cron rejection, webhook-event firing.
+
 ---
 
 ## Phase E — Webhook receiver (relay)
@@ -351,6 +357,15 @@ status; disabling stops firing.
 `curl -X POST <url> -H "X-Ranch-Signature: …" -d '{"alert":…}'` →
 workflow runs on the machine; wrong signature → 401; log shows the
 attempt; second user's webhook cannot target my machine.
+
+**Status**: implemented and deployed (project `prqfseydoxyingbkmiic`,
+2026-09-13). Migration 0007 + `webhook-relay` edge function live;
+verified end-to-end: signed POST → 202 → broadcast → relay → daemon
+→ webhook triggers fire → `TriggerFired` broadcast; bad/stale
+signatures → 401; per-webhook log rows written. Gotchas baked into
+the function: REST broadcast topics carry no `realtime:` prefix,
+private channels need `private: true` per message, and the REST path
+wraps the payload one extra time on the wire.
 
 ---
 

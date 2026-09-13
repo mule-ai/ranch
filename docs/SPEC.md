@@ -143,8 +143,8 @@ One process per machine (systemd user unit; `ranch daemon` /
     rows; hot-upgrade-safe (pipes fd-inherited).
   - *mule worker*: workflow CRUD proxy + run streaming (mule WS hub
     events → workflow pane rows).
-  - *trigger scheduler* **- todo**: cron + event evaluation (§6).
-  - *webhook listener* **- todo**: authenticated inbound events (§7).
+  - *trigger scheduler*: cron + event evaluation (§6) — done.
+  - *webhook listener*: authenticated inbound events (§7) — done.
 
 ### 2.3 Clients
 
@@ -160,12 +160,12 @@ parity for every user-facing capability:
 | agent chat panes (forge + pi) | ✅ bubbles | ✅ bubbles | ✅ bubbles |
 | agent model picker | ✅ | ✅ | ✅ |
 | file browser + editor + md review | ✅ | ✅ | ✅ |
-| forge agent builder (profiles) | ✅ **- todo** | ✅ **- todo** | ✅ **- todo** |
-| mule workflow CRUD + run | ✅ **- todo** | ✅ **- todo** | ✅ **- todo** |
-| workflow run panes | ✅ **- todo** | ✅ **- todo** | ✅ **- todo** |
-| triggers (cron/event) management | ✅ **- todo** | ✅ **- todo** | ✅ **- todo** |
+| forge agent builder (profiles) | ✅ | ✅ | ✅ |
+| mule workflow CRUD + run | ✅ | ✅ | ✅ |
+| workflow run panes | ✅ | ✅ | ✅ |
+| triggers (cron/event) management | ✅ | ✅ | ✅ |
 | agent spawn/steer/close tools | daemon-side | daemon-side | daemon-side |
-| webhook receiver config | ✅ **- todo** | ✅ **- todo** | ✅ **- todo** |
+| webhook receiver config | ✅ | ✅ | ✅ |
 
 The web client is the reference thin client (browser = phone = TUI).
 Local TUI additionally owns tmux-style keyboard bindings; mobile adds
@@ -230,7 +230,7 @@ fixes).
   session overrides). Working/idle metas power the typing indicator on
   all clients.
 
-### 5.2 Agent configuration (agent builder) **- todo**
+### 5.2 Agent configuration (agent builder) — done
 
 Goal: build and configure a forge agent without leaving ranch — on any
 surface. Ranch becomes the configuration front-end for forge.
@@ -257,7 +257,7 @@ ProfileDelete` and `SkillList/SkillGet` in ranch-protocol, proxied by
 the forge worker (same worker/pipe pattern as ForgeList today). No
 forge API key ever reaches a client.
 
-### 5.3 Agents for agents: the ranch tool surface **- todo**
+### 5.3 Agents for agents: the ranch tool surface — done
 
 Agents running in ranch (forge or pi panes) get **ranch tools** so they
 can orchestrate visibly:
@@ -307,7 +307,7 @@ bridge for its own agents; ranch is the policy point either way.
 
 ## 6. Workflows: mule
 
-### 6.1 Workflow panes and CRUD **- todo**
+### 6.1 Workflow panes and CRUD — done
 
 The mule worker (daemon) proxies mule's REST + WS surfaces into ranch
 frames; clients never talk to mule directly (no mule credentials on
@@ -329,7 +329,7 @@ devices):
 - **Status** — `meta {kind:"workflow", status:"running"|"completed"|
   "failed", job_id}` per workflow pane; dashboard badges.
 
-### 6.2 Triggers **- todo**
+### 6.2 Triggers — done
 
 Workflows run without a human present. Ranch (daemon-side trigger
 scheduler) supports three trigger types, managed as first-class
@@ -369,7 +369,7 @@ so the dashboard can show upcoming/last runs for offline machines.
 
 ---
 
-## 7. Webhook receiver (relay) **- todo**
+## 7. Webhook receiver (relay) — done (deployed; see history)
 
 External systems (GitHub, CI, mule itself, forge) need to start work
 on a machine. Supabase Edge Function `webhook-relay` (deployed in the
@@ -474,7 +474,7 @@ types ignored (extensibility rule), chunking for oversized payloads.
 
 Existing: `machines`, `sessions` (mirror), `realtime.messages` RLS.
 
-Added by this spec **- todo**:
+Added by this spec (deployed to the project):
 
 - `triggers` (mirror of daemon state; RLS owner-only) — see §6.2 for
   shape; `machine_id` FK.
@@ -529,7 +529,7 @@ ranch/
 ├── mobile/               Expo/Android app
 ├── supabase/
 │   ├── migrations/       schema + RLS (+ webhooks, triggers, log)
-│   └── functions/        edge functions (webhook-relay) *- todo
+│   └── functions/        edge functions (webhook-relay) — deployed
 ├── systemd/ranchd.service
 ├── docs/                 SPEC, PLAN, PROTOCOL, design/, history/
 ├── vendor/ghostty/       pinned ghostty source (gitignored)
