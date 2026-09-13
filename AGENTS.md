@@ -1,20 +1,34 @@
 # Ranch — Agent Instructions
 
-Personal terminal multiplexer with a cloud relay. Long-lived terminal
-sessions on your machine, reachable from a local terminal (Linux-first),
-an Android app, and — by design — from anywhere later. This is a tmux
-**replacement**, not a companion; Forge agent sessions and Mule workflows
-are first-class pane types.
+A workbench for humans and agents, built on a terminal multiplexer.
+Long-lived terminal sessions on your machine, reachable from a local
+terminal (Linux-first), a browser, and an Android app. This is a tmux
+**replacement**, not a companion; Forge agent sessions and Mule
+workflows are first-class pane types.
 
-Read `docs/SPEC.md` (architecture, security model, milestones M0–M4 and
-M5–M9 completion notes) and `docs/PROTOCOL.md` (wire protocol) before
-making non-trivial changes. They are the source of truth; keep them in
-sync when behavior changes.
+Read before making non-trivial changes (they are the source of truth;
+keep them in sync when behavior changes):
+
+- `docs/SPEC.md` — the target system: architecture, tenants, the forge/
+  mule/webhook/agent-tool surfaces, security model.
+- `docs/PLAN.md` — the implementation plan, grounded in the code.
+- `docs/PROTOCOL.md` — wire protocol (shipped frames + §8 planned
+  frame families).
+- `docs/design/` — design docs with diagrams: agent-tools,
+  webhook-receiver, workflows-and-triggers, agent-builder.
+- `docs/history/` — archived spec versions and the milestone build log
+  (M0–M11 completion notes; historical record, do not update).
+
+New documentation goes in SPEC/PLAN/PROTOCOL/design; milestone
+completion notes continue in the build log (`docs/history/`, append a
+dated entry) rather than the target-system spec.
 
 ## Repository layout
 
 - `crates/ranch-protocol/` — frame types, JSON-lines framing, chunking
   (no I/O; pure data + tests). The one schema shared by every transport.
+  Planned frame families (agent tools, profiles, workflows, triggers,
+  webhooks) are spec'd in PROTOCOL.md §8 before they ship.
 - `crates/ranch-vt/` — hand-rolled FFI wrapper around `libghostty-vt`
   (pinned ghostty source). Server-side terminal emulation, one VT per
   pane. `build.rs` links against `vendor/lib/libghostty-vt.so`.
@@ -31,7 +45,11 @@ sync when behavior changes.
   `mobile/AGENTS.md` (and the versioned Expo v57 docs) before touching
   it. `mobile/CLAUDE.md` just points at `mobile/AGENTS.md`.
 - `supabase/migrations/` — schema + RLS (machines, sessions mirror,
-  Realtime channel gating, self-serve `register_machine` RPC).
+  Realtime channel gating, self-serve `register_machine` RPC);
+  `supabase/functions/` will hold the webhook-relay edge function
+  (PLAN Phase E).
+- `docs/` — SPEC (target system), PLAN, PROTOCOL, design/ diagrams,
+  history/ build log.
 - `systemd/ranchd.service` — user unit for the daemon.
 - `tools/relay-test.mjs` — raw Supabase Realtime test client.
 - `vendor/ghostty/` — shallow clone of pinned ghostty source (gitignored).
@@ -95,6 +113,14 @@ Rust workspace: edition 2024, stable toolchain (rustc 1.98 era).
   `pi --mode rpc` in the pane cwd and map RPC events to the same chat rows.
   A failed attach (e.g. forge down) must flash an error in the status bar,
   **not** `die()` the whole TUI (M8.4).
+- **Planned workers follow the worker pattern** (PLAN.md): any new
+  long-lived integration (mule, trigger scheduler, webhook handling) is
+  a worker thread with its OWN pipe pair, jobs via `mpsc`, frames
+  broadcast to clients like any other client frame, restart-safe across
+  hot upgrade.
+- **Feature parity is a requirement**: every user-facing capability
+  ships on TUI, web, and mobile (or is explicitly daemon-side). PLAN.md
+  tracks parity per phase.
 - **Session persistence & hot upgrade (M10).** Two layers, both live:
   - **Tier 1 (cold restart):** `state.json` is a restore source, not just
     an observability dump. On boot the daemon rebuilds every recorded

@@ -142,6 +142,31 @@ pub fn no_tools_configured() -> bool {
 }
 
 impl LocalPi {
+    /// Locate the ranch pi extension (agent tools). Shipped in-repo at
+    /// `tools/ranch-pi-ext/`; an install copies it to
+    /// `~/.local/share/ranch/ranch-pi-ext` or RANCH_EXT_DIR overrides.
+    fn ranch_ext_path() -> Option<std::path::PathBuf> {
+        if let Ok(dir) = std::env::var("RANCH_EXT_DIR") {
+            let p = std::path::PathBuf::from(dir);
+            if p.join("index.js").exists() {
+                return Some(p);
+            }
+        }
+        if let Ok(home) = std::env::var("HOME") {
+            let p =
+                std::path::PathBuf::from(home).join(".local/share/ranch/ranch-pi-ext");
+            if p.join("index.js").exists() {
+                return Some(p);
+            }
+        }
+        // dev: the repo checkout (daemon run via `make run` from the repo)
+        let rel = std::path::PathBuf::from("tools/ranch-pi-ext");
+        if rel.join("index.js").exists() {
+            return Some(rel);
+        }
+        None
+    }
+
     /// Spawn `pi --mode rpc` in `cwd`. Registers itself in `panes`;
     /// the stdout reader thread starts immediately and emits
     /// Chat/Meta frames into `pipe` (session left blank — the main
@@ -157,6 +182,28 @@ impl LocalPi {
         child.arg("--mode").arg("rpc");
         if no_tools {
             child.arg("--no-tools");
+        }
+        // agent tools (Phase A): when the loopback control API is up,
+        // load the ranch extension and hand the child its credentials
+        // (token + port exported by control_api::spawn; the pane id is
+        // per-child). The extension registers ranch_spawn et al.
+        let control = (
+            std::env::var("RANCH_CONTROL_TOKEN").ok(),
+            std::env::var("RANCH_CONTROL_PORT").ok(),
+        );
+        if let (Some(_tok), Some(_port)) = &control {
+            if let Some(ext) = Self::ranch_ext_path() {
+                // -e resolves against the CHILD's cwd — canonicalize so
+                // the extension loads regardless of spawn dir
+                let ext = std::fs::canonicalize(&ext)
+                    .unwrap_or(ext);
+                child.arg("-e").arg(&ext);
+            }
+        }
+        if let (Some(tok), Some(port)) = &control {
+            child.env("RANCH_CONTROL_TOKEN", tok);
+            child.env("RANCH_CONTROL_PORT", port);
+            child.env("RANCH_CONTROL_PANE", pane.to_string());
         }
         let mut child = child
             .current_dir(cwd)

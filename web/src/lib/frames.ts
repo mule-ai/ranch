@@ -44,7 +44,105 @@ export type ChatMsg = {
   created_at?: string;
 };
 
+
+// ----- agent builder (Phase B): forge profile CRUD proxy -----
+
+export type ProfileSummary = {
+  id: string;
+  name: string;
+  description?: string | null;
+  provider: string;
+  model: string;
+  working_dir?: string | null;
+  updated_at?: string | null;
+};
+
+export type Profile = {
+  id: string;
+  name: string;
+  description?: string | null;
+  provider: string;
+  model: string;
+  base_url?: string | null;
+  api_key?: string | null; // arrives redacted
+  working_dir?: string | null;
+  git_url?: string | null;
+  git_ref?: string | null;
+  nix_shell?: string | null;
+  system_prompt: string;
+  tools: string[];
+  updated_at?: string | null;
+};
+
+export type ProfileDraft = {
+  name: string;
+  description?: string | null;
+  provider: string;
+  model: string;
+  base_url?: string | null;
+  api_key?: string | null; // write-only
+  working_dir?: string | null;
+  git_url?: string | null;
+  git_ref?: string | null;
+  nix_shell?: string | null;
+  system_prompt?: string | null;
+  tools: string[];
+};
+
+// ----- agent tools (Phase A): agent-spawned panes -----
+
+export type ChatMsgDone = { pane: string; outcome: string; last?: string };
+
+
+// ----- workflows (Phase C): mule proxy -----
+
+export type WorkflowSummary = {
+  id: string;
+  name: string;
+  description?: string | null;
+  is_async?: boolean | null;
+  updated_at?: string | null;
+};
+
+export type WorkflowStep = {
+  id?: string | null;
+  step_order: number;
+  type: string; // "agent" | "wasm_module"
+  agent_id?: string | null;
+  wasm_module_id?: string | null;
+  config: unknown;
+};
+
+export type WorkflowDraft = {
+  name: string;
+  description?: string | null;
+  is_async: boolean;
+  steps: WorkflowStep[];
+};
+
 // Binary split tree, mirrors ranch_protocol::Layout
+
+// ----- triggers + webhooks (Phase D/E) -----
+
+export type TriggerRow = {
+  id?: string | null;
+  name: string;
+  workflow_id: string;
+  kind: "cron" | "event" | "webhook";
+  spec: { cron?: string; tz?: string; event?: string; filter?: Record<string, unknown>; source?: string };
+  input?: unknown;
+  enabled: boolean;
+  catch_up?: boolean;
+  last_run?: { job: string; at: number; status: string } | null;
+};
+
+export type WebhookRow = {
+  id: string;
+  name: string;
+  sources: string[];
+  enabled: boolean;
+  created_at?: string | null;
+};
 export type Layout =
   | { k: "Leaf"; pane: string }
   | { k: "Split"; dir: 0 | 1; pct: number; a: Layout; b: Layout };
@@ -109,6 +207,49 @@ export type Frame =
   | { t: "PaneResize"; session: string; pane: string; dir: 0 | 1; delta: number }
   | { t: "PaneKill"; session: string; pane: string }
   | { t: "Meta"; id: string; session: string; pane?: string; kind: string; status?: string; preview?: string }
+  | { t: "AgentSpawn"; req_id: string; caller_pane: string; caller_session: string; kind: string; profile_id?: string | null; name?: string | null; cwd?: string | null; prompt: string; mode?: string; callback?: boolean }
+  | { t: "AgentSpawnOk"; req_id: string; spawn_id: string; session: string; pane: string }
+  | { t: "AgentSpawnRequest"; spawn_id: string; caller_pane: string; kind: string; preview: string }
+  | { t: "AgentSpawnApprove"; spawn_id: string; allow: boolean }
+  | { t: "AgentSend"; req_id: string; caller_pane: string; session: string; pane: string; text: string; delivery?: string }
+  | { t: "AgentStatus"; req_id: string; caller_pane: string; pane: string }
+  | { t: "AgentStatusOk"; req_id: string; pane: string; state: string; model?: string | null }
+  | { t: "AgentRead"; req_id: string; caller_pane: string; pane: string; since_seq?: number; limit?: number }
+  | { t: "AgentReadOk"; req_id: string; pane: string; msgs: ChatMsg[] }
+  | { t: "AgentClose"; req_id: string; caller_pane: string; session: string; pane: string }
+  | { t: "AgentDone"; spawn_id: string; session: string; pane: string; outcome: string; last_row?: ChatMsg | null }
+  | { t: "ProfileList"; id: string; req_id: string }
+  | { t: "ProfileListOk"; id: string; req_id: string; profiles: ProfileSummary[] }
+  | { t: "ProfileGet"; id: string; req_id: string; profile: string }
+  | { t: "ProfileGetOk"; id: string; req_id: string; profile: Profile }
+  | { t: "ProfilePut"; id: string; req_id: string; profile_id?: string | null; draft: ProfileDraft }
+  | { t: "ProfilePutOk"; id: string; req_id: string; profile_id: string }
+  | { t: "ProfileDelete"; id: string; req_id: string; profile: string }
+  | { t: "ProfileDeleteOk"; id: string; req_id: string }
+  | { t: "WorkflowList"; id: string; req_id: string }
+  | { t: "WorkflowListOk"; id: string; req_id: string; workflows: WorkflowSummary[] }
+  | { t: "WorkflowGet"; id: string; req_id: string; workflow: string }
+  | { t: "WorkflowGetOk"; id: string; req_id: string; workflow: WorkflowSummary; steps: WorkflowStep[] }
+  | { t: "WorkflowPut"; id: string; req_id: string; workflow_id?: string | null; draft: WorkflowDraft }
+  | { t: "WorkflowPutOk"; id: string; req_id: string; workflow_id: string }
+  | { t: "WorkflowDelete"; id: string; req_id: string; workflow: string }
+  | { t: "WorkflowDeleteOk"; id: string; req_id: string }
+  | { t: "WorkflowRun"; id: string; req_id: string; workflow: string; input?: unknown }
+  | { t: "WorkflowRunOk"; id: string; req_id: string; job: string; session: string; pane: string }
+  | { t: "TriggerList"; id: string; req_id: string }
+  | { t: "TriggerListOk"; id: string; req_id: string; triggers: TriggerRow[] }
+  | { t: "TriggerPut"; id: string; req_id: string; trigger_id?: string | null; trigger: TriggerRow }
+  | { t: "TriggerPutOk"; id: string; req_id: string; trigger_id: string }
+  | { t: "TriggerDelete"; id: string; req_id: string; trigger: string }
+  | { t: "TriggerDeleteOk"; id: string; req_id: string }
+  | { t: "TriggerRun"; id: string; req_id: string; trigger: string }
+  | { t: "TriggerFired"; trigger: string; job: string }
+  | { t: "WebhookList"; id: string; req_id: string }
+  | { t: "WebhookListOk"; id: string; req_id: string; webhooks: WebhookRow[] }
+  | { t: "WebhookPut"; id: string; req_id: string; webhook_id?: string | null; name: string; sources: string[] }
+  | { t: "WebhookPutOk"; id: string; req_id: string; webhook_id: string; url: string; secret?: string | null }
+  | { t: "WebhookDelete"; id: string; req_id: string; webhook: string }
+  | { t: "WebhookDeleteOk"; id: string; req_id: string }
   | { t: "Chunk"; chunk_id: string; i: number; n: number; data: string }
   | { t: "Error"; id?: string; of?: string; req_id?: string; message: string };
 

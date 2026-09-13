@@ -82,6 +82,86 @@ pub enum RelayOut {
     },
     /// Remove a session row (kill).
     DeleteSession { id: String },
+    /// Mirror a trigger row (Phase D dashboards).
+    UpsertTrigger {
+        id: String,
+        name: String,
+        workflow_id: String,
+        kind: String,
+        enabled: bool,
+        spec: serde_json::Value,
+    },
+    /// Remove a trigger mirror row.
+    DeleteTrigger { id: String },
+    /// Mirror a webhook row (Phase E dashboards; secrets NEVER ride here).
+    UpsertWebhook {
+        id: String,
+        name: String,
+        sources: Vec<String>,
+        enabled: bool,
+    },
+    /// Remove a webhook mirror row.
+    DeleteWebhook { id: String },
+}
+
+// ---------- REST helpers (main loop only; webhook/trigger CRUD) ----------
+
+/// Machine JWT via the password grant (blocking; main loop only).
+pub fn machine_jwt_blocking(cfg: &RelayConfig) -> String {
+    match login(cfg) {
+        Ok(t) => t.access_token,
+        Err(e) => {
+            clog(&format!("relay: machine login failed: {e}"));
+            String::new()
+        }
+    }
+}
+
+fn rest_common<B>(
+    cfg: &RelayConfig,
+    jwt: &str,
+    url: &str,
+    base: ureq::RequestBuilder<B>,
+) -> ureq::RequestBuilder<B> {
+    let r = base.header("apikey", &cfg.anon_key);
+    if jwt.is_empty() {
+        r
+    } else {
+        r.header("Authorization", &format!("Bearer {jwt}"))
+    }
+}
+
+pub fn rest_get(cfg: &RelayConfig, jwt: &str, url: &str) -> Result<Value, String> {
+    let mut res = rest_common(cfg, jwt, url, ureq::get(url))
+        .call()
+        .map_err(|e| format!("rest get: {e}"))?;
+    let mut text = String::new();
+    use std::io::Read as _;
+    res.body_mut().as_reader().read_to_string(&mut text).map_err(|e| format!("rest read: {e}"))?;
+    serde_json::from_str(&text).map_err(|e| format!("rest decode: {e}"))
+}
+
+pub fn rest_post(cfg: &RelayConfig, jwt: &str, url: &str, body: &Value) -> Result<Value, String> {
+    let r = http_agent()
+        .post(url)
+        .header("apikey", &cfg.anon_key)
+        .header("Prefer", "return=representation");
+    let r = if jwt.is_empty() { r } else { r.header("Authorization", &format!("Bearer {jwt}")) };
+    let mut res = r.send_json(body.clone()).map_err(|e| format!("rest post: {e}"))?;
+    let mut text = String::new();
+    use std::io::Read as _;
+    res.body_mut().as_reader().read_to_string(&mut text).map_err(|e| format!("rest read: {e}"))?;
+    if text.trim().is_empty() {
+        return Ok(Value::Null);
+    }
+    serde_json::from_str(&text).map_err(|e| format!("rest decode: {e}"))
+}
+
+pub fn rest_delete(cfg: &RelayConfig, jwt: &str, url: &str) -> Result<(), String> {
+    rest_common(cfg, jwt, url, ureq::delete(url))
+        .call()
+        .map(|_| ())
+        .map_err(|e| format!("rest delete: {e}"))
 }
 
 // ---------- thread plumbing ----------
@@ -277,6 +357,47 @@ fn mirror_upsert(cfg: &RelayConfig, jwt: &str, op: &RelayOut) {
                 "name": name, "kind": kind, "last_active_at": now_iso(),
             }),
         ),
+        RelayOut::UpsertTrigger { id, name, workflow_id, kind, enabled, spec } => (
+            format!("{}/rest/v1/triggers?on_conflict=id", cfg.supabase_url),
+            serde_json::json!({
+                "id": id, "machine_id": cfg.machine_id,
+                "name": name, "workflow_id": workflow_id,
+                "kind": kind, "enabled": enabled, "spec": spec,
+            }),
+        ),
+        RelayOut::DeleteTrigger { id } => {
+            let url = format!("{}/rest/v1/triggers?id=eq.{id}", cfg.supabase_url);
+            match http_agent()
+                .delete(&url)
+                .header("apikey", &cfg.anon_key)
+                .header("Authorization", &format!("Bearer {jwt}"))
+                .call()
+            {
+                Ok(_) => {}
+                Err(e) => eprintln!("relay: trigger mirror delete: {e}"),
+            }
+            return;
+        }
+        RelayOut::UpsertWebhook { id, name, sources, enabled } => (
+            format!("{}/rest/v1/webhooks?on_conflict=id", cfg.supabase_url),
+            serde_json::json!({
+                "id": id, "machine_id": cfg.machine_id,
+                "name": name, "sources": sources, "enabled": enabled,
+            }),
+        ),
+        RelayOut::DeleteWebhook { id } => {
+            let url = format!("{}/rest/v1/webhooks?id=eq.{id}", cfg.supabase_url);
+            match http_agent()
+                .delete(&url)
+                .header("apikey", &cfg.anon_key)
+                .header("Authorization", &format!("Bearer {jwt}"))
+                .call()
+            {
+                Ok(_) => {}
+                Err(e) => eprintln!("relay: webhook mirror delete: {e}"),
+            }
+            return;
+        }
         RelayOut::DeleteSession { id } => {
             let url = format!("{}/rest/v1/sessions?id=eq.{id}", cfg.supabase_url);
             match http_agent()

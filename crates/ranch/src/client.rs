@@ -126,6 +126,7 @@ fn cmd_new(name: Option<String>, kind: Option<String>, cwd: Option<String>) {
             name,
             kind,
             cwd,
+            profile_id: None,
             forge_session: None,
         },
         "ack",
@@ -228,6 +229,7 @@ fn cmd_resume(query: Option<String>) {
             name: None,
             kind: Some("forge".into()),
             cwd: None,
+            profile_id: None,
             forge_session: Some(fsid),
         },
         "ack",
@@ -766,6 +768,7 @@ fn cmd_dashboard() -> Option<String> {
                                     name: if text.is_empty() { None } else { Some(text) },
                                     kind: None,
                                     cwd: None,
+                                    profile_id: None,
                                     forge_session: None,
                                 };
                                 send_frame(&mut stream, &f).ok();
@@ -779,6 +782,7 @@ fn cmd_dashboard() -> Option<String> {
                                     name: if text.is_empty() { None } else { Some(text) },
                                     kind: Some("forge".into()),
                                     cwd: None,
+                                    profile_id: None,
                                     forge_session: None,
                                 };
                                 send_frame(&mut stream, &f).ok();
@@ -834,6 +838,7 @@ fn cmd_dashboard() -> Option<String> {
                         name: None,
                         kind: None,
                         cwd: None,
+                        profile_id: None,
                         forge_session: None,
                     };
                     send_frame(&mut stream, &f).ok();
@@ -927,6 +932,10 @@ fn cmd_attach(ref_: &str) {
     let mut panes: Vec<String> = vec![];
     let mut active_pane = String::new();
     // per-pane client state for split rendering
+    // per-pane child cwd (from PaneSnap.cwd) — file browser start dir,
+    // agent split anchoring hints
+    let mut pane_cwds: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     let mut pane_views: std::collections::HashMap<String, PaneView> =
         std::collections::HashMap::new();
     let mut layout: Option<ranch_protocol::Layout> = None;
@@ -963,6 +972,64 @@ fn cmd_attach(ref_: &str) {
     let resume_items: std::rc::Rc<std::cell::RefCell<Vec<ranch_protocol::ForgeSessionInfo>>> =
         std::rc::Rc::new(std::cell::RefCell::new(vec![]));
     let _ = &resume_sel;
+    // :agents — agent-profile picker (Phase B): j/k/enter/esc. Enter
+    // launches an agent session bound to the picked profile. Editing
+    // happens on the web/mobile surfaces.
+    let agents_open = std::cell::Cell::new(false);
+    let agents_sel = std::cell::Cell::new(0usize);
+    let agents_pending: std::rc::Rc<std::cell::RefCell<Option<String>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(None));
+    let agents_items: std::rc::Rc<std::cell::RefCell<Vec<ranch_protocol::ProfileSummary>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(vec![]));
+    // :workflows — mule workflow picker (Phase C): enter runs into a new
+    // pane. Editing lives on the web surface.
+    let wf_open = std::cell::Cell::new(false);
+    let wf_sel = std::cell::Cell::new(0usize);
+    let wf_pending: std::rc::Rc<std::cell::RefCell<Option<String>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(None));
+    let wf_items: std::rc::Rc<std::cell::RefCell<Vec<ranch_protocol::WorkflowSummary>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(vec![]));
+    // :triggers — trigger list (Phase D): enter = run now, d = disable/
+    // enable. Editing lives on the web surface.
+    let trig_open = std::cell::Cell::new(false);
+    let trig_sel = std::cell::Cell::new(0usize);
+    let trig_pending: std::rc::Rc<std::cell::RefCell<Option<String>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(None));
+    let trig_items: std::rc::Rc<std::cell::RefCell<Vec<serde_json::Value>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(vec![]));
+    // :files [dir] — file browser modal (Phase F): DirList navigation,
+    // FileRead viewer with an inline edit buffer, FileWrite save (mtime
+    // conflict check server-side). prefix-E opens the focused file in
+    // $EDITOR in a shell split (pending_editor_file, wired at Snapshot).
+    let files_open = std::cell::Cell::new(false);
+    // current directory + DirList req_id correlation
+    let files_dir: std::rc::Rc<std::cell::RefCell<String>> =
+        std::rc::Rc::new(std::cell::RefCell::new(String::new()));
+    let files_pending: std::rc::Rc<std::cell::RefCell<Option<String>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(None));
+    let files_dirs: std::rc::Rc<std::cell::RefCell<Vec<String>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(vec![]));
+    let files_files: std::rc::Rc<std::cell::RefCell<Vec<String>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(vec![]));
+    let files_parent: std::rc::Rc<std::cell::RefCell<Option<String>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(None));
+    // mode: browse | view; viewer state for the selected file
+    let files_mode = std::cell::Cell::new(0u8); // 0 browse, 1 view, 2 edit
+    let files_sel = std::cell::Cell::new(0usize); // row in the merged list
+    let files_view_path: std::rc::Rc<std::cell::RefCell<String>> =
+        std::rc::Rc::new(std::cell::RefCell::new(String::new()));
+    let files_view_mtime = std::cell::Cell::new(0i64);
+    let files_view_text: std::rc::Rc<std::cell::RefCell<String>> =
+        std::rc::Rc::new(std::cell::RefCell::new(String::new()));
+    let files_editing = std::cell::Cell::new(false); // viewer is an edit buffer
+    let files_save_pending: std::rc::Rc<std::cell::RefCell<Option<String>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(None));
+    // prefix-E: file to open in $EDITOR once the split's Snapshot shows
+    // the new pane id (diff of leaf order)
+    let pending_editor_file: std::rc::Rc<std::cell::RefCell<Option<String>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(None));
+    let pre_split_leaves: std::rc::Rc<std::cell::RefCell<Vec<String>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(vec![]));
     // :model — agent-model picker (modal; j/k/enter/esc). Items land
     // asynchronously via ModelListOk (matched on req_id).
     let model_open = std::cell::Cell::new(false);
@@ -1049,6 +1116,36 @@ fn cmd_attach(ref_: &str) {
                                     let mut pv = PaneView::default();
                                     pv.apply_snapshot(ps);
                                     pane_views.insert(ps.id.clone(), pv);
+                                    if let Some(cwd) = &ps.cwd {
+                                        pane_cwds.insert(ps.id.clone(), cwd.clone());
+                                    }
+                                }
+                                // prefix-E: a shell split was requested and a
+                                // NEW pane id just appeared — type the editor
+                                // command into it
+                                if let Some(file) = pending_editor_file.borrow_mut().take() {
+                                    let before = pre_split_leaves.borrow();
+                                    let new_pane = panes_snap
+                                        .iter()
+                                        .map(|p| p.id.clone())
+                                        .find(|id| !before.contains(id));
+                                    drop(before);
+                                    if let Some(np) = new_pane {
+                                        let ed = std::env::var("EDITOR")
+                                            .unwrap_or_else(|_| "vi".to_string());
+                                        let cmd = format!("{ed} {}\r", shell_quote(&file));
+                                        let f = Frame::Input {
+                                            id: Uuid::new_v4().to_string(),
+                                            client: "attach".into(),
+                                            session: session_id.clone(),
+                                            pane: np.clone(),
+                                            data: ranch_protocol::b64_encode(cmd.as_bytes()),
+                                        };
+                                        send_frame(&mut stream, &f).ok();
+                                        active_pane = np;
+                                    } else {
+                                        *pending_editor_file.borrow_mut() = Some(file);
+                                    }
                                 }
                                 if let Some(p) = panes_snap
                                     .iter()
@@ -1170,6 +1267,135 @@ fn cmd_attach(ref_: &str) {
                                     resume_sel.set(0);
                                     resume_open.set(true);
                                 }
+                            }
+                            Frame::ProfileListOk { req_id, profiles } => {
+                                let matches_req =
+                                    agents_pending.borrow().as_deref() == Some(req_id.as_str());
+                                if matches_req {
+                                    *agents_pending.borrow_mut() = None;
+                                    agents_items.borrow_mut().clear();
+                                    agents_items.borrow_mut().extend(profiles);
+                                    agents_sel.set(0);
+                                    agents_open.set(true);
+                                }
+                            }
+                            Frame::DirListOk {
+                                id: _,
+                                req_id,
+                                path,
+                                parent,
+                                dirs,
+                                files,
+                            } => {
+                                let matches_req =
+                                    files_pending.borrow().as_deref() == Some(req_id.as_str());
+                                if matches_req {
+                                    *files_pending.borrow_mut() = None;
+                                    *files_dir.borrow_mut() = path;
+                                    *files_parent.borrow_mut() = parent;
+                                    *files_dirs.borrow_mut() = dirs;
+                                    *files_files.borrow_mut() = files;
+                                    files_sel.set(0);
+                                    files_mode.set(0);
+                                    files_open.set(true);
+                                }
+                            }
+                            Frame::FileReadOk {
+                                req_id,
+                                path,
+                                content,
+                                mtime,
+                                ..
+                            } => {
+                                let matches_req =
+                                    files_view_pending_read(req_id.as_str(), &files_pending);
+                                if matches_req {
+                                    *files_view_path.borrow_mut() = path;
+                                    *files_view_text.borrow_mut() = content;
+                                    files_view_mtime.set(mtime);
+                                    files_editing.set(false);
+                                    files_mode.set(1);
+                                    files_open.set(true);
+                                }
+                            }
+                            Frame::FileWriteOk {
+                                id: _,
+                                req_id,
+                                path: ref path,
+                                mtime,
+                            } => {
+                                let matches_req =
+                                    files_save_pending.borrow().as_deref() == Some(req_id.as_str());
+                                if matches_req {
+                                    *files_save_pending.borrow_mut() = None;
+                                    *files_view_path.borrow_mut() = path.clone();
+                                    files_view_mtime.set(mtime);
+                                    files_editing.set(false);
+                                    files_mode.set(1);
+                                    // re-read to confirm + refresh watcher baseline
+                                    let rid = Uuid::new_v4().to_string();
+                                    let f = Frame::FileRead {
+                                        id: Uuid::new_v4().to_string(),
+                                        client: "attach".into(),
+                                        req_id: rid.clone(),
+                                        path: path.clone(),
+                                    };
+                                    // route the read back into view mode: mark
+                                    // the read as a view (pending file read)
+                                    *files_pending.borrow_mut() = Some(rid);
+                                    send_frame(&mut stream, &f).ok();
+                                }
+                            }
+                            Frame::FileChanged { path, mtime } => {
+                                // a watched file changed under us — if it's
+                                // the one in the viewer, flag it by bumping
+                                // the on-disk mtime; the save will then be
+                                // refused by the daemon's conflict check
+                                if files_view_path.borrow().as_str() == path && mtime == 0 {
+                                    // file disappeared
+                                    files_mode.set(0);
+                                    let dir = files_dir.borrow().clone();
+                                    let rid = Uuid::new_v4().to_string();
+                                    *files_pending.borrow_mut() = Some(rid.clone());
+                                    let f = Frame::DirList {
+                                        id: Uuid::new_v4().to_string(),
+                                        client: "attach".into(),
+                                        req_id: rid,
+                                        path: Some(dir),
+                                    };
+                                    send_frame(&mut stream, &f).ok();
+                                }
+                            }
+                            Frame::TriggerListOk { req_id, triggers } => {
+                                let matches_req =
+                                    trig_pending.borrow().as_deref() == Some(req_id.as_str());
+                                if matches_req {
+                                    *trig_pending.borrow_mut() = None;
+                                    *trig_items.borrow_mut() = triggers;
+                                    trig_sel.set(0);
+                                    trig_open.set(true);
+                                }
+                            }
+                            Frame::WorkflowListOk { req_id, workflows } => {
+                                let matches_req =
+                                    wf_pending.borrow().as_deref() == Some(req_id.as_str());
+                                if matches_req {
+                                    *wf_pending.borrow_mut() = None;
+                                    wf_items.borrow_mut().clear();
+                                    wf_items.borrow_mut().extend(workflows);
+                                    wf_sel.set(0);
+                                    wf_open.set(true);
+                                }
+                            }
+                            Frame::WorkflowRunOk { session, .. } => {
+                                // follow the run into its pane (SessionsAck-like)
+                                let f = Frame::Attach {
+                                    id: Uuid::new_v4().to_string(),
+                                    client: "attach".into(),
+                                    session,
+                                    pane: None,
+                                };
+                                send_frame(&mut stream, &f).ok();
                             }
                             Frame::ModelListOk {
                                 req_id, pane, current, models, ..
@@ -1782,6 +2008,210 @@ fn cmd_attach(ref_: &str) {
                 );
             }
 
+            // :files modal — file browser / viewer / editor (Phase F)
+            if files_open.get() {
+                let mw = (76u16).min(term_area.width);
+                let mh = term_area.height.saturating_sub(4).max(6);
+                let mx = (term_area.width.saturating_sub(mw)) / 2;
+                let my = (term_area.height.saturating_sub(mh)) / 2;
+                let marea = Rect::new(mx, my, mw, mh);
+                f.render_widget(ratatui::widgets::Clear, marea);
+                let mode = files_mode.get();
+                let title = match mode {
+                    1 => format!(
+                        " {} · enter edit · esc back ",
+                        files_view_path.borrow()
+                    ),
+                    2 => format!(
+                        " {} · EDIT · ctrl-s save · esc cancel ",
+                        files_view_path.borrow()
+                    ),
+                    _ => format!(
+                        " {} · enter open · esc close ",
+                        files_dir.borrow()
+                    ),
+                };
+                let block = ratatui::widgets::Block::bordered()
+                    .title(title)
+                    .border_style(Style::default().fg(ratatui::style::Color::Green));
+                let inner = block.inner(marea);
+                f.render_widget(block, marea);
+                match mode {
+                    0 => {
+                        // browse: parent + dirs + files, one selectable list
+                        let parent = files_parent.borrow().is_some();
+                        let nd = files_dirs.borrow().len();
+                        let nf = files_files.borrow().len();
+                        let mut items: Vec<Line> = vec![];
+                        if parent {
+                            items.push(Line::from(Span::styled(
+                                "  ../",
+                                Style::default().fg(ratatui::style::Color::Blue),
+                            )));
+                        }
+                        for d in files_dirs.borrow().iter() {
+                            items.push(Line::from(Span::styled(
+                                format!("  {d}/"),
+                                Style::default().fg(ratatui::style::Color::Blue),
+                            )));
+                        }
+                        for fl in files_files.borrow().iter() {
+                            items.push(Line::from(Span::styled(
+                                format!("  {fl}"),
+                                Style::default(),
+                            )));
+                        }
+                        let sel = files_sel.get();
+                        // highlight via a list-state-ish manual overlay: simplest
+                        // is to style the selected row
+                        let items: Vec<Line> = items
+                            .into_iter()
+                            .enumerate()
+                            .map(|(i, l)| {
+                                if i == sel {
+                                    Line::from(l.spans.iter().map(|sp| {
+                                        Span::styled(
+                                            sp.content.clone(),
+                                            sp.style.add_modifier(Modifier::REVERSED),
+                                        )
+                                    }).collect::<Vec<_>>())
+                                } else {
+                                    l
+                                }
+                            })
+                            .collect();
+                        let _ = (nd, nf);
+                        f.render_widget(
+                            Paragraph::new(items),
+                            Rect::new(inner.x, inner.y, inner.width, inner.height),
+                        );
+                    }
+                    _ => {
+                        // view/edit: the file text (monospace, scrollable rows)
+                        let text = files_view_text.borrow();
+                        let show: Vec<Line> = text
+                            .lines()
+                            .map(|l| Line::from(format!(" {l}")))
+                            .collect();
+                        f.render_widget(
+                            Paragraph::new(show),
+                            Rect::new(inner.x, inner.y, inner.width, inner.height),
+                        );
+                    }
+                }
+            }
+
+            // :triggers modal — trigger list (Phase D)
+            if trig_open.get() {
+                let n = trig_items.borrow().len();
+                let mh = ((n + 4) as u16).min(term_area.height);
+                let (mw, _) = (70.min(term_area.width), mh);
+                let mx = (term_area.width.saturating_sub(mw)) / 2;
+                let my = (term_area.height.saturating_sub(mh)) / 2;
+                let marea = Rect::new(mx, my, mw, mh);
+                f.render_widget(ratatui::widgets::Clear, marea);
+                let block = ratatui::widgets::Block::bordered()
+                    .title(" triggers · enter run · d toggle · esc close ")
+                    .border_style(Style::default().fg(ratatui::style::Color::Green));
+                let inner = block.inner(marea);
+                f.render_widget(block, marea);
+                let items: Vec<Line> = trig_items
+                    .borrow()
+                    .iter()
+                    .map(|tv| {
+                        let name = tv.get("name").and_then(|x| x.as_str()).unwrap_or("");
+                        let kind = tv.get("kind").and_then(|x| x.as_str()).unwrap_or("");
+                        let enabled = tv.get("enabled").and_then(|x| x.as_bool()).unwrap_or(true);
+                        let spec_cron = tv
+                            .pointer("/spec/cron")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("");
+                        let label = format!(
+                            "  {:<22} {}{}{}",
+                            name,
+                            kind,
+                            if kind == "cron" && !spec_cron.is_empty() { format!(": {spec_cron}") } else { String::new() },
+                            if enabled { "" } else { " (off)" },
+                        );
+                        Line::from(Span::styled(label, Style::default()))
+                    })
+                    .collect();
+                f.render_widget(
+                    Paragraph::new(items),
+                    Rect::new(inner.x, inner.y, inner.width, inner.height),
+                );
+            }
+
+            // :workflows modal — mule workflow picker (Phase C)
+            if wf_open.get() {
+                let n = wf_items.borrow().len();
+                let mh = ((n + 4) as u16).min(term_area.height);
+                let (mw, _) = (64.min(term_area.width), mh);
+                let mx = (term_area.width.saturating_sub(mw)) / 2;
+                let my = (term_area.height.saturating_sub(mh)) / 2;
+                let marea = Rect::new(mx, my, mw, mh);
+                f.render_widget(ratatui::widgets::Clear, marea);
+                let block = ratatui::widgets::Block::bordered()
+                    .title(" mule workflows · enter run · esc close ")
+                    .border_style(Style::default().fg(ratatui::style::Color::Green));
+                let inner = block.inner(marea);
+                f.render_widget(block, marea);
+                let items: Vec<Line> = wf_items
+                    .borrow()
+                    .iter()
+                    .enumerate()
+                    .map(|(i, w)| {
+                        let sel = i == wf_sel.get();
+                        let mut style = Style::default();
+                        if sel {
+                            style = style.add_modifier(Modifier::REVERSED);
+                        }
+                        let mark = if sel { ">" } else { " " };
+                        let label = format!("{mark} {:<40}{}", w.name, if w.is_async.unwrap_or(false) { " [async]" } else { "" });
+                        Line::from(Span::styled(label, style))
+                    })
+                    .collect();
+                f.render_widget(
+                    Paragraph::new(items),
+                    Rect::new(inner.x, inner.y, inner.width, inner.height),
+                );
+            }
+
+            // :agents modal — centered agent-profile picker (Phase B)
+            if agents_open.get() {
+                let n = agents_items.borrow().len();
+                let mh = ((n + 4) as u16).min(term_area.height);
+                let (mw, _) = (64.min(term_area.width), mh);
+                let mx = (term_area.width.saturating_sub(mw)) / 2;
+                let my = (term_area.height.saturating_sub(mh)) / 2;
+                let marea = Rect::new(mx, my, mw, mh);
+                f.render_widget(ratatui::widgets::Clear, marea);
+                let block = ratatui::widgets::Block::bordered()
+                    .title(" agent profiles · enter launch · esc close ")
+                    .border_style(Style::default().fg(ratatui::style::Color::Green));
+                let inner = block.inner(marea);
+                f.render_widget(block, marea);
+                let items: Vec<Line> = agents_items
+                    .borrow()
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| {
+                        let sel = i == agents_sel.get();
+                        let mut style = Style::default();
+                        if sel {
+                            style = style.add_modifier(Modifier::REVERSED);
+                        }
+                        let mark = if sel { ">" } else { " " };
+                        let label = format!("{mark} {:<20} {}/{}", p.name, p.provider, p.model);
+                        Line::from(Span::styled(label, style))
+                    })
+                    .collect();
+                f.render_widget(
+                    Paragraph::new(items),
+                    Rect::new(inner.x, inner.y, inner.width, inner.height),
+                );
+            }
+
             // prompt line (rename / command)
             if let Some(kind) = prompt_now {
                 let label = match kind {
@@ -1848,7 +2278,293 @@ fn cmd_attach(ref_: &str) {
                                             name: None,
                                             kind: Some("forge".into()),
                                             cwd: None,
+                                            profile_id: None,
                                             forge_session: Some(fsid),
+                                        };
+                                        send_frame(&mut stream, &f).ok();
+                                        // SessionsAck attaches
+                                    }
+                                }
+                                _ => {}
+                            }
+                            continue;
+                        }
+                        // :files modal: browser / viewer / editor (Phase F)
+                        if files_open.get() {
+                            let mode = files_mode.get();
+                            if mode == 2 {
+                                // EDIT: line-buffer editing on the whole text
+                                match key.code {
+                                    KeyCode::Esc => {
+                                        // cancel: reload from disk
+                                        files_editing.set(false);
+                                        files_mode.set(1);
+                                        let p = files_view_path.borrow().clone();
+                                        let rid = Uuid::new_v4().to_string();
+                                        *files_pending.borrow_mut() = Some(rid.clone());
+                                        let f = Frame::FileRead {
+                                            id: Uuid::new_v4().to_string(),
+                                            client: "attach".into(),
+                                            req_id: rid,
+                                            path: p,
+                                        };
+                                        send_frame(&mut stream, &f).ok();
+                                    }
+                                    KeyCode::Char('s')
+                                        if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                    {
+                                        // save with mtime conflict check
+                                        let p = files_view_path.borrow().clone();
+                                        let content = files_view_text.borrow().clone();
+                                        let rid = Uuid::new_v4().to_string();
+                                        *files_save_pending.borrow_mut() = Some(rid.clone());
+                                        let f = Frame::FileWrite {
+                                            id: Uuid::new_v4().to_string(),
+                                            client: "attach".into(),
+                                            req_id: rid,
+                                            path: p,
+                                            content,
+                                            mtime: Some(files_view_mtime.get()),
+                                        };
+                                        send_frame(&mut stream, &f).ok();
+                                    }
+                                    KeyCode::Backspace => {
+                                        files_view_text.borrow_mut().pop();
+                                    }
+                                    KeyCode::Enter => {
+                                        files_view_text.borrow_mut().push('\n');
+                                    }
+                                    KeyCode::Tab => {
+                                        files_view_text.borrow_mut().push_str("    ");
+                                    }
+                                    KeyCode::Char(c) => {
+                                        files_view_text.borrow_mut().push(c);
+                                    }
+                                    _ => {}
+                                }
+                                continue;
+                            }
+                            if mode == 1 {
+                                // VIEW
+                                match key.code {
+                                    KeyCode::Esc | KeyCode::Char('q') => {
+                                        files_mode.set(0);
+                                    }
+                                    KeyCode::Char('e') | KeyCode::Enter => {
+                                        files_mode.set(2);
+                                        files_editing.set(true);
+                                    }
+                                    _ => {}
+                                }
+                                continue;
+                            }
+                            // BROWSE
+                            match key.code {
+                                KeyCode::Esc | KeyCode::Char('q') => {
+                                    files_open.set(false);
+                                }
+                                KeyCode::Up | KeyCode::Char('k') => {
+                                    let sel = files_sel.get();
+                                    if sel > 0 {
+                                        files_sel.set(sel - 1);
+                                    }
+                                }
+                                KeyCode::Down | KeyCode::Char('j') => {
+                                    let n = files_dirs.borrow().len()
+                                        + files_files.borrow().len()
+                                        + usize::from(files_parent.borrow().is_some());
+                                    if files_sel.get() + 1 < n {
+                                        files_sel.set(files_sel.get() + 1);
+                                    }
+                                }
+                                KeyCode::Enter => {
+                                    let parent = files_parent.borrow().is_some();
+                                    let nd = files_dirs.borrow().len();
+                                    let sel = files_sel.get();
+                                    let idx = sel;
+                                    if parent && idx == 0 {
+                                        // up
+                                        let p = files_parent.borrow().clone().unwrap_or_default();
+                                        let rid = Uuid::new_v4().to_string();
+                                        *files_pending.borrow_mut() = Some(rid.clone());
+                                        let f = Frame::DirList {
+                                            id: Uuid::new_v4().to_string(),
+                                            client: "attach".into(),
+                                            req_id: rid,
+                                            path: Some(p),
+                                        };
+                                        send_frame(&mut stream, &f).ok();
+                                    } else if idx < usize::from(parent) + nd {
+                                        // into subdir
+                                        let d = files_dirs.borrow()[idx - usize::from(parent)]
+                                            .clone();
+                                        let base = files_dir.borrow().clone();
+                                        let next = format!(
+                                            "{}/{}",
+                                            base.trim_end_matches('/'),
+                                            d
+                                        );
+                                        let rid = Uuid::new_v4().to_string();
+                                        *files_pending.borrow_mut() = Some(rid.clone());
+                                        let f = Frame::DirList {
+                                            id: Uuid::new_v4().to_string(),
+                                            client: "attach".into(),
+                                            req_id: rid,
+                                            path: Some(next),
+                                        };
+                                        send_frame(&mut stream, &f).ok();
+                                    } else {
+                                        // open file: FileRead into the viewer
+                                        let fi = files_files.borrow()
+                                            [idx - usize::from(parent) - nd]
+                                            .clone();
+                                        let base = files_dir.borrow().clone();
+                                        let full = format!(
+                                            "{}/{}",
+                                            base.trim_end_matches('/'),
+                                            fi
+                                        );
+                                        let rid = Uuid::new_v4().to_string();
+                                        *files_pending.borrow_mut() = Some(rid.clone());
+                                        let f = Frame::FileRead {
+                                            id: Uuid::new_v4().to_string(),
+                                            client: "attach".into(),
+                                            req_id: rid,
+                                            path: full,
+                                        };
+                                        send_frame(&mut stream, &f).ok();
+                                    }
+                                }
+                                _ => {}
+                            }
+                            continue;
+                        }
+                        // :triggers modal: trigger list (Phase D)
+                        if trig_open.get() {
+                            match key.code {
+                                KeyCode::Esc | KeyCode::Char('q') => {
+                                    trig_open.set(false);
+                                }
+                                KeyCode::Up | KeyCode::Char('k') => {
+                                    let sel = trig_sel.get();
+                                    if sel > 0 {
+                                        trig_sel.set(sel - 1);
+                                    }
+                                }
+                                KeyCode::Down | KeyCode::Char('j') => {
+                                    let sel = trig_sel.get();
+                                    if sel + 1 < trig_items.borrow().len() {
+                                        trig_sel.set(sel + 1);
+                                    }
+                                }
+                                KeyCode::Char('d') => {
+                                    // toggle enable/disable
+                                    let picked = trig_items.borrow().get(trig_sel.get()).cloned();
+                                    if let Some(mut tv) = picked {
+                                        let id = tv.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                                        let enabled = tv.get("enabled").and_then(|x| x.as_bool()).unwrap_or(true);
+                                        if let Some(obj) = tv.as_object_mut() {
+                                            obj.insert("enabled".into(), serde_json::Value::Bool(!enabled));
+                                        }
+                                        if !id.is_empty() {
+                                            let f = Frame::TriggerPut {
+                                                req_id: Uuid::new_v4().to_string(),
+                                                trigger_id: Some(id),
+                                                trigger: tv,
+                                            };
+                                            send_frame(&mut stream, &f).ok();
+                                            trig_open.set(false);
+                                        }
+                                    }
+                                }
+                                KeyCode::Enter => {
+                                    let picked = trig_items.borrow().get(trig_sel.get()).cloned();
+                                    if let Some(tv) = picked {
+                                        let id = tv.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                                        if !id.is_empty() {
+                                            trig_open.set(false);
+                                            let f = Frame::TriggerRun {
+                                                req_id: Uuid::new_v4().to_string(),
+                                                trigger: id,
+                                            };
+                                            send_frame(&mut stream, &f).ok();
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                            continue;
+                        }
+                        // :workflows modal: mule workflow picker (Phase C)
+                        if wf_open.get() {
+                            match key.code {
+                                KeyCode::Esc | KeyCode::Char('q') => {
+                                    wf_open.set(false);
+                                }
+                                KeyCode::Up | KeyCode::Char('k') => {
+                                    let sel = wf_sel.get();
+                                    if sel > 0 {
+                                        wf_sel.set(sel - 1);
+                                    }
+                                }
+                                KeyCode::Down | KeyCode::Char('j') => {
+                                    let sel = wf_sel.get();
+                                    if sel + 1 < wf_items.borrow().len() {
+                                        wf_sel.set(sel + 1);
+                                    }
+                                }
+                                KeyCode::Enter => {
+                                    let picked = wf_items
+                                        .borrow()
+                                        .get(wf_sel.get())
+                                        .cloned();
+                                    if let Some(w) = picked {
+                                        wf_open.set(false);
+                                        let f = Frame::WorkflowRun {
+                                            req_id: Uuid::new_v4().to_string(),
+                                            workflow: w.id,
+                                            input: None,
+                                        };
+                                        send_frame(&mut stream, &f).ok();
+                                        // WorkflowRunOk attaches
+                                    }
+                                }
+                                _ => {}
+                            }
+                            continue;
+                        }
+                        // :agents modal: agent-profile picker (Phase B)
+                        if agents_open.get() {
+                            match key.code {
+                                KeyCode::Esc | KeyCode::Char('q') => {
+                                    agents_open.set(false);
+                                }
+                                KeyCode::Up | KeyCode::Char('k') => {
+                                    let sel = agents_sel.get();
+                                    if sel > 0 {
+                                        agents_sel.set(sel - 1);
+                                    }
+                                }
+                                KeyCode::Down | KeyCode::Char('j') => {
+                                    let sel = agents_sel.get();
+                                    if sel + 1 < agents_items.borrow().len() {
+                                        agents_sel.set(sel + 1);
+                                    }
+                                }
+                                KeyCode::Enter => {
+                                    let picked = agents_items
+                                        .borrow()
+                                        .get(agents_sel.get())
+                                        .cloned();
+                                    if let Some(p) = picked {
+                                        agents_open.set(false);
+                                        let f = Frame::SessionsCreate {
+                                            req_id: Uuid::new_v4().to_string(),
+                                            name: Some(p.name),
+                                            kind: Some("forge".into()),
+                                            cwd: None,
+                                            profile_id: Some(p.id),
+                                            forge_session: None,
                                         };
                                         send_frame(&mut stream, &f).ok();
                                         // SessionsAck attaches
@@ -2172,6 +2888,49 @@ fn cmd_attach(ref_: &str) {
                                     }
                                     continue;
                                 }
+                                // E → open the focused file (files browser/
+                                // viewer) in $EDITOR in a shell split
+                                KeyCode::Char('E') => {
+                                    let path = if files_open.get() && files_mode.get() >= 1 {
+                                        Some(files_view_path.borrow().clone())
+                                    } else if files_open.get() && files_mode.get() == 0 {
+                                        // resolve the browser selection to a file
+                                        let parent = files_parent.borrow().is_some();
+                                        let nd = files_dirs.borrow().len();
+                                        let sel = files_sel.get();
+                                        let fi = sel.checked_sub(usize::from(parent) + nd)
+                                            .and_then(|i| files_files.borrow().get(i).cloned());
+                                        fi.map(|f| {
+                                            format!(
+                                                "{}/{}",
+                                                files_dir.borrow().trim_end_matches('/'),
+                                                f
+                                            )
+                                        })
+                                    } else {
+                                        None
+                                    };
+                                    if let Some(file) = path {
+                                        files_open.set(false);
+                                        // remember the current leaf order; when
+                                        // the Snapshot shows the new pane, we
+                                        // type the editor command into it
+                                        if let Some(ly) = &layout {
+                                            *pre_split_leaves.borrow_mut() =
+                                                ranch_protocol::leaf_order(ly);
+                                        }
+                                        *pending_editor_file.borrow_mut() = Some(file);
+                                        let f = Frame::PaneSplit {
+                                            req_id: Uuid::new_v4().to_string(),
+                                            session: session_id.clone(),
+                                            pane: active_pane.clone(),
+                                            dir: 0,
+                                            kind: None,
+                                        };
+                                        send_frame(&mut stream, &f).ok();
+                                    }
+                                    continue;
+                                }
                                 // a → agent split: chat pane bound to a new
                                 // forge session, focused immediately
                                 KeyCode::Char('a') => {
@@ -2281,6 +3040,70 @@ fn cmd_attach(ref_: &str) {
                                             Prompt::Command => {
                                                 // minimal: :agent <name>, :pi [dir],
                                                 // :resume, :kill, :detach
+                                                if prompt_input.trim() == "files"
+                                                    || prompt_input.trim().starts_with("files ")
+                                                {
+                                                    let arg = prompt_input
+                                                        .trim()
+                                                        .strip_prefix("files")
+                                                        .unwrap_or("")
+                                                        .trim()
+                                                        .to_string();
+                                                    prompt_input.clear();
+                                                    prompt.set(None);
+                                                    let start = if arg.is_empty() {
+                                                        pane_cwds
+                                                            .get(&active_pane)
+                                                            .cloned()
+                                                            .unwrap_or_else(|| {
+                                                                std::env::var("HOME")
+                                                                    .unwrap_or_default()
+                                                            })
+                                                    } else {
+                                                        arg
+                                                    };
+                                                    *files_dir.borrow_mut() = start.clone();
+                                                    let rid = Uuid::new_v4().to_string();
+                                                    *files_pending.borrow_mut() = Some(rid.clone());
+                                                    let f = Frame::DirList {
+                                                        id: Uuid::new_v4().to_string(),
+                                                        client: "attach".into(),
+                                                        req_id: rid,
+                                                        path: Some(start),
+                                                    };
+                                                    send_frame(&mut stream, &f).ok();
+                                                    files_sel.set(0);
+                                                    files_mode.set(0);
+                                                    files_open.set(true);
+                                                    continue;
+                                                }
+                                                if prompt_input.trim() == "triggers" {
+                                                    prompt_input.clear();
+                                                    prompt.set(None);
+                                                    let rid = Uuid::new_v4().to_string();
+                                                    *trig_pending.borrow_mut() = Some(rid.clone());
+                                                    let f = Frame::TriggerList { req_id: rid };
+                                                    send_frame(&mut stream, &f).ok();
+                                                    continue;
+                                                }
+                                                if prompt_input.trim() == "workflows" {
+                                                    prompt_input.clear();
+                                                    prompt.set(None);
+                                                    let rid = Uuid::new_v4().to_string();
+                                                    *wf_pending.borrow_mut() = Some(rid.clone());
+                                                    let f = Frame::WorkflowList { req_id: rid };
+                                                    send_frame(&mut stream, &f).ok();
+                                                    continue;
+                                                }
+                                                if prompt_input.trim() == "agents" {
+                                                    prompt_input.clear();
+                                                    prompt.set(None);
+                                                    let rid = Uuid::new_v4().to_string();
+                                                    *agents_pending.borrow_mut() = Some(rid.clone());
+                                                    let f = Frame::ProfileList { req_id: rid };
+                                                    send_frame(&mut stream, &f).ok();
+                                                    continue;
+                                                }
                                                 if prompt_input.trim() == "resume" {
                                                     let rid = Uuid::new_v4().to_string();
                                                     *resume_pending.borrow_mut() =
@@ -2349,6 +3172,7 @@ fn cmd_attach(ref_: &str) {
                                                         },
                                                         kind: Some("forge".into()),
                                                         cwd: None,
+                                                        profile_id: None,
                                                         forge_session: None,
                                                     };
                                                     send_frame(&mut stream, &f).ok();
@@ -2619,6 +3443,17 @@ fn http_json(
 }
 
 /// b64url decode for JWT payload inspection.
+/// FileReadOk correlation: reads destined for the viewer share the
+/// files_pending slot (saves use files_save_pending separately).
+fn files_view_pending_read(req_id: &str, files_pending: &std::rc::Rc<std::cell::RefCell<Option<String>>>) -> bool {
+    files_pending.borrow().as_deref() == Some(req_id)
+}
+
+/// POSIX single-quote shell quoting (file names into shell commands).
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 fn b64url_decode(s: &str) -> Option<Vec<u8>> {
     const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let val = |b: u8| -> Option<u32> { A.iter().position(|&a| a == b).map(|p| p as u32) };

@@ -25,11 +25,21 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
 
 use libc::{SIGINT, WNOHANG, c_int, pollfd};
 use ranch_protocol::{ChatMsg, Cursor, Decoder, Frame, Layout, PaneSnap, SessionMeta};
 use ranch_vt::Vt;
 use uuid::Uuid;
+
+#[path = "agenttools.rs"]
+pub(crate) mod agenttools;
+#[path = "control_api.rs"]
+pub mod control_api;
+#[path = "mule.rs"]
+mod mule;
+#[path = "triggers.rs"]
+mod triggers;
 
 const TICK_MS: i32 = 30;
 /// Max file size the editor will read/write (M10). Keeps relay frames
@@ -499,6 +509,10 @@ struct Client {
     /// Remote frames land on this pipe (read end); set only for the relay
     /// client. The write end lives in the relay thread.
     relay_in: Option<std::fs::File>,
+    /// Control-API pseudo-client: frames "sent" here are collected and
+    /// returned to the agent's HTTP request. Set only for the transient
+    /// ctl client (drained per control request).
+    sink: Option<std::sync::Arc<std::sync::Mutex<Vec<Frame>>>>,
     decoder: Decoder,
     name: String,
     /// Session currently attached; None = not attached.
@@ -529,6 +543,15 @@ struct Daemon {
     /// Chat/Meta frames through the same pipe (the pre-match resolves
     /// + broadcasts them identically)
     forge_pipe_w: Option<std::sync::Arc<std::sync::Mutex<std::fs::File>>>,
+    /// agent tool surface (Phase A): spawned-pane ownership + callbacks
+    spawns: agenttools::SpawnRegistry,
+    /// `[agents] spawn_policy` from daemon.toml (default allow)
+    spawn_policy: agenttools::SpawnPolicy,
+    /// mule worker jobs (None when mule is not configured)
+    mule_tx: Option<std::sync::mpsc::Sender<mule::MuleJob>>,
+    /// trigger scheduler (Phase D): owns the trigger registry; fires
+    /// workflows via mule_tx
+    triggers: triggers::Scheduler,
 }
 
 // ---------- helpers ----------
@@ -621,8 +644,10 @@ fn home_dir_string() -> String {
 fn state_value(
     sessions: &BTreeMap<Uuid, Session>,
     pi_agents: &BTreeMap<Uuid, std::sync::Arc<pilocal::LocalPi>>,
+    spawns: Option<&agenttools::SpawnRegistry>,
+    triggers: Option<&triggers::Scheduler>,
 ) -> serde_json::Value {
-    serde_json::json!({
+    let mut v = serde_json::json!({
         "machine": hostname(),
         "sessions": sessions.iter().map(|(id, s)| serde_json::json!({
             "id": id.to_string(),
@@ -656,7 +681,18 @@ fn state_value(
                 }).flatten(),
             })).collect::<Vec<_>>(),
         })).collect::<Vec<_>>(),
-    })
+    });
+    if let Some(reg) = spawns {
+        if let Some(obj) = v.as_object_mut() {
+            obj.insert("spawns".into(), agenttools::registry_value(reg));
+        }
+    }
+    if let Some(trig) = triggers {
+        if let Some(obj) = v.as_object_mut() {
+            obj.insert("triggers".into(), trig.to_value());
+        }
+    }
+    v
 }
 
 /// Drop layout leaves that reference panes which no longer exist
@@ -835,6 +871,7 @@ fn snapshot_session(s: &Session) -> Option<Frame> {
             chat: None,
             forge_session: None,
             model: None,
+            cwd: pane_cwd(p.child).map(|p| p.to_string_lossy().into_owned()),
         };
         if *pid == s.active {
             active_seq = p.seq;
@@ -854,6 +891,7 @@ fn snapshot_session(s: &Session) -> Option<Frame> {
             chat: Some(cp.chat.clone()),
             forge_session: Some(cp.forge_sid.to_string()),
             model: cp.model.clone(),
+            cwd: None,
         });
     }
     Some(Frame::Snapshot {
@@ -887,11 +925,720 @@ fn send_frame(c: &mut Client, frame: &Frame) {
         let res = match (&mut c.stream, &mut c.relay_out) {
             (Some(s), _) => s.write_all(&bytes),
             (None, Some(w)) => w.write_all(&bytes),
+            // control pseudo-client: collect (the request thread returns
+            // them in the HTTP response)
+            (None, None) if c.sink.is_some() => {
+                if let Some(sink) = &c.sink {
+                    if let Ok(mut g) = sink.lock() {
+                        g.push(frame.clone());
+                    }
+                }
+                Ok(())
+            }
             (None, None) => Ok(()),
         };
         if let Err(e) = res {
             eprintln!("ranchd: write: {e}");
             break;
+        }
+    }
+}
+
+// ---------- agent tools (Phase A) ----------
+
+// Caller-pane resolution. Human clients (unix socket / relay) are nil
+// = unrestricted. Agents calling through the loopback control API
+// identify their pane via the `X-Ranch-Pane` header; the control API
+// forwards it in `ControlRequest.caller_pane`, and frames built from
+// control requests carry it in the frame's caller_pane field. The
+// thread-local below supports callers that construct frames on agent
+// threads; regular daemon frames default to nil.
+thread_local! {
+    static CALLER_PANE: std::cell::RefCell<Option<Uuid>> = const { std::cell::RefCell::new(None) };
+}
+
+#[allow(dead_code)] // reserved: forge-bridge request threads set this
+pub fn set_caller_pane(pane: Option<Uuid>) {
+    CALLER_PANE.with(|c| *c.borrow_mut() = pane);
+}
+
+pub fn caller_pane() -> Uuid {
+    CALLER_PANE.with(|c| c.borrow().unwrap_or(Uuid::nil()))
+}
+
+impl Daemon {
+    /// The effective caller for a frame from client fd `from`. The
+    /// control API runs each request on a thread with CALLER_PANE set;
+    /// normal client frames are human (nil).
+    /// forge-required-but-unconfigured error reply.
+    fn forge_unconfigured(&mut self, from: RawFd, req_id: &str) {
+        if let Some(c) = self.clients.get_mut(&from) {
+            send_frame(
+                c,
+                &Frame::Error {
+                    req_id: Some(req_id.to_string()),
+                    message: "forge not configured (set forge_api_key in daemon.toml)".into(),
+                },
+            );
+        }
+    }
+
+    /// relay-required-but-unconfigured error reply (webhook CRUD needs
+    /// the machine's Supabase credentials).
+    fn relay_unconfigured(&mut self, from: RawFd, req_id: &str) {
+        if let Some(c) = self.clients.get_mut(&from) {
+            send_frame(
+                c,
+                &Frame::Error {
+                    req_id: Some(req_id.to_string()),
+                    message: "relay not configured (run `ranch register`)".into(),
+                },
+            );
+        }
+    }
+
+    /// mule-required-but-unconfigured error reply.
+    fn mule_unconfigured(&mut self, from: RawFd, req_id: &str) {
+        if let Some(c) = self.clients.get_mut(&from) {
+            send_frame(
+                c,
+                &Frame::Error {
+                    req_id: Some(req_id.to_string()),
+                    message: "mule not configured (set mule_url in daemon.toml)".into(),
+                },
+            );
+        }
+    }
+
+    /// The effective caller for an agent-tool frame: the frame's own
+    /// caller_pane field (control API / forge bridge stamp it), falling
+    /// back to the thread-local (reserved) and finally nil = human.
+    fn frame_caller(frame_caller: &str, _req_id: &str) -> Uuid {
+        if let Ok(u) = Uuid::parse_str(frame_caller) {
+            if !u.is_nil() {
+                return u;
+            }
+        }
+        caller_pane()
+    }
+
+    /// Resolve which session/pane a chat pane id lives in.
+    fn find_chat(&self, pid: Uuid) -> Option<(Uuid)> {
+        self.sessions
+            .iter()
+            .find_map(|(sid, s)| s.chats.contains_key(&pid).then_some(*sid))
+    }
+
+    /// Send a frame to every client attached to `sid` (plus the
+    /// originating client fd even if detached).
+    fn broadcast_to_session(&mut self, sid: Uuid, frame: &Frame, also: Option<RawFd>) {
+        let mut recipients: Vec<RawFd> = self
+            .clients
+            .iter()
+            .filter(|(_, c)| c.attach == Some(sid))
+            .map(|(f, _)| *f)
+            .collect();
+        if let Some(fd) = also {
+            if !recipients.contains(&fd) {
+                recipients.push(fd);
+            }
+        }
+        for rfd in recipients {
+            if let Some(c) = self.clients.get_mut(&rfd) {
+                send_frame(c, frame);
+            }
+        }
+    }
+
+    /// Deliver an AgentDone: broadcast to the caller's session + inject
+    /// the system row into the caller's chat pane cache so re-attaches
+    /// still see it. Also clears the spawn record when terminal.
+    fn deliver_agent_done(
+        &mut self,
+        caller_pane: Uuid,
+        spawn: &agenttools::SpawnRecord,
+        spawned_session: Uuid,
+        spawned_pane: Uuid,
+        outcome: &str,
+        last_row: Option<ChatMsg>,
+    ) {
+        let row = agenttools::agent_done_row(spawn, spawned_pane, outcome, last_row.as_ref());
+        // inject into the caller pane's chat cache (if it's a chat pane)
+        let caller_sid = self.find_chat(caller_pane);
+        if let Some(cs) = caller_sid {
+            if let Some(s) = self.sessions.get_mut(&cs) {
+                if let Some(cp) = s.chats.get_mut(&caller_pane) {
+                    cp.chat.push(row.clone());
+                }
+            }
+        }
+        let frame = agenttools::agent_done_frame(spawn, spawned_session, spawned_pane, outcome, last_row);
+        match caller_sid {
+            Some(cs) => self.broadcast_to_session(cs, &frame, None),
+            None => {
+                // caller pane gone: best-effort broadcast everywhere
+                let fds: Vec<RawFd> = self.clients.keys().copied().collect();
+                for fd in fds {
+                    if let Some(c) = self.clients.get_mut(&fd) {
+                        send_frame(c, &frame);
+                    }
+                }
+            }
+        }
+        // "closed"/"denied"/"timeout" release the spawn record;
+        // "completed" keeps it (the caller can still steer/close the
+        // pane after the first turn)
+        if matches!(outcome, "closed" | "denied" | "timeout") {
+            self.spawns.remove_pane(spawned_pane);
+            self.write_state();
+        }
+    }
+
+    /// Frame::AgentSpawn — create the pane, register it, send the
+    /// initial prompt, ack. Honors the policy gate.
+    #[allow(clippy::too_many_arguments)]
+    fn handle_agent_spawn(
+        &mut self,
+        from: RawFd,
+        req_id: &str,
+        caller_pane: &str,
+        caller_session: &str,
+        kind: &str,
+        name: &Option<String>,
+        cwd: &Option<String>,
+        prompt: &str,
+        mode: &str,
+        callback: bool,
+    ) {
+        let caller = Uuid::parse_str(caller_pane).unwrap_or(Uuid::nil());
+        let reply_err = |d: &mut Self, msg: String| {
+            if let Some(c) = d.clients.get_mut(&from) {
+                send_frame(
+                    c,
+                    &Frame::Error {
+                        req_id: Some(req_id.to_string()),
+                        message: msg,
+                    },
+                );
+            }
+        };
+        if kind != "pi" && kind != "forge" {
+            reply_err(self, format!("unknown agent kind {kind:?} (pi|forge)"));
+            return;
+        }
+        if kind == "pi" && !local_pi_allowed() {
+            reply_err(self, "local pi agents are disabled on this machine".into());
+            return;
+        }
+        match self.spawn_policy {
+            agenttools::SpawnPolicy::Deny => {
+                reply_err(self, "agent spawns are disabled on this machine".into());
+                return;
+            }
+            agenttools::SpawnPolicy::Ask => {
+                if !caller.is_nil() {
+                    // agent-initiated: hold for human approval
+                    let spawn_id = Uuid::new_v4().to_string();
+                    let rec = agenttools::SpawnRecord {
+                        spawn_id: spawn_id.clone(),
+                        caller_pane: caller,
+                        created_at: Instant::now(),
+                        callback,
+                        callback_fired: false,
+                    };
+                    let preview: String = prompt.chars().take(120).collect();
+                    self.spawns.pending.insert(spawn_id.clone(), (rec, Instant::now()));
+                    let req = Frame::AgentSpawnRequest {
+                        spawn_id,
+                        caller_pane: caller.to_string(),
+                        kind: kind.to_string(),
+                        preview,
+                    };
+                    let fds: Vec<RawFd> = self.clients.keys().copied().collect();
+                    for fd in fds {
+                        if let Some(c) = self.clients.get_mut(&fd) {
+                            send_frame(c, &req);
+                        }
+                    }
+                    return; // resolution arrives via AgentSpawnApprove
+                }
+                // humans bypass `ask` (they just clicked the thing)
+            }
+            agenttools::SpawnPolicy::Allow => {}
+        }
+
+        let spawn_id = Uuid::new_v4().to_string();
+        let anchor: Option<String> = if caller.is_nil() {
+            cwd.clone()
+        } else {
+            // agent spawns default to the caller's cwd, overridable
+            cwd.clone().or_else(|| {
+                let caller = Uuid::parse_str(caller_pane).unwrap_or(Uuid::nil());
+                self.sessions.values().find_map(|s| {
+                    s.panes.get(&caller).and_then(|p| pane_cwd(p.child)).map(|p| p.to_string_lossy().to_string())
+                })
+            })
+        };
+
+        let result: Result<(Uuid, Uuid), String> = if mode == "session" {
+            self.spawn_agent_session(kind, name.clone(), anchor, prompt, callback, spawn_id.clone())
+        } else {
+            self.spawn_agent_split(kind, caller_session, anchor, prompt, callback, spawn_id.clone())
+        };
+        match result {
+            Ok((sid, pid)) => {
+                // register + send the initial prompt
+                let rec = agenttools::SpawnRecord {
+                    spawn_id: spawn_id.clone(),
+                    caller_pane: caller,
+                    created_at: Instant::now(),
+                    callback,
+                    callback_fired: false,
+                };
+                if let Err(e) = self.spawns.register(pid, rec) {
+                    reply_err(self, e);
+                    return;
+                }
+                if !prompt.is_empty() {
+                    self.send_agent_prompt(pid, prompt);
+                }
+                self.write_state();
+                eprintln!(
+                    "ranchd: agent spawn {spawn_id}: pane {pid} ({kind}, mode={mode}, caller={caller_pane})"
+                );
+                if let Some(c) = self.clients.get_mut(&from) {
+                    send_frame(
+                        c,
+                        &Frame::AgentSpawnOk {
+                            req_id: req_id.to_string(),
+                            spawn_id,
+                            session: sid.to_string(),
+                            pane: pid.to_string(),
+                        },
+                    );
+                }
+            }
+            Err(e) => {
+                eprintln!("ranchd: agent spawn failed: {e}");
+                reply_err(self, e);
+            }
+        }
+    }
+
+    /// mode="split": a new chat pane in the caller's session (or the
+    /// session named by caller_session).
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_agent_split(
+        &mut self,
+        kind: &str,
+        session_ref: &str,
+        anchor: Option<String>,
+        _prompt: &str,
+        _callback: bool,
+        _spawn_id: String,
+    ) -> Result<(Uuid, Uuid), String> {
+        let sid = self
+            .resolve_session(session_ref)
+            .map(|s| s.id)
+            .or_else(|| self.find_chat(Uuid::parse_str(session_ref).unwrap_or(Uuid::nil())))
+            .ok_or_else(|| format!("caller session {session_ref:?} not found"))?;
+        let s = self.sessions.get_mut(&sid).ok_or("session vanished")?;
+        let dir = anchor.as_deref().map(std::path::PathBuf::from);
+        // pick the split target: the caller pane when it lives here,
+        // else the active pane
+        let caller = caller_pane();
+        let target = if !caller.is_nil() && s.chats.contains_key(&caller) {
+            caller
+        } else {
+            s.active
+        };
+        let pid = Uuid::new_v4();
+        match kind {
+            "pi" => {
+                let dir_str = dir
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|| std::env::var("HOME").unwrap_or_default());
+                let pipe_w = self
+                    .forge_pipe_w
+                    .clone()
+                    .ok_or("no agent pipe (forge disabled?)")?;
+                pilocal::LocalPi::spawn(pid, &dir_str, pilocal::no_tools_configured(), pipe_w, &mut self.pi_agents)?;
+                s.chats.insert(
+                    pid,
+                    ChatPane {
+                        forge_sid: Uuid::nil(),
+                        cols: 80,
+                        rows: 24,
+                        chat: vec![],
+                        model: None,
+                        cwd: Some(dir_str),
+                    },
+                );
+            }
+            "forge" => {
+                let fcfg = forge::load_forge_config().ok_or("forge not configured")?;
+                let forge_sid = forge::create_forge_session(
+                    &fcfg,
+                    "agent-spawned",
+                    dir.as_deref().map(|p| p.to_string_lossy()).as_deref(),
+                    None,
+                )?;
+                s.chats.insert(
+                    pid,
+                    ChatPane {
+                        forge_sid,
+                        cols: 80,
+                        rows: 24,
+                        chat: vec![],
+                        model: None,
+                        cwd: dir.map(|p| p.to_string_lossy().to_string()),
+                    },
+                );
+                if let Some(tx) = &self.forge_tx {
+                    let _ = tx.send(forge::ForgeJob::Watch { pane: pid, forge_sid });
+                }
+            }
+            _ => return Err(format!("unknown kind {kind:?}")),
+        }
+        s.win_mut().split_leaf(&target.to_string(), &pid.to_string(), 1);
+        s.active = pid;
+        s.apply_sizes();
+        self.resnap(&sid);
+        Ok((sid, pid))
+    }
+
+    /// mode="session": a full agent session (kind pi/forge), mirroring
+    /// the SessionsCreate agent path.
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_agent_session(
+        &mut self,
+        kind: &str,
+        name: Option<String>,
+        cwd: Option<String>,
+        _prompt: &str,
+        _callback: bool,
+        _spawn_id: String,
+    ) -> Result<(Uuid, Uuid), String> {
+        let id = Uuid::new_v4();
+        let name = name.unwrap_or_else(|| format!("agent-{}", &id.to_string()[..4]));
+        let pid = Uuid::new_v4();
+        let forge_sid = match kind {
+            "pi" => Uuid::nil(),
+            "forge" => {
+                let fcfg = forge::load_forge_config().ok_or("forge not configured")?;
+                forge::create_forge_session(
+                    &fcfg,
+                    &name,
+                    cwd.as_deref(),
+                    None,
+                )?
+            }
+            _ => return Err(format!("unknown kind {kind:?}")),
+        };
+        let mut s = Session {
+            id,
+            name: name.clone(),
+            kind: kind.to_string(),
+            panes: BTreeMap::new(),
+            active: Uuid::nil(),
+            size: (80, 24),
+            windows: vec![Window::new(
+                Layout::Leaf { pane: pid.to_string() },
+                "0".into(),
+            )],
+            win: 0,
+            chats: BTreeMap::new(),
+        };
+        if kind == "pi" {
+            let dir_str = cwd
+                .clone()
+                .unwrap_or_else(|| std::env::var("HOME").unwrap_or_default());
+            let pipe_w = self
+                .forge_pipe_w
+                .clone()
+                .ok_or("no agent pipe (forge disabled?)")?;
+            pilocal::LocalPi::spawn(pid, &dir_str, pilocal::no_tools_configured(), pipe_w, &mut self.pi_agents)?;
+            s.chats.insert(
+                pid,
+                ChatPane {
+                    forge_sid: Uuid::nil(),
+                    cols: 80,
+                    rows: 24,
+                    chat: vec![],
+                    model: None,
+                    cwd: Some(dir_str),
+                },
+            );
+        } else {
+            s.chats.insert(
+                pid,
+                ChatPane {
+                    forge_sid,
+                    cols: 80,
+                    rows: 24,
+                    chat: vec![],
+                    model: None,
+                    cwd,
+                },
+            );
+            if let Some(tx) = &self.forge_tx {
+                let _ = tx.send(forge::ForgeJob::Watch { pane: pid, forge_sid });
+            }
+        }
+        s.active = pid;
+        let kind_out = kind.to_string();
+        self.sessions.insert(id, s);
+        self.mirror(relay::RelayOut::UpsertSession {
+            id: id.to_string(),
+            name,
+            kind: kind_out,
+        });
+        Ok((id, pid))
+    }
+
+    /// Send a prompt to a chat pane's agent (shared by spawn + AgentSend).
+    fn send_agent_prompt(&mut self, pid: Uuid, text: &str) {
+        let backing = self.sessions.values().find_map(|s| s.chats.get(&pid).map(|cp| cp.forge_sid));
+        match backing {
+            Some(fsid) if fsid.is_nil() => {
+                if let Some(lp) = self.pi_agents.get(&pid) {
+                    if let Some(pipe_w) = &self.forge_pipe_w {
+                        if let Err(e) = lp.prompt(pipe_w, text) {
+                            eprintln!("ranchd: pi prompt failed: {e}");
+                        }
+                    }
+                }
+            }
+            Some(fsid) => {
+                if let Some(tx) = &self.forge_tx {
+                    let _ = tx.send(forge::ForgeJob::Send {
+                        pane: pid,
+                        forge_sid: fsid,
+                        text: text.to_string(),
+                    });
+                }
+            }
+            None => eprintln!("ranchd: send_agent_prompt: pane {pid} not found"),
+        }
+    }
+
+    fn handle_agent_send(
+        &mut self,
+        from: RawFd,
+        req_id: &str,
+        caller_pane: &str,
+        session: &str,
+        pane: &str,
+        text: &str,
+        delivery: &str,
+    ) {
+        let _ = delivery; // steer vs queue: forge has no queue concept; pi steer == prompt-while-working
+        let Ok(pid) = Uuid::parse_str(pane) else { return };
+        let caller = Self::frame_caller(caller_pane, req_id);
+        if !self.spawns.authorized(caller, pid) {
+            if let Some(c) = self.clients.get_mut(&from) {
+                send_frame(
+                    c,
+                    &Frame::Error {
+                        req_id: Some(req_id.to_string()),
+                        message: "not your pane".into(),
+                    },
+                );
+            }
+            return;
+        }
+        let _ = session;
+        self.send_agent_prompt(pid, text);
+        if let Some(c) = self.clients.get_mut(&from) {
+            // ack via status (send has no dedicated ok; the chat rows
+            // coming back are the confirmation)
+            send_frame(
+                c,
+                &Frame::AgentStatusOk {
+                    req_id: req_id.to_string(),
+                    pane: pid.to_string(),
+                    state: "working".into(),
+                    model: None,
+                },
+            );
+        }
+    }
+
+    fn handle_agent_close(
+        &mut self,
+        from: RawFd,
+        req_id: &str,
+        caller_pane: &str,
+        session: &str,
+        pane: &str,
+    ) {
+        let Ok(pid) = Uuid::parse_str(pane) else { return };
+        let caller = Self::frame_caller(caller_pane, req_id);
+        if !self.spawns.authorized(caller, pid) {
+            if let Some(c) = self.clients.get_mut(&from) {
+                send_frame(
+                    c,
+                    &Frame::Error {
+                        req_id: Some(req_id.to_string()),
+                        message: "not your pane".into(),
+                    },
+                );
+            }
+            return;
+        }
+        let sid = match self.find_chat(pid) {
+            Some(s) => s,
+            None => {
+                if let Some(c) = self.clients.get_mut(&from) {
+                    send_frame(
+                        c,
+                        &Frame::Error {
+                            req_id: Some(req_id.to_string()),
+                            message: format!("pane {pane} not found"),
+                        },
+                    );
+                }
+                return;
+            }
+        };
+        let _ = session;
+        // last-row snapshot for the callback, then close
+        let last = self
+            .sessions
+            .get(&sid)
+            .and_then(|s| s.chats.get(&pid))
+            .and_then(|cp| cp.chat.iter().rev().find(|m| m.role == "assistant"))
+            .cloned();
+        let rec = self.spawns.get_by_pane(pid).cloned();
+        // kill the backing agent + remove the pane (tmux semantics via
+        // remove_pane_everywhere: killing the last pane kills the
+        // session — that's the right default for agent fan-out too)
+        if let Some(s) = self.sessions.get_mut(&sid) {
+            if s.chats.remove(&pid).is_some() {
+                if let Some(lp) = self.pi_agents.remove(&pid) {
+                    lp.kill();
+                }
+                if let Some(tx) = &self.forge_tx {
+                    let _ = tx.send(forge::ForgeJob::Unwatch { pane: pid });
+                }
+                s.remove_pane_everywhere(&pid.to_string());
+                s.apply_sizes();
+            }
+        }
+        // last chat pane gone (or window collapse) -> kill the session
+        let session_dead = self.sessions.get(&sid).is_none_or(|s| {
+            s.windows.is_empty()
+                || s.win().pane_ids().is_empty()
+        });
+        if session_dead {
+            if let Some(s) = self.sessions.remove(&sid) {
+                for p in s.panes.values() {
+                    self.orphans.push(p.child);
+                }
+                for cpid in s.chats.keys() {
+                    if let Some(lp) = self.pi_agents.remove(cpid) {
+                        lp.kill();
+                    }
+                    if let Some(tx) = &self.forge_tx {
+                        let _ = tx.send(forge::ForgeJob::Unwatch { pane: *cpid });
+                    }
+                }
+                self.mirror(relay::RelayOut::DeleteSession {
+                    id: sid.to_string(),
+                });
+                let gone = Frame::Meta {
+                    session: sid.to_string(),
+                    pane: None,
+                    kind: "exited".into(),
+                    status: Some("session ended".into()),
+                };
+                let recipients: Vec<RawFd> = self.clients.iter().map(|(f, _)| *f).collect();
+                for rfd in recipients {
+                    if let Some(c) = self.clients.get_mut(&rfd) {
+                        if c.attach == Some(sid) {
+                            c.attach = None;
+                        }
+                        send_frame(c, &gone);
+                    }
+                }
+            }
+        } else {
+            self.resnap(&sid);
+        }
+        self.write_state();
+        // ack + callback (AgentDone "closed")
+        if let Some(c) = self.clients.get_mut(&from) {
+            send_frame(
+                c,
+                &Frame::AgentStatusOk {
+                    req_id: req_id.to_string(),
+                    pane: pid.to_string(),
+                    state: "closed".into(),
+                    model: None,
+                },
+            );
+        }
+        if let Some(rec) = rec {
+            // deliver the callback to the spawner (skip if closing
+            // self-spawned-and-self is the same pane — can't happen)
+            self.deliver_agent_done(rec.caller_pane, &rec, sid, pid, "closed", last);
+        }
+    }
+
+    fn handle_agent_approve(&mut self, from: RawFd, spawn_id: String, allow: bool) {
+        let _ = from; // any attached client may resolve
+        let Some((rec, _)) = self.spawns.pending.remove(spawn_id.as_str()) else {
+            return;
+        };
+        if !allow {
+            self.deliver_agent_done(rec.caller_pane, &rec, Uuid::nil(), Uuid::nil(), "denied", None);
+            return;
+        }
+        // approved: re-dispatch the original spawn via the stored record.
+        // The prompt was never stored (approval carries only a preview),
+        // so an approved spawn creates the pane WITHOUT a prompt; the
+        // extension re-sends the prompt as AgentSend after the ack. This
+        // keeps the approval payload small (no prompt in every client's
+        // face).
+        let pid = Uuid::new_v4();
+        let kind = "pi".to_string(); // approved spawns use the local runtime
+        // NOTE: approval re-dispatch: create in the caller's session
+        let caller_session = self
+            .find_chat(rec.caller_pane)
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        let result = self.spawn_agent_split(
+            kind.as_str(),
+            &caller_session,
+            None,
+            "",
+            rec.callback,
+            spawn_id.clone(),
+        );
+        if let Ok((sid, pid)) = result {
+            let mut rec2 = rec.clone();
+            rec2.spawn_id = spawn_id.to_string();
+            if let Err(e) = self.spawns.register(pid, rec2.clone()) {
+                eprintln!("ranchd: approved spawn register failed: {e}");
+                return;
+            }
+            self.write_state();
+            // ack to the (now-forgotten) requester is impossible — the
+            // requester was an agent loopback connection that's gone;
+            // instead broadcast AgentSpawnOk so the extension can
+            // correlate by spawn_id.
+            let ok = Frame::AgentSpawnOk {
+                req_id: spawn_id.to_string(),
+                spawn_id: spawn_id.to_string(),
+                session: sid.to_string(),
+                pane: pid.to_string(),
+            };
+            let fds: Vec<RawFd> = self.clients.keys().copied().collect();
+            for fd in fds {
+                if let Some(c) = self.clients.get_mut(&fd) {
+                    send_frame(c, &ok);
+                }
+            }
         }
     }
 }
@@ -910,6 +1657,7 @@ impl Daemon {
 
     fn base_with_listener(listener: UnixListener, state_path: PathBuf) -> Result<Daemon, String> {
         let socket_path = default_socket_path();
+        let spawn_policy = agenttools::SpawnPolicy::load();
 
         // relay: enabled only when `ranch register` has run (daemon.toml)
         let mut relay_client: Option<Client> = None;
@@ -923,6 +1671,7 @@ impl Daemon {
                         stream: None,
                         relay_out: Some(relay_w),
                         relay_in: Some(fd_file(daemon_r)),
+                        sink: None,
                         decoder: Decoder::new(),
                         name: "relay".into(),
                         attach: None,
@@ -950,6 +1699,10 @@ impl Daemon {
             forge_tx: None,
             pi_agents: BTreeMap::new(),
             forge_pipe_w: None,
+            spawns: agenttools::SpawnRegistry::new(),
+            spawn_policy,
+            mule_tx: None,
+            triggers: triggers::Scheduler::new(None),
         };
         // register the relay as a client keyed by its read-pipe fd; remote
         // frames arrive there and daemon->remote frames go out via relay_out
@@ -977,6 +1730,7 @@ impl Daemon {
                     stream: None,
                     relay_out: None,
                     relay_in: Some(fd_file(f_daemon_r)),
+                    sink: None,
                     decoder: Decoder::new(),
                     name: "forge".into(),
                     attach: None,
@@ -1002,6 +1756,24 @@ impl Daemon {
                 eprintln!("ranchd: agent pipe init failed: {e} (pi panes will not work)");
             }
         }
+
+        // mule worker (Phase C): shares the agent pipe (its frames are
+        // pane-addressed Chat/Meta rows + request replies; the pre-match
+        // resolves + broadcasts them like forge's)
+        if let Some(mcfg) = mule::load_mule_config() {
+            if let Some(pipe_w) = &daemon.forge_pipe_w {
+                if let Ok(clone) = pipe_w.lock().unwrap().try_clone() {
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    mule::spawn_worker(mcfg, clone, rx);
+                    daemon.mule_tx = Some(tx);
+                    eprintln!("ranchd: mule: worker started");
+                }
+            }
+        } else {
+            eprintln!("ranchd: mule: disabled (no mule_url in daemon.toml)");
+        }
+        // trigger scheduler rides the mule worker (Phase D)
+        daemon.triggers = triggers::Scheduler::new(daemon.mule_tx.clone());
         Ok(daemon)
     }
 
@@ -1025,7 +1797,7 @@ impl Daemon {
     }
 
     fn write_state(&self) {
-        let v = state_value(&self.sessions, &self.pi_agents);
+        let v = state_value(&self.sessions, &self.pi_agents, Some(&self.spawns), Some(&self.triggers));
         if let Ok(json) = serde_json::to_string_pretty(&v) {
             std::fs::write(&self.state_path, json).ok();
         }
@@ -1081,7 +1853,7 @@ impl Daemon {
         }
 
         // manifest: Tier-1 state (same shape as state.json) + the fd map
-        let state = state_value(&self.sessions, &self.pi_agents);
+        let state = state_value(&self.sessions, &self.pi_agents, Some(&self.spawns), Some(&self.triggers));
         let manifest = serde_json::json!({ "state": state, "fds": fds });
         std::fs::write(
             &manifest_path,
@@ -1406,6 +2178,10 @@ impl Daemon {
             eprintln!("ranchd: restore: state.json unparseable, starting empty");
             return;
         };
+        // agent-tool spawn registry (ownership + callbacks survive restarts)
+        self.spawns = agenttools::registry_from_value(&v);
+        // trigger registry (Phase D)
+        self.triggers = triggers::Scheduler::from_value(&v, self.mule_tx.clone());
         let Some(sessions) = v.get("sessions").and_then(|s| s.as_array()) else {
             return;
         };
@@ -1780,6 +2556,145 @@ impl Daemon {
                     }
                 }
             }
+            // ----- agent tools (Phase A): agents spawn/steer/close panes -----
+            Frame::AgentSpawn {
+                req_id,
+                caller_pane,
+                caller_session,
+                kind,
+                name,
+                cwd,
+                prompt,
+                mode,
+                callback,
+                ..
+            } => {
+                self.handle_agent_spawn(
+                    from,
+                    req_id,
+                    caller_pane,
+                    caller_session,
+                    kind,
+                    name,
+                    cwd,
+                    prompt,
+                    mode,
+                    *callback,
+                );
+            }
+            Frame::AgentSpawnApprove { spawn_id, allow } => {
+                self.handle_agent_approve(from, spawn_id.clone(), *allow);
+            }
+            Frame::AgentSend {
+                req_id,
+                caller_pane,
+                session,
+                pane,
+                text,
+                delivery,
+            } => {
+                self.handle_agent_send(from, req_id, caller_pane, session, pane, text, delivery);
+            }
+            Frame::AgentStatus {
+                req_id,
+                pane,
+                ..
+            } => {
+                let Ok(pid) = Uuid::parse_str(pane) else { return };
+                let info = self.sessions.values().find_map(|s| {
+                    s.chats.get(&pid).map(|cp| (s.id, cp.model.clone()))
+                });
+                // status is read-only and non-sensitive; allow
+                let (state, model) = match &info {
+                    Some((_, model)) => {
+                        // busy = last row is a user row (snapshot heuristic)
+                        let busy = self.sessions.values().find_map(|s| {
+                            s.chats.get(&pid).map(|cp| {
+                                cp.chat.last().is_some_and(|l| l.role == "user")
+                            })
+                        });
+                        (
+                            match busy {
+                                Some(true) => "working",
+                                Some(false) => "idle",
+                                None => "unknown",
+                            }
+                            .to_string(),
+                            model.clone(),
+                        )
+                    }
+                    None => ("unknown".to_string(), None),
+                };
+                if let Some(c) = self.clients.get_mut(&from) {
+                    send_frame(
+                        c,
+                        &Frame::AgentStatusOk {
+                            req_id: req_id.clone(),
+                            pane: pid.to_string(),
+                            state,
+                            model,
+                        },
+                    );
+                }
+            }
+            Frame::AgentRead {
+                req_id,
+                caller_pane,
+                pane,
+                since_seq,
+                limit,
+            } => {
+                let Ok(pid) = Uuid::parse_str(pane) else { return };
+                let caller = Self::frame_caller(caller_pane, req_id);
+                let authorized = caller.is_nil() || self.spawns.authorized(caller, pid);
+                let msgs = if !authorized {
+                    None
+                } else {
+                    self.sessions.values().find_map(|s| {
+                        s.chats.get(&pid).map(|cp| {
+                            cp.chat
+                                .iter()
+                                .filter(|m| m.seq > *since_seq)
+                                .rev()
+                                .take(*limit as usize)
+                                .cloned()
+                                .collect::<Vec<_>>()
+                                .into_iter()
+                                .rev()
+                                .collect::<Vec<_>>()
+                        })
+                    })
+                };
+                if let Some(c) = self.clients.get_mut(&from) {
+                    match msgs {
+                        Some(msgs) => {
+                            send_frame(
+                                c,
+                                &Frame::AgentReadOk {
+                                    req_id: req_id.clone(),
+                                    pane: pid.to_string(),
+                                    msgs,
+                                },
+                            );
+                        }
+                        None => send_frame(
+                            c,
+                            &Frame::Error {
+                                req_id: Some(req_id.clone()),
+                                message: format!("pane {pane} not found or not yours"),
+                            },
+                        ),
+                    }
+                }
+            }
+            Frame::AgentClose {
+                req_id,
+                caller_pane,
+                session,
+                pane,
+            } => {
+                self.handle_agent_close(from, req_id, caller_pane, session, pane);
+            }
             // client -> agent: list the models a chat pane can run on
             Frame::ModelList { pane, req_id, .. } => {
                 let Ok(pid) = Uuid::parse_str(pane) else {
@@ -2135,13 +3050,531 @@ impl Daemon {
                     );
                 }
             }
+            // ----- agent builder (Phase B): profile CRUD proxy -----
+            Frame::ProfileList { req_id } => {
+                match &self.forge_tx {
+                    Some(tx) => {
+                        let _ = tx.send(forge::ForgeJob::ProfileList { req_id: req_id.clone() });
+                    }
+                    None => {
+                        if let Some(c) = self.clients.get_mut(&from) {
+                            send_frame(
+                                c,
+                                &Frame::Error {
+                                    req_id: Some(req_id.clone()),
+                                    message: "forge not configured".into(),
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+            Frame::ProfileGet { req_id, profile } => {
+                match &self.forge_tx {
+                    Some(tx) => {
+                        let _ = tx.send(forge::ForgeJob::ProfileGet {
+                            req_id: req_id.clone(),
+                            profile_id: profile.clone(),
+                        });
+                    }
+                    None => Self::forge_unconfigured(self, from, req_id),
+                }
+            }
+            Frame::ProfilePut {
+                req_id,
+                profile_id,
+                draft,
+            } => {
+                match &self.forge_tx {
+                    Some(tx) => {
+                        let _ = tx.send(forge::ForgeJob::ProfilePut {
+                            req_id: req_id.clone(),
+                            profile_id: profile_id.clone(),
+                            draft: draft.clone(),
+                        });
+                    }
+                    None => Self::forge_unconfigured(self, from, req_id),
+                }
+            }
+            Frame::ProfileDelete { req_id, profile } => {
+                match &self.forge_tx {
+                    Some(tx) => {
+                        let _ = tx.send(forge::ForgeJob::ProfileDelete {
+                            req_id: req_id.clone(),
+                            profile_id: profile.clone(),
+                        });
+                    }
+                    None => Self::forge_unconfigured(self, from, req_id),
+                }
+            }
+            // ----- triggers (Phase D) -----
+            Frame::TriggerList { req_id } => {
+                if let Some(c) = self.clients.get_mut(&from) {
+                    send_frame(
+                        c,
+                        &Frame::TriggerListOk {
+                            req_id: req_id.clone(),
+                            triggers: self
+                                .triggers
+                                .triggers
+                                .values()
+                                .map(|t| {
+                                    serde_json::json!({
+                                        "id": t.id.to_string(),
+                                        "name": t.name,
+                                        "workflow_id": t.workflow_id,
+                                        "kind": t.kind_tag(),
+                                        "spec": t.spec_value(),
+                                        "input": t.input,
+                                        "enabled": t.enabled,
+                                        "catch_up": t.catch_up,
+                                        "last_run": t.last_run.as_ref().map(|(j, ts, st)| serde_json::json!({
+                                            "job": j, "at": ts, "status": st,
+                                        })),
+                                    })
+                                })
+                                .collect(),
+                        },
+                    );
+                }
+            }
+            Frame::TriggerPut {
+                req_id,
+                trigger_id,
+                trigger,
+            } => {
+                // parse the trigger shape; persist; mirror
+                let res = (|| {
+                    let name = trigger
+                        .get("name")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if name.is_empty() {
+                        return Err("trigger name is required".into());
+                    }
+                    let workflow_id = trigger
+                        .get("workflow_id")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if workflow_id.is_empty() {
+                        return Err("trigger workflow_id is required".into());
+                    }
+                    let kind_tag = trigger.get("kind").and_then(|x| x.as_str()).unwrap_or("");
+                    let spec = trigger.get("spec").cloned().unwrap_or(serde_json::Value::Null);
+                    let kind = match kind_tag {
+                        "cron" => {
+                            let expr = spec.get("cron").and_then(|x| x.as_str()).unwrap_or("");
+                            if triggers::cron_next(expr, triggers::Scheduler::now()).is_none() {
+                                return Err(format!("bad cron expression {expr:?}"));
+                            }
+                            triggers::TriggerKind::Cron { expr: expr.into() }
+                        }
+                        "event" => triggers::TriggerKind::Event {
+                            event: spec.get("event").and_then(|x| x.as_str()).unwrap_or("").into(),
+                            filter: spec.get("filter").cloned().unwrap_or(serde_json::Value::Null),
+                        },
+                        "webhook" => triggers::TriggerKind::Webhook {
+                            source: spec.get("source").and_then(|x| x.as_str()).unwrap_or("").into(),
+                            event_tag: spec.get("event").and_then(|x| x.as_str()).map(String::from),
+                        },
+                        other => return Err(format!("unknown trigger kind {other:?} (cron|event|webhook)")),
+                    };
+                    Ok(triggers::Trigger {
+                        id: trigger_id
+                            .as_deref()
+                            .and_then(|s| Uuid::parse_str(s).ok())
+                            .unwrap_or_else(Uuid::new_v4),
+                        name,
+                        workflow_id,
+                        kind,
+                        input: trigger.get("input").cloned().filter(|x| !x.is_null()),
+                        enabled: trigger.get("enabled").and_then(|x| x.as_bool()).unwrap_or(true),
+                        catch_up: trigger.get("catch_up").and_then(|x| x.as_bool()).unwrap_or(false),
+                        last_run: None,
+                    })
+                })();
+                match res {
+                    Ok(t) => {
+                        let mirror = crate::relay::RelayOut::UpsertTrigger {
+                            id: t.id.to_string(),
+                            name: t.name.clone(),
+                            workflow_id: t.workflow_id.clone(),
+                            kind: t.kind_tag().into(),
+                            enabled: t.enabled,
+                            spec: t.spec_value(),
+                        };
+                        let id = t.id.to_string();
+                        self.triggers.triggers.insert(t.id, t);
+                        self.write_state();
+                        self.mirror(mirror);
+                        if let Some(c) = self.clients.get_mut(&from) {
+                            send_frame(c, &Frame::TriggerPutOk { req_id: req_id.clone(), trigger_id: id });
+                        }
+                    }
+                    Err(e) => {
+                        if let Some(c) = self.clients.get_mut(&from) {
+                            send_frame(
+                                c,
+                                &Frame::Error {
+                                    req_id: Some(req_id.clone()),
+                                    message: e,
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+            Frame::TriggerDelete { req_id, trigger } => {
+                let parsed = Uuid::parse_str(trigger);
+                if let Ok(id) = parsed {
+                    self.triggers.triggers.remove(&id);
+                    self.write_state();
+                    self.mirror(crate::relay::RelayOut::DeleteTrigger { id: id.to_string() });
+                }
+                if let Some(c) = self.clients.get_mut(&from) {
+                    send_frame(c, &Frame::TriggerDeleteOk { req_id: req_id.clone() });
+                }
+            }
+            Frame::TriggerRun { req_id, trigger } => {
+                let id = Uuid::parse_str(trigger).ok();
+                let fireable = id.and_then(|id| self.triggers.triggers.get(&id).cloned());
+                match fireable {
+                    Some(t) if self.mule_tx.is_some() => {
+                        let job_id = Uuid::new_v4().to_string();
+                        let _ = self.mule_tx.as_ref().unwrap().send(mule::MuleJob::Run {
+                            req_id: Uuid::new_v4().to_string(),
+                            workflow_id: t.workflow_id.clone(),
+                            input: t.input.clone(),
+                            session: Uuid::nil(),
+                            pane: Uuid::nil(),
+                        });
+                        if let Some(t) = self.triggers.triggers.get_mut(&t.id) {
+                            t.last_run = Some((job_id.clone(), triggers::Scheduler::now(), "queued".into()));
+                        }
+                        self.write_state();
+                        let fired = Frame::TriggerFired {
+                            trigger: id.unwrap().to_string(),
+                            job: job_id,
+                        };
+                        let fds: Vec<RawFd> = self.clients.keys().copied().collect();
+                        for fd in fds {
+                            if let Some(c) = self.clients.get_mut(&fd) {
+                                send_frame(c, &fired);
+                            }
+                        }
+                    }
+                    _ => {
+                        if let Some(c) = self.clients.get_mut(&from) {
+                            send_frame(
+                                c,
+                                &Frame::Error {
+                                    req_id: Some(req_id.clone()),
+                                    message: if self.mule_tx.is_none() {
+                                        "mule not configured".into()
+                                    } else {
+                                        format!("trigger {trigger:?} not found")
+                                    },
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+
+            // ----- webhooks (Phase E) -----
+            Frame::WebhookEvent {
+                webhook,
+                source,
+                event,
+                payload,
+                ..
+            } => {
+                // Only arrives via the relay pipe (edge function). Match
+                // against webhook triggers and fire workflows. The
+                // payload nests under "payload" for trigger templates.
+                let event_type = event.as_deref().unwrap_or("");
+                let (tframes, tmirrors) = self.triggers.fire_event(
+                    "webhook",
+                    &serde_json::json!({
+                        "source": source,
+                        "event": event_type,
+                        "payload": payload,
+                    }),
+                );
+                for m in tmirrors {
+                    self.mirror(m);
+                }
+                let fired_n = tframes.len();
+                for f in tframes {
+                    let fds: Vec<RawFd> = self.clients.keys().copied().collect();
+                    for fd in fds {
+                        if let Some(c) = self.clients.get_mut(&fd) {
+                            send_frame(c, &f);
+                        }
+                    }
+                }
+                eprintln!(
+                    "ranchd: webhook {source}/{event_type} from {webhook} ({fired_n} triggers fired)"
+                );
+            }
+            Frame::WebhookList { req_id } => {
+                // REST via the relay's REST helpers requires the relay
+                // config; reply unconfigured when absent
+                let Some(rcfg) = relay::load_config() else {
+                    Self::relay_unconfigured(self, from, req_id);
+                    return;
+                };
+                let jwt = relay::machine_jwt_blocking(&rcfg);
+                let url = format!(
+                    "{}/rest/v1/webhooks?select=id,name,sources,enabled,created_at&machine_id=eq.{}",
+                    rcfg.supabase_url, rcfg.machine_id
+                );
+                match relay::rest_get(&rcfg, &jwt, &url) {
+                    Ok(v) => {
+                        if let Some(c) = self.clients.get_mut(&from) {
+                            send_frame(
+                                c,
+                                &Frame::WebhookListOk {
+                                    req_id: req_id.clone(),
+                                    webhooks: v.as_array().cloned().unwrap_or_default(),
+                                },
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        if let Some(c) = self.clients.get_mut(&from) {
+                            send_frame(
+                                c,
+                                &Frame::Error {
+                                    req_id: Some(req_id.clone()),
+                                    message: e,
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+            Frame::WebhookPut {
+                req_id,
+                webhook_id,
+                name,
+                sources,
+            } => {
+                let Some(rcfg) = relay::load_config() else {
+                    Self::relay_unconfigured(self, from, req_id);
+                    return;
+                };
+                let jwt = relay::machine_jwt_blocking(&rcfg);
+                // create: generate the secret here (never from the client),
+                // store it encrypted via the store_webhook_secret RPC
+                let new_id = Uuid::new_v4();
+                let raw_secret = format!("whsec_{}", Uuid::new_v4().simple());
+                let body = serde_json::json!({
+                    "id": new_id.to_string(),
+                    "machine_id": rcfg.machine_id,
+                    "name": name,
+                    "sources": sources,
+                    "enabled": true,
+                });
+                let url = format!("{}/rest/v1/webhooks", rcfg.supabase_url);
+                match relay::rest_post(&rcfg, &jwt, &url, &body) {
+                    Ok(_) => {
+                        // encrypt + store the secret (security-definer RPC)
+                        let _ = relay::rest_post(
+                            &rcfg,
+                            &jwt,
+                            &format!("{}/rest/v1/rpc/store_webhook_secret", rcfg.supabase_url),
+                            &serde_json::json!({
+                                "p_webhook_id": new_id.to_string(),
+                                "p_secret": raw_secret,
+                            }),
+                        );
+                        let url = format!(
+                            "{}/functions/v1/webhook-relay/w/{}",
+                            rcfg.supabase_url.replace(".supabase.co", ".supabase.co"),
+                            new_id
+                        );
+                        if let Some(c) = self.clients.get_mut(&from) {
+                            send_frame(
+                                c,
+                                &Frame::WebhookPutOk {
+                                    req_id: req_id.clone(),
+                                    webhook_id: new_id.to_string(),
+                                    url,
+                                    secret: Some(raw_secret), // shown ONCE
+                                },
+                            );
+                        }
+                        self.mirror(crate::relay::RelayOut::UpsertWebhook {
+                            id: new_id.to_string(),
+                            name: name.clone(),
+                            sources: sources.clone(),
+                            enabled: true,
+                        });
+                    }
+                    Err(e) => {
+                        if let Some(c) = self.clients.get_mut(&from) {
+                            send_frame(
+                                c,
+                                &Frame::Error {
+                                    req_id: Some(req_id.clone()),
+                                    message: e,
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+            Frame::WebhookDelete { req_id, webhook } => {
+                let Some(rcfg) = relay::load_config() else {
+                    Self::relay_unconfigured(self, from, req_id);
+                    return;
+                };
+                let jwt = relay::machine_jwt_blocking(&rcfg);
+                let url = format!(
+                    "{}/rest/v1/webhooks?id=eq.{webhook}&machine_id=eq.{}",
+                    rcfg.supabase_url, rcfg.machine_id
+                );
+                match relay::rest_delete(&rcfg, &jwt, &url) {
+                    Ok(_) => {
+                        self.mirror(crate::relay::RelayOut::DeleteWebhook {
+                            id: webhook.clone(),
+                        });
+                        if let Some(c) = self.clients.get_mut(&from) {
+                            send_frame(c, &Frame::WebhookDeleteOk { req_id: req_id.clone() });
+                        }
+                    }
+                    Err(e) => {
+                        if let Some(c) = self.clients.get_mut(&from) {
+                            send_frame(
+                                c,
+                                &Frame::Error {
+                                    req_id: Some(req_id.clone()),
+                                    message: e,
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+
+            // ----- workflows (Phase C): mule proxy -----
+            Frame::WorkflowList { req_id } => {
+                match &self.mule_tx {
+                    Some(tx) => {
+                        let _ = tx.send(mule::MuleJob::List { req_id: req_id.clone() });
+                    }
+                    None => Self::mule_unconfigured(self, from, req_id),
+                }
+            }
+            Frame::WorkflowGet { req_id, workflow } => {
+                match &self.mule_tx {
+                    Some(tx) => {
+                        let _ = tx.send(mule::MuleJob::Get {
+                            req_id: req_id.clone(),
+                            workflow_id: workflow.clone(),
+                        });
+                    }
+                    None => Self::mule_unconfigured(self, from, req_id),
+                }
+            }
+            Frame::WorkflowPut {
+                req_id,
+                workflow_id,
+                draft,
+            } => {
+                match &self.mule_tx {
+                    Some(tx) => {
+                        let _ = tx.send(mule::MuleJob::Put {
+                            req_id: req_id.clone(),
+                            workflow_id: workflow_id.clone(),
+                            draft: draft.clone(),
+                        });
+                    }
+                    None => Self::mule_unconfigured(self, from, req_id),
+                }
+            }
+            Frame::WorkflowDelete { req_id, workflow } => {
+                match &self.mule_tx {
+                    Some(tx) => {
+                        let _ = tx.send(mule::MuleJob::Delete {
+                            req_id: req_id.clone(),
+                            workflow_id: workflow.clone(),
+                        });
+                    }
+                    None => Self::mule_unconfigured(self, from, req_id),
+                }
+            }
+            Frame::WorkflowRun {
+                req_id,
+                workflow,
+                input,
+            } => {
+                let Some(tx) = &self.mule_tx else {
+                    Self::mule_unconfigured(self, from, req_id);
+                    return;
+                };
+                // the run pane: a dedicated chat pane (no backing agent) in a
+                // session named after the workflow — watchable from any client
+                let wf_name = self
+                    .resolve_session(workflow)
+                    .map(|s| s.name.clone())
+                    .unwrap_or_else(|| "workflow".into());
+                let sid = Uuid::new_v4();
+                let pid = Uuid::new_v4();
+                let mut sess = Session {
+                    id: sid,
+                    name: format!("wf-{}", &workflow[..8.min(workflow.len())]),
+                    kind: "mule".into(),
+                    panes: BTreeMap::new(),
+                    active: Uuid::nil(),
+                    size: (80, 24),
+                    windows: vec![Window::new(
+                        Layout::Leaf { pane: pid.to_string() },
+                        "0".into(),
+                    )],
+                    win: 0,
+                    chats: BTreeMap::new(),
+                };
+                sess.chats.insert(
+                    pid,
+                    ChatPane {
+                        forge_sid: Uuid::nil(), // no agent backing: rows come from the mule worker
+                        cols: 80,
+                        rows: 24,
+                        chat: vec![],
+                        model: None,
+                        cwd: None,
+                    },
+                );
+                sess.active = pid;
+                self.sessions.insert(sid, sess);
+                self.write_state();
+                self.mirror(relay::RelayOut::UpsertSession {
+                    id: sid.to_string(),
+                    name: format!("wf-{}", &workflow[..8.min(workflow.len())]),
+                    kind: "mule".into(),
+                });
+                let _ = tx.send(mule::MuleJob::Run {
+                    req_id: req_id.clone(),
+                    workflow_id: workflow.clone(),
+                    input: input.clone(),
+                    session: sid,
+                    pane: pid,
+                });
+                let _ = wf_name;
+            }
             // forge worker agent-status: resolve + broadcast
             Frame::Meta {
                 session,
                 pane,
                 kind,
                 status,
-            } if session.is_empty() && (kind == "agent" || kind == "model") => {
+            } if session.is_empty()
+                && (kind == "agent" || kind == "model" || kind == "workflow") =>
+            {
                 let pid = Uuid::parse_str(pane.as_deref().unwrap_or("")).ok();
                 let found = pid.and_then(|pid| {
                     self.sessions
@@ -2157,6 +3590,84 @@ impl Daemon {
                                 if let Some(cp) = s.chats.get_mut(&pid) {
                                     cp.model = Some(st.clone());
                                 }
+                            }
+                        }
+                    }
+                    // Phase D: event triggers see every agent turn end
+                    if kind == "agent" && status.as_deref() == Some("idle") {
+                        let (tframes, tmirrors) = self.triggers.fire_event(
+                            "agent_turn_ended",
+                            &serde_json::json!({ "pane": pid.to_string(), "session": sid.to_string() }),
+                        );
+                        for m in tmirrors {
+                            self.mirror(m);
+                        }
+                        for f in tframes {
+                            let fds: Vec<RawFd> = self.clients.keys().copied().collect();
+                            for fd in fds {
+                                if let Some(c) = self.clients.get_mut(&fd) {
+                                    send_frame(c, &f);
+                                }
+                            }
+                        }
+                    }
+                    // Phase D: workflow completion events feed triggers
+                    if kind == "workflow" {
+                        if let Some(st) = status.as_deref() {
+                            if st == "completed" || st == "failed" {
+                                let (tframes, tmirrors) = self.triggers.fire_event(
+                                    "workflow_completed",
+                                    &serde_json::json!({
+                                        "workflow_id": pane.as_deref().unwrap_or(""),
+                                        "pane": pane.as_deref().unwrap_or(""),
+                                        "status": st,
+                                    }),
+                                );
+                                for m in tmirrors {
+                                    self.mirror(m);
+                                }
+                                for f in tframes {
+                                    let fds: Vec<RawFd> = self.clients.keys().copied().collect();
+                                    for fd in fds {
+                                        if let Some(c) = self.clients.get_mut(&fd) {
+                                            send_frame(c, &f);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // agent-tool completion hook (Phase A): a spawned
+                    // pane's FIRST working->idle transition resolves its
+                    // callback — AgentDone to the caller pane. The
+                    // record stays (the caller can still steer/close);
+                    // later idles are the agent's own business.
+                    if kind == "agent" && status.as_deref() == Some("idle") {
+                        let should_fire = self
+                            .spawns
+                            .get_by_pane(pid)
+                            .is_some_and(|r| r.callback && !r.callback_fired);
+                        if should_fire {
+                            if let Some(r) = self.spawns.get_by_pane_mut(pid) {
+                                r.callback_fired = true;
+                            }
+                            if let Some(rec) = self.spawns.get_by_pane(pid).cloned() {
+                                let last = self
+                                    .sessions
+                                    .get(&sid)
+                                    .and_then(|s| s.chats.get(&pid))
+                                    .and_then(|cp| {
+                                        cp.chat.iter().rev().find(|m| m.role == "assistant")
+                                    })
+                                    .cloned();
+                                self.deliver_agent_done(
+                                    rec.caller_pane,
+                                    &rec,
+                                    sid,
+                                    pid,
+                                    "completed",
+                                    last,
+                                );
                             }
                         }
                     }
@@ -2452,6 +3963,7 @@ impl Daemon {
                 name,
                 kind,
                 cwd,
+                profile_id,
                 forge_session,
             } => {
                 let kind = kind.clone().unwrap_or_else(|| "shell".into());
@@ -2528,7 +4040,14 @@ impl Daemon {
                         let forge_cfg = forge::load_forge_config();
                         forge_cfg
                             .as_ref()
-                            .map(|cfg| forge::create_forge_session(cfg, &name, cwd.as_deref()))
+                            .map(|cfg| {
+                                forge::create_forge_session(
+                                    cfg,
+                                    &name,
+                                    cwd.as_deref(),
+                                    profile_id.as_deref(),
+                                )
+                            })
                             .unwrap_or(Err(
                                 "forge not configured (set forge_api_key in daemon.toml)".into(),
                             ))
@@ -2840,6 +4359,7 @@ impl Daemon {
                                         .as_deref()
                                         .map(|p| p.to_string_lossy())
                                         .as_deref(),
+                                    None,
                                 )
                             })
                             .unwrap_or(Err("forge not configured".into()))
@@ -3248,6 +4768,19 @@ fn run(daemon: Daemon) {
     // editor file-watch poll cadence (M10 ph3): stat the watched files
     // every ~2 s (66 x 30 ms ticks)
     let mut fw_tick: u32 = 0;
+    // loopback control API for agent tools (Phase A). Requests are
+    // drained in the loop below; the accept thread blocks on the reply
+    // channel, so an agent's tool call is synchronous end to end.
+    let control_rx = match control_api::spawn() {
+        Ok((port, rx)) => {
+            eprintln!("ranchd: control api on 127.0.0.1:{port} (agent tools)");
+            Some(rx)
+        }
+        Err(e) => {
+            eprintln!("ranchd: control api disabled: {e}");
+            None
+        }
+    };
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
         sa.sa_sigaction = on_signal as *const () as usize;
@@ -3322,6 +4855,7 @@ fn run(daemon: Daemon) {
                         stream: Some(stream),
                         relay_out: None,
                         relay_in: None,
+                        sink: None,
                         decoder: Decoder::new(),
                         name: format!("cli-{fd}"),
                         attach: None,
@@ -3392,10 +4926,78 @@ fn run(daemon: Daemon) {
             daemon.handle_frame(fd, &frame);
         }
 
+        // --- control API: agent tool requests (Phase A). Each request
+        // is handled as a transient pseudo-client whose "stream" is a
+        // sink; the collected reply frames go back to the agent's HTTP
+        // response. The pseudo-client's caller pane makes the ownership
+        // checks in handle_agent_* work. ---
+        if let Some(rx) = &control_rx {
+            loop {
+                match rx.try_recv() {
+                    Ok(req) => {
+                        let sink = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+                        // transient fd slot that cannot collide with real
+                        // clients (poll fds are >= 3, sockets positive)
+                        const CTL_FD: RawFd = -1000;
+                        daemon.clients.insert(
+                            CTL_FD,
+                            Client {
+                                stream: None,
+                                relay_out: None,
+                                relay_in: None,
+                                sink: Some(sink.clone()),
+                                decoder: Decoder::new(),
+                                name: format!("ctl-{}", req.caller_pane),
+                                attach: None,
+                                scrollback_mode: false,
+                                file_watches: BTreeMap::new(),
+                            },
+                        );
+                        daemon.handle_frame(CTL_FD, &req.frame);
+                        daemon.clients.remove(&CTL_FD);
+                        let frames = sink.lock().map(|g| g.clone()).unwrap_or_default();
+                        let _ = req.reply.send(frames);
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                }
+            }
+        }
+
         // --- file watches: external edits to open editor files (M10 ph3).
         // Cheap metadata stats on a handful of files; a changed mtime
         // pushes FileChanged to the watching client (baseline refreshes
         // on FileRead/FileWriteOk so our own saves stay quiet). ---
+        // trigger scheduler: cron evaluation once per second (the
+        // scheduler dedupes to once per trigger per minute)
+        {
+            let (frames, mirrors) = daemon.triggers.tick();
+            for m in mirrors {
+                daemon.mirror(m);
+            }
+            if !frames.is_empty() {
+                let fds: Vec<RawFd> = daemon.clients.keys().copied().collect();
+                for f in frames {
+                    for fd in &fds {
+                        if let Some(c) = daemon.clients.get_mut(fd) {
+                            send_frame(c, &f);
+                        }
+                    }
+                }
+            }
+        }
+        // agent-tool `ask` policy: expire unapproved spawn requests
+        for (spawn_id, caller) in daemon.spawns.expire_pending() {
+            eprintln!("ranchd: spawn request {spawn_id} expired (no approval)");
+            let rec = agenttools::SpawnRecord {
+                spawn_id: spawn_id.clone(),
+                caller_pane: caller,
+                created_at: Instant::now(),
+                callback: true,
+                callback_fired: false,
+            };
+            daemon.deliver_agent_done(caller, &rec, uuid::Uuid::nil(), uuid::Uuid::nil(), "denied", None);
+        }
         fw_tick = fw_tick.wrapping_add(1);
         if fw_tick.wrapping_rem(66) == 0 {
             for c in daemon.clients.values_mut() {

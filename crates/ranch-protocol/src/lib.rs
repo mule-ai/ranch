@@ -124,6 +124,10 @@ pub enum Frame {
         /// `pi` agent instead of a bare shell.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         kind: Option<String>,
+        /// kind="forge" only: use this agent profile (agent builder
+        /// launch). Absent = daemon default (config or first profile).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        profile_id: Option<String>,
         /// Working directory for the session's first pane (default $HOME).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cwd: Option<String>,
@@ -385,6 +389,270 @@ pub enum Frame {
         n: u32,
         data: String,
     },
+    // ----- agent tools (Phase A: agents spawn/steer/close panes) -----
+    /// Agent (or client) -> daemon: spawn a sub-agent pane.
+    /// `mode` "split" = new pane in `caller_session`; "session" = new
+    /// named session. `callback = true` registers a completion waiter
+    /// (AgentDone on the spawned pane's working->idle transition).
+        AgentSpawn {
+        req_id: String,
+        /// the pane requesting the spawn (ownership anchor; may be nil
+        /// for human-initiated spawns)
+        caller_pane: String,
+        caller_session: String,
+        kind: String,               // "pi" | "forge"
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        profile_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+        #[serde(default)]
+        prompt: String,
+        #[serde(default = "default_mode")]
+        mode: String,               // "split" | "session"
+        #[serde(default)]
+        callback: bool,
+    },
+    /// Daemon -> client: ack a successful spawn.
+        AgentSpawnOk {
+        req_id: String,
+        spawn_id: String,
+        session: String,
+        pane: String,
+    },
+    /// Daemon -> clients (policy=ask): a spawn awaits approval.
+        AgentSpawnRequest {
+        spawn_id: String,
+        caller_pane: String,
+        kind: String,
+        /// prompt preview (first ~120 chars)
+        preview: String,
+    },
+    /// Client -> daemon: resolve a pending AgentSpawnRequest.
+        AgentSpawnApprove { spawn_id: String, allow: bool },
+    /// Agent (or client) -> daemon: send a message to a spawned pane's
+    /// agent. delivery: "steer" (pi RPC steer / forge message) or
+    /// "queue" (pi follow_up / forge message).
+        AgentSend {
+        req_id: String,
+        /// requesting pane (ownership anchor; nil = human)
+        #[serde(default)]
+        caller_pane: String,
+        session: String,
+        pane: String,
+        text: String,
+        #[serde(default = "default_delivery")]
+        delivery: String,
+    },
+    /// Agent (or client) -> daemon: cheap status read of a spawned pane.
+        AgentStatus {
+        req_id: String,
+        #[serde(default)]
+        caller_pane: String,
+        pane: String,
+    },
+    /// Daemon -> client: status reply.
+        AgentStatusOk {
+        req_id: String,
+        pane: String,
+        /// "working" | "idle" | "unknown"
+        state: String,
+        model: Option<String>,
+    },
+    /// Agent (or client) -> daemon: read recent conversation rows.
+        AgentRead {
+        req_id: String,
+        #[serde(default)]
+        caller_pane: String,
+        pane: String,
+        #[serde(default)]
+        since_seq: i64,
+        #[serde(default = "default_read_limit")]
+        limit: u32,
+    },
+    /// Daemon -> client: conversation rows for AgentRead.
+        AgentReadOk {
+        req_id: String,
+        pane: String,
+        msgs: Vec<ChatMsg>,
+    },
+    /// Agent (or client) -> daemon: close a spawned pane (spawn-scoped).
+        AgentClose {
+        req_id: String,
+        #[serde(default)]
+        caller_pane: String,
+        session: String,
+        pane: String,
+    },
+    /// Daemon -> clients: ack (or callback) — a spawned pane finished
+    /// (working->idle), was closed, was denied, or timed out.
+        AgentDone {
+        spawn_id: String,
+        session: String,
+        pane: String,
+        /// "completed" | "failed" | "closed" | "denied" | "timeout"
+        outcome: String,
+        /// last assistant row (completed) or last row (failed)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        last_row: Option<ChatMsg>,
+    },
+    // ----- agent builder (Phase B): forge profile CRUD proxy -----
+    /// Client -> daemon: list forge agent profiles.
+    ProfileList { req_id: String },
+    /// Daemon -> client: profile summaries (secrets never included).
+    ProfileListOk {
+        req_id: String,
+        profiles: Vec<ProfileSummary>,
+    },
+    /// Client -> daemon: fetch one profile (secret redacted by forge).
+    ProfileGet { req_id: String, profile: String },
+    /// Daemon -> client: the profile.
+    ProfileGetOk {
+        req_id: String,
+        profile: Profile,
+    },
+    /// Client -> daemon: create (profile_id absent) or update. `api_key`
+    /// is write-only: forge accepts it and never returns it.
+    ProfilePut {
+        req_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        profile_id: Option<String>,
+        draft: ProfileDraft,
+    },
+    /// Daemon -> client: the saved profile's id.
+    ProfilePutOk { req_id: String, profile_id: String },
+    /// Client -> daemon: delete a profile.
+    ProfileDelete { req_id: String, profile: String },
+    /// Daemon -> client: delete ack.
+    ProfileDeleteOk { req_id: String },
+    // ----- workflows (Phase C): mule proxy -----
+    /// Client -> daemon: list mule workflows.
+    WorkflowList { req_id: String },
+    /// Daemon -> client: workflow summaries.
+    WorkflowListOk {
+        req_id: String,
+        workflows: Vec<WorkflowSummary>,
+    },
+    /// Client -> daemon: fetch one workflow (with steps).
+    WorkflowGet { req_id: String, workflow: String },
+    /// Daemon -> client: the workflow + steps.
+    WorkflowGetOk {
+        req_id: String,
+        workflow: WorkflowSummary,
+        steps: Vec<WorkflowStep>,
+    },
+    /// Client -> daemon: create (workflow_id absent) or update a
+    /// workflow with its full step list (the worker diffs mule's
+    /// step endpoints).
+    WorkflowPut {
+        req_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workflow_id: Option<String>,
+        draft: WorkflowDraft,
+    },
+    /// Daemon -> client: the saved workflow's id.
+    WorkflowPutOk { req_id: String, workflow_id: String },
+    /// Client -> daemon: delete a workflow.
+    WorkflowDelete { req_id: String, workflow: String },
+    /// Daemon -> client: delete ack.
+    WorkflowDeleteOk { req_id: String },
+    /// Client -> daemon: run a workflow into a new pane.
+    WorkflowRun {
+        req_id: String,
+        workflow: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input: Option<serde_json::Value>,
+    },
+    /// Daemon -> client: the run started (pane carries the stream).
+    WorkflowRunOk {
+        req_id: String,
+        job: String,
+        session: String,
+        pane: String,
+    },
+    // ----- triggers (Phase D) -----
+    /// Client -> daemon: list trigger definitions + last runs.
+    TriggerList { req_id: String },
+    /// Daemon -> client: trigger list.
+    TriggerListOk {
+        req_id: String,
+        triggers: Vec<serde_json::Value>,
+    },
+    /// Client -> daemon: create (trigger_id absent) or update.
+    TriggerPut {
+        req_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        trigger_id: Option<String>,
+        /// full trigger shape (SPEC §6.2): name, workflow, kind, cron|
+        /// event|webhook spec, input, enabled, catch_up
+        trigger: serde_json::Value,
+    },
+    /// Daemon -> client: the saved trigger's id.
+    TriggerPutOk { req_id: String, trigger_id: String },
+    /// Client -> daemon: delete a trigger.
+    TriggerDelete { req_id: String, trigger: String },
+    /// Daemon -> client: delete ack.
+    TriggerDeleteOk { req_id: String },
+    /// Client -> daemon: fire a trigger immediately (manual run).
+    TriggerRun { req_id: String, trigger: String },
+    /// Daemon -> clients: a trigger fired (dashboard badge / toast).
+    TriggerFired { trigger: String, job: String },
+    // ----- webhooks (Phase E) -----
+    /// Client -> daemon: list webhooks (secrets never returned).
+    WebhookList { req_id: String },
+    /// Daemon -> client: webhook list.
+    WebhookListOk {
+        req_id: String,
+        webhooks: Vec<serde_json::Value>,
+    },
+    /// Client -> daemon: create a webhook. The reply carries the URL +
+    /// raw secret exactly once (stored encrypted server-side).
+    WebhookPut {
+        req_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        webhook_id: Option<String>,
+        name: String,
+        /// allowed source tags (empty = any)
+        #[serde(default)]
+        sources: Vec<String>,
+    },
+    /// Daemon -> client: webhook saved; secret/url shown once.
+    WebhookPutOk {
+        req_id: String,
+        webhook_id: String,
+        url: String,
+        /// raw secret — ONLY present on creation
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        secret: Option<String>,
+    },
+    /// Client -> daemon: delete a webhook.
+    WebhookDelete { req_id: String, webhook: String },
+    /// Daemon -> client: delete ack.
+    WebhookDeleteOk { req_id: String },
+    /// Edge function -> daemon (via the relay): a verified external
+    /// event. The daemon matches it against webhook triggers and fires
+    /// workflows. This frame can only arrive from the relay pipe.
+    WebhookEvent {
+        webhook: String,
+        source: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        event: Option<String>,
+        #[serde(default)]
+        payload: serde_json::Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        received_at: Option<String>,
+    },
+}
+
+fn default_mode() -> String {
+    "split".into()
+}
+fn default_delivery() -> String {
+    "steer".into()
+}
+fn default_read_limit() -> u32 {
+    50
 }
 
 /// One row of a forge agent conversation (M8). Mirrors a forge
@@ -426,6 +694,121 @@ pub struct ForgeSessionInfo {
     /// forge's ended_at, when the session was severed/ended
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ended: Option<String>,
+}
+
+/// Forge agent-profile summary (agent builder, Phase B). Secrets are
+/// redacted server-side; these rows are safe to render anywhere.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProfileSummary {
+    pub id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub provider: String,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+}
+
+/// Full forge profile (ProfileGet). `api_key` arrives redacted.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Profile {
+    pub id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub provider: String,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nix_shell: Option<String>,
+    #[serde(default)]
+    pub system_prompt: String,
+    #[serde(default)]
+    pub tools: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+}
+
+/// Create/update payload (ProfilePut.draft). Mirrors forge's
+/// `CreateProfile`; `api_key` is write-only.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProfileDraft {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub provider: String,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nix_shell: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
+    #[serde(default)]
+    pub tools: Vec<String>,
+}
+
+/// Mule workflow summary (list rows).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WorkflowSummary {
+    pub id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_async: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+}
+
+/// One workflow step (mule WorkflowStep shape).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WorkflowStep {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub step_order: i64,
+    /// "agent" | "wasm_module"
+    #[serde(rename = "type", default)]
+    pub step_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wasm_module_id: Option<String>,
+    #[serde(default)]
+    pub config: serde_json::Value,
+}
+
+/// Create/update payload: the workflow + the full desired step list
+/// (the mule worker diffs against what's stored).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WorkflowDraft {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub is_async: bool,
+    #[serde(default)]
+    pub steps: Vec<WorkflowStep>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -483,6 +866,11 @@ pub struct PaneSnap {
     /// session/profile lookup, or after a model switch).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// PTY panes only: current working directory of the child
+    /// (/proc/<pid>/cwd), for the file browser's start dir and the
+    /// `$EDITOR` split anchor. None for chat panes / unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
 }
 
 /// One selectable agent model (pi `models.json` entry or forge
@@ -823,6 +1211,7 @@ mod tests {
                 chat: None,
                 forge_session: None,
                 model: None,
+                cwd: None,
             }],
             meta: vec![],
             windows: vec![],
@@ -916,5 +1305,128 @@ mod tests {
         let mut d = Decoder::new();
         let frames = d.feed(payload.as_bytes());
         assert_eq!(frames, vec![f1, f2]);
+    }
+
+    // ----- agent tool frames (Phase A) -----
+
+    #[test]
+    fn agent_frames_roundtrip() {
+        let frames = vec![
+            Frame::AgentSpawn {
+                req_id: "r1".into(),
+                caller_pane: "00000000-0000-0000-0000-000000000000".into(),
+                caller_session: "sess".into(),
+                kind: "pi".into(),
+                profile_id: None,
+                name: Some("refactor".into()),
+                cwd: Some("/tmp".into()),
+                prompt: "do the thing".into(),
+                mode: "split".into(),
+                callback: true,
+            },
+            Frame::AgentSpawnOk {
+                req_id: "r1".into(),
+                spawn_id: "sp1".into(),
+                session: "sess".into(),
+                pane: "pane".into(),
+            },
+            Frame::AgentSpawnRequest {
+                spawn_id: "sp2".into(),
+                caller_pane: "pane-a".into(),
+                kind: "forge".into(),
+                preview: "refactor the widget modu...".into(),
+            },
+            Frame::AgentSpawnApprove {
+                spawn_id: "sp2".into(),
+                allow: true,
+            },
+            Frame::AgentSend {
+                req_id: "r2".into(),
+                caller_pane: "pane-a".into(),
+                session: "sess".into(),
+                pane: "pane".into(),
+                text: "stop, do this instead".into(),
+                delivery: "steer".into(),
+            },
+            Frame::AgentStatus {
+                req_id: "r3".into(),
+                caller_pane: "pane-a".into(),
+                pane: "pane".into(),
+            },
+            Frame::AgentStatusOk {
+                req_id: "r3".into(),
+                pane: "pane".into(),
+                state: "working".into(),
+                model: Some("claude".into()),
+            },
+            Frame::AgentRead {
+                req_id: "r4".into(),
+                caller_pane: "pane-a".into(),
+                pane: "pane".into(),
+                since_seq: 5,
+                limit: 50,
+            },
+            Frame::AgentReadOk {
+                req_id: "r4".into(),
+                pane: "pane".into(),
+                msgs: vec![ChatMsg {
+                    seq: 6,
+                    role: "assistant".into(),
+                    text: "done".into(),
+                    tool_name: None,
+                    tool_call_id: None,
+                    tool_output: None,
+                    duration_ms: None,
+                    created_at: None,
+                }],
+            },
+            Frame::AgentClose {
+                req_id: "r5".into(),
+                caller_pane: "pane-a".into(),
+                session: "sess".into(),
+                pane: "pane".into(),
+            },
+            Frame::AgentDone {
+                spawn_id: "sp1".into(),
+                session: "sess".into(),
+                pane: "pane".into(),
+                outcome: "completed".into(),
+                last_row: None,
+            },
+        ];
+        for f in frames {
+            let lines = encode_frame(&f, "c1");
+            let mut payload = String::new();
+            for l in &lines {
+                payload.push_str(l);
+                payload.push('\n');
+            }
+            let mut d = Decoder::new();
+            let got = d.feed(payload.as_bytes());
+            assert_eq!(got, vec![f]);
+        }
+    }
+
+    #[test]
+    fn agent_spawn_defaults() {
+        // minimal JSON: mode/delivery/limit default; missing optional
+        // fields deserialize to None/false
+        let json = r#"{"t":"AgentSpawn","req_id":"r1","caller_pane":"p","caller_session":"s","kind":"pi","prompt":"hi"}"#;
+        let f: Frame = serde_json::from_str(json).unwrap();
+        match f {
+            Frame::AgentSpawn { mode, callback, name, cwd, profile_id, .. } => {
+                assert_eq!(mode, "split");
+                assert!(!callback);
+                assert!(name.is_none());
+                assert!(cwd.is_none());
+                assert!(profile_id.is_none());
+            }
+            _ => panic!("wrong variant"),
+        }
+        let json = r#"{"t":"AgentSend","req_id":"r","session":"s","pane":"p","text":"x"}"#;
+        match serde_json::from_str::<Frame>(json).unwrap() {
+            Frame::AgentSend { delivery, .. } => assert_eq!(delivery, "steer"),
+            _ => panic!("wrong variant"),
+        }
     }
 }

@@ -76,7 +76,13 @@ per app install for mobile so reconnects are stable).
     "panes": [ {"id":"<uuid>", "cols":48, "rows":29,
                  "lines":["…"], "cursor":{"x":12,"y":7,"visible":true},
                  "kind":"pty"|"forge-chat",
-                 "chat":[…], "forge_session":"<uuid>"} ]
+                 "chat":[…], "forge_session":"<uuid>",
+                 "model":"display name"} ]
+
+  For chat panes, `model` carries the agent's active-model display name
+  (daemon-known: pi `get_state` at spawn/restore, forge session
+  `override_model` ?? profile `model`, or the last successful
+  switch).
   }
   ```
   Each pane runs at its own (cols, rows) computed by the daemon from
@@ -92,6 +98,9 @@ per app install for mobile so reconnects are stable).
   in response to `scrollback-req`.
 - **`meta`** — status updates without screen change:
   `{"kind":"forge","status":"running"|"done"|"error","preview":"last 240 chars"}`.
+  Also `kind:"model"` on chat panes (`pane` set, `status` = the active
+  model's display name): emitted when the daemon learns/reports a pane's
+  model and after every successful model switch.
 
 ### Control (both directions)
 
@@ -201,6 +210,19 @@ The daemon is the file server; clients (mobile/CLI) are thin editors.
   `{"type":"prompt","message":...}` and maps pi RPC events
   (`message_end`, `tool_execution_*`, `turn_end`) to `chat` rows and
   `meta kind="agent"` status.
+- **Agent model selection** (chat panes, both backends):
+  - `ModelList {pane, req_id}` → `ModelListOk {req_id, pane, current?,
+    models: [{provider, id, name}]}`. Pi panes: `get_available_models`
+    + `get_state`. Forge panes: `GET /v1/models/catalog` + the session's
+    `override_provider`/`override_model` (effective model = override ??
+    profile default). Broadcast to all clients; matched by `req_id`.
+  - `ModelSet {session, pane, provider, model, req_id}` — switch the
+    active model (pi `set_model {provider, modelId}`; forge
+    `PATCH /sessions/:id`). Success is confirmed out-of-band as
+    `meta {kind:"model"}` with the new display name (the daemon caches
+    it into `PaneSnap.model` for re-attach); failure returns
+    `Error {req_id}` — clients ignore `error` frames whose `req_id`
+    doesn't match their own in-flight request.
 
 ## 4. Coalescing & sequencing
 
@@ -247,3 +269,96 @@ everywhere for uniformity.
   they travel as control frames alongside the VT pane, keyed by the
   same `to` address, so a client can switch between "raw TUI" and
   "chat view" of the same session without protocol changes.
+
+## 8. Planned frame families (SPEC v1.0)
+
+The frame families below are specified (docs/SPEC.md §8) and land per
+docs/PLAN.md phases. They follow all existing conventions: `req_id`
+correlation, daemon broadcast + client-side match, `Error {req_id}`
+on failure, chunking for oversized payloads. Documented here so
+clients can be built against them; this section graduates into the
+reference above as frames ship.
+
+### 8.1 Agent tools (Phase A)
+
+```
+AgentSpawn { req_id, caller_session, caller_pane,
+             kind: "pi"|"forge", profile_id?, name?, cwd?,
+             prompt, mode: "split"|"session",
+             callback: bool }
+  → AgentSpawnOk { req_id, session, pane, spawn_id }
+  → (policy=ask) AgentSpawnRequest { spawn_id, caller, kind, preview }   // broadcast
+  |            AgentSpawnApprove { spawn_id, allow }                     // any client
+AgentSend { session, pane, text, delivery: "steer"|"queue", req_id }
+AgentStatus { pane, req_id }
+  → AgentStatusOk { req_id, pane, state, busy, model? }
+AgentRead { pane, since_seq?, limit, req_id }
+  → AgentReadOk { req_id, pane, msgs: Vec<ChatMsg> }
+AgentClose { session, pane, req_id }
+  → AgentCloseOk { req_id }
+AgentDone { spawn_id, pane, session, outcome: "completed"|"failed"|"closed"|"denied"|"timeout", last_row? }
+  // daemon → broadcast; callers render as a system chat row
+```
+
+PaneMeta gains `spawned_by: Option<String>` (pane badge). Completion
+detection = the pane's agent status transition working→idle (the
+existing `meta kind="agent"` signal).
+
+### 8.2 Forge profiles (agent builder, Phase B)
+
+```
+ProfileList {}                          → ProfileListOk { profiles: [ProfileSummary] }
+ProfileGet { profile }                  → ProfileGetOk { profile }        // secrets redacted
+ProfilePut { profile_id?, draft }       → ProfilePutOk { profile_id }     // upsert; api_key write-only
+ProfileDelete { profile }               → ProfileDeleteOk
+SkillList {}                            → SkillListOk { skills }
+```
+
+Proxied by the forge worker to forge's `/profiles` endpoints;
+`forge_profile_id` in daemon.toml remains the default profile.
+
+### 8.3 Workflows (mule, Phase C)
+
+```
+WorkflowList {}                         → WorkflowListOk { workflows }
+WorkflowGet { workflow }                → WorkflowGetOk { workflow, steps }
+WorkflowPut { workflow_id?, draft }     → WorkflowPutOk { workflow_id }   // upsert incl. steps
+WorkflowDelete { workflow }             → WorkflowDeleteOk
+WorkflowRun { workflow, input?, req_id }
+  → WorkflowRunOk { req_id, job, session, pane }   // opens/attaches a workflow pane
+MuleAgentList {} / MuleSkillList {} / MuleProviderList {}   // editor pickers
+  → …Ok { items }
+```
+
+Workflow panes are headless VT panes fed by the mule worker
+(`job_update` / `job_step_update` / agent events filtered by job id);
+status rides `Meta { kind:"workflow", status, job_id }`.
+
+### 8.4 Triggers (Phase D)
+
+```
+TriggerList {}                          → TriggerListOk { triggers }
+TriggerPut { trigger_id?, draft }       → TriggerPutOk { trigger_id }
+TriggerDelete { trigger }               → TriggerDeleteOk
+TriggerRun { trigger, req_id }          → TriggerRunOk { req_id, job }
+TriggerFired { trigger, job }           // broadcast (dashboards, badges)
+```
+
+Trigger shape: SPEC.md §6.2 (cron with tz + catch_up; event filters over
+`agent_turn_ended | workflow_completed | file_changed | pane_exited |
+webhook`; templated input).
+
+### 8.5 Webhooks (Phase E)
+
+```
+WebhookList {}                          → WebhookListOk { webhooks }
+WebhookPut { webhook_id?, draft }       → WebhookPutOk { webhook_id, url, secret? }
+                                          // secret present ONCE (creation), then never
+WebhookDelete { webhook }               → WebhookDeleteOk
+WebhookEvent { webhook, source, event, payload, received_at }
+  // edge function → daemon via the machine's Realtime channel;
+  // daemon matches webhook triggers and fires workflows
+```
+
+Transport/auth for `WebhookEvent`: see docs/design/webhook-receiver.md
+(HMAC `X-Ranch-Signature`, 64 KB cap, rate limits, `webhook_log`).
