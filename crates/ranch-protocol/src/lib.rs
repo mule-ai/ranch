@@ -498,6 +498,16 @@ pub enum Frame {
         last_row: Option<ChatMsg>,
     },
     // ----- agent builder (Phase B): forge profile CRUD proxy -----
+    /// Client -> daemon: the pi model catalog (for profile forms).
+    /// Pane-less variant of `ModelList` (which needs a chat pane).
+    ModelCatalog { req_id: String },
+    /// Daemon -> client: catalog entries (secrets stripped). Empty
+    /// `models` when forge is unreachable — clients keep a free-text
+    /// fallback so a custom model id still works.
+    ModelCatalogOk {
+        req_id: String,
+        models: Vec<ModelChoice>,
+    },
     /// Client -> daemon: list forge agent profiles.
     ProfileList { req_id: String },
     /// Daemon -> client: profile summaries (secrets never included).

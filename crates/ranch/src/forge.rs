@@ -96,6 +96,8 @@ pub enum ForgeJob {
         model: String,
     },
     // ----- agent builder (Phase B): profile CRUD proxy -----
+    /// The pi model catalog (GET /v1/models/catalog) for profile forms.
+    ModelCatalog { req_id: String },
     /// List agent profiles (GET /profiles).
     ProfileList { req_id: String },
     /// Fetch one profile (GET /profiles/{id}; api_key arrives redacted).
@@ -611,6 +613,10 @@ pub fn spawn_worker(cfg: ForgeConfig, pipe_w: std::fs::File, rx: mpsc::Receiver<
                         }
                     }
                     // ----- agent builder (Phase B): profile CRUD proxy -----
+                    ForgeJob::ModelCatalog { req_id } => {
+                        let (models, _) = fetch_catalog(&cfg);
+                        write_frame(&pipe, &Frame::ModelCatalogOk { req_id, models });
+                    }
                     ForgeJob::ProfileList { req_id } => {
                         match http_json(&cfg, "GET", "/profiles", None) {
                             Ok(v) => {

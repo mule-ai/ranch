@@ -5,6 +5,7 @@ import { useCallback, useEffect, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
+  BackHandler,
   FlatList,
   Pressable,
   StyleSheet,
@@ -14,6 +15,14 @@ import {
 import { Relay } from "../lib/relay";
 import { Frame, TriggerRow, nextId } from "../lib/frames";
 
+// Android back gesture/button = the on-screen back control.
+function useAndroidBack(handler: () => boolean) {
+  useEffect(() => {
+    const sub = BackHandler.addEventListener("hardwareBackPress", handler);
+    return () => sub.remove();
+  }, [handler]);
+}
+
 type Props = { relay: Relay; onExit: () => void };
 
 export function TriggersScreen({ relay, onExit }: Props) {
@@ -22,6 +31,12 @@ export function TriggersScreen({ relay, onExit }: Props) {
   const refresh = useCallback(() => {
     relay.send({ t: "TriggerList", id: nextId(), client: "mobile", req_id: nextId() } as Frame);
   }, [relay]);
+
+  // back gesture/button = the on-screen back control
+  useAndroidBack(useCallback(() => {
+    onExit();
+    return true;
+  }, [onExit]));
 
   useEffect(() => {
     const un = relay.onFrame((f: Frame) => {

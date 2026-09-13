@@ -252,6 +252,8 @@ export type Frame =
   | { t: "WebhookDeleteOk"; id: string; req_id: string }
   | { t: "ModelList"; id: string; client: string; pane: string; req_id: string }
   | { t: "ModelListOk"; id: string; req_id: string; pane: string; current: ModelChoice | null; models: ModelChoice[] }
+  | { t: "ModelCatalog"; id: string; client: string; req_id: string }
+  | { t: "ModelCatalogOk"; id: string; req_id: string; models: ModelChoice[] }
   | { t: "ModelSet"; id: string; client: string; session: string; pane: string; provider: string; model: string; req_id: string }
   | { t: "Chunk"; chunk_id: string; i: number; n: number; data: string }
   | { t: "Error"; id?: string; of?: string; req_id?: string; message: string };

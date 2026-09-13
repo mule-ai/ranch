@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import {
   Alert,
+  BackHandler,
   Keyboard,
   Pressable,
   ScrollView,
@@ -115,6 +116,17 @@ export function EditorScreen({ relay, onExit }: Props) {
       onExit();
     }
   };
+
+  // Android back gesture/button = the on-screen back control. The
+  // discard-confirm alert is async (the user answers later), so consume
+  // the event whenever we're not already at the browser root.
+  useEffect(() => {
+    const sub = BackHandler.addEventListener("hardwareBackPress", () => {
+      backTapped();
+      return true;
+    });
+    return () => sub.remove();
+  }, [backTapped]);
 
   const openFileFromPath = (path: string) => {
     const rid = nextId();

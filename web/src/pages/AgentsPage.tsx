@@ -7,6 +7,7 @@ import {
   Frame,
   ProfileSummary,
   ProfileDraft,
+  ModelChoice,
   nextId,
 } from "../lib/frames";
 
@@ -187,7 +188,23 @@ function ProfileForm({
   const [draft, setDraft] = useState<ProfileDraft>(initial);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
+  // pi model catalog via the daemon (empty when forge is unreachable —
+  // then the model field falls back to free text)
+  const [catalog, setCatalog] = useState<ModelChoice[]>([]);
   const set = (patch: Partial<ProfileDraft>) => setDraft((d) => ({ ...d, ...patch }));
+
+  useEffect(() => {
+    if (!relay) return;
+    const rid = nextId();
+    const un = relay.onFrame((f: Frame) => {
+      if (f.t === "ModelCatalogOk" && f.req_id === rid) {
+        un();
+        setCatalog(f.models);
+      }
+    });
+    relay.send({ t: "ModelCatalog", id: nextId(), req_id: rid } as Frame);
+    return un;
+  }, [relay]);
 
   const save = () => {
     if (!relay) return;
@@ -263,7 +280,30 @@ function ProfileForm({
             ))}
           </select>,
         )}
-        {field("model", input(draft.model, (v) => set({ model: v }), { placeholder: "model id" }))}
+        {field(
+          "model",
+          catalog.length > 0 ? (
+            // dropdown from pi's models.json (via forge); keep the
+            // current value selectable even if the catalog doesn't
+            // list it (e.g. a custom id from an older profile)
+            <select
+              value={draft.model}
+              onChange={(e) => set({ model: e.target.value })}
+              style={{ display: "block", width: "100%" }}
+            >
+              {!catalog.some((m) => m.id === draft.model) && draft.model !== "" && (
+                <option value={draft.model}>{draft.model}</option>
+              )}
+              {catalog.map((m) => (
+                <option key={m.provider + "/" + m.id} value={m.id}>
+                  {m.name !== m.id ? `${m.name} (${m.id})` : m.id}
+                </option>
+              ))}
+            </select>
+          ) : (
+            input(draft.model, (v) => set({ model: v }), { placeholder: "model id" })
+          ),
+        )}
       </div>
       {field(
         "system prompt",

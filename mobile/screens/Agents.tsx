@@ -6,6 +6,7 @@ import { useCallback, useEffect, useState } from "react";
 import {
   Alert,
   ActivityIndicator,
+  BackHandler,
   FlatList,
   Pressable,
   StyleSheet,
@@ -14,7 +15,7 @@ import {
   View,
 } from "react-native";
 import { Relay } from "../lib/relay";
-import { Frame, ProfileSummary, ProfileDraft, nextId } from "../lib/frames";
+import { Frame, ModelChoice, ProfileSummary, ProfileDraft, nextId } from "../lib/frames";
 
 const PROVIDERS = ["openai", "anthropic", "proxy-anthropic", "proxy", "google", "gemini", "custom"];
 const KNOWN_TOOLS = ["bash", "read", "write", "edit"];
@@ -24,6 +25,20 @@ type Props = { relay: Relay; onLaunch: (p: ProfileSummary) => void; onExit: () =
 export function AgentsScreen({ relay, onLaunch, onExit }: Props) {
   const [profiles, setProfiles] = useState<ProfileSummary[] | null>(null);
   const [editing, setEditing] = useState<{ id: string | null; draft: ProfileDraft } | null>(null);
+
+  // back gesture/button: close the profile form first (mirrors the
+  // form's "‹ agents" control), then exit the screen
+  useEffect(() => {
+    const sub = BackHandler.addEventListener("hardwareBackPress", () => {
+      if (editing) {
+        setEditing(null);
+      } else {
+        onExit();
+      }
+      return true;
+    });
+    return () => sub.remove();
+  }, [editing, onExit]);
 
   const refresh = useCallback(() => {
     relay.send({ t: "ProfileList", id: nextId(), client: "mobile", req_id: nextId() } as Frame);
@@ -165,7 +180,24 @@ function ProfileForm({
 }) {
   const [draft, setDraft] = useState<ProfileDraft>(initial);
   const [busy, setBusy] = useState(false);
+  // pi model catalog via the daemon (empty when forge is unreachable —
+  // then the model field falls back to free text)
+  const [catalog, setCatalog] = useState<ModelChoice[]>([]);
+  // which provider's models to show in the picker (null = all)
+  const [catProv, setCatProv] = useState<string | null>(null);
   const set = (patch: Partial<ProfileDraft>) => setDraft((d) => ({ ...d, ...patch }));
+
+  useEffect(() => {
+    const rid = nextId();
+    const un = relay.onFrame((f: Frame) => {
+      if (f.t === "ModelCatalogOk" && f.req_id === rid) {
+        un();
+        setCatalog(f.models);
+      }
+    });
+    relay.send({ t: "ModelCatalog", id: nextId(), client: "mobile", req_id: rid } as Frame);
+    return un;
+  }, [relay]);
 
   const save = () => {
     if (!draft.name.trim() || !draft.model.trim()) return;
@@ -210,7 +242,54 @@ function ProfileForm({
               ))}
             </View>
             <Text style={s.label}>model</Text>
-            <TextInput style={s.input} value={draft.model} onChangeText={(v) => set({ model: v })} autoCapitalize="none" placeholder="model id" placeholderTextColor="#4b5563" />
+            {(() => {
+              const provs = Array.from(new Set(catalog.map((m) => m.provider)));
+              const models = catProv
+                ? catalog.filter((m) => m.provider === catProv)
+                : catalog;
+              if (catalog.length === 0) {
+                // no catalog (forge unreachable): free text fallback
+                return (
+                  <TextInput style={s.input} value={draft.model} onChangeText={(v) => set({ model: v })} autoCapitalize="none" placeholder="model id" placeholderTextColor="#4b5563" />
+                );
+              }
+              return (
+                <View style={{ gap: 6 }}>
+                  <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 6 }}>
+                    {provs.map((p) => (
+                      <Pressable
+                        key={p}
+                        style={[s.chip, catProv === p && s.chipOn]}
+                        onPress={() => setCatProv(catProv === p ? null : p)}
+                      >
+                        <Text style={[s.chipText, catProv === p && s.chipTextOn]}>{p}</Text>
+                      </Pressable>
+                    ))}
+                  </View>
+                  <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 6 }}>
+                    {(!draft.model.trim() || models.some((m) => m.id === draft.model)) ? null : (
+                      <Pressable style={[s.chip, s.chipOn]} onPress={() => set({ model: "" })}>
+                        <Text style={[s.chipText, s.chipTextOn]} numberOfLines={1}>{draft.model}</Text>
+                      </Pressable>
+                    )}
+                    {models.map((m) => (
+                      <Pressable
+                        key={m.provider + "/" + m.id}
+                        style={[s.chip, draft.model === m.id && s.chipOn]}
+                        onPress={() => set({ model: m.id, provider: m.provider })}
+                      >
+                        <Text style={[s.chipText, draft.model === m.id && s.chipTextOn]} numberOfLines={1}>
+                          {m.name !== m.id ? `${m.name} (${m.id})` : m.id}
+                        </Text>
+                      </Pressable>
+                    ))}
+                  </View>
+                  {draft.model.trim() !== "" && (
+                    <Text style={s.dim}>model: {draft.model}</Text>
+                  )}
+                </View>
+              );
+            })()}
             <Text style={s.label}>system prompt</Text>
             <TextInput
               style={[s.input, { minHeight: 90, textAlignVertical: "top" }]}

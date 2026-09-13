@@ -6,6 +6,7 @@ import { useCallback, useEffect, useState } from "react";
 import {
   Alert,
   ActivityIndicator,
+  BackHandler,
   FlatList,
   Pressable,
   StyleSheet,
@@ -14,6 +15,14 @@ import {
 } from "react-native";
 import { Relay } from "../lib/relay";
 import { Frame, WorkflowSummary, nextId } from "../lib/frames";
+
+// Android back gesture/button = the on-screen back control.
+function useAndroidBack(handler: () => boolean) {
+  useEffect(() => {
+    const sub = BackHandler.addEventListener("hardwareBackPress", handler);
+    return () => sub.remove();
+  }, [handler]);
+}
 
 type Props = { relay: Relay; onExit: () => void };
 
@@ -24,6 +33,12 @@ export function WorkflowsScreen({ relay, onExit }: Props) {
   const refresh = useCallback(() => {
     relay.send({ t: "WorkflowList", id: nextId(), client: "mobile", req_id: nextId() } as Frame);
   }, [relay]);
+
+  // back gesture/button = the on-screen back control
+  useAndroidBack(useCallback(() => {
+    onExit();
+    return true;
+  }, [onExit]));
 
   useEffect(() => {
     const un = relay.onFrame((f: Frame) => {

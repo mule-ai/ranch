@@ -3,6 +3,7 @@ import { useFonts } from "expo-font";
 import {
   ActivityIndicator,
   Alert,
+  BackHandler,
   FlatList,
   Keyboard,
   Pressable,
@@ -84,6 +85,24 @@ export default function App() {
       hide.remove();
     };
   }, []);
+
+  // Android back gesture/button: mirror the on-screen back control for
+  // whatever view is on top. Each full-screen sub-screen (editor, agents,
+  // workflows, triggers, terminal) installs its own handler for its
+  // internal back (including unsaved-changes confirms); this one covers
+  // the app-level views and must yield when a sub-screen is up.
+  const backReqRef = useRef(false);
+  backReqRef.current = !!(editing || agentsView || workflowsView || triggersView || attached);
+  useEffect(() => {
+    const sub = BackHandler.addEventListener("hardwareBackPress", () => {
+      if (backReqRef.current) return false; // let the sub-screen's handler run
+      if (attached !== null) setAttached(null);
+      else if (machine) setMachine(null);
+      else return false; // login/machines root: default (exit/background)
+      return true;
+    });
+    return () => sub.remove();
+  }, [attached, machine]);
 
   // auth state
   useEffect(() => {
@@ -504,6 +523,18 @@ export default function App() {
       }}
     />
   ) : null;
+}
+
+/** Install the given handler as the Android hardware/gesture back
+ * handler while mounted (the swipe-back gesture fires the same
+ * `hardwareBackPress` event as the button). Returns true from `handler`
+ * consumes the event; false lets the app-level handler (or the system)
+ * take it. */
+export function useAndroidBack(handler: () => boolean) {
+  useEffect(() => {
+    const sub = BackHandler.addEventListener("hardwareBackPress", handler);
+    return () => sub.remove();
+  }, [handler]);
 }
 
 const s = StyleSheet.create({

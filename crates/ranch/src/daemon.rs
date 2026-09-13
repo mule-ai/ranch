@@ -3051,6 +3051,26 @@ impl Daemon {
                 }
             }
             // ----- agent builder (Phase B): profile CRUD proxy -----
+            Frame::ModelCatalog { req_id } => {
+                match &self.forge_tx {
+                    Some(tx) => {
+                        let _ = tx.send(forge::ForgeJob::ModelCatalog { req_id: req_id.clone() });
+                    }
+                    None => {
+                        if let Some(c) = self.clients.get_mut(&from) {
+                            // no forge: empty catalog (clients fall back
+                            // to a free-text model field)
+                            send_frame(
+                                c,
+                                &Frame::ModelCatalogOk {
+                                    req_id: req_id.clone(),
+                                    models: Vec::new(),
+                                },
+                            );
+                        }
+                    }
+                }
+            }
             Frame::ProfileList { req_id } => {
                 match &self.forge_tx {
                     Some(tx) => {

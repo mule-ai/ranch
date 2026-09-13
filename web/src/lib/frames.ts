@@ -47,6 +47,11 @@ export type ChatMsg = {
 
 // ----- agent builder (Phase B): forge profile CRUD proxy -----
 
+// ----- agent builder (Phase B): forge profile CRUD proxy -----
+
+// One selectable agent model (pi models.json entry via forge's catalog).
+export type ModelChoice = { provider: string; id: string; name: string };
+
 export type ProfileSummary = {
   id: string;
   name: string;
@@ -219,6 +224,8 @@ export type Frame =
   | { t: "AgentClose"; req_id: string; caller_pane: string; session: string; pane: string }
   | { t: "AgentDone"; spawn_id: string; session: string; pane: string; outcome: string; last_row?: ChatMsg | null }
   | { t: "ProfileList"; id: string; req_id: string }
+  | { t: "ModelCatalog"; id: string; req_id: string }
+  | { t: "ModelCatalogOk"; id: string; req_id: string; models: ModelChoice[] }
   | { t: "ProfileListOk"; id: string; req_id: string; profiles: ProfileSummary[] }
   | { t: "ProfileGet"; id: string; req_id: string; profile: string }
   | { t: "ProfileGetOk"; id: string; req_id: string; profile: Profile }

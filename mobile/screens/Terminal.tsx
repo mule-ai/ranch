@@ -1,6 +1,7 @@
 import { useEffect, useState, useCallback, useRef } from "react";
 import {
   ActivityIndicator,
+  BackHandler,
   Keyboard,
   Pressable,
   ScrollView,
@@ -42,6 +43,14 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
   const [layout, setLayout] = useState<Layout | null>(null);
   const [activePane, setActivePane] = useState<string>("");
   const [conn, setConn] = useState("connecting…");
+  // back gesture/button = the on-screen back control (detach to sessions)
+  useEffect(() => {
+    const sub = BackHandler.addEventListener("hardwareBackPress", () => {
+      onExit();
+      return true;
+    });
+    return () => sub.remove();
+  }, [onExit]);
   const [history, setHistory] = useState<string[] | null>(null);
   const [blink, setBlink] = useState(true);
   const inputRef = useRef<TextInput | null>(null);
