@@ -4746,13 +4746,14 @@ pub fn run_daemon_with_args(args: Vec<String>) {
                 }
             }
         };
-        run(daemon);
+        run(daemon, spawn_control_api());
         return;
     }
     if args.len() >= 2 && args[1] == "upgrade" {
         eprintln!("ranchd: `upgrade` is sent as a frame to the running daemon (ranch upgrade)");
         std::process::exit(2);
     }
+    let control_rx = spawn_control_api();
     let mut daemon = match Daemon::new() {
         Ok(d) => d,
         Err(e) => {
@@ -4760,18 +4761,17 @@ pub fn run_daemon_with_args(args: Vec<String>) {
             std::process::exit(1);
         }
     };
-    run(daemon);
+    run(daemon, control_rx);
 }
 
-fn run(daemon: Daemon) {
-    let mut daemon = daemon;
-    // editor file-watch poll cadence (M10 ph3): stat the watched files
-    // every ~2 s (66 x 30 ms ticks)
-    let mut fw_tick: u32 = 0;
-    // loopback control API for agent tools (Phase A). Requests are
-    // drained in the loop below; the accept thread blocks on the reply
-    // channel, so an agent's tool call is synchronous end to end.
-    let control_rx = match control_api::spawn() {
+/// Loopback control API for agent tools (Phase A). MUST run before any
+/// pi pane spawn (cold start's restore_state() respawns saved panes and
+/// they inherit RANCH_CONTROL_* env at spawn — a control API started
+/// after restore leaves every restored pane without agent tools until
+/// the next manual spawn). The accept thread blocks on the reply
+/// channel, so an agent's tool call is synchronous end to end.
+fn spawn_control_api() -> Option<std::sync::mpsc::Receiver<control_api::ControlRequest>> {
+    match control_api::spawn() {
         Ok((port, rx)) => {
             eprintln!("ranchd: control api on 127.0.0.1:{port} (agent tools)");
             Some(rx)
@@ -4780,7 +4780,16 @@ fn run(daemon: Daemon) {
             eprintln!("ranchd: control api disabled: {e}");
             None
         }
-    };
+    }
+}
+
+fn run(
+    mut daemon: Daemon,
+    control_rx: Option<std::sync::mpsc::Receiver<control_api::ControlRequest>>,
+) {
+    // editor file-watch poll cadence (M10 ph3): stat the watched files
+    // every ~2 s (66 x 30 ms ticks)
+    let mut fw_tick: u32 = 0;
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
         sa.sa_sigaction = on_signal as *const () as usize;
