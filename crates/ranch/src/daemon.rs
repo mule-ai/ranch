@@ -3802,6 +3802,35 @@ impl Daemon {
                 }
                 return;
             }
+            // forge/mule worker -> clients: the remaining request replies
+            // (profile CRUD, workflow CRUD, trigger/webhook CRUD, model
+            // catalog). Not pane-addressable; broadcast (clients match on
+            // req_id). Request arms live in the second match below; these
+            // Ok shapes only ever arrive FROM the workers.
+            Frame::ModelCatalogOk { .. }
+            | Frame::ProfileListOk { .. }
+            | Frame::ProfileGetOk { .. }
+            | Frame::ProfilePutOk { .. }
+            | Frame::ProfileDeleteOk { .. }
+            | Frame::WorkflowListOk { .. }
+            | Frame::WorkflowGetOk { .. }
+            | Frame::WorkflowPutOk { .. }
+            | Frame::WorkflowDeleteOk { .. }
+            | Frame::WorkflowRunOk { .. }
+            | Frame::TriggerListOk { .. }
+            | Frame::TriggerPutOk { .. }
+            | Frame::TriggerDeleteOk { .. }
+            | Frame::WebhookListOk { .. }
+            | Frame::WebhookPutOk { .. }
+            | Frame::WebhookDeleteOk { .. } => {
+                let recipients: Vec<RawFd> = self.clients.keys().copied().collect();
+                for rfd in recipients {
+                    if let Some(c) = self.clients.get_mut(&rfd) {
+                        send_frame(c, frame);
+                    }
+                }
+                return;
+            }
             _ => {}
         }
         match frame {
