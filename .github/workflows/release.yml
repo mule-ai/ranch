@@ -47,10 +47,12 @@ jobs:
           # tools/zig-cc maps rust's musl triple to zig's; make build uses it as CC
           RANCH_ZIG: ${{ github.workspace }}/.tools/zig/zig
           CC_x86_64_unknown_linux_musl: ${{ github.workspace }}/tools/zig-cc
-        run: |
+        env:
           # baked into the binary; HelloOk reports it so clients can
           # flag stale installs (same string as versions.json below)
-          RANCH_VERSION="main-${GITHUB_SHA:0:7}" cargo build --release --target x86_64-unknown-linux-musl
+          RANCH_VERSION: main-${{ github.sha }}
+        run: |
+          cargo build --release --target x86_64-unknown-linux-musl
           file target/x86_64-unknown-linux-musl/release/ranch
           file target/x86_64-unknown-linux-musl/release/ranch | grep -qE "statically linked|static-pie"
       - name: Smoke test (host target)
@@ -94,9 +96,10 @@ jobs:
           echo "$RANCH_KEYSTORE_B64" | base64 -d > ~/.local/android-keystore/ranch.keystore
       - name: Build APK
         working-directory: mobile
-        run: |
+        env:
           # update banner: compared with versions.json's version field
-          echo "EXPO_PUBLIC_APP_VERSION=main-${GITHUB_SHA:0:7}" >> "$GITHUB_ENV"
+          EXPO_PUBLIC_APP_VERSION: main-${{ github.sha }}
+        run: |
           npm install
           npx expo prebuild --platform android --no-install
           python3 apply-signing.py
@@ -136,7 +139,7 @@ jobs:
           cp ../android-apk/ranch.apk* .
           cat > versions.json <<EOF
           {
-            "version": "$VERSION",
+            "version": "main-${{ github.sha }}",
             "built": "$DATE",
             "apk": "ranch.apk",
             "linux": "ranch-linux-x86_64.tar.gz",

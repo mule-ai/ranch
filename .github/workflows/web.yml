@@ -37,9 +37,12 @@ jobs:
           # user; it only owns the public demo machine (see ct/ranch-demo)
           VITE_DEMO_EMAIL: ranch-demo@jbutler.dev
           VITE_DEMO_PASSWORD: ranch-demo-2026
-        run: |
+        env:
           # update banner: compared with versions.json's version field
-          echo "VITE_APP_VERSION=main-${GITHUB_SHA:0:7}" >> "$GITHUB_ENV"
+          # (same-step env — GITHUB_ENV set here wouldn't apply to npm
+          # running in this step)
+          VITE_APP_VERSION: main-${{ github.sha }}
+        run: |
           npm ci
           npm run build
       - name: Upload Pages artifact
