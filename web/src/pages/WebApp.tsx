@@ -18,6 +18,7 @@ import { demoAvailable } from "../lib/demo";
 import { Login } from "./Login";
 import { AgentsPage } from "./AgentsPage";
 import { WorkflowsPage } from "./WorkflowsPage";
+import { TriggersPage } from "./TriggersPage";
 import type { ProfileSummary } from "../lib/frames";
 
 type Machine = { id: string; name: string; last_seen_at: string | null };
@@ -124,7 +125,7 @@ function MachineClient({ machine, onBack }: { machine: Machine; onBack: () => vo
   const [relay, setRelay] = useState<Relay | null>(null);
   const [sessions, setSessions] = useState<SessionMeta[] | null>(null);
   // null = sessions view; "agents" / "workflows" = builder pages
-  const [view, setView] = useState<null | "agents" | "workflows">(null);
+  const [view, setView] = useState<null | "agents" | "workflows" | "triggers">(null);
   const [pendingProfile, setPendingProfile] = useState<ProfileSummary | null>(null);
   const [attached, setAttached] = useState<SessionMeta | null>(null);
   const [conn, setConn] = useState("connecting…");
@@ -270,6 +271,16 @@ function MachineClient({ machine, onBack }: { machine: Machine; onBack: () => vo
           }}
         />
       )}
+      {view === "triggers" && (
+        <TriggersPage
+          relay={relay}
+          onAttach={(sid) => {
+            const s = sessions?.find((x) => x.id === sid);
+            if (s) setAttached(s);
+            setView(null);
+          }}
+        />
+      )}
       {view === null && (
       <>
       {sessions === null && <p className="dim">loading sessions…</p>}
@@ -312,6 +323,9 @@ function MachineClient({ machine, onBack }: { machine: Machine; onBack: () => vo
         </button>
         <button className="btn btn-ghost" onClick={() => setView(view === "workflows" ? null : "workflows")}>
           {view === "workflows" ? "sessions" : "workflows"}
+        </button>
+        <button className="btn btn-ghost" onClick={() => setView(view === "triggers" ? null : "triggers")}>
+          {view === "triggers" ? "sessions" : "triggers"}
         </button>
       </div>
     </div>

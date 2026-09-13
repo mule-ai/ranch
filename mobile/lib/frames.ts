@@ -123,6 +123,28 @@ export type WorkflowDraft = {
 };
 
 // Binary split tree, mirrors ranch_protocol::Layout
+
+// ----- triggers + webhooks (Phase D/E) -----
+
+export type TriggerRow = {
+  id?: string | null;
+  name: string;
+  workflow_id: string;
+  kind: "cron" | "event" | "webhook";
+  spec: { cron?: string; tz?: string; event?: string; filter?: Record<string, unknown>; source?: string };
+  input?: unknown;
+  enabled: boolean;
+  catch_up?: boolean;
+  last_run?: { job: string; at: number; status: string } | null;
+};
+
+export type WebhookRow = {
+  id: string;
+  name: string;
+  sources: string[];
+  enabled: boolean;
+  created_at?: string | null;
+};
 export type Layout =
   | { k: "Leaf"; pane: string }
   | { k: "Split"; dir: 0 | 1; pct: number; a: Layout; b: Layout };
@@ -216,6 +238,18 @@ export type Frame =
   | { t: "WorkflowDeleteOk"; id: string; req_id: string }
   | { t: "WorkflowRun"; id: string; req_id: string; workflow: string; input?: unknown }
   | { t: "WorkflowRunOk"; id: string; req_id: string; job: string; session: string; pane: string }
+  | { t: "TriggerList"; id: string; req_id: string }
+  | { t: "TriggerListOk"; id: string; req_id: string; triggers: TriggerRow[] }
+  | { t: "TriggerPut"; id: string; req_id: string; trigger_id?: string | null; trigger: TriggerRow }
+  | { t: "TriggerPutOk"; id: string; req_id: string; trigger_id: string }
+  | { t: "TriggerDelete"; id: string; req_id: string; trigger: string }
+  | { t: "TriggerDeleteOk"; id: string; req_id: string }
+  | { t: "TriggerRun"; id: string; req_id: string; trigger: string }
+  | { t: "TriggerFired"; trigger: string; job: string }
+  | { t: "WebhookList"; id: string; req_id: string }
+  | { t: "WebhookListOk"; id: string; req_id: string; webhooks: WebhookRow[] }
+  | { t: "WebhookDelete"; id: string; req_id: string; webhook: string }
+  | { t: "WebhookDeleteOk"; id: string; req_id: string }
   | { t: "ModelList"; id: string; client: string; pane: string; req_id: string }
   | { t: "ModelListOk"; id: string; req_id: string; pane: string; current: ModelChoice | null; models: ModelChoice[] }
   | { t: "ModelSet"; id: string; client: string; session: string; pane: string; provider: string; model: string; req_id: string }

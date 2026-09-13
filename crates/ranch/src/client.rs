@@ -985,6 +985,14 @@ fn cmd_attach(ref_: &str) {
         std::rc::Rc::new(std::cell::RefCell::new(None));
     let wf_items: std::rc::Rc<std::cell::RefCell<Vec<ranch_protocol::WorkflowSummary>>> =
         std::rc::Rc::new(std::cell::RefCell::new(vec![]));
+    // :triggers — trigger list (Phase D): enter = run now, d = disable/
+    // enable. Editing lives on the web surface.
+    let trig_open = std::cell::Cell::new(false);
+    let trig_sel = std::cell::Cell::new(0usize);
+    let trig_pending: std::rc::Rc<std::cell::RefCell<Option<String>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(None));
+    let trig_items: std::rc::Rc<std::cell::RefCell<Vec<serde_json::Value>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(vec![]));
     // :model — agent-model picker (modal; j/k/enter/esc). Items land
     // asynchronously via ModelListOk (matched on req_id).
     let model_open = std::cell::Cell::new(false);
@@ -1202,6 +1210,16 @@ fn cmd_attach(ref_: &str) {
                                     agents_items.borrow_mut().extend(profiles);
                                     agents_sel.set(0);
                                     agents_open.set(true);
+                                }
+                            }
+                            Frame::TriggerListOk { req_id, triggers } => {
+                                let matches_req =
+                                    trig_pending.borrow().as_deref() == Some(req_id.as_str());
+                                if matches_req {
+                                    *trig_pending.borrow_mut() = None;
+                                    *trig_items.borrow_mut() = triggers;
+                                    trig_sel.set(0);
+                                    trig_open.set(true);
                                 }
                             }
                             Frame::WorkflowListOk { req_id, workflows } => {
@@ -1836,6 +1854,47 @@ fn cmd_attach(ref_: &str) {
                 );
             }
 
+            // :triggers modal — trigger list (Phase D)
+            if trig_open.get() {
+                let n = trig_items.borrow().len();
+                let mh = ((n + 4) as u16).min(term_area.height);
+                let (mw, _) = (70.min(term_area.width), mh);
+                let mx = (term_area.width.saturating_sub(mw)) / 2;
+                let my = (term_area.height.saturating_sub(mh)) / 2;
+                let marea = Rect::new(mx, my, mw, mh);
+                f.render_widget(ratatui::widgets::Clear, marea);
+                let block = ratatui::widgets::Block::bordered()
+                    .title(" triggers · enter run · d toggle · esc close ")
+                    .border_style(Style::default().fg(ratatui::style::Color::Green));
+                let inner = block.inner(marea);
+                f.render_widget(block, marea);
+                let items: Vec<Line> = trig_items
+                    .borrow()
+                    .iter()
+                    .map(|tv| {
+                        let name = tv.get("name").and_then(|x| x.as_str()).unwrap_or("");
+                        let kind = tv.get("kind").and_then(|x| x.as_str()).unwrap_or("");
+                        let enabled = tv.get("enabled").and_then(|x| x.as_bool()).unwrap_or(true);
+                        let spec_cron = tv
+                            .pointer("/spec/cron")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("");
+                        let label = format!(
+                            "  {:<22} {}{}{}",
+                            name,
+                            kind,
+                            if kind == "cron" && !spec_cron.is_empty() { format!(": {spec_cron}") } else { String::new() },
+                            if enabled { "" } else { " (off)" },
+                        );
+                        Line::from(Span::styled(label, Style::default()))
+                    })
+                    .collect();
+                f.render_widget(
+                    Paragraph::new(items),
+                    Rect::new(inner.x, inner.y, inner.width, inner.height),
+                );
+            }
+
             // :workflows modal — mule workflow picker (Phase C)
             if wf_open.get() {
                 let n = wf_items.borrow().len();
@@ -1977,6 +2036,62 @@ fn cmd_attach(ref_: &str) {
                                         };
                                         send_frame(&mut stream, &f).ok();
                                         // SessionsAck attaches
+                                    }
+                                }
+                                _ => {}
+                            }
+                            continue;
+                        }
+                        // :triggers modal: trigger list (Phase D)
+                        if trig_open.get() {
+                            match key.code {
+                                KeyCode::Esc | KeyCode::Char('q') => {
+                                    trig_open.set(false);
+                                }
+                                KeyCode::Up | KeyCode::Char('k') => {
+                                    let sel = trig_sel.get();
+                                    if sel > 0 {
+                                        trig_sel.set(sel - 1);
+                                    }
+                                }
+                                KeyCode::Down | KeyCode::Char('j') => {
+                                    let sel = trig_sel.get();
+                                    if sel + 1 < trig_items.borrow().len() {
+                                        trig_sel.set(sel + 1);
+                                    }
+                                }
+                                KeyCode::Char('d') => {
+                                    // toggle enable/disable
+                                    let picked = trig_items.borrow().get(trig_sel.get()).cloned();
+                                    if let Some(mut tv) = picked {
+                                        let id = tv.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                                        let enabled = tv.get("enabled").and_then(|x| x.as_bool()).unwrap_or(true);
+                                        if let Some(obj) = tv.as_object_mut() {
+                                            obj.insert("enabled".into(), serde_json::Value::Bool(!enabled));
+                                        }
+                                        if !id.is_empty() {
+                                            let f = Frame::TriggerPut {
+                                                req_id: Uuid::new_v4().to_string(),
+                                                trigger_id: Some(id),
+                                                trigger: tv,
+                                            };
+                                            send_frame(&mut stream, &f).ok();
+                                            trig_open.set(false);
+                                        }
+                                    }
+                                }
+                                KeyCode::Enter => {
+                                    let picked = trig_items.borrow().get(trig_sel.get()).cloned();
+                                    if let Some(tv) = picked {
+                                        let id = tv.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                                        if !id.is_empty() {
+                                            trig_open.set(false);
+                                            let f = Frame::TriggerRun {
+                                                req_id: Uuid::new_v4().to_string(),
+                                                trigger: id,
+                                            };
+                                            send_frame(&mut stream, &f).ok();
+                                        }
                                     }
                                 }
                                 _ => {}
@@ -2485,6 +2600,15 @@ fn cmd_attach(ref_: &str) {
                                             Prompt::Command => {
                                                 // minimal: :agent <name>, :pi [dir],
                                                 // :resume, :kill, :detach
+                                                if prompt_input.trim() == "triggers" {
+                                                    prompt_input.clear();
+                                                    prompt.set(None);
+                                                    let rid = Uuid::new_v4().to_string();
+                                                    *trig_pending.borrow_mut() = Some(rid.clone());
+                                                    let f = Frame::TriggerList { req_id: rid };
+                                                    send_frame(&mut stream, &f).ok();
+                                                    continue;
+                                                }
                                                 if prompt_input.trim() == "workflows" {
                                                     prompt_input.clear();
                                                     prompt.set(None);
