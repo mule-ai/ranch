@@ -172,9 +172,19 @@ Deno.serve(async (req: Request) => {
       body: JSON.stringify({
         messages: [
           {
+            // REST broadcast topics carry no "realtime:" prefix (the
+            // server adds it on the wire) and private channels require
+            // the private flag — without it the message is silently
+            // dropped for subscribers of the private channel.
             topic: `machines:${hook.machine_id}`,
             event: "broadcast",
-            payload: { event: "frame", payload: frame },
+            private: true,
+            // NB: the REST endpoint wraps our payload one extra time on
+            // the wire ({event:"broadcast", payload:<ours>}), so the
+            // daemon — which unwraps exactly one level — receives the
+            // frame itself here (unlike the WS path, which needs the
+            // {event:"frame", payload} envelope).
+            payload: frame,
           },
         ],
       }),
