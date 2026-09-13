@@ -259,10 +259,19 @@ fn cmd_ls() {
         }
         for f in decoder.feed(&buf[..n]) {
             if let Frame::HelloOk {
-                machine, sessions, ..
+                machine,
+                sessions,
+                version,
+                ..
             } = f
             {
                 println!("machine: {machine}");
+                if let Some(v) = &version {
+                    let own = crate::daemon::build_version();
+                    if *v != own {
+                        eprintln!("⚠ daemon version {v} != client {own} — consider `ranch upgrade`");
+                    }
+                }
                 if sessions.is_empty() {
                     println!("(no sessions)");
                 }
@@ -622,6 +631,10 @@ fn cmd_dashboard() -> Option<String> {
     let mut sessions: Vec<ranch_protocol::SessionMeta> = vec![];
     let mut sel: usize = 0;
     let mut status = String::new();
+    // version banner: the daemon may be older/newer than this binary —
+    // hot upgrade realigns them
+    let own_version = crate::daemon::build_version();
+    let mut daemon_version: Option<String> = None;
     // Some(kind) while an inline input is active: "new" | "rename"
     let mut input: Option<&'static str> = None;
     let mut input_text = String::new();
@@ -642,8 +655,13 @@ fn cmd_dashboard() -> Option<String> {
                 Ok(n) => {
                     for f in decoder.feed(&buf[..n]) {
                         match f {
-                            Frame::HelloOk { sessions: ss, .. } => {
+                            Frame::HelloOk {
+                                sessions: ss,
+                                version,
+                                ..
+                            } => {
                                 sessions = ss;
+                                daemon_version = version;
                                 if sel >= sessions.len() {
                                     sel = sessions.len().saturating_sub(1);
                                 }
@@ -691,6 +709,18 @@ fn cmd_dashboard() -> Option<String> {
                 ),
                 Style::default().add_modifier(Modifier::REVERSED),
             )));
+            // update banner: daemon binary differs from this client's
+            // build (they ship together — mismatch means one is stale)
+            match &daemon_version {
+                Some(v) if *v != own_version => lines.push(Line::from(Span::styled(
+                    format!(
+                        " ⚠ version mismatch: daemon {v}, client {own_version} — run `ranch upgrade` or restart ranchd"
+                    ),
+                    Style::default().fg(ratatui::style::Color::Yellow),
+                ))),
+                Some(_) => {}
+                None => {}
+            }
             lines.push(Line::raw(""));
             if sess_ref.is_empty() {
                 lines.push(Line::raw("  no sessions yet — press c to create one"));
@@ -4062,6 +4092,9 @@ pub fn main_client() {
             cmd_new(args.get(1).cloned(), Some("forge".into()), cwd)
         }
         "ls" | "list" => cmd_ls(),
+        "--version" | "version" => {
+            println!("ranch {}", crate::daemon::build_version());
+        }
         "attach" => match args.get(1) {
             Some(r) => cmd_attach(r),
             None => die("usage: ranch attach <session>"),

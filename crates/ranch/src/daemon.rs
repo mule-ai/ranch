@@ -635,6 +635,17 @@ fn hostname() -> String {
         .unwrap_or_else(|| "ranch".into())
 }
 
+/// Build version reported in HelloOk: CI sets RANCH_VERSION (git-sha
+/// based, e.g. "main-82c0643" — the same string as the release index);
+/// local/source builds report "dev".
+pub fn build_version() -> String {
+    std::env::var("RANCH_VERSION")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| option_env!("RANCH_VERSION").map(String::from))
+        .unwrap_or_else(|| "dev".into())
+}
+
 fn home_dir_string() -> String {
     home_dir().to_string_lossy().into_owned()
 }
@@ -3860,6 +3871,7 @@ impl Daemon {
                             id: id.clone(),
                             machine: self.machine.clone(),
                             sessions,
+                            version: Some(crate::daemon::build_version()),
                         },
                     );
                 }
