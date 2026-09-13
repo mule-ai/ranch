@@ -44,6 +44,55 @@ export type ChatMsg = {
   created_at?: string;
 };
 
+
+// ----- agent builder (Phase B): forge profile CRUD proxy -----
+
+export type ProfileSummary = {
+  id: string;
+  name: string;
+  description?: string | null;
+  provider: string;
+  model: string;
+  working_dir?: string | null;
+  updated_at?: string | null;
+};
+
+export type Profile = {
+  id: string;
+  name: string;
+  description?: string | null;
+  provider: string;
+  model: string;
+  base_url?: string | null;
+  api_key?: string | null; // arrives redacted
+  working_dir?: string | null;
+  git_url?: string | null;
+  git_ref?: string | null;
+  nix_shell?: string | null;
+  system_prompt: string;
+  tools: string[];
+  updated_at?: string | null;
+};
+
+export type ProfileDraft = {
+  name: string;
+  description?: string | null;
+  provider: string;
+  model: string;
+  base_url?: string | null;
+  api_key?: string | null; // write-only
+  working_dir?: string | null;
+  git_url?: string | null;
+  git_ref?: string | null;
+  nix_shell?: string | null;
+  system_prompt?: string | null;
+  tools: string[];
+};
+
+// ----- agent tools (Phase A): agent-spawned panes -----
+
+export type ChatMsgDone = { pane: string; outcome: string; last?: string };
+
 // Binary split tree, mirrors ranch_protocol::Layout
 export type Layout =
   | { k: "Leaf"; pane: string }
@@ -109,6 +158,25 @@ export type Frame =
   | { t: "PaneResize"; session: string; pane: string; dir: 0 | 1; delta: number }
   | { t: "PaneKill"; session: string; pane: string }
   | { t: "Meta"; id: string; session: string; pane?: string; kind: string; status?: string; preview?: string }
+  | { t: "AgentSpawn"; req_id: string; caller_pane: string; caller_session: string; kind: string; profile_id?: string | null; name?: string | null; cwd?: string | null; prompt: string; mode?: string; callback?: boolean }
+  | { t: "AgentSpawnOk"; req_id: string; spawn_id: string; session: string; pane: string }
+  | { t: "AgentSpawnRequest"; spawn_id: string; caller_pane: string; kind: string; preview: string }
+  | { t: "AgentSpawnApprove"; spawn_id: string; allow: boolean }
+  | { t: "AgentSend"; req_id: string; caller_pane: string; session: string; pane: string; text: string; delivery?: string }
+  | { t: "AgentStatus"; req_id: string; caller_pane: string; pane: string }
+  | { t: "AgentStatusOk"; req_id: string; pane: string; state: string; model?: string | null }
+  | { t: "AgentRead"; req_id: string; caller_pane: string; pane: string; since_seq?: number; limit?: number }
+  | { t: "AgentReadOk"; req_id: string; pane: string; msgs: ChatMsg[] }
+  | { t: "AgentClose"; req_id: string; caller_pane: string; session: string; pane: string }
+  | { t: "AgentDone"; spawn_id: string; session: string; pane: string; outcome: string; last_row?: ChatMsg | null }
+  | { t: "ProfileList"; id: string; req_id: string }
+  | { t: "ProfileListOk"; id: string; req_id: string; profiles: ProfileSummary[] }
+  | { t: "ProfileGet"; id: string; req_id: string; profile: string }
+  | { t: "ProfileGetOk"; id: string; req_id: string; profile: Profile }
+  | { t: "ProfilePut"; id: string; req_id: string; profile_id?: string | null; draft: ProfileDraft }
+  | { t: "ProfilePutOk"; id: string; req_id: string; profile_id: string }
+  | { t: "ProfileDelete"; id: string; req_id: string; profile: string }
+  | { t: "ProfileDeleteOk"; id: string; req_id: string }
   | { t: "Chunk"; chunk_id: string; i: number; n: number; data: string }
   | { t: "Error"; id?: string; of?: string; req_id?: string; message: string };
 

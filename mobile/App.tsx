@@ -13,11 +13,12 @@ import {
 } from "react-native";
 import { supabase } from "./lib/supabase";
 import { Relay } from "./lib/relay";
-import { Frame, ForgeSessionInfo, SessionMeta, nextId } from "./lib/frames";
+import { Frame, ForgeSessionInfo, ProfileSummary, SessionMeta, nextId } from "./lib/frames";
 import { LoginScreen, EmailFallback } from "./screens/Login";
 import { MachinesScreen } from "./screens/Machines";
 import { TerminalScreen } from "./screens/Terminal";
 import { EditorScreen } from "./screens/Editor";
+import { AgentsScreen } from "./screens/Agents";
 
 type Machine = { id: string; name: string };
 
@@ -33,6 +34,9 @@ export default function App() {
   const [attached, setAttached] = useState<SessionMeta | null>(null);
   // M10: file editor (browse/read/write files on this machine)
   const [editing, setEditing] = useState(false);
+  // Phase B: agent builder (profiles) + a profile awaiting launch
+  const [agentsView, setAgentsView] = useState(false);
+  const [pendingProfile, setPendingProfile] = useState<ProfileSummary | null>(null);
   // hot daemon upgrade in flight (button shows progress, err shows result)
   const [upgrading, setUpgrading] = useState(false);
   const upgradingRef = useRef(false);
@@ -88,6 +92,18 @@ export default function App() {
   }, []);
 
   const signedIn = useCallback(() => setAuthed(true), []);
+
+  // Phase B: launch an agent profile from the builder — create a forge
+  // session bound to the profile; SessionsAck attaches (existing flow).
+  useEffect(() => {
+    if (!relay || !pendingProfile) return;
+    relay.send({
+      t: "SessionsCreate", req_id: nextId(), name: pendingProfile.name,
+      kind: "forge", profile_id: pendingProfile.id,
+    } as Frame);
+    setPendingProfile(null);
+  }, [relay, pendingProfile]);
+
 
   // when a machine is picked: open relay, hello, list sessions.
   // Hello is retried every 3s until the daemon answers — the daemon's
@@ -204,6 +220,19 @@ export default function App() {
     return <MachinesScreen onPick={(m) => setMachine(m)} />;
   }
 
+  if (agentsView && relay) {
+    return (
+      <AgentsScreen
+        relay={relay}
+        onExit={() => setAgentsView(false)}
+        onLaunch={(p) => {
+          setPendingProfile(p);
+          setAgentsView(false);
+        }}
+      />
+    );
+  }
+
   if (editing && relay) {
     return <EditorScreen relay={relay} onExit={() => setEditing(false)} />;
   }
@@ -251,6 +280,9 @@ export default function App() {
             <Pressable onPress={() => setEditing(true)} hitSlop={8}>
               <Text style={s.back}>files</Text>
             </Pressable>
+            <Pressable onPress={() => setAgentsView(true)} hitSlop={8}>
+              <Text style={s.back}>agents</Text>
+            </Pressable>
           </View>
         </View>
         {err !== "" && <Text style={s.err}>{err}</Text>}
@@ -291,6 +323,13 @@ export default function App() {
               </Pressable>
             )}
           />
+        )}
+        {pendingProfile !== null && relay && (
+          <View style={{ paddingVertical: 8 }}>
+            <Text style={s.dim}>
+              launching agent "{pendingProfile.name}"…
+            </Text>
+          </View>
         )}
         {resumeList !== null && (
           <View style={[s.resumeSheet]}>

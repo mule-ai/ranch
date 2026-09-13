@@ -124,6 +124,10 @@ pub enum Frame {
         /// `pi` agent instead of a bare shell.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         kind: Option<String>,
+        /// kind="forge" only: use this agent profile (agent builder
+        /// launch). Absent = daemon default (config or first profile).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        profile_id: Option<String>,
         /// Working directory for the session's first pane (default $HOME).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cwd: Option<String>,
@@ -493,6 +497,35 @@ pub enum Frame {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         last_row: Option<ChatMsg>,
     },
+    // ----- agent builder (Phase B): forge profile CRUD proxy -----
+    /// Client -> daemon: list forge agent profiles.
+    ProfileList { req_id: String },
+    /// Daemon -> client: profile summaries (secrets never included).
+    ProfileListOk {
+        req_id: String,
+        profiles: Vec<ProfileSummary>,
+    },
+    /// Client -> daemon: fetch one profile (secret redacted by forge).
+    ProfileGet { req_id: String, profile: String },
+    /// Daemon -> client: the profile.
+    ProfileGetOk {
+        req_id: String,
+        profile: Profile,
+    },
+    /// Client -> daemon: create (profile_id absent) or update. `api_key`
+    /// is write-only: forge accepts it and never returns it.
+    ProfilePut {
+        req_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        profile_id: Option<String>,
+        draft: ProfileDraft,
+    },
+    /// Daemon -> client: the saved profile's id.
+    ProfilePutOk { req_id: String, profile_id: String },
+    /// Client -> daemon: delete a profile.
+    ProfileDelete { req_id: String, profile: String },
+    /// Daemon -> client: delete ack.
+    ProfileDeleteOk { req_id: String },
 }
 
 fn default_mode() -> String {
@@ -544,6 +577,78 @@ pub struct ForgeSessionInfo {
     /// forge's ended_at, when the session was severed/ended
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ended: Option<String>,
+}
+
+/// Forge agent-profile summary (agent builder, Phase B). Secrets are
+/// redacted server-side; these rows are safe to render anywhere.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProfileSummary {
+    pub id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub provider: String,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+}
+
+/// Full forge profile (ProfileGet). `api_key` arrives redacted.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Profile {
+    pub id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub provider: String,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nix_shell: Option<String>,
+    #[serde(default)]
+    pub system_prompt: String,
+    #[serde(default)]
+    pub tools: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+}
+
+/// Create/update payload (ProfilePut.draft). Mirrors forge's
+/// `CreateProfile`; `api_key` is write-only.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProfileDraft {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub provider: String,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nix_shell: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
+    #[serde(default)]
+    pub tools: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

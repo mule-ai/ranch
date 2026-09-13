@@ -953,6 +953,19 @@ impl Daemon {
     /// The effective caller for a frame from client fd `from`. The
     /// control API runs each request on a thread with CALLER_PANE set;
     /// normal client frames are human (nil).
+    /// forge-required-but-unconfigured error reply.
+    fn forge_unconfigured(&mut self, from: RawFd, req_id: &str) {
+        if let Some(c) = self.clients.get_mut(&from) {
+            send_frame(
+                c,
+                &Frame::Error {
+                    req_id: Some(req_id.to_string()),
+                    message: "forge not configured (set forge_api_key in daemon.toml)".into(),
+                },
+            );
+        }
+    }
+
     /// The effective caller for an agent-tool frame: the frame's own
     /// caller_pane field (control API / forge bridge stamp it), falling
     /// back to the thread-local (reserved) and finally nil = human.
@@ -1224,6 +1237,7 @@ impl Daemon {
                     &fcfg,
                     "agent-spawned",
                     dir.as_deref().map(|p| p.to_string_lossy()).as_deref(),
+                    None,
                 )?;
                 s.chats.insert(
                     pid,
@@ -1272,6 +1286,7 @@ impl Daemon {
                     &fcfg,
                     &name,
                     cwd.as_deref(),
+                    None,
                 )?
             }
             _ => return Err(format!("unknown kind {kind:?}")),
@@ -2969,6 +2984,63 @@ impl Daemon {
                     );
                 }
             }
+            // ----- agent builder (Phase B): profile CRUD proxy -----
+            Frame::ProfileList { req_id } => {
+                match &self.forge_tx {
+                    Some(tx) => {
+                        let _ = tx.send(forge::ForgeJob::ProfileList { req_id: req_id.clone() });
+                    }
+                    None => {
+                        if let Some(c) = self.clients.get_mut(&from) {
+                            send_frame(
+                                c,
+                                &Frame::Error {
+                                    req_id: Some(req_id.clone()),
+                                    message: "forge not configured".into(),
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+            Frame::ProfileGet { req_id, profile } => {
+                match &self.forge_tx {
+                    Some(tx) => {
+                        let _ = tx.send(forge::ForgeJob::ProfileGet {
+                            req_id: req_id.clone(),
+                            profile_id: profile.clone(),
+                        });
+                    }
+                    None => Self::forge_unconfigured(self, from, req_id),
+                }
+            }
+            Frame::ProfilePut {
+                req_id,
+                profile_id,
+                draft,
+            } => {
+                match &self.forge_tx {
+                    Some(tx) => {
+                        let _ = tx.send(forge::ForgeJob::ProfilePut {
+                            req_id: req_id.clone(),
+                            profile_id: profile_id.clone(),
+                            draft: draft.clone(),
+                        });
+                    }
+                    None => Self::forge_unconfigured(self, from, req_id),
+                }
+            }
+            Frame::ProfileDelete { req_id, profile } => {
+                match &self.forge_tx {
+                    Some(tx) => {
+                        let _ = tx.send(forge::ForgeJob::ProfileDelete {
+                            req_id: req_id.clone(),
+                            profile_id: profile.clone(),
+                        });
+                    }
+                    None => Self::forge_unconfigured(self, from, req_id),
+                }
+            }
             // forge worker agent-status: resolve + broadcast
             Frame::Meta {
                 session,
@@ -3320,6 +3392,7 @@ impl Daemon {
                 name,
                 kind,
                 cwd,
+                profile_id,
                 forge_session,
             } => {
                 let kind = kind.clone().unwrap_or_else(|| "shell".into());
@@ -3396,7 +3469,14 @@ impl Daemon {
                         let forge_cfg = forge::load_forge_config();
                         forge_cfg
                             .as_ref()
-                            .map(|cfg| forge::create_forge_session(cfg, &name, cwd.as_deref()))
+                            .map(|cfg| {
+                                forge::create_forge_session(
+                                    cfg,
+                                    &name,
+                                    cwd.as_deref(),
+                                    profile_id.as_deref(),
+                                )
+                            })
                             .unwrap_or(Err(
                                 "forge not configured (set forge_api_key in daemon.toml)".into(),
                             ))
@@ -3708,6 +3788,7 @@ impl Daemon {
                                         .as_deref()
                                         .map(|p| p.to_string_lossy())
                                         .as_deref(),
+                                    None,
                                 )
                             })
                             .unwrap_or(Err("forge not configured".into()))

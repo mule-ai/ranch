@@ -16,6 +16,8 @@ import { PaneView, Rect, FS, LH } from "../components/PaneView";
 import { supabase } from "../lib/supabase";
 import { demoAvailable } from "../lib/demo";
 import { Login } from "./Login";
+import { AgentsPage } from "./AgentsPage";
+import type { ProfileSummary } from "../lib/frames";
 
 type Machine = { id: string; name: string; last_seen_at: string | null };
 
@@ -120,6 +122,9 @@ function MachinePicker({
 function MachineClient({ machine, onBack }: { machine: Machine; onBack: () => void }) {
   const [relay, setRelay] = useState<Relay | null>(null);
   const [sessions, setSessions] = useState<SessionMeta[] | null>(null);
+  // null = sessions view; "agents" = the agent-builder page
+  const [view, setView] = useState<null | "agents">(null);
+  const [pendingProfile, setPendingProfile] = useState<ProfileSummary | null>(null);
   const [attached, setAttached] = useState<SessionMeta | null>(null);
   const [conn, setConn] = useState("connecting…");
   const [err, setErr] = useState("");
@@ -235,12 +240,27 @@ function MachineClient({ machine, onBack }: { machine: Machine; onBack: () => vo
   return (
     <div className="page narrow">
       <p className="rowline">
-        <button className="linkbtn" onClick={onBack}>‹ machines</button>
+        {view === "agents" ? (
+          <button className="linkbtn" onClick={() => setView(null)}>‹ sessions</button>
+        ) : (
+          <button className="linkbtn" onClick={onBack}>‹ machines</button>
+        )}
         <span className="title-inline">{machine.name}</span>
         <span className="conn-badge">{conn}</span>
       </p>
       {err !== "" && <p className="err">{err}</p>}
 
+      {view === "agents" && (
+        <AgentsPage
+          relay={relay}
+          onLaunch={(profile) => {
+            setPendingProfile(profile);
+            setView(null); // back to sessions; CreateRow handles the launch
+          }}
+        />
+      )}
+      {view !== "agents" && (
+      <>
       {sessions === null && <p className="dim">loading sessions…</p>}
       {sessions !== null && sessions.length === 0 && (
         <p className="dim">No sessions. Create one below.</p>
@@ -258,7 +278,10 @@ function MachineClient({ machine, onBack }: { machine: Machine; onBack: () => vo
         />
       ))}
 
-      <CreateRow relay={relay} />
+      <CreateRow relay={relay} pendingProfile={pendingProfile} onProfileLaunched={() => setPendingProfile(null)} />
+      </>
+      )}
+      {view !== "agents" && (
       <div className="btnrow" style={{ marginTop: 24 }}>
         {/* demo build: hot upgrade is denied server-side for relay clients,
             so don't offer the button to public demo visitors */}
@@ -269,6 +292,12 @@ function MachineClient({ machine, onBack }: { machine: Machine; onBack: () => vo
         )}
         <button className="btn btn-ghost danger" onClick={() => supabase.auth.signOut()}>
           Sign out
+        </button>
+      </div>
+      )}
+      <div className="btnrow" style={{ marginTop: 12 }}>
+        <button className="btn btn-ghost" onClick={() => setView(view === "agents" ? null : "agents")}>
+          {view === "agents" ? "sessions" : "agents"}
         </button>
       </div>
     </div>
@@ -343,7 +372,7 @@ function SessionRow({
   );
 }
 
-function CreateRow({ relay }: { relay: Relay | null }) {
+function CreateRow({ relay, pendingProfile, onProfileLaunched }: { relay: Relay | null; pendingProfile?: ProfileSummary | null; onProfileLaunched?: () => void }) {
   const [name, setName] = useState("");
   // Demo build: the agent is forge-backed with no tools (the demo API
   // key is restricted server-side — profile CRUD, working_dir anchors,
@@ -389,6 +418,16 @@ function CreateRow({ relay }: { relay: Relay | null }) {
       cwd: kind === "pi" ? (piDir ?? undefined) : undefined,
     } as Frame);
   };
+
+  // agent-builder launch: create a forge session bound to the picked profile
+  useEffect(() => {
+    if (!relay || !pendingProfile) return;
+    relay.send({
+      t: "SessionsCreate", req_id: nextId(), name: pendingProfile.name,
+      kind: "forge", profile_id: pendingProfile.id,
+    } as unknown as Frame);
+    onProfileLaunched?.();
+  }, [relay, pendingProfile, onProfileLaunched]);
 
   return (
     <div className="createrow">

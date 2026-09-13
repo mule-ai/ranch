@@ -126,6 +126,7 @@ fn cmd_new(name: Option<String>, kind: Option<String>, cwd: Option<String>) {
             name,
             kind,
             cwd,
+            profile_id: None,
             forge_session: None,
         },
         "ack",
@@ -228,6 +229,7 @@ fn cmd_resume(query: Option<String>) {
             name: None,
             kind: Some("forge".into()),
             cwd: None,
+            profile_id: None,
             forge_session: Some(fsid),
         },
         "ack",
@@ -766,6 +768,7 @@ fn cmd_dashboard() -> Option<String> {
                                     name: if text.is_empty() { None } else { Some(text) },
                                     kind: None,
                                     cwd: None,
+                                    profile_id: None,
                                     forge_session: None,
                                 };
                                 send_frame(&mut stream, &f).ok();
@@ -779,6 +782,7 @@ fn cmd_dashboard() -> Option<String> {
                                     name: if text.is_empty() { None } else { Some(text) },
                                     kind: Some("forge".into()),
                                     cwd: None,
+                                    profile_id: None,
                                     forge_session: None,
                                 };
                                 send_frame(&mut stream, &f).ok();
@@ -834,6 +838,7 @@ fn cmd_dashboard() -> Option<String> {
                         name: None,
                         kind: None,
                         cwd: None,
+                        profile_id: None,
                         forge_session: None,
                     };
                     send_frame(&mut stream, &f).ok();
@@ -963,6 +968,15 @@ fn cmd_attach(ref_: &str) {
     let resume_items: std::rc::Rc<std::cell::RefCell<Vec<ranch_protocol::ForgeSessionInfo>>> =
         std::rc::Rc::new(std::cell::RefCell::new(vec![]));
     let _ = &resume_sel;
+    // :agents — agent-profile picker (Phase B): j/k/enter/esc. Enter
+    // launches an agent session bound to the picked profile. Editing
+    // happens on the web/mobile surfaces.
+    let agents_open = std::cell::Cell::new(false);
+    let agents_sel = std::cell::Cell::new(0usize);
+    let agents_pending: std::rc::Rc<std::cell::RefCell<Option<String>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(None));
+    let agents_items: std::rc::Rc<std::cell::RefCell<Vec<ranch_protocol::ProfileSummary>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(vec![]));
     // :model — agent-model picker (modal; j/k/enter/esc). Items land
     // asynchronously via ModelListOk (matched on req_id).
     let model_open = std::cell::Cell::new(false);
@@ -1169,6 +1183,17 @@ fn cmd_attach(ref_: &str) {
                                     resume_items.borrow_mut().extend(sessions);
                                     resume_sel.set(0);
                                     resume_open.set(true);
+                                }
+                            }
+                            Frame::ProfileListOk { req_id, profiles } => {
+                                let matches_req =
+                                    agents_pending.borrow().as_deref() == Some(req_id.as_str());
+                                if matches_req {
+                                    *agents_pending.borrow_mut() = None;
+                                    agents_items.borrow_mut().clear();
+                                    agents_items.borrow_mut().extend(profiles);
+                                    agents_sel.set(0);
+                                    agents_open.set(true);
                                 }
                             }
                             Frame::ModelListOk {
@@ -1782,6 +1807,41 @@ fn cmd_attach(ref_: &str) {
                 );
             }
 
+            // :agents modal — centered agent-profile picker (Phase B)
+            if agents_open.get() {
+                let n = agents_items.borrow().len();
+                let mh = ((n + 4) as u16).min(term_area.height);
+                let (mw, _) = (64.min(term_area.width), mh);
+                let mx = (term_area.width.saturating_sub(mw)) / 2;
+                let my = (term_area.height.saturating_sub(mh)) / 2;
+                let marea = Rect::new(mx, my, mw, mh);
+                f.render_widget(ratatui::widgets::Clear, marea);
+                let block = ratatui::widgets::Block::bordered()
+                    .title(" agent profiles · enter launch · esc close ")
+                    .border_style(Style::default().fg(ratatui::style::Color::Green));
+                let inner = block.inner(marea);
+                f.render_widget(block, marea);
+                let items: Vec<Line> = agents_items
+                    .borrow()
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| {
+                        let sel = i == agents_sel.get();
+                        let mut style = Style::default();
+                        if sel {
+                            style = style.add_modifier(Modifier::REVERSED);
+                        }
+                        let mark = if sel { ">" } else { " " };
+                        let label = format!("{mark} {:<20} {}/{}", p.name, p.provider, p.model);
+                        Line::from(Span::styled(label, style))
+                    })
+                    .collect();
+                f.render_widget(
+                    Paragraph::new(items),
+                    Rect::new(inner.x, inner.y, inner.width, inner.height),
+                );
+            }
+
             // prompt line (rename / command)
             if let Some(kind) = prompt_now {
                 let label = match kind {
@@ -1848,7 +1908,49 @@ fn cmd_attach(ref_: &str) {
                                             name: None,
                                             kind: Some("forge".into()),
                                             cwd: None,
+                                            profile_id: None,
                                             forge_session: Some(fsid),
+                                        };
+                                        send_frame(&mut stream, &f).ok();
+                                        // SessionsAck attaches
+                                    }
+                                }
+                                _ => {}
+                            }
+                            continue;
+                        }
+                        // :agents modal: agent-profile picker (Phase B)
+                        if agents_open.get() {
+                            match key.code {
+                                KeyCode::Esc | KeyCode::Char('q') => {
+                                    agents_open.set(false);
+                                }
+                                KeyCode::Up | KeyCode::Char('k') => {
+                                    let sel = agents_sel.get();
+                                    if sel > 0 {
+                                        agents_sel.set(sel - 1);
+                                    }
+                                }
+                                KeyCode::Down | KeyCode::Char('j') => {
+                                    let sel = agents_sel.get();
+                                    if sel + 1 < agents_items.borrow().len() {
+                                        agents_sel.set(sel + 1);
+                                    }
+                                }
+                                KeyCode::Enter => {
+                                    let picked = agents_items
+                                        .borrow()
+                                        .get(agents_sel.get())
+                                        .cloned();
+                                    if let Some(p) = picked {
+                                        agents_open.set(false);
+                                        let f = Frame::SessionsCreate {
+                                            req_id: Uuid::new_v4().to_string(),
+                                            name: Some(p.name),
+                                            kind: Some("forge".into()),
+                                            cwd: None,
+                                            profile_id: Some(p.id),
+                                            forge_session: None,
                                         };
                                         send_frame(&mut stream, &f).ok();
                                         // SessionsAck attaches
@@ -2281,6 +2383,15 @@ fn cmd_attach(ref_: &str) {
                                             Prompt::Command => {
                                                 // minimal: :agent <name>, :pi [dir],
                                                 // :resume, :kill, :detach
+                                                if prompt_input.trim() == "agents" {
+                                                    prompt_input.clear();
+                                                    prompt.set(None);
+                                                    let rid = Uuid::new_v4().to_string();
+                                                    *agents_pending.borrow_mut() = Some(rid.clone());
+                                                    let f = Frame::ProfileList { req_id: rid };
+                                                    send_frame(&mut stream, &f).ok();
+                                                    continue;
+                                                }
                                                 if prompt_input.trim() == "resume" {
                                                     let rid = Uuid::new_v4().to_string();
                                                     *resume_pending.borrow_mut() =
@@ -2349,6 +2460,7 @@ fn cmd_attach(ref_: &str) {
                                                         },
                                                         kind: Some("forge".into()),
                                                         cwd: None,
+                                                        profile_id: None,
                                                         forge_session: None,
                                                     };
                                                     send_frame(&mut stream, &f).ok();
