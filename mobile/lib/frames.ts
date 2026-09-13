@@ -98,6 +98,12 @@ export type ProfileDraft = {
 
 // ----- workflows (Phase C): mule proxy -----
 
+export type MuleAgent = {
+  id: string;
+  name: string;
+  description?: string | null;
+};
+
 export type WorkflowSummary = {
   id: string;
   name: string;
@@ -229,6 +235,8 @@ export type Frame =
   | { t: "ProfileDelete"; id: string; req_id: string; profile: string }
   | { t: "ProfileDeleteOk"; id: string; req_id: string }
   | { t: "WorkflowList"; id: string; req_id: string }
+  | { t: "MuleAgents"; id: string; req_id: string }
+  | { t: "MuleAgentsOk"; id: string; req_id: string; agents: MuleAgent[] }
   | { t: "WorkflowListOk"; id: string; req_id: string; workflows: WorkflowSummary[] }
   | { t: "WorkflowGet"; id: string; req_id: string; workflow: string }
   | { t: "WorkflowGetOk"; id: string; req_id: string; workflow: WorkflowSummary; steps: WorkflowStep[] }

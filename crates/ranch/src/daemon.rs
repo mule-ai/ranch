@@ -3481,6 +3481,14 @@ impl Daemon {
             }
 
             // ----- workflows (Phase C): mule proxy -----
+            Frame::MuleAgents { req_id } => {
+                match &self.mule_tx {
+                    Some(tx) => {
+                        let _ = tx.send(mule::MuleJob::Agents { req_id: req_id.clone() });
+                    }
+                    None => Self::mule_unconfigured(self, from, req_id),
+                }
+            }
             Frame::WorkflowList { req_id } => {
                 match &self.mule_tx {
                     Some(tx) => {
@@ -3813,6 +3821,7 @@ impl Daemon {
             | Frame::ProfilePutOk { .. }
             | Frame::ProfileDeleteOk { .. }
             | Frame::WorkflowListOk { .. }
+            | Frame::MuleAgentsOk { .. }
             | Frame::WorkflowGetOk { .. }
             | Frame::WorkflowPutOk { .. }
             | Frame::WorkflowDeleteOk { .. }

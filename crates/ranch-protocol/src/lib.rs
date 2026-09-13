@@ -539,6 +539,13 @@ pub enum Frame {
     // ----- workflows (Phase C): mule proxy -----
     /// Client -> daemon: list mule workflows.
     WorkflowList { req_id: String },
+    /// Client -> daemon: mule agents (for workflow-step pickers).
+    MuleAgents { req_id: String },
+    /// Daemon -> client: agent summaries (id + name).
+    MuleAgentsOk {
+        req_id: String,
+        agents: Vec<MuleAgent>,
+    },
     /// Daemon -> client: workflow summaries.
     WorkflowListOk {
         req_id: String,
@@ -776,6 +783,15 @@ pub struct ProfileDraft {
     pub system_prompt: Option<String>,
     #[serde(default)]
     pub tools: Vec<String>,
+}
+
+/// Mule agent summary (workflow-step picker rows).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MuleAgent {
+    pub id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 /// Mule workflow summary (list rows).

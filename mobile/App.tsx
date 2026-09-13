@@ -13,6 +13,7 @@ import {
   View,
 } from "react-native";
 import { supabase } from "./lib/supabase";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { Relay } from "./lib/relay";
 import { Frame, ForgeSessionInfo, ProfileSummary, SessionMeta, nextId } from "./lib/frames";
 import { LoginScreen, EmailFallback } from "./screens/Login";
@@ -26,6 +27,7 @@ import { TriggersScreen } from "./screens/Triggers";
 type Machine = { id: string; name: string };
 
 export default function App() {
+  const insets = useSafeAreaInsets();
   const [fontsLoaded] = useFonts({
     "JetBrainsMono NF Mono": require("./assets/fonts/JetBrainsMonoNerdFontMono-Regular.ttf"),
   });
@@ -295,7 +297,7 @@ export default function App() {
     );
 
   return (
-    <View style={[s.wrap, { paddingBottom: kbHeight + 64 }]}>
+    <View style={[s.wrap, { paddingBottom: kbHeight + 64 + insets.bottom }]}>
       <View style={s.header}>
         <Pressable onPress={() => setMachine(null)} hitSlop={8}>
           <Text style={s.back}>‹ machines</Text>
@@ -529,6 +531,8 @@ function TabBar({
   tab: "sessions" | "files" | "agents" | "automation";
   onPick: (t: "sessions" | "files" | "agents" | "automation") => void;
 }) {
+  // sit above the Android gesture-bar/home-pill area, not under it
+  const insets = useSafeAreaInsets();
   const tabs = [
     { id: "sessions" as const, label: "sessions", icon: "□" },
     { id: "files" as const, label: "files", icon: "≡" },
@@ -536,7 +540,7 @@ function TabBar({
     { id: "automation" as const, label: "automation", icon: "⏱" },
   ];
   return (
-    <View style={s.tabbar}>
+    <View style={[s.tabbar, { paddingBottom: 10 + insets.bottom }]}>
       {tabs.map((t) => (
         <Pressable key={t.id} style={s.tab} onPress={() => onPick(t.id)} hitSlop={4}>
           <Text style={[s.tabIcon, tab === t.id && s.tabIconOn]}>{t.icon}</Text>

@@ -22,7 +22,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::sync::mpsc;
 use uuid::Uuid;
 
-use ranch_protocol::{Frame, WorkflowDraft, WorkflowStep, WorkflowSummary};
+use ranch_protocol::{Frame, MuleAgent, WorkflowDraft, WorkflowStep, WorkflowSummary};
 use crate::forge::PipeWriter;
 
 #[derive(Debug, Clone)]
@@ -65,6 +65,8 @@ pub fn load_mule_config() -> Option<MuleConfig> {
 /// Jobs the main loop hands to the worker.
 pub enum MuleJob {
     List { req_id: String },
+    /// mule agents (workflow-step pickers)
+    Agents { req_id: String },
     Get { req_id: String, workflow_id: String },
     Put { req_id: String, workflow_id: Option<String>, draft: WorkflowDraft },
     Delete { req_id: String, workflow_id: String },
@@ -337,6 +339,28 @@ pub fn spawn_worker(cfg: MuleConfig, pipe_w: std::fs::File, rx: mpsc::Receiver<M
                                 })
                                 .collect();
                             write_frame(&pipe, &Frame::WorkflowListOk { req_id, workflows });
+                        }
+                        Err(e) => write_frame(&pipe, &Frame::Error { req_id: Some(req_id), message: e }),
+                    },
+                    MuleJob::Agents { req_id } => match http_json(&cfg, "GET", "/api/v1/agents", None) {
+                        Ok(v) => {
+                            let arr = v
+                                .get("agents")
+                                .and_then(|x| x.as_array())
+                                .cloned()
+                                .or_else(|| v.as_array().cloned())
+                                .unwrap_or_default();
+                            let agents: Vec<MuleAgent> = arr
+                                .iter()
+                                .filter_map(|a| {
+                                    Some(MuleAgent {
+                                        id: a.get("id")?.as_str()?.to_string(),
+                                        name: a.get("name").and_then(|n| n.as_str()).unwrap_or("").into(),
+                                        description: a.get("description").and_then(|d| d.as_str()).map(String::from),
+                                    })
+                                })
+                                .collect();
+                            write_frame(&pipe, &Frame::MuleAgentsOk { req_id, agents });
                         }
                         Err(e) => write_frame(&pipe, &Frame::Error { req_id: Some(req_id), message: e }),
                     },

@@ -179,6 +179,8 @@ function ProfileForm({
   // dropdown open state (mobile has no <select>; Terminal's model
   // switcher uses the same modal-sheet pattern)
   const [pickerOpen, setPickerOpen] = useState(false);
+  // catalog fetch failed (forge unreachable etc.) — surface + free text
+  const [catErr, setCatErr] = useState<string | null>(null);
   const set = (patch: Partial<ProfileDraft>) => setDraft((d) => ({ ...d, ...patch }));
   // every catalog entry for the selected provider (all entries when the
   // provider has none — providers in pi's models.json don't always match
@@ -190,15 +192,34 @@ function ProfileForm({
   const currentModel = catalog.find((m) => m.id === draft.model);
 
   useEffect(() => {
-    const rid = nextId();
-    const un = relay.onFrame((f: Frame) => {
-      if (f.t === "ModelCatalogOk" && f.req_id === rid) {
-        un();
-        setCatalog(f.models);
-      }
-    });
-    relay.send({ t: "ModelCatalog", id: nextId(), client: "mobile", req_id: rid } as Frame);
-    return un;
+    let alive = true;
+    const fetchCatalog = () => {
+      const rid = nextId();
+      const un = relay.onFrame((f: Frame) => {
+        if (!alive) return;
+        if (f.t === "ModelCatalogOk" && f.req_id === rid) {
+          un();
+          setCatalog(f.models);
+          setCatErr(null);
+        } else if (f.t === "Error" && f.req_id === rid) {
+          un();
+          setCatErr("couldn't load models — type the id");
+        }
+      });
+      relay.send({ t: "ModelCatalog", id: nextId(), client: "mobile", req_id: rid } as Frame);
+      return un;
+    };
+    const un = fetchCatalog();
+    // daemon restarts / dropped frames: retry while the form is open and
+    // nothing arrived (cheap — a reply just overwrites state)
+    const retry = setInterval(() => {
+      if (alive) fetchCatalog();
+    }, 5000);
+    return () => {
+      alive = false;
+      un();
+      clearInterval(retry);
+    };
   }, [relay]);
 
   const save = () => {
@@ -244,7 +265,11 @@ function ProfileForm({
               ))}
             </View>
             <Text style={s.label}>model</Text>
-            {catalog.length === 0 ? (
+            {catErr !== null && <Text style={s.dim}>{catErr}</Text>}
+            {catalog.length === 0 && catErr === null ? (
+              <Text style={s.dim}>loading models…</Text>
+            ) : null}
+            {catalog.length === 0 && catErr !== null ? (
               // no catalog (forge unreachable): free text fallback
               <TextInput style={s.input} value={draft.model} onChangeText={(v) => set({ model: v })} autoCapitalize="none" placeholder="model id" placeholderTextColor="#4b5563" />
             ) : (

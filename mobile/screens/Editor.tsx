@@ -42,15 +42,12 @@ export function EditorScreen({ relay, onExit }: Props) {
   const [browseLoading, setBrowseLoading] = useState(false);
   const [openFile, setOpenFile] = useState<OpenFile | null>(null);
   const [draft, setDraft] = useState("");
-  const [view, setView] = useState<"edit" | "review">("edit");
+  const [view, setView] = useState<"edit" | "review" | "code">("edit");
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   // path of a file that changed on disk while the draft was dirty
   const [externChanged, setExternChanged] = useState<string | null>(null);
-  // syntax-highlight scroll sync (overlay mirrors the input's offset)
-  const hlScrollRef = useRef<ScrollView | null>(null);
-  const hlInputYRef = useRef(0);
 
   // req_id matching so replies land in the right handler
   const dirReqRef = useRef<string | null>(null);
@@ -230,7 +227,14 @@ export function EditorScreen({ relay, onExit }: Props) {
   }, [relay]);
 
   const dirty = openFile ? draft !== openFile.original : false;
-  const showMarkdownTabs = openFile && isMarkdown(openFile.path);
+  const showTabs = openFile && (isMarkdown(openFile.path) || supportsHighlight(openFile.path));
+  const otherTab: "review" | "code" | null = !openFile
+    ? null
+    : isMarkdown(openFile.path)
+      ? "review"
+      : supportsHighlight(openFile.path)
+        ? "code"
+        : null;
 
   return (
     <View style={[styles.wrap, { paddingBottom: kbHeight }]}>
@@ -278,13 +282,18 @@ export function EditorScreen({ relay, onExit }: Props) {
         </View>
       )}
 
-      {showMarkdownTabs && (
+      {showTabs && otherTab !== null && (
         <View style={styles.tabs}>
           <Pressable style={[styles.tab, view === "edit" && styles.tabOn]} onPress={() => setView("edit")}>
             <Text style={[styles.tabText, view === "edit" && styles.tabTextOn]}>edit</Text>
           </Pressable>
-          <Pressable style={[styles.tab, view === "review" && styles.tabOn]} onPress={() => setView("review")}>
-            <Text style={[styles.tabText, view === "review" && styles.tabTextOn]}>review</Text>
+          <Pressable
+            style={[styles.tab, view === otherTab && styles.tabOn]}
+            onPress={() => setView(otherTab)}
+          >
+            <Text style={[styles.tabText, view === otherTab && styles.tabTextOn]}>
+              {otherTab === "review" ? "review" : "code"}
+            </Text>
           </Pressable>
         </View>
       )}
@@ -293,44 +302,6 @@ export function EditorScreen({ relay, onExit }: Props) {
         <Text style={styles.dim}>loading…</Text>
       ) : openFile ? (
         view === "edit" ? (
-          supportsHighlight(openFile.path) ? (
-            // code file: highlighted text layer under a transparent-text
-            // TextInput (same font/size/line-height ⇒ rows align 1:1;
-            // the module header in lib/highlight.ts documents the trick).
-            // Scroll offsets are synced so long files scroll as one body.
-            <View style={styles.hlStack}>
-              <ScrollView
-                ref={hlScrollRef}
-                style={styles.editor}
-                scrollEnabled={false}
-                pointerEvents="none"
-              >
-                <HlBody lines={highlightAll(draft, langForPath(openFile.path))} />
-              </ScrollView>
-              <TextInput
-                style={[styles.editor, styles.editorGhost, StyleSheet.absoluteFill]}
-                value={draft}
-                onChangeText={setDraft}
-                multiline
-                textAlignVertical="top"
-                autoCapitalize="none"
-                autoCorrect={false}
-                autoComplete="off"
-                spellCheck={false}
-                selectionColor="#4ade80"
-                onScroll={(e) => {
-                  const y = e.nativeEvent.contentOffset.y;
-                  hlInputYRef.current = y;
-                  hlScrollRef.current?.scrollTo({ y, animated: false });
-                }}
-                onContentSizeChange={() => {
-                  // keep the overlay in sync when rows re-wrap
-                  const y = hlInputYRef.current;
-                  if (y > 0) hlScrollRef.current?.scrollTo({ y, animated: false });
-                }}
-              />
-            </View>
-          ) : (
           <TextInput
             style={styles.editor}
             value={draft}
@@ -344,7 +315,11 @@ export function EditorScreen({ relay, onExit }: Props) {
             spellCheck={false}
             selectionColor="#4ade80"
           />
-          )
+        ) : view === "code" ? (
+          // highlighted, read-only rendering (blur-free: one text layer)
+          <ScrollView style={styles.editor} scrollEnabled>
+            <HlBody lines={highlightAll(draft, langForPath(openFile.path))} />
+          </ScrollView>
         ) : (
           <ScrollView style={styles.review} contentContainerStyle={styles.reviewContent}>
             <MarkdownView source={draft} />
@@ -646,9 +621,8 @@ const styles = StyleSheet.create({
     fontSize: 14, lineHeight: 20, paddingTop: 12, paddingHorizontal: 4,
     backgroundColor: "#0a0a0e",
   },
-  // syntax-highlight stack: colored overlay + transparent-text input
-  hlStack: { flex: 1, backgroundColor: "#0a0a0e" },
-  editorGhost: { color: "transparent", backgroundColor: "transparent" },
+  // highlighted (read-only) code rendering — single text layer, no
+  // overlay alignment issues
   hlLine: {
     color: "#d1d5db", fontFamily: "JetBrainsMono NF Mono",
     fontSize: 14, lineHeight: 20,
