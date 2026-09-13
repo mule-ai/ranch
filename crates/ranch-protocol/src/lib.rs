@@ -385,6 +385,124 @@ pub enum Frame {
         n: u32,
         data: String,
     },
+    // ----- agent tools (Phase A: agents spawn/steer/close panes) -----
+    /// Agent (or client) -> daemon: spawn a sub-agent pane.
+    /// `mode` "split" = new pane in `caller_session`; "session" = new
+    /// named session. `callback = true` registers a completion waiter
+    /// (AgentDone on the spawned pane's working->idle transition).
+        AgentSpawn {
+        req_id: String,
+        /// the pane requesting the spawn (ownership anchor; may be nil
+        /// for human-initiated spawns)
+        caller_pane: String,
+        caller_session: String,
+        kind: String,               // "pi" | "forge"
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        profile_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+        #[serde(default)]
+        prompt: String,
+        #[serde(default = "default_mode")]
+        mode: String,               // "split" | "session"
+        #[serde(default)]
+        callback: bool,
+    },
+    /// Daemon -> client: ack a successful spawn.
+        AgentSpawnOk {
+        req_id: String,
+        spawn_id: String,
+        session: String,
+        pane: String,
+    },
+    /// Daemon -> clients (policy=ask): a spawn awaits approval.
+        AgentSpawnRequest {
+        spawn_id: String,
+        caller_pane: String,
+        kind: String,
+        /// prompt preview (first ~120 chars)
+        preview: String,
+    },
+    /// Client -> daemon: resolve a pending AgentSpawnRequest.
+        AgentSpawnApprove { spawn_id: String, allow: bool },
+    /// Agent (or client) -> daemon: send a message to a spawned pane's
+    /// agent. delivery: "steer" (pi RPC steer / forge message) or
+    /// "queue" (pi follow_up / forge message).
+        AgentSend {
+        req_id: String,
+        /// requesting pane (ownership anchor; nil = human)
+        #[serde(default)]
+        caller_pane: String,
+        session: String,
+        pane: String,
+        text: String,
+        #[serde(default = "default_delivery")]
+        delivery: String,
+    },
+    /// Agent (or client) -> daemon: cheap status read of a spawned pane.
+        AgentStatus {
+        req_id: String,
+        #[serde(default)]
+        caller_pane: String,
+        pane: String,
+    },
+    /// Daemon -> client: status reply.
+        AgentStatusOk {
+        req_id: String,
+        pane: String,
+        /// "working" | "idle" | "unknown"
+        state: String,
+        model: Option<String>,
+    },
+    /// Agent (or client) -> daemon: read recent conversation rows.
+        AgentRead {
+        req_id: String,
+        #[serde(default)]
+        caller_pane: String,
+        pane: String,
+        #[serde(default)]
+        since_seq: i64,
+        #[serde(default = "default_read_limit")]
+        limit: u32,
+    },
+    /// Daemon -> client: conversation rows for AgentRead.
+        AgentReadOk {
+        req_id: String,
+        pane: String,
+        msgs: Vec<ChatMsg>,
+    },
+    /// Agent (or client) -> daemon: close a spawned pane (spawn-scoped).
+        AgentClose {
+        req_id: String,
+        #[serde(default)]
+        caller_pane: String,
+        session: String,
+        pane: String,
+    },
+    /// Daemon -> clients: ack (or callback) — a spawned pane finished
+    /// (working->idle), was closed, was denied, or timed out.
+        AgentDone {
+        spawn_id: String,
+        session: String,
+        pane: String,
+        /// "completed" | "failed" | "closed" | "denied" | "timeout"
+        outcome: String,
+        /// last assistant row (completed) or last row (failed)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        last_row: Option<ChatMsg>,
+    },
+}
+
+fn default_mode() -> String {
+    "split".into()
+}
+fn default_delivery() -> String {
+    "steer".into()
+}
+fn default_read_limit() -> u32 {
+    50
 }
 
 /// One row of a forge agent conversation (M8). Mirrors a forge
@@ -916,5 +1034,128 @@ mod tests {
         let mut d = Decoder::new();
         let frames = d.feed(payload.as_bytes());
         assert_eq!(frames, vec![f1, f2]);
+    }
+
+    // ----- agent tool frames (Phase A) -----
+
+    #[test]
+    fn agent_frames_roundtrip() {
+        let frames = vec![
+            Frame::AgentSpawn {
+                req_id: "r1".into(),
+                caller_pane: "00000000-0000-0000-0000-000000000000".into(),
+                caller_session: "sess".into(),
+                kind: "pi".into(),
+                profile_id: None,
+                name: Some("refactor".into()),
+                cwd: Some("/tmp".into()),
+                prompt: "do the thing".into(),
+                mode: "split".into(),
+                callback: true,
+            },
+            Frame::AgentSpawnOk {
+                req_id: "r1".into(),
+                spawn_id: "sp1".into(),
+                session: "sess".into(),
+                pane: "pane".into(),
+            },
+            Frame::AgentSpawnRequest {
+                spawn_id: "sp2".into(),
+                caller_pane: "pane-a".into(),
+                kind: "forge".into(),
+                preview: "refactor the widget modu...".into(),
+            },
+            Frame::AgentSpawnApprove {
+                spawn_id: "sp2".into(),
+                allow: true,
+            },
+            Frame::AgentSend {
+                req_id: "r2".into(),
+                caller_pane: "pane-a".into(),
+                session: "sess".into(),
+                pane: "pane".into(),
+                text: "stop, do this instead".into(),
+                delivery: "steer".into(),
+            },
+            Frame::AgentStatus {
+                req_id: "r3".into(),
+                caller_pane: "pane-a".into(),
+                pane: "pane".into(),
+            },
+            Frame::AgentStatusOk {
+                req_id: "r3".into(),
+                pane: "pane".into(),
+                state: "working".into(),
+                model: Some("claude".into()),
+            },
+            Frame::AgentRead {
+                req_id: "r4".into(),
+                caller_pane: "pane-a".into(),
+                pane: "pane".into(),
+                since_seq: 5,
+                limit: 50,
+            },
+            Frame::AgentReadOk {
+                req_id: "r4".into(),
+                pane: "pane".into(),
+                msgs: vec![ChatMsg {
+                    seq: 6,
+                    role: "assistant".into(),
+                    text: "done".into(),
+                    tool_name: None,
+                    tool_call_id: None,
+                    tool_output: None,
+                    duration_ms: None,
+                    created_at: None,
+                }],
+            },
+            Frame::AgentClose {
+                req_id: "r5".into(),
+                caller_pane: "pane-a".into(),
+                session: "sess".into(),
+                pane: "pane".into(),
+            },
+            Frame::AgentDone {
+                spawn_id: "sp1".into(),
+                session: "sess".into(),
+                pane: "pane".into(),
+                outcome: "completed".into(),
+                last_row: None,
+            },
+        ];
+        for f in frames {
+            let lines = encode_frame(&f, "c1");
+            let mut payload = String::new();
+            for l in &lines {
+                payload.push_str(l);
+                payload.push('\n');
+            }
+            let mut d = Decoder::new();
+            let got = d.feed(payload.as_bytes());
+            assert_eq!(got, vec![f]);
+        }
+    }
+
+    #[test]
+    fn agent_spawn_defaults() {
+        // minimal JSON: mode/delivery/limit default; missing optional
+        // fields deserialize to None/false
+        let json = r#"{"t":"AgentSpawn","req_id":"r1","caller_pane":"p","caller_session":"s","kind":"pi","prompt":"hi"}"#;
+        let f: Frame = serde_json::from_str(json).unwrap();
+        match f {
+            Frame::AgentSpawn { mode, callback, name, cwd, profile_id, .. } => {
+                assert_eq!(mode, "split");
+                assert!(!callback);
+                assert!(name.is_none());
+                assert!(cwd.is_none());
+                assert!(profile_id.is_none());
+            }
+            _ => panic!("wrong variant"),
+        }
+        let json = r#"{"t":"AgentSend","req_id":"r","session":"s","pane":"p","text":"x"}"#;
+        match serde_json::from_str::<Frame>(json).unwrap() {
+            Frame::AgentSend { delivery, .. } => assert_eq!(delivery, "steer"),
+            _ => panic!("wrong variant"),
+        }
     }
 }
