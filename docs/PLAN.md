@@ -378,6 +378,10 @@ wraps the payload one extra time on the wire.
   `$EDITOR` in a shell pane (`prefix-E` opens the focused file in
   `$EDITOR` in a split) — the multiplexer stays the multiplexer.
 
+**Status**: implemented (2026-09-13). `:files [dir]` browser/viewer/
+editor modal + `prefix-E` split; PaneSnap now carries the pane cwd
+(back-compat field) so the browser starts where the focused pane is.
+
 ---
 
 ## Sequencing & dependencies

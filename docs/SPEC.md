@@ -206,9 +206,9 @@ Shipped:
   markdown review via `marked` token rendering.
 - Web: editor surfaces ride the same frames.
 
-**- todo** — TUI file browser/editor over the same frames (rofi-style
-picker + `$EDITOR` handoff for full editing; inline editing for quick
-fixes).
+**Done** — TUI `:files` browser over the same frames (rofi-style
+picker, inline editing for quick fixes) and `prefix-E` `$EDITOR`
+handoff in a shell split for full editing.
 
 ---
 
