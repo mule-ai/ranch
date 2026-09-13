@@ -36,11 +36,11 @@ export default function App() {
   const [sessions, setSessions] = useState<SessionMeta[] | null>(null);
   const [attached, setAttached] = useState<SessionMeta | null>(null);
   // M10: file editor (browse/read/write files on this machine)
-  const [editing, setEditing] = useState(false);
   // Phase B: agent builder (profiles) + a profile awaiting launch
-  const [agentsView, setAgentsView] = useState(false);
-  const [workflowsView, setWorkflowsView] = useState(false);
-  const [triggersView, setTriggersView] = useState(false);
+  // Bottom tabs while a machine is picked: sessions | files | agents |
+  // automation (the old top-bar action pile — five text buttons
+  // crammed next to the title — is unusable on a phone)
+  const [tab, setTab] = useState<"sessions" | "files" | "agents" | "automation">("sessions");
   const [pendingProfile, setPendingProfile] = useState<ProfileSummary | null>(null);
   // hot daemon upgrade in flight (button shows progress, err shows result)
   const [upgrading, setUpgrading] = useState(false);
@@ -92,7 +92,7 @@ export default function App() {
   // internal back (including unsaved-changes confirms); this one covers
   // the app-level views and must yield when a sub-screen is up.
   const backReqRef = useRef(false);
-  backReqRef.current = !!(editing || agentsView || workflowsView || triggersView || attached);
+  backReqRef.current = !!(tab !== "sessions" || attached);
   useEffect(() => {
     const sub = BackHandler.addEventListener("hardwareBackPress", () => {
       if (backReqRef.current) return false; // let the sub-screen's handler run
@@ -243,89 +243,80 @@ export default function App() {
     return <MachinesScreen onPick={(m) => setMachine(m)} />;
   }
 
-  if (workflowsView && relay) {
-    return <WorkflowsScreen relay={relay} onExit={() => setWorkflowsView(false)} />;
-  }
-
-  if (triggersView && relay) {
-    return <TriggersScreen relay={relay} onExit={() => setTriggersView(false)} />;
-  }
-
-  if (agentsView && relay) {
+  // Terminal is attached full-screen above the tab bar; everything else
+  // lives under the tabs.
+  if (attached && relay) {
     return (
-      <AgentsScreen
+      <TerminalScreen
         relay={relay}
-        onExit={() => setAgentsView(false)}
-        onLaunch={(p) => {
-          setPendingProfile(p);
-          setAgentsView(false);
+        sessionId={attached.id}
+        sessionName={attached.name}
+        onExit={() => {
+          setAttached(null);
+          relay.send({ t: "Hello", id: nextId(), client: "mobile" } as Frame);
         }}
       />
     );
   }
 
-  if (editing && relay) {
-    return <EditorScreen relay={relay} onExit={() => setEditing(false)} />;
+  if (!machine) {
+    return null;
   }
 
-  if (!attached) {
+  if (!relay) {
     return (
-      <View style={[s.wrap, { paddingBottom: kbHeight }]}>
-        <View style={s.header}>
-          <Pressable onPress={() => setMachine(null)} hitSlop={8}>
-            <Text style={s.back}>‹ machines</Text>
-          </Pressable>
-          <Text style={s.title}>{machine.name}</Text>
-          <View style={{ flexDirection: "row", alignItems: "center" }}>
-            <Pressable
-              onPress={() =>
-                Alert.alert(
-                  "hot upgrade",
-                  "restart the daemon in place? Sessions and agent panes are kept alive (zero downtime).",
-                  [
-                    { text: "cancel", style: "cancel" },
-                    {
-                      text: "upgrade",
-                      onPress: () => {
-                        setUpgrading(true);
-                        relay?.send({ t: "Upgrade" } as Frame);
-                        // if the daemon doesn't come back in 30s, surface it
-                        setTimeout(() => {
-                          if (upgradingRef.current) {
-                            setUpgrading(false);
-                            setErr("daemon did not come back after upgrade — try refresh");
-                          }
-                        }, 30000);
-                      },
-                    },
-                  ]
-                )
+      <View style={s.center}>
+        <ActivityIndicator color="#4ade80" />
+      </View>
+    );
+  }
+
+  const upgrade = () =>
+    Alert.alert(
+      "hot upgrade",
+      "restart the daemon in place? Sessions and agent panes are kept alive (zero downtime).",
+      [
+        { text: "cancel", style: "cancel" },
+        {
+          text: "upgrade",
+          onPress: () => {
+            setUpgrading(true);
+            relay.send({ t: "Upgrade" } as Frame);
+            // if the daemon doesn't come back in 30s, surface it
+            setTimeout(() => {
+              if (upgradingRef.current) {
+                setUpgrading(false);
+                setErr("daemon did not come back after upgrade — try refresh");
               }
-              hitSlop={8}
-              disabled={upgrading}
-            >
-              <Text style={[s.back, upgrading && { color: "#6b7280" }]}>
-                {upgrading ? "upgrading…" : "upgrade"}
-              </Text>
-            </Pressable>
-            <Pressable onPress={() => setEditing(true)} hitSlop={8}>
-              <Text style={s.back}>files</Text>
-            </Pressable>
-            <Pressable onPress={() => setAgentsView(true)} hitSlop={8}>
-              <Text style={s.back}>agents</Text>
-            </Pressable>
-            <Pressable onPress={() => setWorkflowsView(true)} hitSlop={8}>
-              <Text style={s.back}>flows</Text>
-            </Pressable>
-            <Pressable onPress={() => setTriggersView(true)} hitSlop={8}>
-              <Text style={s.back}>trigs</Text>
-            </Pressable>
-          </View>
-        </View>
-        {err !== "" && <Text style={s.err}>{err}</Text>}
-        {sessions === null ? (
-          <ActivityIndicator color="#4ade80" style={{ marginTop: 32 }} />
-        ) : (
+            }, 30000);
+          },
+        },
+      ],
+    );
+
+  return (
+    <View style={[s.wrap, { paddingBottom: kbHeight + 64 }]}>
+      <View style={s.header}>
+        <Pressable onPress={() => setMachine(null)} hitSlop={8}>
+          <Text style={s.back}>‹ machines</Text>
+        </Pressable>
+        <Text style={s.title} numberOfLines={1}>{machine.name}</Text>
+        <Pressable onPress={() =>
+          Alert.alert(machine.name, undefined, [
+            { text: "cancel", style: "cancel" },
+            { text: upgrading ? "upgrading…" : "hot upgrade", onPress: upgrade },
+            { text: "switch machine", onPress: () => setMachine(null) },
+          ])
+        } hitSlop={8}>
+          <Text style={s.menu}>⋯</Text>
+        </Pressable>
+      </View>
+      {tab === "sessions" && (
+        <>
+          {err !== "" && <Text style={s.err}>{err}</Text>}
+          {sessions === null ? (
+            <ActivityIndicator color="#4ade80" style={{ marginTop: 32 }} />
+          ) : (
           <FlatList
             data={sessions}
             keyExtractor={(x) => x.id}
@@ -508,21 +499,81 @@ export default function App() {
             <Text style={s.btnText}>{newKind === "forge" ? "agent" : "new"}</Text>
           </Pressable>
         </View>
-      </View>
-    );
-  }
+        </>
+      )}
+      {tab === "files" && (
+        <EditorScreen relay={relay} onExit={() => setTab("sessions")} />
+      )}
+      {tab === "agents" && (
+        <AgentsScreen
+          relay={relay}
+          onExit={() => setTab("sessions")}
+          onLaunch={(p) => {
+            setPendingProfile(p);
+            setTab("sessions");
+          }}
+        />
+      )}
+      {tab === "automation" && <AutomationScreen relay={relay} />}
+      <TabBar tab={tab} onPick={setTab} />
+    </View>
+  );
+}
 
-  return relay ? (
-    <TerminalScreen
-      relay={relay}
-      sessionId={attached.id}
-      sessionName={attached.name}
-      onExit={() => {
-        setAttached(null);
-        relay.send({ t: "Hello", id: nextId(), client: "mobile" } as Frame);
-      }}
-    />
-  ) : null;
+/** Bottom tab bar: the machine's five surfaces, always visible and
+ * thumb-reachable. The terminal (attached) renders above it full-screen. */
+function TabBar({
+  tab,
+  onPick,
+}: {
+  tab: "sessions" | "files" | "agents" | "automation";
+  onPick: (t: "sessions" | "files" | "agents" | "automation") => void;
+}) {
+  const tabs = [
+    { id: "sessions" as const, label: "sessions", icon: "□" },
+    { id: "files" as const, label: "files", icon: "≡" },
+    { id: "agents" as const, label: "agents", icon: "◆" },
+    { id: "automation" as const, label: "automation", icon: "⏱" },
+  ];
+  return (
+    <View style={s.tabbar}>
+      {tabs.map((t) => (
+        <Pressable key={t.id} style={s.tab} onPress={() => onPick(t.id)} hitSlop={4}>
+          <Text style={[s.tabIcon, tab === t.id && s.tabIconOn]}>{t.icon}</Text>
+          <Text style={[s.tabLabel, tab === t.id && s.tabLabelOn]}>{t.label}</Text>
+        </Pressable>
+      ))}
+    </View>
+  );
+}
+
+/** Workflows + triggers under one roof (one automation domain, two
+ * lists) — a segmented control instead of two top-bar entries. */
+function AutomationScreen({ relay }: { relay: Relay }) {
+  const [seg, setSeg] = useState<"workflows" | "triggers">("workflows");
+  return (
+    <View style={{ flex: 1 }}>
+      <View style={s.segRow}>
+        <Pressable
+          style={[s.segBtn, seg === "workflows" && s.segBtnOn]}
+          onPress={() => setSeg("workflows")}
+        >
+          <Text style={[s.segText, seg === "workflows" && s.segTextOn]}>workflows</Text>
+        </Pressable>
+        <Pressable
+          style={[s.segBtn, seg === "triggers" && s.segBtnOn]}
+          onPress={() => setSeg("triggers")}
+        >
+          <Text style={[s.segText, seg === "triggers" && s.segTextOn]}>triggers</Text>
+        </Pressable>
+      </View>
+      {seg === "workflows" ? (
+        <WorkflowsScreen relay={relay} onExit={() => setSeg("triggers")} />
+      ) : (
+        <TriggersScreen relay={relay} onExit={() => setSeg("workflows")} />
+      )}
+    </View>
+  );
 }
 
 /** Install the given handler as the Android hardware/gesture back
@@ -540,6 +591,8 @@ export function useAndroidBack(handler: () => boolean) {
 const s = StyleSheet.create({
   center: { flex: 1, backgroundColor: "#101014", justifyContent: "center", alignItems: "center" },
   wrap: { flex: 1, backgroundColor: "#101014", paddingTop: 60, paddingHorizontal: 16 },
+  // sessions tab body (fills the space under the header)
+  tabBody: { flex: 1 },
   header: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginBottom: 12 },
   back: { color: "#4ade80", width: 70 },
   title: { color: "#f3f4f6", fontWeight: "700", fontSize: 17 },
@@ -570,4 +623,26 @@ const s = StyleSheet.create({
   },
   sendBtn: { backgroundColor: "#16a34a", borderRadius: 8, paddingHorizontal: 16, justifyContent: "center" },
   btnText: { color: "#fff", fontWeight: "700" },
+  // header machine menu + bottom tab bar
+  menu: { color: "#9ca3af", fontSize: 20, paddingHorizontal: 6, fontWeight: "700" },
+  tabbar: {
+    position: "absolute", bottom: 0, left: 0, right: 0,
+    flexDirection: "row", backgroundColor: "#121218",
+    borderTopWidth: 1, borderTopColor: "#1f2430",
+    paddingTop: 6, paddingBottom: 10,
+  },
+  tab: { flex: 1, alignItems: "center", gap: 2 },
+  tabIcon: { color: "#6b7280", fontSize: 18, lineHeight: 22 },
+  tabIconOn: { color: "#4ade80" },
+  tabLabel: { color: "#6b7280", fontSize: 11 },
+  tabLabelOn: { color: "#4ade80", fontWeight: "600" },
+  // automation segmented control
+  segRow: { flexDirection: "row", gap: 8, paddingHorizontal: 16, paddingTop: 64, paddingBottom: 6 },
+  segBtn: {
+    borderWidth: 1, borderColor: "#374151", borderRadius: 999,
+    paddingHorizontal: 14, paddingVertical: 5,
+  },
+  segBtnOn: { borderColor: "#4ade80", backgroundColor: "rgba(74,222,128,0.12)" },
+  segText: { color: "#9ca3af", fontSize: 13 },
+  segTextOn: { color: "#4ade80", fontWeight: "600" },
 });

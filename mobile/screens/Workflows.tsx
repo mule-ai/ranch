@@ -24,9 +24,9 @@ function useAndroidBack(handler: () => boolean) {
   }, [handler]);
 }
 
-type Props = { relay: Relay; onExit: () => void };
+type Props = { relay: Relay; onExit: () => void; embedded?: boolean };
 
-export function WorkflowsScreen({ relay, onExit }: Props) {
+export function WorkflowsScreen({ relay, onExit, embedded }: Props) {
   const [workflows, setWorkflows] = useState<WorkflowSummary[] | null>(null);
   const [running, setRunning] = useState<string | null>(null);
 
@@ -62,6 +62,7 @@ export function WorkflowsScreen({ relay, onExit }: Props) {
 
   return (
     <View style={s.wrap}>
+      {!embedded && (
       <View style={s.header}>
         <Pressable onPress={onExit} hitSlop={8}>
           <Text style={s.back}>‹ sessions</Text>
@@ -69,6 +70,7 @@ export function WorkflowsScreen({ relay, onExit }: Props) {
         <Text style={s.title}>workflows</Text>
         <View style={{ width: 70 }} />
       </View>
+      )}
       {workflows === null ? (
         <ActivityIndicator color="#4ade80" style={{ marginTop: 32 }} />
       ) : (
@@ -121,7 +123,7 @@ export function WorkflowsScreen({ relay, onExit }: Props) {
 }
 
 const s = StyleSheet.create({
-  wrap: { flex: 1, backgroundColor: "#101014", paddingTop: 60, paddingHorizontal: 16 },
+  wrap: { flex: 1, backgroundColor: "#101014" },
   header: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginBottom: 12 },
   back: { color: "#4ade80", width: 70 },
   title: { color: "#f3f4f6", fontWeight: "700", fontSize: 17 },

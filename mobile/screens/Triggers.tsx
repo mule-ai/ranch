@@ -23,9 +23,9 @@ function useAndroidBack(handler: () => boolean) {
   }, [handler]);
 }
 
-type Props = { relay: Relay; onExit: () => void };
+type Props = { relay: Relay; onExit: () => void; embedded?: boolean };
 
-export function TriggersScreen({ relay, onExit }: Props) {
+export function TriggersScreen({ relay, onExit, embedded }: Props) {
   const [triggers, setTriggers] = useState<TriggerRow[] | null>(null);
 
   const refresh = useCallback(() => {
@@ -73,6 +73,7 @@ export function TriggersScreen({ relay, onExit }: Props) {
 
   return (
     <View style={s.wrap}>
+      {!embedded && (
       <View style={s.header}>
         <Pressable onPress={onExit} hitSlop={8}>
           <Text style={s.back}>‹ sessions</Text>
@@ -80,6 +81,7 @@ export function TriggersScreen({ relay, onExit }: Props) {
         <Text style={s.title}>triggers</Text>
         <View style={{ width: 70 }} />
       </View>
+      )}
       {triggers === null ? (
         <ActivityIndicator color="#4ade80" style={{ marginTop: 32 }} />
       ) : (
@@ -144,7 +146,7 @@ export function TriggersScreen({ relay, onExit }: Props) {
 }
 
 const s = StyleSheet.create({
-  wrap: { flex: 1, backgroundColor: "#101014", paddingTop: 60, paddingHorizontal: 16 },
+  wrap: { flex: 1, backgroundColor: "#101014" },
   header: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginBottom: 12 },
   back: { color: "#4ade80", width: 70 },
   title: { color: "#f3f4f6", fontWeight: "700", fontSize: 17 },

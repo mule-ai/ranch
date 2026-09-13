@@ -236,7 +236,7 @@ export function EditorScreen({ relay, onExit }: Props) {
     <View style={[styles.wrap, { paddingBottom: kbHeight }]}>
       <View style={styles.header}>
         <Pressable onPress={backTapped} hitSlop={8}>
-          <Text style={styles.back}>{openFile ? "‹ files" : "‹ back"}</Text>
+          <Text style={styles.back}>{openFile ? "‹ files" : "‹ sessions"}</Text>
         </Pressable>
         <Text style={styles.title} numberOfLines={1}>
           {openFile ? openFile.path : "files"}
@@ -592,7 +592,7 @@ function Inline({ tokens }: { tokens: Token[] }) {
 }
 
 const styles = StyleSheet.create({
-  wrap: { flex: 1, backgroundColor: "#101014", paddingTop: 56, paddingHorizontal: 12 },
+  wrap: { flex: 1, backgroundColor: "#101014" },
   header: {
     flexDirection: "row", alignItems: "center", gap: 10,
     paddingBottom: 8, borderBottomWidth: 1, borderBottomColor: "#1f2430",

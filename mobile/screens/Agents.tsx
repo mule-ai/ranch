@@ -76,13 +76,6 @@ export function AgentsScreen({ relay, onLaunch, onExit }: Props) {
 
   return (
     <View style={s.wrap}>
-      <View style={s.header}>
-        <Pressable onPress={onExit} hitSlop={8}>
-          <Text style={s.back}>‹ sessions</Text>
-        </Pressable>
-        <Text style={s.title}>agents</Text>
-        <View style={{ width: 70 }} />
-      </View>
       {profiles === null ? (
         <ActivityIndicator color="#4ade80" style={{ marginTop: 32 }} />
       ) : (
@@ -357,7 +350,7 @@ function ProfileForm({
 }
 
 const s = StyleSheet.create({
-  wrap: { flex: 1, backgroundColor: "#101014", paddingTop: 60, paddingHorizontal: 16 },
+  wrap: { flex: 1, backgroundColor: "#101014" },
   header: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginBottom: 12 },
   back: { color: "#4ade80", width: 70 },
   title: { color: "#f3f4f6", fontWeight: "700", fontSize: 17 },
