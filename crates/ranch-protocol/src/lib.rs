@@ -571,6 +571,78 @@ pub enum Frame {
         session: String,
         pane: String,
     },
+    // ----- triggers (Phase D) -----
+    /// Client -> daemon: list trigger definitions + last runs.
+    TriggerList { req_id: String },
+    /// Daemon -> client: trigger list.
+    TriggerListOk {
+        req_id: String,
+        triggers: Vec<serde_json::Value>,
+    },
+    /// Client -> daemon: create (trigger_id absent) or update.
+    TriggerPut {
+        req_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        trigger_id: Option<String>,
+        /// full trigger shape (SPEC §6.2): name, workflow, kind, cron|
+        /// event|webhook spec, input, enabled, catch_up
+        trigger: serde_json::Value,
+    },
+    /// Daemon -> client: the saved trigger's id.
+    TriggerPutOk { req_id: String, trigger_id: String },
+    /// Client -> daemon: delete a trigger.
+    TriggerDelete { req_id: String, trigger: String },
+    /// Daemon -> client: delete ack.
+    TriggerDeleteOk { req_id: String },
+    /// Client -> daemon: fire a trigger immediately (manual run).
+    TriggerRun { req_id: String, trigger: String },
+    /// Daemon -> clients: a trigger fired (dashboard badge / toast).
+    TriggerFired { trigger: String, job: String },
+    // ----- webhooks (Phase E) -----
+    /// Client -> daemon: list webhooks (secrets never returned).
+    WebhookList { req_id: String },
+    /// Daemon -> client: webhook list.
+    WebhookListOk {
+        req_id: String,
+        webhooks: Vec<serde_json::Value>,
+    },
+    /// Client -> daemon: create a webhook. The reply carries the URL +
+    /// raw secret exactly once (stored encrypted server-side).
+    WebhookPut {
+        req_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        webhook_id: Option<String>,
+        name: String,
+        /// allowed source tags (empty = any)
+        #[serde(default)]
+        sources: Vec<String>,
+    },
+    /// Daemon -> client: webhook saved; secret/url shown once.
+    WebhookPutOk {
+        req_id: String,
+        webhook_id: String,
+        url: String,
+        /// raw secret — ONLY present on creation
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        secret: Option<String>,
+    },
+    /// Client -> daemon: delete a webhook.
+    WebhookDelete { req_id: String, webhook: String },
+    /// Daemon -> client: delete ack.
+    WebhookDeleteOk { req_id: String },
+    /// Edge function -> daemon (via the relay): a verified external
+    /// event. The daemon matches it against webhook triggers and fires
+    /// workflows. This frame can only arrive from the relay pipe.
+    WebhookEvent {
+        webhook: String,
+        source: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        event: Option<String>,
+        #[serde(default)]
+        payload: serde_json::Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        received_at: Option<String>,
+    },
 }
 
 fn default_mode() -> String {

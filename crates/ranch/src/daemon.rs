@@ -38,6 +38,8 @@ pub(crate) mod agenttools;
 pub mod control_api;
 #[path = "mule.rs"]
 mod mule;
+#[path = "triggers.rs"]
+mod triggers;
 
 const TICK_MS: i32 = 30;
 /// Max file size the editor will read/write (M10). Keeps relay frames
@@ -547,6 +549,9 @@ struct Daemon {
     spawn_policy: agenttools::SpawnPolicy,
     /// mule worker jobs (None when mule is not configured)
     mule_tx: Option<std::sync::mpsc::Sender<mule::MuleJob>>,
+    /// trigger scheduler (Phase D): owns the trigger registry; fires
+    /// workflows via mule_tx
+    triggers: triggers::Scheduler,
 }
 
 // ---------- helpers ----------
@@ -640,6 +645,7 @@ fn state_value(
     sessions: &BTreeMap<Uuid, Session>,
     pi_agents: &BTreeMap<Uuid, std::sync::Arc<pilocal::LocalPi>>,
     spawns: Option<&agenttools::SpawnRegistry>,
+    triggers: Option<&triggers::Scheduler>,
 ) -> serde_json::Value {
     let mut v = serde_json::json!({
         "machine": hostname(),
@@ -679,6 +685,11 @@ fn state_value(
     if let Some(reg) = spawns {
         if let Some(obj) = v.as_object_mut() {
             obj.insert("spawns".into(), agenttools::registry_value(reg));
+        }
+    }
+    if let Some(trig) = triggers {
+        if let Some(obj) = v.as_object_mut() {
+            obj.insert("triggers".into(), trig.to_value());
         }
     }
     v
@@ -965,6 +976,20 @@ impl Daemon {
                 &Frame::Error {
                     req_id: Some(req_id.to_string()),
                     message: "forge not configured (set forge_api_key in daemon.toml)".into(),
+                },
+            );
+        }
+    }
+
+    /// relay-required-but-unconfigured error reply (webhook CRUD needs
+    /// the machine's Supabase credentials).
+    fn relay_unconfigured(&mut self, from: RawFd, req_id: &str) {
+        if let Some(c) = self.clients.get_mut(&from) {
+            send_frame(
+                c,
+                &Frame::Error {
+                    req_id: Some(req_id.to_string()),
+                    message: "relay not configured (run `ranch register`)".into(),
                 },
             );
         }
@@ -1675,6 +1700,7 @@ impl Daemon {
             spawns: agenttools::SpawnRegistry::new(),
             spawn_policy,
             mule_tx: None,
+            triggers: triggers::Scheduler::new(None),
         };
         // register the relay as a client keyed by its read-pipe fd; remote
         // frames arrive there and daemon->remote frames go out via relay_out
@@ -1744,6 +1770,8 @@ impl Daemon {
         } else {
             eprintln!("ranchd: mule: disabled (no mule_url in daemon.toml)");
         }
+        // trigger scheduler rides the mule worker (Phase D)
+        daemon.triggers = triggers::Scheduler::new(daemon.mule_tx.clone());
         Ok(daemon)
     }
 
@@ -1767,7 +1795,7 @@ impl Daemon {
     }
 
     fn write_state(&self) {
-        let v = state_value(&self.sessions, &self.pi_agents, Some(&self.spawns));
+        let v = state_value(&self.sessions, &self.pi_agents, Some(&self.spawns), Some(&self.triggers));
         if let Ok(json) = serde_json::to_string_pretty(&v) {
             std::fs::write(&self.state_path, json).ok();
         }
@@ -1823,7 +1851,7 @@ impl Daemon {
         }
 
         // manifest: Tier-1 state (same shape as state.json) + the fd map
-        let state = state_value(&self.sessions, &self.pi_agents, Some(&self.spawns));
+        let state = state_value(&self.sessions, &self.pi_agents, Some(&self.spawns), Some(&self.triggers));
         let manifest = serde_json::json!({ "state": state, "fds": fds });
         std::fs::write(
             &manifest_path,
@@ -2150,6 +2178,8 @@ impl Daemon {
         };
         // agent-tool spawn registry (ownership + callbacks survive restarts)
         self.spawns = agenttools::registry_from_value(&v);
+        // trigger registry (Phase D)
+        self.triggers = triggers::Scheduler::from_value(&v, self.mule_tx.clone());
         let Some(sessions) = v.get("sessions").and_then(|s| s.as_array()) else {
             return;
         };
@@ -3075,6 +3105,359 @@ impl Daemon {
                     None => Self::forge_unconfigured(self, from, req_id),
                 }
             }
+            // ----- triggers (Phase D) -----
+            Frame::TriggerList { req_id } => {
+                if let Some(c) = self.clients.get_mut(&from) {
+                    send_frame(
+                        c,
+                        &Frame::TriggerListOk {
+                            req_id: req_id.clone(),
+                            triggers: self
+                                .triggers
+                                .triggers
+                                .values()
+                                .map(|t| {
+                                    serde_json::json!({
+                                        "id": t.id.to_string(),
+                                        "name": t.name,
+                                        "workflow_id": t.workflow_id,
+                                        "kind": t.kind_tag(),
+                                        "spec": t.spec_value(),
+                                        "input": t.input,
+                                        "enabled": t.enabled,
+                                        "catch_up": t.catch_up,
+                                        "last_run": t.last_run.as_ref().map(|(j, ts, st)| serde_json::json!({
+                                            "job": j, "at": ts, "status": st,
+                                        })),
+                                    })
+                                })
+                                .collect(),
+                        },
+                    );
+                }
+            }
+            Frame::TriggerPut {
+                req_id,
+                trigger_id,
+                trigger,
+            } => {
+                // parse the trigger shape; persist; mirror
+                let res = (|| {
+                    let name = trigger
+                        .get("name")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if name.is_empty() {
+                        return Err("trigger name is required".into());
+                    }
+                    let workflow_id = trigger
+                        .get("workflow_id")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if workflow_id.is_empty() {
+                        return Err("trigger workflow_id is required".into());
+                    }
+                    let kind_tag = trigger.get("kind").and_then(|x| x.as_str()).unwrap_or("");
+                    let spec = trigger.get("spec").cloned().unwrap_or(serde_json::Value::Null);
+                    let kind = match kind_tag {
+                        "cron" => {
+                            let expr = spec.get("cron").and_then(|x| x.as_str()).unwrap_or("");
+                            if triggers::cron_next(expr, triggers::Scheduler::now()).is_none() {
+                                return Err(format!("bad cron expression {expr:?}"));
+                            }
+                            triggers::TriggerKind::Cron { expr: expr.into() }
+                        }
+                        "event" => triggers::TriggerKind::Event {
+                            event: spec.get("event").and_then(|x| x.as_str()).unwrap_or("").into(),
+                            filter: spec.get("filter").cloned().unwrap_or(serde_json::Value::Null),
+                        },
+                        "webhook" => triggers::TriggerKind::Webhook {
+                            source: spec.get("source").and_then(|x| x.as_str()).unwrap_or("").into(),
+                            event_tag: spec.get("event").and_then(|x| x.as_str()).map(String::from),
+                        },
+                        other => return Err(format!("unknown trigger kind {other:?} (cron|event|webhook)")),
+                    };
+                    Ok(triggers::Trigger {
+                        id: trigger_id
+                            .as_deref()
+                            .and_then(|s| Uuid::parse_str(s).ok())
+                            .unwrap_or_else(Uuid::new_v4),
+                        name,
+                        workflow_id,
+                        kind,
+                        input: trigger.get("input").cloned().filter(|x| !x.is_null()),
+                        enabled: trigger.get("enabled").and_then(|x| x.as_bool()).unwrap_or(true),
+                        catch_up: trigger.get("catch_up").and_then(|x| x.as_bool()).unwrap_or(false),
+                        last_run: None,
+                    })
+                })();
+                match res {
+                    Ok(t) => {
+                        let mirror = crate::relay::RelayOut::UpsertTrigger {
+                            id: t.id.to_string(),
+                            name: t.name.clone(),
+                            workflow_id: t.workflow_id.clone(),
+                            kind: t.kind_tag().into(),
+                            enabled: t.enabled,
+                            spec: t.spec_value(),
+                        };
+                        let id = t.id.to_string();
+                        self.triggers.triggers.insert(t.id, t);
+                        self.write_state();
+                        self.mirror(mirror);
+                        if let Some(c) = self.clients.get_mut(&from) {
+                            send_frame(c, &Frame::TriggerPutOk { req_id: req_id.clone(), trigger_id: id });
+                        }
+                    }
+                    Err(e) => {
+                        if let Some(c) = self.clients.get_mut(&from) {
+                            send_frame(
+                                c,
+                                &Frame::Error {
+                                    req_id: Some(req_id.clone()),
+                                    message: e,
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+            Frame::TriggerDelete { req_id, trigger } => {
+                let parsed = Uuid::parse_str(trigger);
+                if let Ok(id) = parsed {
+                    self.triggers.triggers.remove(&id);
+                    self.write_state();
+                    self.mirror(crate::relay::RelayOut::DeleteTrigger { id: id.to_string() });
+                }
+                if let Some(c) = self.clients.get_mut(&from) {
+                    send_frame(c, &Frame::TriggerDeleteOk { req_id: req_id.clone() });
+                }
+            }
+            Frame::TriggerRun { req_id, trigger } => {
+                let id = Uuid::parse_str(trigger).ok();
+                let fireable = id.and_then(|id| self.triggers.triggers.get(&id).cloned());
+                match fireable {
+                    Some(t) if self.mule_tx.is_some() => {
+                        let job_id = Uuid::new_v4().to_string();
+                        let _ = self.mule_tx.as_ref().unwrap().send(mule::MuleJob::Run {
+                            req_id: Uuid::new_v4().to_string(),
+                            workflow_id: t.workflow_id.clone(),
+                            input: t.input.clone(),
+                            session: Uuid::nil(),
+                            pane: Uuid::nil(),
+                        });
+                        if let Some(t) = self.triggers.triggers.get_mut(&t.id) {
+                            t.last_run = Some((job_id.clone(), triggers::Scheduler::now(), "queued".into()));
+                        }
+                        self.write_state();
+                        let fired = Frame::TriggerFired {
+                            trigger: id.unwrap().to_string(),
+                            job: job_id,
+                        };
+                        let fds: Vec<RawFd> = self.clients.keys().copied().collect();
+                        for fd in fds {
+                            if let Some(c) = self.clients.get_mut(&fd) {
+                                send_frame(c, &fired);
+                            }
+                        }
+                    }
+                    _ => {
+                        if let Some(c) = self.clients.get_mut(&from) {
+                            send_frame(
+                                c,
+                                &Frame::Error {
+                                    req_id: Some(req_id.clone()),
+                                    message: if self.mule_tx.is_none() {
+                                        "mule not configured".into()
+                                    } else {
+                                        format!("trigger {trigger:?} not found")
+                                    },
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+
+            // ----- webhooks (Phase E) -----
+            Frame::WebhookEvent {
+                webhook,
+                source,
+                event,
+                payload,
+                ..
+            } => {
+                // Only arrives via the relay pipe (edge function). Match
+                // against webhook triggers and fire workflows. The
+                // payload nests under "payload" for trigger templates.
+                let event_type = event.as_deref().unwrap_or("");
+                let (tframes, tmirrors) = self.triggers.fire_event(
+                    "webhook",
+                    &serde_json::json!({
+                        "source": source,
+                        "event": event_type,
+                        "payload": payload,
+                    }),
+                );
+                for m in tmirrors {
+                    self.mirror(m);
+                }
+                let fired_n = tframes.len();
+                for f in tframes {
+                    let fds: Vec<RawFd> = self.clients.keys().copied().collect();
+                    for fd in fds {
+                        if let Some(c) = self.clients.get_mut(&fd) {
+                            send_frame(c, &f);
+                        }
+                    }
+                }
+                eprintln!(
+                    "ranchd: webhook {source}/{event_type} from {webhook} ({fired_n} triggers fired)"
+                );
+            }
+            Frame::WebhookList { req_id } => {
+                // REST via the relay's REST helpers requires the relay
+                // config; reply unconfigured when absent
+                let Some(rcfg) = relay::load_config() else {
+                    Self::relay_unconfigured(self, from, req_id);
+                    return;
+                };
+                let jwt = relay::machine_jwt_blocking(&rcfg);
+                let url = format!(
+                    "{}/rest/v1/webhooks?select=id,name,sources,enabled,created_at&machine_id=eq.{}",
+                    rcfg.supabase_url, rcfg.machine_id
+                );
+                match relay::rest_get(&rcfg, &jwt, &url) {
+                    Ok(v) => {
+                        if let Some(c) = self.clients.get_mut(&from) {
+                            send_frame(
+                                c,
+                                &Frame::WebhookListOk {
+                                    req_id: req_id.clone(),
+                                    webhooks: v.as_array().cloned().unwrap_or_default(),
+                                },
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        if let Some(c) = self.clients.get_mut(&from) {
+                            send_frame(
+                                c,
+                                &Frame::Error {
+                                    req_id: Some(req_id.clone()),
+                                    message: e,
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+            Frame::WebhookPut {
+                req_id,
+                webhook_id,
+                name,
+                sources,
+            } => {
+                let Some(rcfg) = relay::load_config() else {
+                    Self::relay_unconfigured(self, from, req_id);
+                    return;
+                };
+                let jwt = relay::machine_jwt_blocking(&rcfg);
+                // create: generate the secret here (never from the client),
+                // store it encrypted via the store_webhook_secret RPC
+                let new_id = Uuid::new_v4();
+                let raw_secret = format!("whsec_{}", Uuid::new_v4().simple());
+                let body = serde_json::json!({
+                    "id": new_id.to_string(),
+                    "machine_id": rcfg.machine_id,
+                    "name": name,
+                    "sources": sources,
+                    "enabled": true,
+                });
+                let url = format!("{}/rest/v1/webhooks", rcfg.supabase_url);
+                match relay::rest_post(&rcfg, &jwt, &url, &body) {
+                    Ok(_) => {
+                        // encrypt + store the secret (security-definer RPC)
+                        let _ = relay::rest_post(
+                            &rcfg,
+                            &jwt,
+                            &format!("{}/rest/v1/rpc/store_webhook_secret", rcfg.supabase_url),
+                            &serde_json::json!({
+                                "p_webhook_id": new_id.to_string(),
+                                "p_secret": raw_secret,
+                            }),
+                        );
+                        let url = format!(
+                            "{}/functions/v1/webhook-relay/w/{}",
+                            rcfg.supabase_url.replace(".supabase.co", ".supabase.co"),
+                            new_id
+                        );
+                        if let Some(c) = self.clients.get_mut(&from) {
+                            send_frame(
+                                c,
+                                &Frame::WebhookPutOk {
+                                    req_id: req_id.clone(),
+                                    webhook_id: new_id.to_string(),
+                                    url,
+                                    secret: Some(raw_secret), // shown ONCE
+                                },
+                            );
+                        }
+                        self.mirror(crate::relay::RelayOut::UpsertWebhook {
+                            id: new_id.to_string(),
+                            name: name.clone(),
+                            sources: sources.clone(),
+                            enabled: true,
+                        });
+                    }
+                    Err(e) => {
+                        if let Some(c) = self.clients.get_mut(&from) {
+                            send_frame(
+                                c,
+                                &Frame::Error {
+                                    req_id: Some(req_id.clone()),
+                                    message: e,
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+            Frame::WebhookDelete { req_id, webhook } => {
+                let Some(rcfg) = relay::load_config() else {
+                    Self::relay_unconfigured(self, from, req_id);
+                    return;
+                };
+                let jwt = relay::machine_jwt_blocking(&rcfg);
+                let url = format!(
+                    "{}/rest/v1/webhooks?id=eq.{webhook}&machine_id=eq.{}",
+                    rcfg.supabase_url, rcfg.machine_id
+                );
+                match relay::rest_delete(&rcfg, &jwt, &url) {
+                    Ok(_) => {
+                        self.mirror(crate::relay::RelayOut::DeleteWebhook {
+                            id: webhook.clone(),
+                        });
+                        if let Some(c) = self.clients.get_mut(&from) {
+                            send_frame(c, &Frame::WebhookDeleteOk { req_id: req_id.clone() });
+                        }
+                    }
+                    Err(e) => {
+                        if let Some(c) = self.clients.get_mut(&from) {
+                            send_frame(
+                                c,
+                                &Frame::Error {
+                                    req_id: Some(req_id.clone()),
+                                    message: e,
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+
             // ----- workflows (Phase C): mule proxy -----
             Frame::WorkflowList { req_id } => {
                 match &self.mule_tx {
@@ -3187,7 +3570,9 @@ impl Daemon {
                 pane,
                 kind,
                 status,
-            } if session.is_empty() && (kind == "agent" || kind == "model") => {
+            } if session.is_empty()
+                && (kind == "agent" || kind == "model" || kind == "workflow") =>
+            {
                 let pid = Uuid::parse_str(pane.as_deref().unwrap_or("")).ok();
                 let found = pid.and_then(|pid| {
                     self.sessions
@@ -3202,6 +3587,50 @@ impl Daemon {
                             if let Some(s) = self.sessions.get_mut(&sid) {
                                 if let Some(cp) = s.chats.get_mut(&pid) {
                                     cp.model = Some(st.clone());
+                                }
+                            }
+                        }
+                    }
+                    // Phase D: event triggers see every agent turn end
+                    if kind == "agent" && status.as_deref() == Some("idle") {
+                        let (tframes, tmirrors) = self.triggers.fire_event(
+                            "agent_turn_ended",
+                            &serde_json::json!({ "pane": pid.to_string(), "session": sid.to_string() }),
+                        );
+                        for m in tmirrors {
+                            self.mirror(m);
+                        }
+                        for f in tframes {
+                            let fds: Vec<RawFd> = self.clients.keys().copied().collect();
+                            for fd in fds {
+                                if let Some(c) = self.clients.get_mut(&fd) {
+                                    send_frame(c, &f);
+                                }
+                            }
+                        }
+                    }
+                    // Phase D: workflow completion events feed triggers
+                    if kind == "workflow" {
+                        if let Some(st) = status.as_deref() {
+                            if st == "completed" || st == "failed" {
+                                let (tframes, tmirrors) = self.triggers.fire_event(
+                                    "workflow_completed",
+                                    &serde_json::json!({
+                                        "workflow_id": pane.as_deref().unwrap_or(""),
+                                        "pane": pane.as_deref().unwrap_or(""),
+                                        "status": st,
+                                    }),
+                                );
+                                for m in tmirrors {
+                                    self.mirror(m);
+                                }
+                                for f in tframes {
+                                    let fds: Vec<RawFd> = self.clients.keys().copied().collect();
+                                    for fd in fds {
+                                        if let Some(c) = self.clients.get_mut(&fd) {
+                                            send_frame(c, &f);
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -4537,6 +4966,24 @@ fn run(daemon: Daemon) {
         // Cheap metadata stats on a handful of files; a changed mtime
         // pushes FileChanged to the watching client (baseline refreshes
         // on FileRead/FileWriteOk so our own saves stay quiet). ---
+        // trigger scheduler: cron evaluation once per second (the
+        // scheduler dedupes to once per trigger per minute)
+        {
+            let (frames, mirrors) = daemon.triggers.tick();
+            for m in mirrors {
+                daemon.mirror(m);
+            }
+            if !frames.is_empty() {
+                let fds: Vec<RawFd> = daemon.clients.keys().copied().collect();
+                for f in frames {
+                    for fd in &fds {
+                        if let Some(c) = daemon.clients.get_mut(fd) {
+                            send_frame(c, &f);
+                        }
+                    }
+                }
+            }
+        }
         // agent-tool `ask` policy: expire unapproved spawn requests
         for (spawn_id, caller) in daemon.spawns.expire_pending() {
             eprintln!("ranchd: spawn request {spawn_id} expired (no approval)");
