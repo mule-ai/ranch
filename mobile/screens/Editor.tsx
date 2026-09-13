@@ -13,6 +13,7 @@ import {
   View,
 } from "react-native";
 import { lexer, type Token, type Tokens } from "marked";
+import { highlightAll, langForPath, supportsHighlight, type HlSpan } from "../lib/highlight";
 import { Frame, nextId } from "../lib/frames";
 import { Relay } from "../lib/relay";
 
@@ -47,6 +48,9 @@ export function EditorScreen({ relay, onExit }: Props) {
   const [saved, setSaved] = useState(false);
   // path of a file that changed on disk while the draft was dirty
   const [externChanged, setExternChanged] = useState<string | null>(null);
+  // syntax-highlight scroll sync (overlay mirrors the input's offset)
+  const hlScrollRef = useRef<ScrollView | null>(null);
+  const hlInputYRef = useRef(0);
 
   // req_id matching so replies land in the right handler
   const dirReqRef = useRef<string | null>(null);
@@ -289,6 +293,44 @@ export function EditorScreen({ relay, onExit }: Props) {
         <Text style={styles.dim}>loading…</Text>
       ) : openFile ? (
         view === "edit" ? (
+          supportsHighlight(openFile.path) ? (
+            // code file: highlighted text layer under a transparent-text
+            // TextInput (same font/size/line-height ⇒ rows align 1:1;
+            // the module header in lib/highlight.ts documents the trick).
+            // Scroll offsets are synced so long files scroll as one body.
+            <View style={styles.hlStack}>
+              <ScrollView
+                ref={hlScrollRef}
+                style={styles.editor}
+                scrollEnabled={false}
+                pointerEvents="none"
+              >
+                <HlBody lines={highlightAll(draft, langForPath(openFile.path))} />
+              </ScrollView>
+              <TextInput
+                style={[styles.editor, styles.editorGhost, StyleSheet.absoluteFill]}
+                value={draft}
+                onChangeText={setDraft}
+                multiline
+                textAlignVertical="top"
+                autoCapitalize="none"
+                autoCorrect={false}
+                autoComplete="off"
+                spellCheck={false}
+                selectionColor="#4ade80"
+                onScroll={(e) => {
+                  const y = e.nativeEvent.contentOffset.y;
+                  hlInputYRef.current = y;
+                  hlScrollRef.current?.scrollTo({ y, animated: false });
+                }}
+                onContentSizeChange={() => {
+                  // keep the overlay in sync when rows re-wrap
+                  const y = hlInputYRef.current;
+                  if (y > 0) hlScrollRef.current?.scrollTo({ y, animated: false });
+                }}
+              />
+            </View>
+          ) : (
           <TextInput
             style={styles.editor}
             value={draft}
@@ -302,6 +344,7 @@ export function EditorScreen({ relay, onExit }: Props) {
             spellCheck={false}
             selectionColor="#4ade80"
           />
+          )
         ) : (
           <ScrollView style={styles.review} contentContainerStyle={styles.reviewContent}>
             <MarkdownView source={draft} />
@@ -350,6 +393,33 @@ function useKbHeight(): number {
     };
   }, []);
   return h;
+}
+
+// One highlighted row = a line of colored spans + an explicit newline
+// (the TextInput's rows include the \n, so the overlay must too).
+function HlRow({ spans }: { spans: HlSpan[] }) {
+  return (
+    <Text style={styles.hlLine}>
+      {spans.map((sp, i) => (
+        <Text
+          key={i}
+          style={{ color: sp.color ?? styles.hlLine.color, fontWeight: sp.bold ? "700" : "400", fontStyle: sp.italic ? "italic" : "normal" }}
+        >
+          {sp.text}
+        </Text>
+      ))}
+    </Text>
+  );
+}
+
+function HlBody({ lines }: { lines: HlSpan[][] }) {
+  return (
+    <View>
+      {lines.map((spans, i) => (
+        <HlRow key={i} spans={spans} />
+      ))}
+    </View>
+  );
 }
 
 // ---------- markdown rendering (marked tokens → RN views) ----------
@@ -575,6 +645,13 @@ const styles = StyleSheet.create({
     flex: 1, color: "#d1d5db", fontFamily: "JetBrainsMono NF Mono",
     fontSize: 14, lineHeight: 20, paddingTop: 12, paddingHorizontal: 4,
     backgroundColor: "#0a0a0e",
+  },
+  // syntax-highlight stack: colored overlay + transparent-text input
+  hlStack: { flex: 1, backgroundColor: "#0a0a0e" },
+  editorGhost: { color: "transparent", backgroundColor: "transparent" },
+  hlLine: {
+    color: "#d1d5db", fontFamily: "JetBrainsMono NF Mono",
+    fontSize: 14, lineHeight: 20,
   },
   review: { flex: 1, backgroundColor: "#0a0a0e" },
   reviewContent: { padding: 12, paddingBottom: 40 },

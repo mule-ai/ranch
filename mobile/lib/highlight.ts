@@ -88,7 +88,7 @@ const langPython: Lang = {
   literals: new Set(["True", "False", "None"]),
   types: new Set(["str", "int", "float", "bool", "list", "dict", "tuple", "set", "bytes"]),
   specials: new RegExp(
-    String.raw`([rbufRBUF]{0,2}"(?:\\.|[^\n"])*|[rbufRBUF]{0,2}'(?:\\.|[^\n'])*|"(?:\\.|[^\n"])*|'(?:\\.|[^\n'])*))|(#[^\n]*)`,
+    String.raw`([rbufRBUF]{0,2}"(?:\\.|[^\n"])*|[rbufRBUF]{0,2}'(?:\\.|[^\n'])*])|(#[^\n]*)`,
     "g"
   ),
 };
@@ -109,7 +109,7 @@ const langJson: Lang = {
   keywords: new Set(),
   literals: new Set(["true", "false", "null"]),
   types: new Set(),
-  specials: new RegExp(String.raw`("(?:\\.|[^\n"])*|'(?:\\.|[^\n'])*))|(#[^\n]*)`, "g"),
+  specials: new RegExp(String.raw`("(?:\\.|[^\n"])*|'(?:\\.|[^\n'])*])|(#[^\n]*)`, "g"),
 };
 
 const langToml: Lang = {
