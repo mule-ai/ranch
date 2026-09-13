@@ -283,18 +283,28 @@ function ProfileForm({
         {field(
           "model",
           catalog.length > 0 ? (
-            // dropdown from pi's models.json (via forge); keep the
-            // current value selectable even if the catalog doesn't
-            // list it (e.g. a custom id from an older profile)
+            // dropdown from pi's models.json (via forge), filtered to the
+            // selected provider (all entries when the provider has none —
+            // pi's provider names don't always match the profile
+            // allowlist). The current value stays selectable even when
+            // the catalog doesn't list it (a custom/older id).
             <select
               value={draft.model}
-              onChange={(e) => set({ model: e.target.value })}
+              onChange={(e) => {
+                const v = e.target.value;
+                const hit = catalog.find((m) => m.id === v);
+                set({ model: v, provider: hit ? hit.provider : draft.provider });
+              }}
               style={{ display: "block", width: "100%" }}
             >
+              <option value="">select a model…</option>
               {!catalog.some((m) => m.id === draft.model) && draft.model !== "" && (
-                <option value={draft.model}>{draft.model}</option>
+                <option value={draft.model}>{draft.model} (custom)</option>
               )}
-              {catalog.map((m) => (
+              {(catalog.some((m) => m.provider === draft.provider)
+                ? catalog.filter((m) => m.provider === draft.provider)
+                : catalog
+              ).map((m) => (
                 <option key={m.provider + "/" + m.id} value={m.id}>
                   {m.name !== m.id ? `${m.name} (${m.id})` : m.id}
                 </option>

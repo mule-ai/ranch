@@ -183,9 +183,18 @@ function ProfileForm({
   // pi model catalog via the daemon (empty when forge is unreachable —
   // then the model field falls back to free text)
   const [catalog, setCatalog] = useState<ModelChoice[]>([]);
-  // which provider's models to show in the picker (null = all)
-  const [catProv, setCatProv] = useState<string | null>(null);
+  // dropdown open state (mobile has no <select>; Terminal's model
+  // switcher uses the same modal-sheet pattern)
+  const [pickerOpen, setPickerOpen] = useState(false);
   const set = (patch: Partial<ProfileDraft>) => setDraft((d) => ({ ...d, ...patch }));
+  // every catalog entry for the selected provider (all entries when the
+  // provider has none — providers in pi's models.json don't always match
+  // the profile allowlist names)
+  const providerModels = catalog.filter((m) => m.provider === draft.provider);
+  const pickerModels = providerModels.length > 0
+    ? providerModels
+    : catalog;
+  const currentModel = catalog.find((m) => m.id === draft.model);
 
   useEffect(() => {
     const rid = nextId();
@@ -242,54 +251,75 @@ function ProfileForm({
               ))}
             </View>
             <Text style={s.label}>model</Text>
-            {(() => {
-              const provs = Array.from(new Set(catalog.map((m) => m.provider)));
-              const models = catProv
-                ? catalog.filter((m) => m.provider === catProv)
-                : catalog;
-              if (catalog.length === 0) {
-                // no catalog (forge unreachable): free text fallback
-                return (
-                  <TextInput style={s.input} value={draft.model} onChangeText={(v) => set({ model: v })} autoCapitalize="none" placeholder="model id" placeholderTextColor="#4b5563" />
-                );
-              }
-              return (
-                <View style={{ gap: 6 }}>
-                  <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 6 }}>
-                    {provs.map((p) => (
-                      <Pressable
-                        key={p}
-                        style={[s.chip, catProv === p && s.chipOn]}
-                        onPress={() => setCatProv(catProv === p ? null : p)}
-                      >
-                        <Text style={[s.chipText, catProv === p && s.chipTextOn]}>{p}</Text>
-                      </Pressable>
-                    ))}
-                  </View>
-                  <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 6 }}>
-                    {(!draft.model.trim() || models.some((m) => m.id === draft.model)) ? null : (
-                      <Pressable style={[s.chip, s.chipOn]} onPress={() => set({ model: "" })}>
-                        <Text style={[s.chipText, s.chipTextOn]} numberOfLines={1}>{draft.model}</Text>
-                      </Pressable>
-                    )}
-                    {models.map((m) => (
-                      <Pressable
-                        key={m.provider + "/" + m.id}
-                        style={[s.chip, draft.model === m.id && s.chipOn]}
-                        onPress={() => set({ model: m.id, provider: m.provider })}
-                      >
-                        <Text style={[s.chipText, draft.model === m.id && s.chipTextOn]} numberOfLines={1}>
-                          {m.name !== m.id ? `${m.name} (${m.id})` : m.id}
+            {catalog.length === 0 ? (
+              // no catalog (forge unreachable): free text fallback
+              <TextInput style={s.input} value={draft.model} onChangeText={(v) => set({ model: v })} autoCapitalize="none" placeholder="model id" placeholderTextColor="#4b5563" />
+            ) : (
+              <View>
+                <Pressable style={s.pickerBtn} onPress={() => setPickerOpen(true)}>
+                  <Text style={s.pickerBtnText} numberOfLines={1}>
+                    {currentModel
+                      ? currentModel.name !== currentModel.id
+                        ? `${currentModel.name} · ${currentModel.id}`
+                        : currentModel.id
+                      : draft.model.trim() !== ""
+                        ? `${draft.model} (custom)`
+                        : "select a model…"}
+                  </Text>
+                  <Text style={s.pickerBtnChev}>▾</Text>
+                </Pressable>
+                {pickerOpen && (
+                  <View style={s.pickerOverlay}>
+                    <Pressable style={StyleSheet.absoluteFill} onPress={() => setPickerOpen(false)} />
+                    <View style={s.pickerSheet}>
+                      <View style={s.pickerHeader}>
+                        <Text style={s.pickerTitle}>
+                          model{providerModels.length > 0 ? ` · ${draft.provider}` : ""}
                         </Text>
-                      </Pressable>
-                    ))}
+                        <Pressable onPress={() => setPickerOpen(false)} hitSlop={8}>
+                          <Text style={s.pickerClose}>close ✕</Text>
+                        </Pressable>
+                      </View>
+                      <FlatList
+                        data={pickerModels}
+                        keyExtractor={(m) => m.provider + "/" + m.id}
+                        style={{ maxHeight: 380 }}
+                        renderItem={({ item: m }) => (
+                          <Pressable
+                            style={[s.pickerRow, draft.model === m.id && s.pickerRowOn]}
+                            onPress={() => {
+                              set({ model: m.id, provider: m.provider });
+                              setPickerOpen(false);
+                            }}
+                          >
+                            <Text style={s.pickerRowText} numberOfLines={1}>
+                              {draft.model === m.id ? "◈ " : "  "}
+                              {m.name !== m.id ? `${m.name} · ${m.id}` : m.id}
+                            </Text>
+                          </Pressable>
+                        )}
+                        ListEmptyComponent={
+                          <Text style={s.dim}>no models for this provider</Text>
+                        }
+                        ListFooterComponent={
+                          draft.model.trim() !== "" &&
+                          !pickerModels.some((m) => m.id === draft.model) ? (
+                            <Pressable
+                              style={[s.pickerRow, s.pickerRowOn]}
+                              onPress={() => setPickerOpen(false)}
+                            >
+                              <Text style={s.pickerRowText} numberOfLines={1}>
+                                ◈ {draft.model} (custom)
+                              </Text>
+                            </Pressable>
+                          ) : null
+                        }
+                      />
+                    </View>
                   </View>
-                  {draft.model.trim() !== "" && (
-                    <Text style={s.dim}>model: {draft.model}</Text>
-                  )}
-                </View>
-              );
-            })()}
+                )}
+              </View>
+            )}
             <Text style={s.label}>system prompt</Text>
             <TextInput
               style={[s.input, { minHeight: 90, textAlignVertical: "top" }]}
@@ -354,4 +384,30 @@ const s = StyleSheet.create({
     alignItems: "center", marginVertical: 8,
   },
   newBtnText: { color: "#fff", fontWeight: "700" },
+  // model dropdown (mirrors Terminal's model switcher sheet)
+  pickerBtn: {
+    backgroundColor: "#1a1b23", borderRadius: 8, paddingHorizontal: 12,
+    paddingVertical: 10, flexDirection: "row", alignItems: "center",
+    justifyContent: "space-between",
+  },
+  pickerBtnText: { color: "#f3f4f6", fontSize: 14, flex: 1, marginRight: 8 },
+  pickerBtnChev: { color: "#6b7280", fontSize: 13 },
+  pickerOverlay: {
+    ...StyleSheet.absoluteFill, backgroundColor: "rgba(0,0,0,0.6)",
+    justifyContent: "center", alignItems: "center", zIndex: 10,
+  },
+  pickerSheet: {
+    width: "88%", maxHeight: "70%", backgroundColor: "#14151c",
+    borderRadius: 12, borderWidth: 1, borderColor: "#26262e", overflow: "hidden",
+  },
+  pickerHeader: {
+    flexDirection: "row", justifyContent: "space-between", alignItems: "center",
+    paddingHorizontal: 12, paddingTop: 10, paddingBottom: 8,
+    borderBottomWidth: 1, borderBottomColor: "#23232c",
+  },
+  pickerTitle: { color: "#9ca3af", fontSize: 12, fontWeight: "700" },
+  pickerClose: { color: "#4ade80", fontSize: 13 },
+  pickerRow: { paddingHorizontal: 12, paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: "#1c1d24" },
+  pickerRowOn: { backgroundColor: "#1a2018" },
+  pickerRowText: { color: "#d1d5db", fontSize: 13, fontFamily: "JetBrainsMono NF Mono" },
 });
