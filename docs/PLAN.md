@@ -158,6 +158,13 @@ can interject by focusing the pane and typing (it's just a chat pane).
     — persists a `role:"system"` row + publishes to the bus so an
     idle forge agent's harness can pick up a spawn callback. Small,
     additive (mirrors `messages.rs` create + bus publish).
+
+    **Status**: implemented on both ends (2026-09-13). Forge: branch
+    `ranch-tool-bridge` (forge repo, commit 5f1a053) — queue, SSE
+    event, result endpoint, 60s bounded long-poll, notify hook.
+    Ranch: the forge worker answers `ranch_tool_request` via the
+    loopback control API and POSTs results back. Deploying the forge
+    build to the remote host is ops, not code.
 - **F4. Agent recipes** (target-system feature): a `recipes` table +
   CRUD (`profile_ref`, `skills`, `workflow_hint`) — schedule with forge
   maintainers; the ranch side should code against a thin proxy so
