@@ -19,6 +19,7 @@ import { MachinesScreen } from "./screens/Machines";
 import { TerminalScreen } from "./screens/Terminal";
 import { EditorScreen } from "./screens/Editor";
 import { AgentsScreen } from "./screens/Agents";
+import { WorkflowsScreen } from "./screens/Workflows";
 
 type Machine = { id: string; name: string };
 
@@ -36,6 +37,7 @@ export default function App() {
   const [editing, setEditing] = useState(false);
   // Phase B: agent builder (profiles) + a profile awaiting launch
   const [agentsView, setAgentsView] = useState(false);
+  const [workflowsView, setWorkflowsView] = useState(false);
   const [pendingProfile, setPendingProfile] = useState<ProfileSummary | null>(null);
   // hot daemon upgrade in flight (button shows progress, err shows result)
   const [upgrading, setUpgrading] = useState(false);
@@ -220,6 +222,10 @@ export default function App() {
     return <MachinesScreen onPick={(m) => setMachine(m)} />;
   }
 
+  if (workflowsView && relay) {
+    return <WorkflowsScreen relay={relay} onExit={() => setWorkflowsView(false)} />;
+  }
+
   if (agentsView && relay) {
     return (
       <AgentsScreen
@@ -282,6 +288,9 @@ export default function App() {
             </Pressable>
             <Pressable onPress={() => setAgentsView(true)} hitSlop={8}>
               <Text style={s.back}>agents</Text>
+            </Pressable>
+            <Pressable onPress={() => setWorkflowsView(true)} hitSlop={8}>
+              <Text style={s.back}>flows</Text>
             </Pressable>
           </View>
         </View>

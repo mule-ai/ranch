@@ -977,6 +977,14 @@ fn cmd_attach(ref_: &str) {
         std::rc::Rc::new(std::cell::RefCell::new(None));
     let agents_items: std::rc::Rc<std::cell::RefCell<Vec<ranch_protocol::ProfileSummary>>> =
         std::rc::Rc::new(std::cell::RefCell::new(vec![]));
+    // :workflows — mule workflow picker (Phase C): enter runs into a new
+    // pane. Editing lives on the web surface.
+    let wf_open = std::cell::Cell::new(false);
+    let wf_sel = std::cell::Cell::new(0usize);
+    let wf_pending: std::rc::Rc<std::cell::RefCell<Option<String>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(None));
+    let wf_items: std::rc::Rc<std::cell::RefCell<Vec<ranch_protocol::WorkflowSummary>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(vec![]));
     // :model — agent-model picker (modal; j/k/enter/esc). Items land
     // asynchronously via ModelListOk (matched on req_id).
     let model_open = std::cell::Cell::new(false);
@@ -1195,6 +1203,27 @@ fn cmd_attach(ref_: &str) {
                                     agents_sel.set(0);
                                     agents_open.set(true);
                                 }
+                            }
+                            Frame::WorkflowListOk { req_id, workflows } => {
+                                let matches_req =
+                                    wf_pending.borrow().as_deref() == Some(req_id.as_str());
+                                if matches_req {
+                                    *wf_pending.borrow_mut() = None;
+                                    wf_items.borrow_mut().clear();
+                                    wf_items.borrow_mut().extend(workflows);
+                                    wf_sel.set(0);
+                                    wf_open.set(true);
+                                }
+                            }
+                            Frame::WorkflowRunOk { session, .. } => {
+                                // follow the run into its pane (SessionsAck-like)
+                                let f = Frame::Attach {
+                                    id: Uuid::new_v4().to_string(),
+                                    client: "attach".into(),
+                                    session,
+                                    pane: None,
+                                };
+                                send_frame(&mut stream, &f).ok();
                             }
                             Frame::ModelListOk {
                                 req_id, pane, current, models, ..
@@ -1807,6 +1836,41 @@ fn cmd_attach(ref_: &str) {
                 );
             }
 
+            // :workflows modal — mule workflow picker (Phase C)
+            if wf_open.get() {
+                let n = wf_items.borrow().len();
+                let mh = ((n + 4) as u16).min(term_area.height);
+                let (mw, _) = (64.min(term_area.width), mh);
+                let mx = (term_area.width.saturating_sub(mw)) / 2;
+                let my = (term_area.height.saturating_sub(mh)) / 2;
+                let marea = Rect::new(mx, my, mw, mh);
+                f.render_widget(ratatui::widgets::Clear, marea);
+                let block = ratatui::widgets::Block::bordered()
+                    .title(" mule workflows · enter run · esc close ")
+                    .border_style(Style::default().fg(ratatui::style::Color::Green));
+                let inner = block.inner(marea);
+                f.render_widget(block, marea);
+                let items: Vec<Line> = wf_items
+                    .borrow()
+                    .iter()
+                    .enumerate()
+                    .map(|(i, w)| {
+                        let sel = i == wf_sel.get();
+                        let mut style = Style::default();
+                        if sel {
+                            style = style.add_modifier(Modifier::REVERSED);
+                        }
+                        let mark = if sel { ">" } else { " " };
+                        let label = format!("{mark} {:<40}{}", w.name, if w.is_async.unwrap_or(false) { " [async]" } else { "" });
+                        Line::from(Span::styled(label, style))
+                    })
+                    .collect();
+                f.render_widget(
+                    Paragraph::new(items),
+                    Rect::new(inner.x, inner.y, inner.width, inner.height),
+                );
+            }
+
             // :agents modal — centered agent-profile picker (Phase B)
             if agents_open.get() {
                 let n = agents_items.borrow().len();
@@ -1913,6 +1977,44 @@ fn cmd_attach(ref_: &str) {
                                         };
                                         send_frame(&mut stream, &f).ok();
                                         // SessionsAck attaches
+                                    }
+                                }
+                                _ => {}
+                            }
+                            continue;
+                        }
+                        // :workflows modal: mule workflow picker (Phase C)
+                        if wf_open.get() {
+                            match key.code {
+                                KeyCode::Esc | KeyCode::Char('q') => {
+                                    wf_open.set(false);
+                                }
+                                KeyCode::Up | KeyCode::Char('k') => {
+                                    let sel = wf_sel.get();
+                                    if sel > 0 {
+                                        wf_sel.set(sel - 1);
+                                    }
+                                }
+                                KeyCode::Down | KeyCode::Char('j') => {
+                                    let sel = wf_sel.get();
+                                    if sel + 1 < wf_items.borrow().len() {
+                                        wf_sel.set(sel + 1);
+                                    }
+                                }
+                                KeyCode::Enter => {
+                                    let picked = wf_items
+                                        .borrow()
+                                        .get(wf_sel.get())
+                                        .cloned();
+                                    if let Some(w) = picked {
+                                        wf_open.set(false);
+                                        let f = Frame::WorkflowRun {
+                                            req_id: Uuid::new_v4().to_string(),
+                                            workflow: w.id,
+                                            input: None,
+                                        };
+                                        send_frame(&mut stream, &f).ok();
+                                        // WorkflowRunOk attaches
                                     }
                                 }
                                 _ => {}
@@ -2383,6 +2485,15 @@ fn cmd_attach(ref_: &str) {
                                             Prompt::Command => {
                                                 // minimal: :agent <name>, :pi [dir],
                                                 // :resume, :kill, :detach
+                                                if prompt_input.trim() == "workflows" {
+                                                    prompt_input.clear();
+                                                    prompt.set(None);
+                                                    let rid = Uuid::new_v4().to_string();
+                                                    *wf_pending.borrow_mut() = Some(rid.clone());
+                                                    let f = Frame::WorkflowList { req_id: rid };
+                                                    send_frame(&mut stream, &f).ok();
+                                                    continue;
+                                                }
                                                 if prompt_input.trim() == "agents" {
                                                     prompt_input.clear();
                                                     prompt.set(None);

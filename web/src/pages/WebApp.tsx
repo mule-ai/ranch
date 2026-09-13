@@ -17,6 +17,7 @@ import { supabase } from "../lib/supabase";
 import { demoAvailable } from "../lib/demo";
 import { Login } from "./Login";
 import { AgentsPage } from "./AgentsPage";
+import { WorkflowsPage } from "./WorkflowsPage";
 import type { ProfileSummary } from "../lib/frames";
 
 type Machine = { id: string; name: string; last_seen_at: string | null };
@@ -122,8 +123,8 @@ function MachinePicker({
 function MachineClient({ machine, onBack }: { machine: Machine; onBack: () => void }) {
   const [relay, setRelay] = useState<Relay | null>(null);
   const [sessions, setSessions] = useState<SessionMeta[] | null>(null);
-  // null = sessions view; "agents" = the agent-builder page
-  const [view, setView] = useState<null | "agents">(null);
+  // null = sessions view; "agents" / "workflows" = builder pages
+  const [view, setView] = useState<null | "agents" | "workflows">(null);
   const [pendingProfile, setPendingProfile] = useState<ProfileSummary | null>(null);
   const [attached, setAttached] = useState<SessionMeta | null>(null);
   const [conn, setConn] = useState("connecting…");
@@ -259,7 +260,17 @@ function MachineClient({ machine, onBack }: { machine: Machine; onBack: () => vo
           }}
         />
       )}
-      {view !== "agents" && (
+      {view === "workflows" && (
+        <WorkflowsPage
+          relay={relay}
+          onAttach={(sid) => {
+            const s = sessions?.find((x) => x.id === sid);
+            if (s) setAttached(s);
+            setView(null);
+          }}
+        />
+      )}
+      {view === null && (
       <>
       {sessions === null && <p className="dim">loading sessions…</p>}
       {sessions !== null && sessions.length === 0 && (
@@ -281,7 +292,7 @@ function MachineClient({ machine, onBack }: { machine: Machine; onBack: () => vo
       <CreateRow relay={relay} pendingProfile={pendingProfile} onProfileLaunched={() => setPendingProfile(null)} />
       </>
       )}
-      {view !== "agents" && (
+      {view === null && (
       <div className="btnrow" style={{ marginTop: 24 }}>
         {/* demo build: hot upgrade is denied server-side for relay clients,
             so don't offer the button to public demo visitors */}
@@ -298,6 +309,9 @@ function MachineClient({ machine, onBack }: { machine: Machine; onBack: () => vo
       <div className="btnrow" style={{ marginTop: 12 }}>
         <button className="btn btn-ghost" onClick={() => setView(view === "agents" ? null : "agents")}>
           {view === "agents" ? "sessions" : "agents"}
+        </button>
+        <button className="btn btn-ghost" onClick={() => setView(view === "workflows" ? null : "workflows")}>
+          {view === "workflows" ? "sessions" : "workflows"}
         </button>
       </div>
     </div>

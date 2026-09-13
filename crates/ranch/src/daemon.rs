@@ -33,9 +33,11 @@ use ranch_vt::Vt;
 use uuid::Uuid;
 
 #[path = "agenttools.rs"]
-mod agenttools;
+pub(crate) mod agenttools;
 #[path = "control_api.rs"]
 pub mod control_api;
+#[path = "mule.rs"]
+mod mule;
 
 const TICK_MS: i32 = 30;
 /// Max file size the editor will read/write (M10). Keeps relay frames
@@ -543,6 +545,8 @@ struct Daemon {
     spawns: agenttools::SpawnRegistry,
     /// `[agents] spawn_policy` from daemon.toml (default allow)
     spawn_policy: agenttools::SpawnPolicy,
+    /// mule worker jobs (None when mule is not configured)
+    mule_tx: Option<std::sync::mpsc::Sender<mule::MuleJob>>,
 }
 
 // ---------- helpers ----------
@@ -961,6 +965,19 @@ impl Daemon {
                 &Frame::Error {
                     req_id: Some(req_id.to_string()),
                     message: "forge not configured (set forge_api_key in daemon.toml)".into(),
+                },
+            );
+        }
+    }
+
+    /// mule-required-but-unconfigured error reply.
+    fn mule_unconfigured(&mut self, from: RawFd, req_id: &str) {
+        if let Some(c) = self.clients.get_mut(&from) {
+            send_frame(
+                c,
+                &Frame::Error {
+                    req_id: Some(req_id.to_string()),
+                    message: "mule not configured (set mule_url in daemon.toml)".into(),
                 },
             );
         }
@@ -1657,6 +1674,7 @@ impl Daemon {
             forge_pipe_w: None,
             spawns: agenttools::SpawnRegistry::new(),
             spawn_policy,
+            mule_tx: None,
         };
         // register the relay as a client keyed by its read-pipe fd; remote
         // frames arrive there and daemon->remote frames go out via relay_out
@@ -1709,6 +1727,22 @@ impl Daemon {
             Err(e) => {
                 eprintln!("ranchd: agent pipe init failed: {e} (pi panes will not work)");
             }
+        }
+
+        // mule worker (Phase C): shares the agent pipe (its frames are
+        // pane-addressed Chat/Meta rows + request replies; the pre-match
+        // resolves + broadcasts them like forge's)
+        if let Some(mcfg) = mule::load_mule_config() {
+            if let Some(pipe_w) = &daemon.forge_pipe_w {
+                if let Ok(clone) = pipe_w.lock().unwrap().try_clone() {
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    mule::spawn_worker(mcfg, clone, rx);
+                    daemon.mule_tx = Some(tx);
+                    eprintln!("ranchd: mule: worker started");
+                }
+            }
+        } else {
+            eprintln!("ranchd: mule: disabled (no mule_url in daemon.toml)");
         }
         Ok(daemon)
     }
@@ -3040,6 +3074,112 @@ impl Daemon {
                     }
                     None => Self::forge_unconfigured(self, from, req_id),
                 }
+            }
+            // ----- workflows (Phase C): mule proxy -----
+            Frame::WorkflowList { req_id } => {
+                match &self.mule_tx {
+                    Some(tx) => {
+                        let _ = tx.send(mule::MuleJob::List { req_id: req_id.clone() });
+                    }
+                    None => Self::mule_unconfigured(self, from, req_id),
+                }
+            }
+            Frame::WorkflowGet { req_id, workflow } => {
+                match &self.mule_tx {
+                    Some(tx) => {
+                        let _ = tx.send(mule::MuleJob::Get {
+                            req_id: req_id.clone(),
+                            workflow_id: workflow.clone(),
+                        });
+                    }
+                    None => Self::mule_unconfigured(self, from, req_id),
+                }
+            }
+            Frame::WorkflowPut {
+                req_id,
+                workflow_id,
+                draft,
+            } => {
+                match &self.mule_tx {
+                    Some(tx) => {
+                        let _ = tx.send(mule::MuleJob::Put {
+                            req_id: req_id.clone(),
+                            workflow_id: workflow_id.clone(),
+                            draft: draft.clone(),
+                        });
+                    }
+                    None => Self::mule_unconfigured(self, from, req_id),
+                }
+            }
+            Frame::WorkflowDelete { req_id, workflow } => {
+                match &self.mule_tx {
+                    Some(tx) => {
+                        let _ = tx.send(mule::MuleJob::Delete {
+                            req_id: req_id.clone(),
+                            workflow_id: workflow.clone(),
+                        });
+                    }
+                    None => Self::mule_unconfigured(self, from, req_id),
+                }
+            }
+            Frame::WorkflowRun {
+                req_id,
+                workflow,
+                input,
+            } => {
+                let Some(tx) = &self.mule_tx else {
+                    Self::mule_unconfigured(self, from, req_id);
+                    return;
+                };
+                // the run pane: a dedicated chat pane (no backing agent) in a
+                // session named after the workflow — watchable from any client
+                let wf_name = self
+                    .resolve_session(workflow)
+                    .map(|s| s.name.clone())
+                    .unwrap_or_else(|| "workflow".into());
+                let sid = Uuid::new_v4();
+                let pid = Uuid::new_v4();
+                let mut sess = Session {
+                    id: sid,
+                    name: format!("wf-{}", &workflow[..8.min(workflow.len())]),
+                    kind: "mule".into(),
+                    panes: BTreeMap::new(),
+                    active: Uuid::nil(),
+                    size: (80, 24),
+                    windows: vec![Window::new(
+                        Layout::Leaf { pane: pid.to_string() },
+                        "0".into(),
+                    )],
+                    win: 0,
+                    chats: BTreeMap::new(),
+                };
+                sess.chats.insert(
+                    pid,
+                    ChatPane {
+                        forge_sid: Uuid::nil(), // no agent backing: rows come from the mule worker
+                        cols: 80,
+                        rows: 24,
+                        chat: vec![],
+                        model: None,
+                        cwd: None,
+                    },
+                );
+                sess.active = pid;
+                self.sessions.insert(sid, sess);
+                self.write_state();
+                self.mirror(relay::RelayOut::UpsertSession {
+                    id: sid.to_string(),
+                    name: format!("wf-{}", &workflow[..8.min(workflow.len())]),
+                    kind: "mule".into(),
+                });
+                let _ = tx.send(mule::MuleJob::Run {
+                    req_id: req_id.clone(),
+                    workflow_id: workflow.clone(),
+                    input: input.clone(),
+                    session: sid,
+                    pane: pid,
+                });
+                let _ = wf_name;
             }
             // forge worker agent-status: resolve + broadcast
             Frame::Meta {

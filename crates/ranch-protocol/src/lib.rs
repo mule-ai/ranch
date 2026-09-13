@@ -526,6 +526,51 @@ pub enum Frame {
     ProfileDelete { req_id: String, profile: String },
     /// Daemon -> client: delete ack.
     ProfileDeleteOk { req_id: String },
+    // ----- workflows (Phase C): mule proxy -----
+    /// Client -> daemon: list mule workflows.
+    WorkflowList { req_id: String },
+    /// Daemon -> client: workflow summaries.
+    WorkflowListOk {
+        req_id: String,
+        workflows: Vec<WorkflowSummary>,
+    },
+    /// Client -> daemon: fetch one workflow (with steps).
+    WorkflowGet { req_id: String, workflow: String },
+    /// Daemon -> client: the workflow + steps.
+    WorkflowGetOk {
+        req_id: String,
+        workflow: WorkflowSummary,
+        steps: Vec<WorkflowStep>,
+    },
+    /// Client -> daemon: create (workflow_id absent) or update a
+    /// workflow with its full step list (the worker diffs mule's
+    /// step endpoints).
+    WorkflowPut {
+        req_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workflow_id: Option<String>,
+        draft: WorkflowDraft,
+    },
+    /// Daemon -> client: the saved workflow's id.
+    WorkflowPutOk { req_id: String, workflow_id: String },
+    /// Client -> daemon: delete a workflow.
+    WorkflowDelete { req_id: String, workflow: String },
+    /// Daemon -> client: delete ack.
+    WorkflowDeleteOk { req_id: String },
+    /// Client -> daemon: run a workflow into a new pane.
+    WorkflowRun {
+        req_id: String,
+        workflow: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input: Option<serde_json::Value>,
+    },
+    /// Daemon -> client: the run started (pane carries the stream).
+    WorkflowRunOk {
+        req_id: String,
+        job: String,
+        session: String,
+        pane: String,
+    },
 }
 
 fn default_mode() -> String {
@@ -649,6 +694,49 @@ pub struct ProfileDraft {
     pub system_prompt: Option<String>,
     #[serde(default)]
     pub tools: Vec<String>,
+}
+
+/// Mule workflow summary (list rows).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WorkflowSummary {
+    pub id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_async: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+}
+
+/// One workflow step (mule WorkflowStep shape).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WorkflowStep {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub step_order: i64,
+    /// "agent" | "wasm_module"
+    #[serde(rename = "type", default)]
+    pub step_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wasm_module_id: Option<String>,
+    #[serde(default)]
+    pub config: serde_json::Value,
+}
+
+/// Create/update payload: the workflow + the full desired step list
+/// (the mule worker diffs against what's stored).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WorkflowDraft {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub is_async: bool,
+    #[serde(default)]
+    pub steps: Vec<WorkflowStep>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

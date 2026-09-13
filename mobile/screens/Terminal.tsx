@@ -9,7 +9,7 @@ import {
   TextInput,
   View,
 } from "react-native";
-import { ChatMsg, Frame, Layout, PaneSnap, b64, nextId } from "../lib/frames";
+import { ChatMsg, Frame, Layout, ModelChoice, PaneSnap, b64, nextId } from "../lib/frames";
 import { Relay } from "../lib/relay";
 import { parseSgrRow, Span as SgrSpan } from "../lib/sgr";
 
@@ -165,8 +165,34 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
               setPanes(next);
             }
           }
+          if (f.kind === "model" && f.pane && f.status) {
+            // the pane's active model changed / was reported
+            const cur = panesRef.current.get(f.pane);
+            if (cur) {
+              const next = new Map(panesRef.current);
+              next.set(f.pane, { ...cur, model: f.status });
+              setPanes(next);
+            }
+            modelSetReq.current = null; // the switch was confirmed
+          }
           break;
+        case "ModelListOk": {
+          setModelOpts((o) => ({ ...o, [f.pane]: f.models }));
+          if (f.current) {
+            const cur = panesRef.current.get(f.pane);
+            if (cur) {
+              const next = new Map(panesRef.current);
+              next.set(f.pane, { ...cur, model: f.current.name });
+              setPanes(next);
+            }
+          }
+          break;
+        }
         case "Error":
+          // request-scoped errors (model switch etc.) only matter when the
+          // req_id is one we sent; daemon-side failures flash a banner
+          if (f.req_id && f.req_id !== modelSetReq.current) break;
+          modelSetReq.current = null;
           setConn(`error: ${f.message}`);
           break;
       }
@@ -249,6 +275,12 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
 
   // forge-chat pane draft (the focused pane is a chat pane when set)
   const [chatDraft, setChatDraft] = useState("");
+  // agent model picker (chat panes): catalog per pane + open/closed.
+  // The pane's active model lives on the PaneSnap (`model`).
+  const [modelOpts, setModelOpts] = useState<Record<string, ModelChoice[]>>({});
+  const [modelPicker, setModelPicker] = useState(false);
+  // req_id of the last ModelSet we sent (error correlation)
+  const modelSetReq = useRef<string | null>(null);
   const chatRef = useRef<TextInput | null>(null);
   const chatScrollRef = useRef<ScrollView | null>(null);
   // sticky-bottom chat: only auto-follow when the user is at the bottom;
@@ -313,6 +345,31 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
     } as Frame);
   };
 
+  // agent model picker: open the overlay; fetch the catalog from the
+  // daemon on first use (ModelListOk lands into modelOpts[pane])
+  const openModelPicker = () => {
+    if (!activePane) return;
+    setModelPicker(true);
+    const opts = modelOpts[activePane];
+    if (!opts || opts.length === 0) {
+      relay.send({
+        t: "ModelList", id: nextId(), client: "mobile",
+        pane: activePane, req_id: "model-list",
+      } as Frame);
+    }
+  };
+  const pickModel = (m: ModelChoice) => {
+    if (!activePane) return;
+    const rid = `model-set-${Date.now()}`;
+    modelSetReq.current = rid;
+    relay.send({
+      t: "ModelSet", id: nextId(), client: "mobile",
+      session: sessionId, pane: activePane,
+      provider: m.provider, model: m.id, req_id: rid,
+    } as Frame);
+    setModelPicker(false);
+  };
+
   const COLS = geom.cols;
   const ROWS = geom.rows;
   const rects = layout ? layoutRects(layout, 0, 0, COLS, ROWS) : [];
@@ -339,6 +396,18 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
         </Pressable>
         <Text style={styles.conn}>{conn}</Text>
       </View>
+
+      {chatMode && (
+        // active-model chip: tap to open the model picker
+        <View style={styles.modelBar}>
+          <Pressable style={styles.modelChip} onPress={openModelPicker} hitSlop={8}>
+            <Text style={styles.modelChipText} numberOfLines={1}>
+              ◈ {activeSnap?.model ?? "pick a model…"}
+            </Text>
+          </Pressable>
+          <Text style={styles.modelHint}>tap to switch</Text>
+        </View>
+      )}
 
       {chatMode ? (
         // forge-chat pane: conversation bubbles + input, full area
@@ -592,6 +661,40 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
       />
       )}
 
+      {modelPicker && chatMode ? (
+        <View style={styles.pickerOverlay}>
+          <View style={styles.picker}>
+            <View style={styles.pickerHeader}>
+              <Text style={styles.pickerTitle}>switch agent model</Text>
+              <Pressable onPress={() => setModelPicker(false)} hitSlop={8}>
+                <Text style={styles.back}>close ✕</Text>
+              </Pressable>
+            </View>
+            <ScrollView style={styles.pickerList}>
+              {(modelOpts[activePane] ?? []).length === 0 ? (
+                <Text style={styles.dim}>loading models…</Text>
+              ) : (
+                (modelOpts[activePane] ?? []).map((m) => {
+                  const active = activeSnap?.model === m.name;
+                  return (
+                    <Pressable
+                      key={`${m.provider}/${m.id}`}
+                      style={[styles.pickerRow, active && styles.pickerRowActive]}
+                      onPress={() => pickModel(m)}
+                    >
+                      <Text style={[styles.pickerRowText, active && { color: "#4ade80" }]} numberOfLines={1}>
+                        {active ? "◈ " : "  "}{m.name}
+                        {m.provider ? ` · ${m.provider}` : ""}
+                      </Text>
+                    </Pressable>
+                  );
+                })
+              )}
+            </ScrollView>
+          </View>
+        </View>
+      ) : null}
+
       {history !== null ? (
         <View style={styles.histWrap}>
           <View style={styles.histHeader}>
@@ -717,6 +820,37 @@ const styles = StyleSheet.create({
   workingText: { color: "#9ca3af", fontSize: 12, letterSpacing: 3 },
   toolOutOpen: { maxHeight: 220, marginTop: 6 },
   toolOutFull: { color: "#8b8b96", fontSize: 11, fontFamily: "JetBrainsMono NF Mono" },
+  modelBar: {
+    flexDirection: "row", alignItems: "center", gap: 10,
+    marginHorizontal: 8, marginBottom: 6, paddingTop: 0,
+  },
+  modelChip: {
+    backgroundColor: "#16161c", borderRadius: 8, borderWidth: 1,
+    borderColor: "#2c2c36", paddingHorizontal: 10, paddingVertical: 5,
+  },
+  modelChipText: { color: "#4ade80", fontSize: 12, fontFamily: "JetBrainsMono NF Mono" },
+  modelHint: { color: "#4b5563", fontSize: 11 },
+  pickerOverlay: {
+    ...StyleSheet.absoluteFill, backgroundColor: "rgba(0,0,0,0.6)",
+    justifyContent: "center", alignItems: "center",
+  },
+  picker: {
+    width: "88%", maxHeight: "70%", backgroundColor: "#14151c",
+    borderRadius: 12, borderWidth: 1, borderColor: "#26262e", overflow: "hidden",
+  },
+  pickerHeader: {
+    flexDirection: "row", justifyContent: "space-between", alignItems: "center",
+    paddingHorizontal: 12, paddingTop: 10, paddingBottom: 8,
+    borderBottomWidth: 1, borderBottomColor: "#23232c",
+  },
+  pickerTitle: { color: "#9ca3af", fontSize: 12, fontWeight: "700" },
+  pickerList: { maxHeight: 360 },
+  pickerRow: {
+    paddingHorizontal: 12, paddingVertical: 10, borderBottomWidth: 1,
+    borderBottomColor: "#1c1d24",
+  },
+  pickerRowActive: { backgroundColor: "#1a2018" },
+  pickerRowText: { color: "#d1d5db", fontSize: 13, fontFamily: "JetBrainsMono NF Mono" },
   chatInputRow: {
     flexDirection: "row", borderTopWidth: 1, borderTopColor: "#23232c",
     padding: 8, paddingTop: 10, paddingBottom: 30, gap: 8,

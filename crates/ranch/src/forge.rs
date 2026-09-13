@@ -17,7 +17,6 @@ use ranch_protocol::{ChatMsg, Frame, ModelChoice, encode_frame};
 use std::io::{BufRead as _, Write as _};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::mpsc::RecvError;
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
@@ -95,6 +94,19 @@ pub enum ForgeJob {
         provider: String,
         model: String,
     },
+    // ----- agent builder (Phase B): profile CRUD proxy -----
+    /// List agent profiles (GET /profiles).
+    ProfileList { req_id: String },
+    /// Fetch one profile (GET /profiles/{id}; api_key arrives redacted).
+    ProfileGet { req_id: String, profile_id: String },
+    /// Create (no id) or update (id) a profile.
+    ProfilePut {
+        req_id: String,
+        profile_id: Option<String>,
+        draft: ranch_protocol::ProfileDraft,
+    },
+    /// Delete a profile (DELETE /profiles/{id}).
+    ProfileDelete { req_id: String, profile_id: String },
 }
 
 /// Shared per-watch state: the SSE thread owns one; the job thread
@@ -511,6 +523,103 @@ pub fn spawn_worker(cfg: ForgeConfig, pipe_w: std::fs::File, rx: mpsc::Receiver<
                             }
                         }
                     }
+                    // ----- agent builder (Phase B): profile CRUD proxy -----
+                    ForgeJob::ProfileList { req_id } => {
+                        match http_json(&cfg, "GET", "/profiles", None) {
+                            Ok(v) => {
+                                let arr = v
+                                    .get("profiles")
+                                    .and_then(|x| x.as_array())
+                                    .cloned()
+                                    .or_else(|| v.as_array().cloned())
+                                    .unwrap_or_default();
+                                let profiles: Vec<ranch_protocol::ProfileSummary> = arr
+                                    .iter()
+                                    .filter_map(|p| {
+                                        Some(ranch_protocol::ProfileSummary {
+                                            id: p.get("id")?.as_str()?.to_string(),
+                                            name: p.get("name").and_then(|n| n.as_str()).unwrap_or("").into(),
+                                            description: p.get("description").and_then(|d| d.as_str()).map(String::from),
+                                            provider: p.get("provider").and_then(|n| n.as_str()).unwrap_or("").into(),
+                                            model: p.get("model").and_then(|n| n.as_str()).unwrap_or("").into(),
+                                            working_dir: p.get("working_dir").and_then(|d| d.as_str()).map(String::from),
+                                            updated_at: p.get("updated_at").and_then(|d| d.as_str()).map(String::from),
+                                        })
+                                    })
+                                    .collect();
+                                write_frame(&pipe, &Frame::ProfileListOk { req_id, profiles });
+                            }
+                            Err(e) => write_frame(
+                                &pipe,
+                                &Frame::Error { req_id: Some(req_id), message: e },
+                            ),
+                        }
+                    }
+                    ForgeJob::ProfileGet { req_id, profile_id } => {
+                        match http_json(&cfg, "GET", &format!("/profiles/{profile_id}"), None) {
+                            Ok(v) => match serde_json::from_value::<ranch_protocol::Profile>(v) {
+                                Ok(prof) => {
+                                    write_frame(&pipe, &Frame::ProfileGetOk { req_id, profile: prof });
+                                }
+                                Err(e) => write_frame(
+                                    &pipe,
+                                    &Frame::Error { req_id: Some(req_id), message: format!("profile decode: {e}") },
+                                ),
+                            },
+                            Err(e) => write_frame(
+                                &pipe,
+                                &Frame::Error { req_id: Some(req_id), message: e },
+                            ),
+                        }
+                    }
+                    ForgeJob::ProfilePut { req_id, profile_id, draft } => {
+                        let body = serde_json::json!({
+                            "name": draft.name,
+                            "description": draft.description,
+                            "provider": draft.provider,
+                            "model": draft.model,
+                            "base_url": draft.base_url,
+                            "api_key": draft.api_key,
+                            "working_dir": draft.working_dir,
+                            "git_url": draft.git_url,
+                            "git_ref": draft.git_ref,
+                            "nix_shell": draft.nix_shell,
+                            "system_prompt": draft.system_prompt,
+                            "tools": draft.tools,
+                        });
+                        let res = match &profile_id {
+                            Some(id) => http_json(
+                                &cfg,
+                                "PATCH",
+                                &format!("/profiles/update?id={id}"),
+                                Some(&body),
+                            )
+                            .map(|_| id.clone()),
+                            None => http_json(&cfg, "POST", "/profiles", Some(&body)).map(|v| {
+                                v.pointer("/profile/id")
+                                    .or_else(|| v.get("id"))
+                                    .and_then(|x| x.as_str())
+                                    .unwrap_or("")
+                                    .to_string()
+                            }),
+                        };
+                        match res {
+                            Ok(id) => write_frame(&pipe, &Frame::ProfilePutOk { req_id, profile_id: id }),
+                            Err(e) => write_frame(
+                                &pipe,
+                                &Frame::Error { req_id: Some(req_id), message: e },
+                            ),
+                        }
+                    }
+                    ForgeJob::ProfileDelete { req_id, profile_id } => {
+                        match http_json(&cfg, "DELETE", &format!("/profiles/{profile_id}"), None) {
+                            Ok(_) => write_frame(&pipe, &Frame::ProfileDeleteOk { req_id }),
+                            Err(e) => write_frame(
+                                &pipe,
+                                &Frame::Error { req_id: Some(req_id), message: e },
+                            ),
+                        }
+                    }
                 },
                 Err(mpsc::RecvError) => return,
             }
@@ -668,11 +777,14 @@ pub fn create_forge_session(
     cfg: &ForgeConfig,
     title: &str,
     working_dir: Option<&str>,
+    profile_override: Option<&str>,
 ) -> Result<Uuid, String> {
-    // profile: configured or the first one
-    let profile_id = match &cfg.profile {
-        Some(p) => p.clone(),
-        None => {
+    // profile: explicit override > configured > the first one
+    let profile_id = match profile_override {
+        Some(p) => p.to_string(),
+        None => match &cfg.profile {
+            Some(p) => p.clone(),
+            None => {
             let v = http_json(cfg, "GET", "/profiles", None)?;
             // response is {profiles: [...]} (or a bare array)
             let arr = v
@@ -681,12 +793,13 @@ pub fn create_forge_session(
                 .cloned()
                 .or_else(|| v.as_array().cloned())
                 .ok_or("GET /profiles: unexpected shape")?;
-            arr.first()
-                .and_then(|p| p.get("id"))
-                .and_then(|i| i.as_str())
-                .ok_or("no forge profiles")?
-                .to_string()
-        }
+                arr.first()
+                    .and_then(|p| p.get("id"))
+                    .and_then(|i| i.as_str())
+                    .ok_or("no forge profiles")?
+                    .to_string()
+            }
+        },
     };
     let mut body = serde_json::json!({ "profile_id": profile_id, "title": title });
     if let Some(dir) = working_dir {

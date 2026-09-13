@@ -95,6 +95,33 @@ export type ProfileDraft = {
   tools: string[];
 };
 
+
+// ----- workflows (Phase C): mule proxy -----
+
+export type WorkflowSummary = {
+  id: string;
+  name: string;
+  description?: string | null;
+  is_async?: boolean | null;
+  updated_at?: string | null;
+};
+
+export type WorkflowStep = {
+  id?: string | null;
+  step_order: number;
+  type: string; // "agent" | "wasm_module"
+  agent_id?: string | null;
+  wasm_module_id?: string | null;
+  config: unknown;
+};
+
+export type WorkflowDraft = {
+  name: string;
+  description?: string | null;
+  is_async: boolean;
+  steps: WorkflowStep[];
+};
+
 // Binary split tree, mirrors ranch_protocol::Layout
 export type Layout =
   | { k: "Leaf"; pane: string }
@@ -179,6 +206,16 @@ export type Frame =
   | { t: "ProfilePutOk"; id: string; req_id: string; profile_id: string }
   | { t: "ProfileDelete"; id: string; req_id: string; profile: string }
   | { t: "ProfileDeleteOk"; id: string; req_id: string }
+  | { t: "WorkflowList"; id: string; req_id: string }
+  | { t: "WorkflowListOk"; id: string; req_id: string; workflows: WorkflowSummary[] }
+  | { t: "WorkflowGet"; id: string; req_id: string; workflow: string }
+  | { t: "WorkflowGetOk"; id: string; req_id: string; workflow: WorkflowSummary; steps: WorkflowStep[] }
+  | { t: "WorkflowPut"; id: string; req_id: string; workflow_id?: string | null; draft: WorkflowDraft }
+  | { t: "WorkflowPutOk"; id: string; req_id: string; workflow_id: string }
+  | { t: "WorkflowDelete"; id: string; req_id: string; workflow: string }
+  | { t: "WorkflowDeleteOk"; id: string; req_id: string }
+  | { t: "WorkflowRun"; id: string; req_id: string; workflow: string; input?: unknown }
+  | { t: "WorkflowRunOk"; id: string; req_id: string; job: string; session: string; pane: string }
   | { t: "ModelList"; id: string; client: string; pane: string; req_id: string }
   | { t: "ModelListOk"; id: string; req_id: string; pane: string; current: ModelChoice | null; models: ModelChoice[] }
   | { t: "ModelSet"; id: string; client: string; session: string; pane: string; provider: string; model: string; req_id: string }

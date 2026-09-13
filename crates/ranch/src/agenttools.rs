@@ -211,7 +211,7 @@ fn now_iso() -> String {
 
 /// RFC3339-ish timestamp from unix seconds (same calendar math as
 /// daemon.rs `civil_from_unix`).
-fn iso_from_unix(secs: i64) -> String {
+pub fn iso_from_unix(secs: i64) -> String {
     let (y, mo, d, h, mi, s) = civil_from_unix(secs);
     format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
 }
