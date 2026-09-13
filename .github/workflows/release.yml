@@ -47,7 +47,6 @@ jobs:
           # tools/zig-cc maps rust's musl triple to zig's; make build uses it as CC
           RANCH_ZIG: ${{ github.workspace }}/.tools/zig/zig
           CC_x86_64_unknown_linux_musl: ${{ github.workspace }}/tools/zig-cc
-        env:
           # baked into the binary; HelloOk reports it so clients can
           # flag stale installs (same string as versions.json below)
           RANCH_VERSION: main-${{ github.sha }}
