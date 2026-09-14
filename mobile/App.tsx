@@ -337,7 +337,14 @@ export default function App() {
         <Pressable onPress={() => setMachine(null)} hitSlop={8}>
           <Text style={s.back}>‹ machines</Text>
         </Pressable>
-        <Text style={s.title} numberOfLines={1}>{machine.name}</Text>
+        <View style={{ flex: 1, alignItems: "center" }}>
+          <Text style={s.title} numberOfLines={1}>{machine.name}</Text>
+          {daemonVersion !== null && (
+            <Text style={{ color: "#6b7280", fontSize: 10 }} numberOfLines={1}>
+              daemon {daemonVersion}
+            </Text>
+          )}
+        </View>
         <Pressable onPress={() =>
           Alert.alert(machine.name, undefined, [
             { text: "cancel", style: "cancel" },

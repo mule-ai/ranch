@@ -87,6 +87,12 @@ export function EditorScreen({ relay, onExit }: Props) {
   const webviewRef = useRef<WebView | null>(null);
   const webReady = useRef(false);
   const webDoc = useRef<string | null>(null);
+  // height debugging: DEBUG_EDITOR_HUD shows the RN container height
+  // vs the WebView viewport vs the CodeMirror wrapper — whichever one
+  // is short is the guilty layer. Set false once the height is right.
+  const DEBUG_EDITOR_HUD = true;
+  const [editorBoxH, setEditorBoxH] = useState(0);
+  const [webMetrics, setWebMetrics] = useState<{ vw: number; vh: number; cmw: number; cmh: number } | null>(null);
   useEffect(() => {
     draftRef.current = draft;
   }, [draft]);
@@ -265,7 +271,7 @@ export function EditorScreen({ relay, onExit }: Props) {
     webviewRef.current?.postMessage(JSON.stringify({ t: "setDoc", value: content, mode }));
   };
   const onWebMessage = (e: WebViewMessageEvent) => {
-    let f: { t?: string; value?: string };
+    let f: { t?: string; value?: string; vw?: number; vh?: number; cmw?: number; cmh?: number };
     try {
       f = JSON.parse(e.nativeEvent.data);
     } catch {
@@ -280,6 +286,8 @@ export function EditorScreen({ relay, onExit }: Props) {
     } else if (f.t === "change" && typeof f.value === "string") {
       webDoc.current = f.value;
       setDraft(f.value);
+    } else if (f.t === "metrics" && typeof f.vh === "number" && typeof f.vw === "number" && typeof f.cmw === "number" && typeof f.cmh === "number") {
+      setWebMetrics({ vw: f.vw, vh: f.vh, cmw: f.cmw, cmh: f.cmh });
     }
   };
   // keep the page in sync when the draft changes out-of-band (file
@@ -369,15 +377,25 @@ export function EditorScreen({ relay, onExit }: Props) {
           // highlighting/undo/search — none of the overlay hacks.
           // Beyond ~1MB the bridge round-trips get ugly: fall back to
           // the plain edit input below.
-          <WebView
-            ref={webviewRef}
-            source={{ html: EDITOR_HTML }}
+          <View
             style={styles.codeWrap}
-            onMessage={onWebMessage}
-            overScrollMode="never"
-            hideKeyboardAccessoryView
-            keyboardDisplayRequiresUserAction={false}
-          />
+            onLayout={(e) => setEditorBoxH(e.nativeEvent.layout.height)}
+          >
+            <WebView
+              ref={webviewRef}
+              source={{ html: EDITOR_HTML }}
+              style={styles.codeWrap}
+              onMessage={onWebMessage}
+              overScrollMode="never"
+              hideKeyboardAccessoryView
+              keyboardDisplayRequiresUserAction={false}
+            />
+            {DEBUG_EDITOR_HUD && webMetrics !== null && (
+              <Text style={styles.hud} pointerEvents="none">
+                box {Math.round(editorBoxH)} · vh {Math.round(webMetrics.vh)} · cm {Math.round(webMetrics.cmh)}
+              </Text>
+            )}
+          </View>
         ) : (
           <TextInput
             style={styles.editor}
@@ -669,6 +687,11 @@ const styles = StyleSheet.create({
   },
   // "code" view = CodeMirror in a WebView
   codeWrap: { flex: 1, backgroundColor: "#0a0a0e" },
+  hud: {
+    position: "absolute", bottom: 66, right: 10,
+    color: "#f59e0b", fontSize: 10, fontFamily: "JetBrainsMono NF Mono",
+    backgroundColor: "rgba(0,0,0,0.6)", paddingHorizontal: 4, borderRadius: 4,
+  },
   review: { flex: 1, backgroundColor: "#0a0a0e" },
   reviewContent: { padding: 12, paddingBottom: 40 },
   codeBlock: {

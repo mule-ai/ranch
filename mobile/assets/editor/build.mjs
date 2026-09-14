@@ -78,6 +78,26 @@ const glue = `
     if (document.hidden) send({ t: "change", value: editor.getValue() });
   });
 
+  // ---- height telemetry (debug HUD) ----
+  // RN shows box/vh/cm so a short-editor report comes with numbers:
+  //   box  = measured RN container height
+  //   vh   = WebView viewport height
+  //   cm   = CodeMirror wrapper height
+  var metricsTimer = null;
+  function report() {
+    if (metricsTimer) return;
+    metricsTimer = setTimeout(function () {
+      metricsTimer = null;
+      var cm = editor.getWrapperElement();
+      send({ t: "metrics", vw: window.innerWidth, vh: window.innerHeight,
+             cmw: cm.clientWidth, cmh: cm.clientHeight });
+    }, 150);
+  }
+  window.addEventListener("resize", report);
+  if (window.ResizeObserver) {
+    new ResizeObserver(report).observe(editor.getWrapperElement());
+  }
+
   // react-native-webview on Android delivers webviewRef.postMessage here
   document.addEventListener("message", function (e) {
     var msg;
@@ -94,6 +114,7 @@ const glue = `
   });
 
   send({ t: "ready" });
+  report();
 })();
 `;
 
@@ -102,10 +123,10 @@ const html = `<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
 <style>
-  html, body { margin: 0; padding: 0; background: #0a0a0e; height: 100%; }
-  /* fill the WebView by explicit percentage chain — 100vh is flaky
-     in Android WebViews (keyboard/viewport interactions) */
-  .CodeMirror { height: 100%; }
+  html, body { margin: 0; padding: 0; background: #0a0a0e; height: 100%; overflow: hidden; }
+  /* pin the editor to the WebView viewport directly — no height chain
+     (100vh / 100% both proved flaky on Android) can break this */
+  .CodeMirror { position: fixed; top: 0; left: 0; right: 0; bottom: 0; height: auto; }
 </style>
 <style>${css}</style>
 <style>${theme}</style>
