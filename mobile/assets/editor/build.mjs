@@ -17,8 +17,13 @@ const files = readdirSync(dir)
   .sort()
   .map((f) => readFileSync(join(dir, f), "utf8"));
 
-// app-matched dark theme; colors echo lib/highlight.ts's palette
+// app-matched dark theme; colors echo lib/highlight.ts's palette.
+// IMPORTANT: this block is emitted AFTER codemirror.min.css — the pin
+// rule here must win over CM's built-in `.CodeMirror { height: 300px }`
+// (it previously lost the ordering war and the editor was a 300px
+// sliver — cm=300 in the HUD was CM's default showing through).
 const theme = `
+.CodeMirror { position: fixed; top: 0; left: 0; right: 0; bottom: 0; height: auto; }
 .cm-s-ranch.CodeMirror { background: #0a0a0e; color: #d1d5db;
   font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 13px; line-height: 1.5; }
 .cm-s-ranch .CodeMirror-gutters { background: #0a0a0e; border-right: 1px solid #1f2430; }
@@ -124,9 +129,6 @@ const html = `<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
 <style>
   html, body { margin: 0; padding: 0; background: #0a0a0e; height: 100%; overflow: hidden; }
-  /* pin the editor to the WebView viewport directly — no height chain
-     (100vh / 100% both proved flaky on Android) can break this */
-  .CodeMirror { position: fixed; top: 0; left: 0; right: 0; bottom: 0; height: auto; }
 </style>
 <style>${css}</style>
 <style>${theme}</style>
