@@ -13,11 +13,35 @@ import {
   View,
 } from "react-native";
 import { lexer, type Token, type Tokens } from "marked";
-import { highlightAll, langForPath, supportsHighlight, type HlSpan } from "../lib/highlight";
+import { WebView, type WebViewMessageEvent } from "react-native-webview";
+import { langForPath, supportsHighlight } from "../lib/highlight";
+import { EDITOR_HTML } from "../lib/editor-html";
 import { Frame, nextId } from "../lib/frames";
 import { Relay } from "../lib/relay";
 
 type Props = { relay: Relay; onExit: () => void };
+
+// CodeMirror mode for a path (see assets/editor/build.mjs for what's
+// bundled; anything unknown renders unhighlighted but still edits fine)
+function cmMode(path: string): string {
+  switch (langForPath(path)) {
+    case "rust": return "rust";
+    case "c": return "text/x-csrc";
+    case "cpp": return "text/x-c++src";
+    case "csharp": return "text/x-csharp";
+    case "go": return "text/x-go";
+    case "java": return "text/x-java";
+    case "js": case "jsx": return "text/javascript";
+    case "ts": case "tsx": return "application/typescript";
+    case "python": return "text/x-python";
+    case "shell": return "text/x-sh";
+    case "json": case "json5": return "application/json";
+    case "toml": return "text/x-toml";
+    case "yaml": return "text/x-yaml";
+    case "markdown": return "markdown";
+    default: return "null";
+  }
+}
 
 type BrowseState = {
   path: string;
@@ -57,13 +81,12 @@ export function EditorScreen({ relay, onExit }: Props) {
   // sees first-render closures
   const draftRef = useRef("");
   const openFileRef = useRef<OpenFile | null>(null);
-  // code view: false = colored reading view, true = plain editable
-  // input (tap the colored view to edit; keyboard hide reverts)
-  const [codeEditing, setCodeEditing] = useState(false);
-  useEffect(() => {
-    const hide = Keyboard.addListener("keyboardDidHide", () => setCodeEditing(false));
-    return () => hide.remove();
-  }, []);
+  // CodeMirror-in-WebView: the page announces itself with {t:"ready"},
+  // then pushes every edit back as {t:"change", value}. webDoc mirrors
+  // what the page holds so pushes and echoes don't loop.
+  const webviewRef = useRef<WebView | null>(null);
+  const webReady = useRef(false);
+  const webDoc = useRef<string | null>(null);
   useEffect(() => {
     draftRef.current = draft;
   }, [draft]);
@@ -233,6 +256,39 @@ export function EditorScreen({ relay, onExit }: Props) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [relay]);
 
+  // ---- CodeMirror bridge (WebView <-> draft) ----
+  const pushDocToWeb = (content: string, mode: string) => {
+    // webDoc mirrors what the page holds — filter echoes of our own
+    // pushes/changes so the two sides can't loop
+    if (content === webDoc.current) return;
+    webDoc.current = content;
+    webviewRef.current?.postMessage(JSON.stringify({ t: "setDoc", value: content, mode }));
+  };
+  const onWebMessage = (e: WebViewMessageEvent) => {
+    let f: { t?: string; value?: string };
+    try {
+      f = JSON.parse(e.nativeEvent.data);
+    } catch {
+      return;
+    }
+    if (f.t === "ready") {
+      // fresh page boot (first open or a tab re-mount): force-push
+      webReady.current = true;
+      webDoc.current = null;
+      if (openFileRef.current)
+        pushDocToWeb(draftRef.current, cmMode(openFileRef.current.path));
+    } else if (f.t === "change" && typeof f.value === "string") {
+      webDoc.current = f.value;
+      setDraft(f.value);
+    }
+  };
+  // keep the page in sync when the draft changes out-of-band (file
+  // load, reload after external change)
+  useEffect(() => {
+    if (webReady.current && openFile) pushDocToWeb(draft, cmMode(openFile.path));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [draft, openFile]);
+
   const dirty = openFile ? draft !== openFile.original : false;
   const showTabs = openFile && (isMarkdown(openFile.path) || supportsHighlight(openFile.path));
   const otherTab: "review" | "code" | null = !openFile
@@ -323,14 +379,21 @@ export function EditorScreen({ relay, onExit }: Props) {
             selectionColor="#4ade80"
           />
         ) : view === "code" ? (
-          // "code" view: colored reading view, and TAPPING it swaps to
-          // a plain editable input (keyboard opens; dismissing the
-          // keyboard swaps back). Never render the highlight layer and
-          // an editing input stacked: Android draws Text and TextInput
-          // line boxes a hair differently, so the overlay ghost-blurs —
-          // uniformly when static, worse while scrolling. One layer at
-          // a time reads cleanly, always.
-          codeEditing ? (
+          draft.length <= 1_000_000 ? (
+            // real editor: CodeMirror 5 in a WebView (single inlined HTML
+            // doc — see assets/editor/build.mjs). One text layer, real
+            // highlighting/undo/search — none of the overlay hacks.
+            // Beyond ~1MB the bridge round-trips get ugly: fall back to
+            // the plain edit input below.
+            <WebView
+              ref={webviewRef}
+              source={{ html: EDITOR_HTML }}
+              style={styles.codeWrap}
+              onMessage={onWebMessage}
+              hideKeyboardAccessoryView
+              keyboardDisplayRequiresUserAction={false}
+            />
+          ) : (
             <TextInput
               style={styles.editor}
               value={draft}
@@ -338,22 +401,12 @@ export function EditorScreen({ relay, onExit }: Props) {
               multiline
               scrollEnabled
               textAlignVertical="top"
-              autoFocus
               autoCapitalize="none"
               autoCorrect={false}
               autoComplete="off"
               spellCheck={false}
               selectionColor="#4ade80"
             />
-          ) : (
-            <ScrollView
-              style={styles.codeWrap}
-              contentContainerStyle={styles.codePad}
-              // a touch starts editing immediately (keyboard up)
-              onTouchStart={() => setCodeEditing(true)}
-            >
-              <HlBody lines={highlightAll(draft, langForPath(openFile.path))} />
-            </ScrollView>
           )
         ) : (
           <ScrollView style={styles.review} contentContainerStyle={styles.reviewContent}>
@@ -407,33 +460,6 @@ function useKbHeight(): number {
     };
   }, []);
   return h;
-}
-
-// One highlighted row = a line of colored spans + an explicit newline
-// (the TextInput's rows include the \n, so the overlay must too).
-function HlRow({ spans }: { spans: HlSpan[] }) {
-  return (
-    <Text style={styles.hlLine}>
-      {spans.map((sp, i) => (
-        <Text
-          key={i}
-          style={{ color: sp.color ?? styles.hlLine.color, fontWeight: sp.bold ? "700" : "400", fontStyle: sp.italic ? "italic" : "normal" }}
-        >
-          {sp.text}
-        </Text>
-      ))}
-    </Text>
-  );
-}
-
-function HlBody({ lines }: { lines: HlSpan[][] }) {
-  return (
-    <View>
-      {lines.map((spans, i) => (
-        <HlRow key={i} spans={spans} />
-      ))}
-    </View>
-  );
 }
 
 // ---------- markdown rendering (marked tokens → RN views) ----------
@@ -661,13 +687,8 @@ const styles = StyleSheet.create({
     fontSize: 14, lineHeight: 20, paddingTop: 12, paddingHorizontal: 4,
     backgroundColor: "#0a0a0e",
   },
-  // "code" reading view (editing swaps to the plain editor input)
+  // "code" view = CodeMirror in a WebView
   codeWrap: { flex: 1, backgroundColor: "#0a0a0e" },
-  codePad: { paddingBottom: 60 },
-  hlLine: {
-    color: "#d1d5db", fontFamily: "JetBrainsMono NF Mono",
-    fontSize: 14, lineHeight: 20,
-  },
   review: { flex: 1, backgroundColor: "#0a0a0e" },
   reviewContent: { padding: 12, paddingBottom: 40 },
   codeBlock: {
