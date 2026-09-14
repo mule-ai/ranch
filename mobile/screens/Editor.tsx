@@ -57,11 +57,13 @@ export function EditorScreen({ relay, onExit }: Props) {
   // sees first-render closures
   const draftRef = useRef("");
   const openFileRef = useRef<OpenFile | null>(null);
-  // code view: the shared scroller follows the caret — track its
-  // visible height and current offset so revealCaret can decide
-  const codeScrollRef = useRef<ScrollView | null>(null);
-  const codeViewH = useRef(0);
-  const codeOffset = useRef(0);
+  // code view: false = colored reading view, true = plain editable
+  // input (tap the colored view to edit; keyboard hide reverts)
+  const [codeEditing, setCodeEditing] = useState(false);
+  useEffect(() => {
+    const hide = Keyboard.addListener("keyboardDidHide", () => setCodeEditing(false));
+    return () => hide.remove();
+  }, []);
   useEffect(() => {
     draftRef.current = draft;
   }, [draft]);
@@ -232,21 +234,6 @@ export function EditorScreen({ relay, onExit }: Props) {
   }, [relay]);
 
   const dirty = openFile ? draft !== openFile.original : false;
-  // scroll the shared code-view scroller so the caret line sits in the
-  // visible band (lines are exactly lineHeight 20 tall — see hlLine)
-  const revealCaret = (start: number) => {
-    const h = codeViewH.current;
-    if (h <= 0) return;
-    let line = 0;
-    const d = draftRef.current;
-    for (let i = 0; i < start && i < d.length; i++) if (d.charCodeAt(i) === 10) line++;
-    const y = line * 20;
-    const top = codeOffset.current;
-    if (y < top + 20 || y > top + h - 40) {
-      codeScrollRef.current?.scrollTo({ y: Math.max(0, y - h / 2), animated: false });
-      codeOffset.current = Math.max(0, y - h / 2);
-    }
-  };
   const showTabs = openFile && (isMarkdown(openFile.path) || supportsHighlight(openFile.path));
   const otherTab: "review" | "code" | null = !openFile
     ? null
@@ -336,41 +323,38 @@ export function EditorScreen({ relay, onExit }: Props) {
             selectionColor="#4ade80"
           />
         ) : view === "code" ? (
-          // highlighted code view you can edit in: the colored text is a
-          // read-only layer underneath; a transparent TextInput sits on
-          // top and does the actual editing (caret + selection show
-          // through, the colored layer never blurs). Both layers live in
-          // ONE ScrollView (the input's own scrolling is disabled and it
-          // grows with its text) so they can never drift apart — two
-          // scrollers with a JS scroll-mirror produced visible ghosting.
-          // The ScrollView follows the caret on selection change instead.
-          <View style={styles.codeWrap}>
+          // "code" view: colored reading view, and TAPPING it swaps to
+          // a plain editable input (keyboard opens; dismissing the
+          // keyboard swaps back). Never render the highlight layer and
+          // an editing input stacked: Android draws Text and TextInput
+          // line boxes a hair differently, so the overlay ghost-blurs —
+          // uniformly when static, worse while scrolling. One layer at
+          // a time reads cleanly, always.
+          codeEditing ? (
+            <TextInput
+              style={styles.editor}
+              value={draft}
+              onChangeText={setDraft}
+              multiline
+              scrollEnabled
+              textAlignVertical="top"
+              autoFocus
+              autoCapitalize="none"
+              autoCorrect={false}
+              autoComplete="off"
+              spellCheck={false}
+              selectionColor="#4ade80"
+            />
+          ) : (
             <ScrollView
-              ref={codeScrollRef}
-              keyboardShouldPersistTaps="handled"
-              onLayout={(e) => (codeViewH.current = e.nativeEvent.layout.height)}
-              onScroll={(e) => (codeOffset.current = e.nativeEvent.contentOffset.y)}
-              scrollEventThrottle={16}
+              style={styles.codeWrap}
+              contentContainerStyle={styles.codePad}
+              // a touch starts editing immediately (keyboard up)
+              onTouchStart={() => setCodeEditing(true)}
             >
-              <View style={styles.codePad}>
-                <HlBody lines={highlightAll(draft, langForPath(openFile.path))} />
-                <TextInput
-                  style={styles.codeInput}
-                  value={draft}
-                  onChangeText={setDraft}
-                  multiline
-                  scrollEnabled={false}
-                  onSelectionChange={(e) => revealCaret(e.nativeEvent.selection.start)}
-                  autoCapitalize="none"
-                  autoCorrect={false}
-                  autoComplete="off"
-                  spellCheck={false}
-                  selectionColor="#4ade80"
-                  underlineColorAndroid="transparent"
-                />
-              </View>
+              <HlBody lines={highlightAll(draft, langForPath(openFile.path))} />
             </ScrollView>
-          </View>
+          )
         ) : (
           <ScrollView style={styles.review} contentContainerStyle={styles.reviewContent}>
             <MarkdownView source={draft} />
@@ -677,19 +661,9 @@ const styles = StyleSheet.create({
     fontSize: 14, lineHeight: 20, paddingTop: 12, paddingHorizontal: 4,
     backgroundColor: "#0a0a0e",
   },
-  // highlighted (editable) code view — both layers share one scroller
-  // and identical font metrics so colored lines sit exactly under the
-  // input's rows
+  // "code" reading view (editing swaps to the plain editor input)
   codeWrap: { flex: 1, backgroundColor: "#0a0a0e" },
-  codePad: { paddingTop: 12, paddingHorizontal: 4, paddingBottom: 60 },
-  // the editor itself: transparent text (the colored layer shows
-  // through), visible caret/selection; its own scrolling is disabled —
-  // it grows with its text inside the shared ScrollView
-  codeInput: {
-    position: "absolute", top: 12, left: 4, right: 4, padding: 0,
-    color: "transparent", fontFamily: "JetBrainsMono NF Mono",
-    fontSize: 14, lineHeight: 20, textAlignVertical: "top",
-  },
+  codePad: { paddingBottom: 60 },
   hlLine: {
     color: "#d1d5db", fontFamily: "JetBrainsMono NF Mono",
     fontSize: 14, lineHeight: 20,
