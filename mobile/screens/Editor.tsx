@@ -87,10 +87,9 @@ export function EditorScreen({ relay, onExit }: Props) {
   const webviewRef = useRef<WebView | null>(null);
   const webReady = useRef(false);
   const webDoc = useRef<string | null>(null);
-  // height debugging: DEBUG_EDITOR_HUD shows the RN container height
-  // vs the WebView viewport vs the CodeMirror wrapper — whichever one
-  // is short is the guilty layer. Set false once the height is right.
-  const DEBUG_EDITOR_HUD = true;
+  // height debugging: flip to false once the editor fills the screen
+  // (confirmed on device — box/vh/cm all match)
+  const DEBUG_EDITOR_HUD = false;
   const [editorBoxH, setEditorBoxH] = useState(0);
   const [webMetrics, setWebMetrics] = useState<{ vw: number; vh: number; cmw: number; cmh: number } | null>(null);
   useEffect(() => {
