@@ -102,8 +102,10 @@ const html = `<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
 <style>
-  html, body { margin: 0; padding: 0; background: #0a0a0e; }
-  .CodeMirror { height: 100vh; }
+  html, body { margin: 0; padding: 0; background: #0a0a0e; height: 100%; }
+  /* fill the WebView by explicit percentage chain — 100vh is flaky
+     in Android WebViews (keyboard/viewport interactions) */
+  .CodeMirror { height: 100%; }
 </style>
 <style>${css}</style>
 <style>${theme}</style>

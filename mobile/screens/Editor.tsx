@@ -14,7 +14,7 @@ import {
 } from "react-native";
 import { lexer, type Token, type Tokens } from "marked";
 import { WebView, type WebViewMessageEvent } from "react-native-webview";
-import { langForPath, supportsHighlight } from "../lib/highlight";
+import { langForPath } from "../lib/highlight";
 import { EDITOR_HTML } from "../lib/editor-html";
 import { Frame, nextId } from "../lib/frames";
 import { Relay } from "../lib/relay";
@@ -66,7 +66,7 @@ export function EditorScreen({ relay, onExit }: Props) {
   const [browseLoading, setBrowseLoading] = useState(false);
   const [openFile, setOpenFile] = useState<OpenFile | null>(null);
   const [draft, setDraft] = useState("");
-  const [view, setView] = useState<"edit" | "review" | "code">("edit");
+  const [showReview, setShowReview] = useState(false); // markdown: rendered view
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
@@ -140,7 +140,7 @@ export function EditorScreen({ relay, onExit }: Props) {
     }
     if (openFile) {
       setOpenFile(null);
-      setView("edit");
+      setShowReview(false);
       setError(null);
       setExternChanged(null);
     } else {
@@ -184,7 +184,7 @@ export function EditorScreen({ relay, onExit }: Props) {
             setBrowseLoading(false);
             setOpenFile({ path: f.path, original: f.content, mtime: f.mtime, size: f.size });
             setDraft(f.content);
-            setView(isMarkdown(f.path) ? "review" : "edit");
+            setShowReview(isMarkdown(f.path));
           }
           break;
         case "FileWriteOk":
@@ -290,14 +290,6 @@ export function EditorScreen({ relay, onExit }: Props) {
   }, [draft, openFile]);
 
   const dirty = openFile ? draft !== openFile.original : false;
-  const showTabs = openFile && (isMarkdown(openFile.path) || supportsHighlight(openFile.path));
-  const otherTab: "review" | "code" | null = !openFile
-    ? null
-    : isMarkdown(openFile.path)
-      ? "review"
-      : supportsHighlight(openFile.path)
-        ? "code"
-        : null;
 
   return (
     <View style={[styles.wrap, { paddingBottom: kbHeight }]}>
@@ -345,18 +337,21 @@ export function EditorScreen({ relay, onExit }: Props) {
         </View>
       )}
 
-      {showTabs && otherTab !== null && (
+      {openFile && isMarkdown(openFile.path) && (
+        // markdown only: toggle the rendered-review view (code files are
+        // CodeMirror-only — no edit/code tab pair)
         <View style={styles.tabs}>
-          <Pressable style={[styles.tab, view === "edit" && styles.tabOn]} onPress={() => setView("edit")}>
-            <Text style={[styles.tabText, view === "edit" && styles.tabTextOn]}>edit</Text>
+          <Pressable
+            style={[styles.tab, !showReview && styles.tabOn]}
+            onPress={() => setShowReview(false)}
+          >
+            <Text style={[styles.tabText, !showReview && styles.tabTextOn]}>code</Text>
           </Pressable>
           <Pressable
-            style={[styles.tab, view === otherTab && styles.tabOn]}
-            onPress={() => setView(otherTab)}
+            style={[styles.tab, showReview && styles.tabOn]}
+            onPress={() => setShowReview(true)}
           >
-            <Text style={[styles.tabText, view === otherTab && styles.tabTextOn]}>
-              {otherTab === "review" ? "review" : "code"}
-            </Text>
+            <Text style={[styles.tabText, showReview && styles.tabTextOn]}>review</Text>
           </Pressable>
         </View>
       )}
@@ -364,7 +359,26 @@ export function EditorScreen({ relay, onExit }: Props) {
       {browseLoading && !openFile ? (
         <Text style={styles.dim}>loading…</Text>
       ) : openFile ? (
-        view === "edit" ? (
+        showReview && isMarkdown(openFile.path) ? (
+          <ScrollView style={styles.review} contentContainerStyle={styles.reviewContent}>
+            <MarkdownView source={draft} />
+          </ScrollView>
+        ) : draft.length <= 1_000_000 ? (
+          // real editor: CodeMirror 5 in a WebView (single inlined HTML
+          // doc — see assets/editor/build.mjs). One text layer, real
+          // highlighting/undo/search — none of the overlay hacks.
+          // Beyond ~1MB the bridge round-trips get ugly: fall back to
+          // the plain edit input below.
+          <WebView
+            ref={webviewRef}
+            source={{ html: EDITOR_HTML }}
+            style={styles.codeWrap}
+            onMessage={onWebMessage}
+            overScrollMode="never"
+            hideKeyboardAccessoryView
+            keyboardDisplayRequiresUserAction={false}
+          />
+        ) : (
           <TextInput
             style={styles.editor}
             value={draft}
@@ -378,40 +392,6 @@ export function EditorScreen({ relay, onExit }: Props) {
             spellCheck={false}
             selectionColor="#4ade80"
           />
-        ) : view === "code" ? (
-          draft.length <= 1_000_000 ? (
-            // real editor: CodeMirror 5 in a WebView (single inlined HTML
-            // doc — see assets/editor/build.mjs). One text layer, real
-            // highlighting/undo/search — none of the overlay hacks.
-            // Beyond ~1MB the bridge round-trips get ugly: fall back to
-            // the plain edit input below.
-            <WebView
-              ref={webviewRef}
-              source={{ html: EDITOR_HTML }}
-              style={styles.codeWrap}
-              onMessage={onWebMessage}
-              hideKeyboardAccessoryView
-              keyboardDisplayRequiresUserAction={false}
-            />
-          ) : (
-            <TextInput
-              style={styles.editor}
-              value={draft}
-              onChangeText={setDraft}
-              multiline
-              scrollEnabled
-              textAlignVertical="top"
-              autoCapitalize="none"
-              autoCorrect={false}
-              autoComplete="off"
-              spellCheck={false}
-              selectionColor="#4ade80"
-            />
-          )
-        ) : (
-          <ScrollView style={styles.review} contentContainerStyle={styles.reviewContent}>
-            <MarkdownView source={draft} />
-          </ScrollView>
         )
       ) : browse ? (
         <ScrollView
