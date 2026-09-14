@@ -328,7 +328,11 @@ export default function App() {
     );
 
   return (
-    <View style={[s.wrap, { paddingBottom: kbHeight + 64 + insets.bottom }]}>
+    <View style={[s.wrap, { paddingBottom: (tab === "files" ? 0 : kbHeight) + 64 + insets.bottom }]}>
+      {/* files tab: EditorScreen pads for the keyboard itself — adding it
+          here too would squeeze the editor to nothing ("keyboard popped
+          up and I couldn't see the file anymore"). Other tabs have no
+          own padding and still need the lift. */}
       <View style={s.header}>
         <Pressable onPress={() => setMachine(null)} hitSlop={8}>
           <Text style={s.back}>‹ machines</Text>

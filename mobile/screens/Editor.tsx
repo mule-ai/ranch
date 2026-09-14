@@ -57,6 +57,9 @@ export function EditorScreen({ relay, onExit }: Props) {
   // sees first-render closures
   const draftRef = useRef("");
   const openFileRef = useRef<OpenFile | null>(null);
+  // scroll mirror for the code view: the editable TextInput is the
+  // scroller, the highlight layer follows its offset
+  const codeScrollRef = useRef<ScrollView | null>(null);
   useEffect(() => {
     draftRef.current = draft;
   }, [draft]);
@@ -316,17 +319,54 @@ export function EditorScreen({ relay, onExit }: Props) {
             selectionColor="#4ade80"
           />
         ) : view === "code" ? (
-          // highlighted, read-only rendering (blur-free: one text layer)
-          <ScrollView style={styles.editor} scrollEnabled>
-            <HlBody lines={highlightAll(draft, langForPath(openFile.path))} />
-          </ScrollView>
+          // highlighted code view you can edit in: the colored text is a
+          // read-only layer underneath; a transparent TextInput sits on
+          // top and does the actual editing (caret + selection show
+          // through, the colored layer never blurs). The input is the
+          // scroller — it reports its offset and we mirror it onto the
+          // highlight layer, so colors stay in lockstep with the text.
+          <View style={styles.codeWrap}>
+            <ScrollView
+              ref={codeScrollRef}
+              scrollEnabled={false}
+              showsVerticalScrollIndicator={false}
+              contentContainerStyle={styles.codeLayer}
+            >
+              <HlBody lines={highlightAll(draft, langForPath(openFile.path))} />
+            </ScrollView>
+            <TextInput
+              style={[styles.codeLayer, styles.codeInput]}
+              value={draft}
+              onChangeText={setDraft}
+              multiline
+              // RN honors scrollEventThrottle on Android at runtime, but
+              // the TextInput typings omit it
+              {...({ scrollEventThrottle: 16 } as object)}
+              onScroll={(e) =>
+                codeScrollRef.current?.scrollTo({
+                  y: e.nativeEvent.contentOffset.y,
+                  animated: false,
+                })
+              }
+              autoCapitalize="none"
+              autoCorrect={false}
+              autoComplete="off"
+              spellCheck={false}
+              selectionColor="#4ade80"
+              underlineColorAndroid="transparent"
+            />
+          </View>
         ) : (
           <ScrollView style={styles.review} contentContainerStyle={styles.reviewContent}>
             <MarkdownView source={draft} />
           </ScrollView>
         )
       ) : browse ? (
-        <View style={styles.browse}>
+        <ScrollView
+          style={styles.browse}
+          contentContainerStyle={styles.browseContent}
+          keyboardShouldPersistTaps="handled"
+        >
           {browse.parent !== null && (
             <Pressable style={styles.row} onPress={() => loadDir(browse.parent ?? undefined)}>
               <Text style={styles.rowTitle}>../</Text>
@@ -348,7 +388,7 @@ export function EditorScreen({ relay, onExit }: Props) {
           {browse.dirs.length === 0 && browse.files.length === 0 && (
             <Text style={styles.dim}>empty directory</Text>
           )}
-        </View>
+        </ScrollView>
       ) : (
         <Text style={styles.dim}>no directory selected</Text>
       )}
@@ -609,6 +649,7 @@ const styles = StyleSheet.create({
   tabText: { color: "#9ca3af", fontSize: 13 },
   tabTextOn: { color: "#4ade80", fontWeight: "600" },
   browse: { flex: 1, marginTop: 4 },
+  browseContent: { paddingBottom: 40 },
   row: {
     flexDirection: "row", alignItems: "center", justifyContent: "space-between",
     paddingVertical: 13, borderBottomWidth: 1, borderBottomColor: "#1f2430",
@@ -621,8 +662,17 @@ const styles = StyleSheet.create({
     fontSize: 14, lineHeight: 20, paddingTop: 12, paddingHorizontal: 4,
     backgroundColor: "#0a0a0e",
   },
-  // highlighted (read-only) code rendering — single text layer, no
-  // overlay alignment issues
+  // highlighted (editable) code view — one shared geometry for the two
+  // stacked layers so colored lines sit exactly under the input's rows
+  codeWrap: { flex: 1, backgroundColor: "#0a0a0e" },
+  codeLayer: { paddingTop: 12, paddingHorizontal: 4, paddingBottom: 40 },
+  // the editor itself: transparent text (the colored layer shows
+  // through), visible caret/selection; it owns the scrolling
+  codeInput: {
+    position: "absolute", top: 0, left: 0, right: 0, bottom: 0,
+    color: "transparent", fontFamily: "JetBrainsMono NF Mono",
+    fontSize: 14, lineHeight: 20, textAlignVertical: "top",
+  },
   hlLine: {
     color: "#d1d5db", fontFamily: "JetBrainsMono NF Mono",
     fontSize: 14, lineHeight: 20,

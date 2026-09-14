@@ -288,6 +288,9 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
   // The pane's active model lives on the PaneSnap (`model`).
   const [modelOpts, setModelOpts] = useState<Record<string, ModelChoice[]>>({});
   const [modelPicker, setModelPicker] = useState(false);
+  // free-text filter for the model picker (catalogs are long; scroll-
+  // hunting for e.g. "sonnet" is miserable on a phone)
+  const [modelQuery, setModelQuery] = useState("");
   // req_id of the last ModelSet we sent (error correlation)
   const modelSetReq = useRef<string | null>(null);
   const chatRef = useRef<TextInput | null>(null);
@@ -358,6 +361,7 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
   // daemon on first use (ModelListOk lands into modelOpts[pane])
   const openModelPicker = () => {
     if (!activePane) return;
+    setModelQuery("");
     setModelPicker(true);
     const opts = modelOpts[activePane];
     if (!opts || opts.length === 0) {
@@ -679,11 +683,32 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
                 <Text style={styles.back}>close ✕</Text>
               </Pressable>
             </View>
-            <ScrollView style={styles.pickerList}>
+            <TextInput
+              style={styles.pickerSearch}
+              value={modelQuery}
+              onChangeText={setModelQuery}
+              placeholder="filter models…"
+              placeholderTextColor="#4b5563"
+              autoCapitalize="none"
+              autoCorrect={false}
+              autoComplete="off"
+              spellCheck={false}
+            />
+            <ScrollView style={styles.pickerList} keyboardShouldPersistTaps="handled">
               {(modelOpts[activePane] ?? []).length === 0 ? (
                 <Text style={styles.dim}>loading models…</Text>
               ) : (
-                (modelOpts[activePane] ?? []).map((m) => {
+                (modelOpts[activePane] ?? [])
+                  .filter((m) => {
+                    const q = modelQuery.trim().toLowerCase();
+                    if (!q) return true;
+                    return (
+                      m.name.toLowerCase().includes(q) ||
+                      m.id.toLowerCase().includes(q) ||
+                      m.provider.toLowerCase().includes(q)
+                    );
+                  })
+                  .map((m) => {
                   const active = activeSnap?.model === m.name;
                   return (
                     <Pressable
@@ -697,7 +722,9 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
                       </Text>
                     </Pressable>
                   );
-                })
+                }).length === 0 && (
+                  <Text style={styles.dim}>no models match "{modelQuery.trim()}"</Text>
+                )
               )}
             </ScrollView>
           </View>
@@ -853,6 +880,12 @@ const styles = StyleSheet.create({
     borderBottomWidth: 1, borderBottomColor: "#23232c",
   },
   pickerTitle: { color: "#9ca3af", fontSize: 12, fontWeight: "700" },
+  pickerSearch: {
+    color: "#f3f4f6", fontSize: 13, fontFamily: "JetBrainsMono NF Mono",
+    backgroundColor: "#0f1016", borderRadius: 8, borderWidth: 1,
+    borderColor: "#26262e", paddingHorizontal: 10, paddingVertical: 7,
+    marginHorizontal: 10, marginTop: 8,
+  },
   pickerList: { maxHeight: 360 },
   pickerRow: {
     paddingHorizontal: 12, paddingVertical: 10, borderBottomWidth: 1,
