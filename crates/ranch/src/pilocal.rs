@@ -87,9 +87,10 @@ pub struct LocalPi {
     child: Mutex<Option<Child>>,
     inherited_pid: Mutex<Option<libc::pid_t>>,
     /// Write end of the rpc child's stdin. On the inherit path this is a
-    /// raw fd wrapped as File (ChildStdin lacks FromRawFd). Mutex: the
-    /// prompt/send paths take &self.
-    stdin: Mutex<Option<Box<dyn std::io::Write + Send>>>,
+    /// raw fd wrapped as File (ChildStdin lacks FromRawFd). Arc+Mutex:
+    /// the prompt/send paths take &self and the reader thread issues its
+    /// own read-only RPCs (`get_session_stats` after each turn).
+    stdin: Arc<Mutex<Option<Box<dyn std::io::Write + Send>>>>,
     /// Read end of the rpc child's stdout (same).
     stdout: Mutex<Option<Box<dyn std::io::Read + Send>>>,
     /// Raw fds backing stdin/stdout — kept separately so the hot-upgrade
@@ -110,6 +111,9 @@ pub struct LocalPi {
     /// req_id of an in-flight `set_model`; echoed in the `error` frame
     /// when the switch fails.
     model_set_req: Arc<Mutex<Option<String>>>,
+    /// req_id of an in-flight `compact`; the reader thread echoes it in
+    /// the `error` frame when the compaction fails.
+    compact_req: Arc<Mutex<Option<String>>>,
 }
 
 /// `pi_no_tools = "true"` in ~/.config/ranch/daemon.toml disables all
@@ -228,7 +232,7 @@ impl LocalPi {
             cwd: cwd.to_string(),
             child: Mutex::new(Some(child)),
             inherited_pid: Mutex::new(None),
-            stdin: Mutex::new(Some(Box::new(stdin))),
+            stdin: Arc::new(Mutex::new(Some(Box::new(stdin)))),
             stdout: Mutex::new(Some(Box::new(stdout))),
             raw_fds: (Some(stdin_fd), Some(stdout_fd)),
             stop: Arc::new(AtomicBool::new(false)),
@@ -236,6 +240,7 @@ impl LocalPi {
             model: Arc::new(Mutex::new(None)),
             model_list_req: Arc::new(Mutex::new(None)),
             model_set_req: Arc::new(Mutex::new(None)),
+            compact_req: Arc::new(Mutex::new(None)),
         });
         panes.insert(pane, lp.clone());
         lp.start_reader(pipe);
@@ -244,6 +249,8 @@ impl LocalPi {
         // are captured in the reader); harmless if they arrive before/
         // after the first prompt
         let _ = lp.send_rpc(&serde_json::json!({"type": "get_state"}));
+        // initial context-window readout
+        let _ = lp.send_rpc(&serde_json::json!({"type": "get_session_stats"}));
         Ok(())
     }
 
@@ -299,9 +306,10 @@ impl LocalPi {
             inherited_pid: Mutex::new(child_pid),
             // ChildStdin/Stdout don't implement FromRawFd — use owned
             // Files (Read/Write impls are equivalent for our use)
-            stdin: Mutex::new(Some(Box::new(unsafe {
+            stdin: Arc::new(Mutex::new(Some(Box::new(unsafe {
                 std::fs::File::from_raw_fd(stdin_fd)
-            }))),
+            })))),
+
             stdout: Mutex::new(Some(Box::new(unsafe {
                 std::fs::File::from_raw_fd(stdout_fd)
             }))),
@@ -311,6 +319,7 @@ impl LocalPi {
             model: Arc::new(Mutex::new(None)),
             model_list_req: Arc::new(Mutex::new(None)),
             model_set_req: Arc::new(Mutex::new(None)),
+            compact_req: Arc::new(Mutex::new(None)),
         });
         panes.insert(pane, lp.clone());
         lp.start_reader(pipe);
@@ -318,6 +327,8 @@ impl LocalPi {
         // (the inheriting daemon's chat buffer starts empty)
         let _ = lp.send_rpc(&serde_json::json!({"type": "get_state"}));
         let _ = lp.send_rpc(&serde_json::json!({"type": "get_messages"}));
+        // initial context-window readout
+        let _ = lp.send_rpc(&serde_json::json!({"type": "get_session_stats"}));
         Ok(())
     }
 
@@ -335,9 +346,20 @@ impl LocalPi {
         let model = self.model.clone();
         let model_list_req = self.model_list_req.clone();
         let model_set_req = self.model_set_req.clone();
+        let compact_req = self.compact_req.clone();
+        let stdin = self.stdin.clone();
         std::thread::spawn(move || {
             run_pi_reader(
-                dup, t_pane, session_file, stop, model, model_list_req, model_set_req, pipe,
+                dup,
+                t_pane,
+                session_file,
+                stop,
+                model,
+                model_list_req,
+                model_set_req,
+                compact_req,
+                stdin,
+                pipe,
             );
         });
     }
@@ -381,6 +403,20 @@ impl LocalPi {
             "provider": provider,
             "modelId": model,
         }))
+    }
+
+    /// Manually compact the agent's context now (pi `compact` RPC).
+    /// The reader thread confirms with `meta kind="context"` on
+    /// success or an `error { req_id }` frame on failure.
+    pub fn compact(&self, req_id: &str) -> Result<(), String> {
+        *self.compact_req.lock().unwrap() = Some(req_id.to_string());
+        self.send_rpc(&serde_json::json!({"type": "compact"}))
+    }
+
+    /// Ask pi for its context-window usage; the reader thread emits
+    /// `meta kind="context"` when the response arrives.
+    pub fn request_stats(&self) -> Result<(), String> {
+        self.send_rpc(&serde_json::json!({"type": "get_session_stats"}))
     }
 
     /// Switch pi to a previously-recorded session file (restore path).
@@ -445,8 +481,21 @@ fn run_pi_reader(
     model: Arc<Mutex<Option<ModelChoice>>>,
     model_list_req: Arc<Mutex<Option<String>>>,
     model_set_req: Arc<Mutex<Option<String>>>,
+    compact_req: Arc<Mutex<Option<String>>>,
+    stdin: Arc<Mutex<Option<Box<dyn std::io::Write + Send>>>>,
     pipe: PipeWriter,
 ) {
+    /// Fire a read-only RPC from the reader thread (best-effort; used
+    /// for context-window refreshes).
+    fn rpc(stdin: &Arc<Mutex<Option<Box<dyn std::io::Write + Send>>>>, cmd: &str) {
+        if let Ok(mut g) = stdin.lock() {
+            if let Some(s) = g.as_mut() {
+                let _ = s.write_all(cmd.as_bytes());
+                let _ = s.write_all(b"\n");
+                let _ = s.flush();
+            }
+        }
+    }
     let reader = BufReader::new(stdout);
     let mut pending_tool: Option<(String, std::time::Instant)> = None;
     for line in reader.lines() {
@@ -531,6 +580,60 @@ fn run_pi_reader(
                             },
                         );
                         write_status(&pipe, "idle");
+                    }
+                } else if v.get("command").and_then(|c| c.as_str()) == Some("compact") {
+                    let success = v.get("success").and_then(|s| s.as_bool()).unwrap_or(false);
+                    if success {
+                        let after = v
+                            .pointer("/data/estimatedTokensAfter")
+                            .and_then(|a| a.as_i64())
+                            .map(|n| format_k_tokens(n))
+                            .unwrap_or_default();
+                        let note = if after.is_empty() {
+                            "compacted".to_string()
+                        } else {
+                            format!("compacted → {after} est. tokens")
+                        };
+                        write_context_status(&pipe, t_pane, &note);
+                        // refresh the live readout (pi re-reported after
+                        // the window shrank)
+                        rpc(
+                            &stdin,
+                            r#"{"type": "get_session_stats"}"#,
+                        );
+                    } else {
+                        let msg = v
+                            .get("error")
+                            .and_then(|e| e.as_str())
+                            .unwrap_or("compaction failed")
+                            .to_string();
+                        eprintln!("ranchd: local pi {t_pane} compact failed: {msg}");
+                        let req_id = compact_req.lock().ok().and_then(|mut g| g.take());
+                        write_frame(
+                            &pipe,
+                            &Frame::Error {
+                                req_id,
+                                message: format!("compact failed: {msg}"),
+                            },
+                        );
+                        write_status(&pipe, "idle");
+                    }
+                } else if v.get("command").and_then(|c| c.as_str()) == Some("get_session_stats") {
+                    // context-window readout (footer-style numbers)
+                    if let Some(cu) = v.pointer("/data/contextUsage") {
+                        let tokens = cu.get("tokens").and_then(|x| x.as_i64());
+                        let window = cu.get("contextWindow").and_then(|x| x.as_i64());
+                        let pct = cu.get("percent").and_then(|x| x.as_f64());
+                        let status = match (tokens, window, pct) {
+                            (Some(t), Some(w), Some(p)) => {
+                                format!("ctx {p:.0}% · {}/{}", format_k_tokens(t), format_k_tokens(w))
+                            }
+                            (Some(t), _, _) => format!("ctx ~{} est.", format_k_tokens(t)),
+                            _ => String::new(),
+                        };
+                        if !status.is_empty() {
+                            write_context_status(&pipe, t_pane, &status);
+                        }
                     }
                 } else if v.get("command").and_then(|c| c.as_str()) == Some("get_messages") {
                     // hot-upgrade resync: rebuild the pane's chat rows from
@@ -754,6 +857,12 @@ fn run_pi_reader(
             }
             "turn_end" | "agent_end" => {
                 write_status(&pipe, "idle");
+                // the turn may have grown the context — refresh the
+                // readout (reader thread fires the RPC itself)
+                rpc(
+                    &stdin,
+                    r#"{"type": "get_session_stats"}"#,
+                );
             }
             "error" => {
                 let msg = v
@@ -844,6 +953,30 @@ fn write_model_status(pipe: &PipeWriter, pane: Uuid, display: &str) {
             status: Some(display.to_string()),
         },
     );
+}
+
+/// Out-of-band context-window readout (kind="context").
+fn write_context_status(pipe: &PipeWriter, pane: Uuid, status: &str) {
+    write_frame(
+        pipe,
+        &Frame::Meta {
+            session: String::new(),
+            pane: Some(pane.to_string()),
+            kind: "context".into(),
+            status: Some(status.to_string()),
+        },
+    );
+}
+
+/// Human-friendly token count (12345 → "12k").
+fn format_k_tokens(n: i64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1000 {
+        format!("{}k", n / 1000)
+    } else {
+        n.to_string()
+    }
 }
 
 fn write_status(pipe: &PipeWriter, status: &str) {

@@ -30,6 +30,7 @@ export type PaneSnap = {
   chat?: ChatMsg[];
   forge_session?: string;
   agentBusy?: boolean;
+  context?: string; // context-window readout (chat panes)
 };
 
 // One row of a forge agent conversation (M8)
@@ -202,6 +203,7 @@ export type Frame =
   | { t: "FileChanged"; path: string; mtime: number }
   | { t: "ForgeListOk"; id: string; req_id: string; sessions: ForgeSessionInfo[] }
   | { t: "ChatSend"; id: string; client: string; session: string; pane: string; text: string }
+  | { t: "ChatCompact"; id: string; client: string; session: string; pane: string; req_id: string }
   | { t: "Chat"; id: string; session: string; pane: string; msgs: ChatMsg[]; reset?: boolean }
   | { t: "SessionsAck"; req_id: string; session: string; pane: string }
   | { t: "SessionsRename"; session: string; name: string }

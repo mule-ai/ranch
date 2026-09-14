@@ -2835,6 +2835,78 @@ impl Daemon {
                     }
                 }
             }
+            // client -> agent: manually compact a chat pane's context.
+            // Success is confirmed out-of-band (meta kind="context");
+            // sync failures answer with `error { req_id }`.
+            Frame::ChatCompact {
+                session,
+                pane,
+                req_id,
+                ..
+            } => {
+                let sid = match self.resolve_session(session).map(|s| s.id) {
+                    Some(s) => s,
+                    None => return,
+                };
+                let Ok(pid) = Uuid::parse_str(pane) else {
+                    return;
+                };
+                let backing = self
+                    .sessions
+                    .get(&sid)
+                    .and_then(|s| s.chats.get(&pid))
+                    .map(|cp| cp.forge_sid);
+                match backing {
+                    Some(fs) => {
+                        if fs.is_nil() {
+                            match self.pi_agents.get(&pid) {
+                                Some(lp) => {
+                                    if let Err(e) = lp.compact(req_id) {
+                                        eprintln!("ranchd: pi compact failed: {e}");
+                                        if let Some(c) = self.clients.get_mut(&from) {
+                                            send_frame(
+                                                c,
+                                                &Frame::Error {
+                                                    req_id: Some(req_id.clone()),
+                                                    message: e,
+                                                },
+                                            );
+                                        }
+                                    }
+                                }
+                                None => {
+                                    if let Some(c) = self.clients.get_mut(&from) {
+                                        send_frame(
+                                            c,
+                                            &Frame::Error {
+                                                req_id: Some(req_id.clone()),
+                                                message: format!("no agent for pane {pane}"),
+                                            },
+                                        );
+                                    }
+                                }
+                            }
+                        } else if let Some(tx) = &self.forge_tx {
+                            let _ = tx.send(forge::ForgeJob::Compact {
+                                pane: pid,
+                                forge_sid: fs,
+                                req_id: req_id.clone(),
+                            });
+                        }
+                    }
+                    None => {
+                        if let Some(c) = self.clients.get_mut(&from) {
+                            send_frame(
+                                c,
+                                &Frame::Error {
+                                    req_id: Some(req_id.clone()),
+                                    message: format!("not a chat pane: {pane}"),
+                                },
+                            );
+                        }
+                    }
+                }
+            }
             // forge worker -> clients: broadcast new chat rows to
             // everyone attached to the session (pipe client has no
             // attach; the frame carries the session in `session` —

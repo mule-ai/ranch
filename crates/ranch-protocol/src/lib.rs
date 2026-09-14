@@ -368,9 +368,24 @@ pub enum Frame {
         /// echoed back on the `error` frame when the switch fails
         req_id: String,
     },
+    /// Client -> daemon: manually compact the agent context of a chat
+    /// pane (pi `compact` RPC for local-pi panes; forge's compact
+    /// endpoint for forge-backed ones). Success is confirmed
+    /// out-of-band as `meta { kind: "context" }` with the updated usage;
+    /// failure → `error { req_id }`.
+    ChatCompact {
+        id: String,
+        client: String,
+        session: String,
+        pane: String,
+        /// echoed back on the `error` frame when the compact fails
+        req_id: String,
+    },
     /// Out-of-band status (no screen change).
     /// `kind` values: `"agent"` (working/idle), `"model"` (chat pane's
-    /// active model reported or changed; `status` = display name).
+    /// active model reported or changed; `status` = display name),
+    /// `"context"` (chat pane's context-window usage, e.g.
+    /// `"31% · 62k/200k"`).
     Meta {
         session: String,
         #[serde(skip_serializing_if = "Option::is_none")]

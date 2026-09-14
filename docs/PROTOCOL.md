@@ -223,6 +223,24 @@ The daemon is the file server; clients (mobile/CLI) are thin editors.
     it into `PaneSnap.model` for re-attach); failure returns
     `Error {req_id}` — clients ignore `error` frames whose `req_id`
     doesn't match their own in-flight request.
+- **Context usage + manual compaction** (chat panes, both backends):
+  - Context readout is carried on `meta {kind:"context"}` —
+    `status` is the readout string (e.g. `"ctx 31% · 62k/200k"`,
+    `"ctx ~62k est."` when no live window, or
+    `"compacted → 32k est. tokens"` right after a manual compact).
+    The daemon emits it when it (re)watches a chat pane and after
+    every agent turn. Forge panes: `GET /sessions/{id}/context`
+    (live pi `get_session_stats` when an agent is registered, else a
+    chars/4 estimate over the messages table). Pi panes: `get_session_stats`
+    RPC fired on spawn/restore, after each `turn_end`/`agent_end`, and
+    after a compact; the reader thread emits the meta.
+  - `ChatCompact {session, pane, req_id}` — manually compact the pane's
+    agent context now. Forge panes: `POST /sessions/{id}/compact`
+    (409 when a turn is in flight; records a `system` row in the
+    message history so chat clients see the compaction). Pi panes: the
+    `compact` RPC on the child. Success is confirmed out-of-band as
+    `meta {kind:"context"}` (status begins with `"compacted"`) plus a
+    refreshed readout; failure returns `Error {req_id}`.
 
 ## 4. Coalescing & sequencing
 

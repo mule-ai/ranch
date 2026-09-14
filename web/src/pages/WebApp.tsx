@@ -276,6 +276,11 @@ function MachineClient({ machine, onBack }: { machine: Machine; onBack: () => vo
           <button className="linkbtn" onClick={onBack}>‹ machines</button>
         )}
         <span className="title-inline">{machine.name}</span>
+        {daemonVersion ? (
+          <span className="dim" style={{ marginLeft: 8, fontFamily: "var(--mono)", fontSize: "0.8rem" }}>
+            daemon {daemonVersion}
+          </span>
+        ) : null}
         <span className="conn-badge">{conn}</span>
       </p>
       {err !== "" && <p className="err">{err}</p>}
@@ -699,6 +704,14 @@ function Terminal({
               setPanes(next);
             }
           }
+          if (f.kind === "context" && f.pane && f.status) {
+            const cur = panesRef.current.get(f.pane);
+            if (cur) {
+              const next = new Map(panesRef.current);
+              next.set(f.pane, { ...cur, context: f.status });
+              setPanes(next);
+            }
+          }
           break;
         case "Error":
           setConn(`error: ${f.message}`);
@@ -872,6 +885,10 @@ function Terminal({
 
       {chatMode ? (
         <div className="chat-wrap">
+          <div className="dim" style={{ padding: "6px 10px 0", fontSize: "0.85rem", fontFamily: "var(--mono)" }}>
+            {activeSnap?.context ?? ""}
+            {activeSnap?.context ? <span> · /compact to compress</span> : null}
+          </div>
           <div
             className="chat-list"
             ref={chatScrollRef}
@@ -908,10 +925,18 @@ function Terminal({
               placeholder="message the agent"
               onKeyDown={(e) => {
                 if (e.key === "Enter" && chatDraft.trim()) {
-                  relay.send({
-                    t: "ChatSend", id: nextId(), client: "web",
-                    session: sessionId, pane: activePane, text: chatDraft.trim(),
-                  } as Frame);
+                  const text = chatDraft.trim();
+                  if (text === "/compact") {
+                    relay.send({
+                      t: "ChatCompact", id: nextId(), client: "web",
+                      session: sessionId, pane: activePane, req_id: `compact-${Date.now()}`,
+                    } as Frame);
+                  } else {
+                    relay.send({
+                      t: "ChatSend", id: nextId(), client: "web",
+                      session: sessionId, pane: activePane, text,
+                    } as Frame);
+                  }
                   chatAtBottomRef.current = true; // our own send ⇒ follow
                   setChatDraft("");
                 }

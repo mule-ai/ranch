@@ -14,7 +14,7 @@
 //! the first profile is used when absent.
 
 use ranch_protocol::{ChatMsg, Frame, ModelChoice, encode_frame};
-use std::io::{BufRead as _, Write as _};
+use std::io::{BufRead as _, Read as _, Write as _};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -95,6 +95,13 @@ pub enum ForgeJob {
         provider: String,
         model: String,
     },
+    /// Fetch the session's context-window usage (GET /sessions/:id/context)
+    /// and broadcast it as `meta { kind: "context" }`.
+    Context { pane: Uuid, forge_sid: Uuid },
+    /// Manually compact the session's pi context (POST /sessions/:id/compact).
+    /// Success → a `meta { kind: "context" }` with the new usage (plus a
+    /// refresh); failure → `error { req_id }`.
+    Compact { pane: Uuid, forge_sid: Uuid, req_id: String },
     // ----- agent builder (Phase B): profile CRUD proxy -----
     /// The pi model catalog (GET /v1/models/catalog) for profile forms.
     ModelCatalog { req_id: String },
@@ -303,6 +310,7 @@ fn handle_event(
             let w = w.clone();
             let pane = state.pane;
             let before = state.turn_gen.load(Ordering::Relaxed);
+            let cfg = cfg.clone();
             std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(2500));
                 if state.stop.load(Ordering::Relaxed)
@@ -311,6 +319,9 @@ fn handle_event(
                     return; // cancelled: a new turn started
                 }
                 write_agent_status(&w, pane, "idle");
+                // the turn may have grown the context — refresh the
+                // readout so clients show the new usage
+                emit_context(&w, &cfg, pane, state.forge_sid);
             });
         }
         "ranch_tool_request" => {
@@ -465,6 +476,12 @@ pub fn spawn_worker(cfg: ForgeConfig, pipe_w: std::fs::File, rx: mpsc::Receiver<
                                 },
                             );
                         }
+                        // initial context-window readout
+                        let t_pipe2 = pipe.clone();
+                        let t_cfg2 = t_cfg.clone();
+                        std::thread::spawn(move || {
+                            emit_context(&t_pipe2, &t_cfg2, pane, forge_sid);
+                        });
                         std::thread::spawn(move || {
                             run_sse(t_state, t_cfg, t_pipe);
                         });
@@ -573,6 +590,56 @@ pub fn spawn_worker(cfg: ForgeConfig, pipe_w: std::fs::File, rx: mpsc::Receiver<
                                 models,
                             },
                         );
+                    }
+                    ForgeJob::Context { pane, forge_sid } => {
+                        emit_context(&pipe, &cfg, pane, forge_sid);
+                    }
+                    ForgeJob::Compact { pane, forge_sid, req_id } => {
+                        let path = format!("/sessions/{forge_sid}/compact");
+                        match http_json(
+                            &cfg,
+                            "POST",
+                            &path,
+                            Some(&serde_json::json!({})),
+                        ) {
+                            Ok(v) => {
+                                let after = v
+                                    .get("estimated_tokens_after")
+                                    .and_then(|a| a.as_i64())
+                                    .map(format_k)
+                                    .unwrap_or_default();
+                                let note = if after.is_empty() {
+                                    "compacted".to_string()
+                                } else {
+                                    format!("compacted → {after} tokens")
+                                };
+                                write_frame(
+                                    &pipe,
+                                    &Frame::Meta {
+                                        session: String::new(),
+                                        pane: Some(pane.to_string()),
+                                        kind: "context".into(),
+                                        status: Some(note),
+                                    },
+                                );
+                                // the compaction changed the window — refresh
+                                let t_pipe = pipe.clone();
+                                let t_cfg = cfg.clone();
+                                std::thread::spawn(move || {
+                                    emit_context(&t_pipe, &t_cfg, pane, forge_sid);
+                                });
+                            }
+                            Err(e) => {
+                                eprintln!("ranchd: forge compact failed: {e}");
+                                write_frame(
+                                    &pipe,
+                                    &Frame::Error {
+                                        req_id: Some(req_id),
+                                        message: format!("forge compact: {e}"),
+                                    },
+                                );
+                            }
+                        }
                     }
                     ForgeJob::ModelSet {
                         pane,
@@ -718,6 +785,66 @@ pub fn spawn_worker(cfg: ForgeConfig, pipe_w: std::fs::File, rx: mpsc::Receiver<
             }
         }
     });
+}
+
+/// Fetch the session's context-window usage (GET /sessions/{id}/context)
+/// and broadcast it as `meta { kind: "context", status: "31% · 62k/200k" }`
+/// (estimate fallback: `"~62k est."`). Runs on its own thread — blocking
+/// HTTP must never stall the poll loop.
+fn emit_context(pipe: &PipeWriter, cfg: &ForgeConfig, pane: Uuid, forge_sid: Uuid) {
+    let Ok(mut res) = ureq::get(&format!(
+        "{}/sessions/{forge_sid}/context",
+        cfg.base
+    ))
+    .header("X-API-Key", &cfg.key)
+    .call()
+    else {
+        return;
+    };
+    let mut text = String::new();
+    if res.body_mut().as_reader().read_to_string(&mut text).is_err() {
+        return;
+    }
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return;
+    };
+    let status = match (v.get("source"), v.get("percent")) {
+        (Some(serde_json::Value::String(s)), p) if s == "live" => {
+            let tokens = v.get("tokens").and_then(|t| t.as_i64());
+            let window = v.get("context_window").and_then(|w| w.as_i64());
+            let pct = p.and_then(|x| x.as_f64());
+            match (tokens, window, pct) {
+                (Some(t), Some(w), Some(p)) => {
+                    format!("ctx {p:.0}% · {}/{}", format_k(t), format_k(w))
+                }
+                _ => format!("ctx ~{} est.", format_k(tokens.unwrap_or(0))),
+            }
+        }
+        _ => format!(
+            "ctx ~{} est.",
+            format_k(v.get("tokens").and_then(|t| t.as_i64()).unwrap_or(0))
+        ),
+    };
+    write_frame(
+        pipe,
+        &Frame::Meta {
+            session: String::new(),
+            pane: Some(pane.to_string()),
+            kind: "context".into(),
+            status: Some(status),
+        },
+    );
+}
+
+/// Human-friendly token count (12345 → "12k").
+fn format_k(n: i64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1000 {
+        format!("{}k", n / 1000)
+    } else {
+        n.to_string()
+    }
 }
 
 /// Send a user message (job thread only — blocking).

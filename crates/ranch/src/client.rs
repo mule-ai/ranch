@@ -464,6 +464,8 @@ struct PaneView {
     /// active agent model display name (chat panes; snapshot +
     /// meta kind="model")
     model: Option<String>,
+    /// context-window usage readout (chat panes; meta kind="context")
+    context: Option<String>,
 }
 
 impl PaneView {
@@ -504,6 +506,10 @@ impl PaneView {
     /// Active model display name (meta kind="model").
     fn apply_model(&mut self, name: &str) {
         self.model = Some(name.to_string());
+    }
+    /// Context-window usage readout (meta kind="context").
+    fn apply_context(&mut self, status: &str) {
+        self.context = Some(status.to_string());
     }
     fn apply_update(
         &mut self,
@@ -632,7 +638,7 @@ fn cmd_dashboard() -> Option<String> {
     let mut sel: usize = 0;
     let mut status = String::new();
     // version banner: the daemon may be older/newer than this binary —
-    // hot upgrade realigns them
+    // hot upgrade realigns them; the header always shows the live version
     let own_version = crate::daemon::build_version();
     let mut daemon_version: Option<String> = None;
     // Some(kind) while an inline input is active: "new" | "rename"
@@ -701,9 +707,13 @@ fn cmd_dashboard() -> Option<String> {
         let _ = term.draw(|f: &mut RFrame| {
             let area = f.area();
             let mut lines: Vec<Line> = Vec::new();
+            let version_suffix = match &daemon_version {
+                Some(v) => format!(" · v{v}"),
+                None => String::new(),
+            };
             lines.push(Line::from(Span::styled(
                 format!(
-                    " ranch — {} session{} on this machine",
+                    " ranch — {} session{} on this machine{version_suffix}",
                     sess_ref.len(),
                     if sess_ref.len() == 1 { "" } else { "s" }
                 ),
@@ -975,6 +985,9 @@ fn cmd_attach(ref_: &str) {
     // draft for the focused forge-chat pane (M8) — can hold newlines
     // (Ctrl-J / Shift+Enter), Enter sends
     let mut chat_input = String::new();
+    // daemon build version (HelloOk) — shown in the status bar so the
+    // user always knows which binary the daemon is running
+    let mut daemon_version: Option<String> = None;
     // transient error flash (status bar) — errors are feedback, not fatal
     let err_flash: std::cell::Cell<Option<(std::time::Instant, String)>> =
         std::cell::Cell::new(None);
@@ -1071,6 +1084,9 @@ fn cmd_attach(ref_: &str) {
     // req_id of the last model switch; matched against Error frames
     let model_set_pending: std::rc::Rc<std::cell::RefCell<Option<String>>> =
         std::rc::Rc::new(std::cell::RefCell::new(None));
+    // req_id of an in-flight :compact; matched against Error frames
+    let compact_pending: std::rc::Rc<std::cell::RefCell<Option<String>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(None));
     let _ = &model_sel;
     #[derive(Clone, Copy, PartialEq)]
     enum Prompt {
@@ -1102,10 +1118,13 @@ fn cmd_attach(ref_: &str) {
                 Ok(n) => {
                     for f in decoder.feed(&buf[..n]) {
                         match f {
-                            Frame::HelloOk { sessions, .. } => {
+                            Frame::HelloOk { sessions, version, .. } => {
                                 *session_list.borrow_mut() =
                                     sessions.iter().map(|s| s.id.clone()).collect();
                                 sessions_meta.clone_from(&sessions);
+                                if version.is_some() {
+                                    daemon_version = version;
+                                }
                             }
                             Frame::SessionsAck {
                                 session: new_sess, ..
@@ -1240,6 +1259,20 @@ fn cmd_attach(ref_: &str) {
                                             .get_mut(mpane.as_deref().unwrap_or(""))
                                         {
                                             pv.apply_model(&status);
+                                        }
+                                    }
+                                } else if msess == session_id && mkind == "context" {
+                                    // context-window readout for the chat
+                                    // pane; "compacted …" also confirms our
+                                    // :compact request
+                                    if let Some(status) = mstat {
+                                        if let Some(pv) = pane_views
+                                            .get_mut(mpane.as_deref().unwrap_or(""))
+                                        {
+                                            pv.apply_context(&status);
+                                        }
+                                        if status.starts_with("compacted") {
+                                            compact_pending.borrow_mut().take();
                                         }
                                     }
                                 } else if mkind != "agent" {
@@ -1455,6 +1488,7 @@ fn cmd_attach(ref_: &str) {
                                 let mine = req_id.as_deref().is_some_and(|r| {
                                     *model_set_pending.borrow() == Some(r.to_string())
                                         || *model_pending.borrow() == Some(r.to_string())
+                                        || *compact_pending.borrow() == Some(r.to_string())
                                 });
                                 let attach_phase = !got_snapshot.get();
                                 if attach_phase {
@@ -1467,6 +1501,7 @@ fn cmd_attach(ref_: &str) {
                                 } else {
                                     model_set_pending.borrow_mut().take();
                                     model_pending.borrow_mut().take();
+                                    compact_pending.borrow_mut().take();
                                     err_flash.set(Some((
                                         std::time::Instant::now(),
                                         message.clone(),
@@ -1505,6 +1540,7 @@ fn cmd_attach(ref_: &str) {
         let views_ref = &pane_views;
         let layout_ref = &layout;
         let active_ref = &active_pane;
+        let daemon_version_ref = &daemon_version;
         let _ = term.draw(|f: &mut RFrame| {
             let area = f.area();
             let status_h = if area.height >= 2 { 1 } else { 0 };
@@ -1579,13 +1615,17 @@ fn cmd_attach(ref_: &str) {
                         let dim = Style::default().fg(ratatui::style::Color::Rgb(110, 114, 126));
                         let mut li: Vec<Line> = Vec::new();
                         // header line: active agent model (:model switches)
+                        let ctx_txt = match &pv.context {
+                            Some(c) => format!(" · {c}"),
+                            None => String::new(),
+                        };
                         match &pv.model {
                             Some(m) => li.push(Line::from(Span::styled(
-                                format!(" ◈ {m}  ·  :model to switch"),
+                                format!(" ◈ {m}  ·  :model to switch{ctx_txt}"),
                                 dim,
                             ))),
                             None => li.push(Line::from(Span::styled(
-                                " ◈ :model to pick a model".to_string(),
+                                format!(" ◈ :model to pick a model{ctx_txt}"),
                                 dim.add_modifier(Modifier::DIM),
                             ))),
                         }
@@ -1898,8 +1938,12 @@ fn cmd_attach(ref_: &str) {
                     }
                     None => String::new(),
                 };
+                let version_txt = match daemon_version_ref {
+                    Some(v) => format!("  v{v}"),
+                    None => String::new(),
+                };
                 let status = format!(
-                    " ranch  {nowix}{winlist} {panes_n} pane{} {}{flash_txt}",
+                    " ranch  {nowix}{winlist} {panes_n} pane{} {}{flash_txt}{version_txt}",
                     if panes_n == 1 { "" } else { "s" },
                     pfx
                 );
@@ -3184,6 +3228,37 @@ fn cmd_attach(ref_: &str) {
                                                         err_flash.set(Some((
                                                             std::time::Instant::now(),
                                                             "model: not an agent (chat) pane".into(),
+                                                        )));
+                                                    }
+                                                    prompt_input.clear();
+                                                    continue;
+                                                }
+                                                // :compact — manually compact the focused agent
+                                                // (chat) pane's context now
+                                                if prompt_input.trim() == "compact" {
+                                                    let is_chat = pane_views
+                                                        .get(&active_pane)
+                                                        .is_some_and(|pv| pv.is_chat());
+                                                    if is_chat {
+                                                        let rid = Uuid::new_v4().to_string();
+                                                        *compact_pending.borrow_mut() =
+                                                            Some(rid.clone());
+                                                        let f = Frame::ChatCompact {
+                                                            id: Uuid::new_v4().to_string(),
+                                                            client: "attach".into(),
+                                                            session: session_id.clone(),
+                                                            pane: active_pane.clone(),
+                                                            req_id: rid,
+                                                        };
+                                                        send_frame(&mut stream, &f).ok();
+                                                        err_flash.set(Some((
+                                                            std::time::Instant::now(),
+                                                            "compacting…".into(),
+                                                        )));
+                                                    } else {
+                                                        err_flash.set(Some((
+                                                            std::time::Instant::now(),
+                                                            "compact: not an agent (chat) pane".into(),
                                                         )));
                                                     }
                                                     prompt_input.clear();

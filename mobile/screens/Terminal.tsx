@@ -184,6 +184,15 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
             }
             modelSetReq.current = null; // the switch was confirmed
           }
+          if (f.kind === "context" && f.pane && f.status) {
+            // the pane's context-window usage readout
+            const cur = panesRef.current.get(f.pane);
+            if (cur) {
+              const next = new Map(panesRef.current);
+              next.set(f.pane, { ...cur, context: f.status });
+              setPanes(next);
+            }
+          }
           break;
         case "ModelListOk": {
           setModelOpts((o) => ({ ...o, [f.pane]: f.models }));
@@ -432,6 +441,23 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
             </Text>
           </Pressable>
           <Text style={styles.modelHint}>tap to switch</Text>
+          {activeSnap?.context ? (
+            <Pressable
+              style={[styles.modelChip, styles.ctxChip]}
+              hitSlop={8}
+              onPress={() => {
+                if (!activePane) return;
+                relay.send({
+                  t: "ChatCompact", id: nextId(), client: "mobile",
+                  session: sessionId, pane: activePane, req_id: `compact-${Date.now()}`,
+                } as Frame);
+              }}
+            >
+              <Text style={styles.ctxChipText} numberOfLines={1}>
+                {activeSnap.context} · tap to compact
+              </Text>
+            </Pressable>
+          ) : null}
         </View>
       )}
 
@@ -872,6 +898,8 @@ const styles = StyleSheet.create({
   },
   modelChipText: { color: "#4ade80", fontSize: 12, fontFamily: "JetBrainsMono NF Mono" },
   modelHint: { color: "#4b5563", fontSize: 11 },
+  ctxChip: { marginLeft: 8, borderColor: "#3f3f46" },
+  ctxChipText: { color: "#fbbf24", fontSize: 11, fontFamily: "JetBrainsMono NF Mono" },
   pickerOverlay: {
     ...StyleSheet.absoluteFill, backgroundColor: "rgba(0,0,0,0.6)",
     justifyContent: "center", alignItems: "center",
