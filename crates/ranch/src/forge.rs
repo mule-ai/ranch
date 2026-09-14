@@ -740,25 +740,43 @@ fn http_json(
     path: &str,
     body: Option<&serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
+    use std::io::Read as _;
     let url = format!("{}{}", cfg.base, path);
     let m = method.to_ascii_uppercase();
+    // Agent with status-as-error OFF so 4xx/5xx responses come back as
+    // readable responses instead of Error::StatusCode(code) — that lets
+    // us surface Forge's actual error body (e.g. "missing field
+    // `working_dir`", "tools: invalid type") instead of a bare "422".
+    let agent = ureq::Agent::new_with_config(
+        ureq::Agent::config_builder().http_status_as_error(false).build(),
+    );
     let sent = match (m.as_str(), body) {
-        ("GET", _) => ureq::get(&url).header("X-API-Key", &cfg.key).call(),
-        ("POST", b) => ureq::post(&url)
+        ("GET", _) => agent.get(&url).header("X-API-Key", &cfg.key).call(),
+        ("POST", b) => agent
+            .post(&url)
             .header("X-API-Key", &cfg.key)
             .send_json(b.cloned().unwrap_or(serde_json::Value::Null)),
-        ("PATCH", b) => ureq::patch(&url)
+        ("PATCH", b) => agent
+            .patch(&url)
             .header("X-API-Key", &cfg.key)
             .send_json(b.cloned().unwrap_or(serde_json::Value::Null)),
         _ => return Err(format!("forge: unsupported method {method}")),
     };
     let mut res = sent.map_err(|e| format!("forge {method} {path}: {e}"))?;
     let mut text = String::new();
-    use std::io::Read as _;
     res.body_mut()
         .as_reader()
         .read_to_string(&mut text)
         .map_err(|e| format!("forge read {path}: {e}"))?;
+    // 4xx/5xx: report the status + Forge's error body, and stop here.
+    if !res.status().is_success() {
+        let detail = text.trim();
+        return Err(if detail.is_empty() {
+            format!("forge {method} {path}: HTTP {}", res.status())
+        } else {
+            format!("forge {method} {path}: HTTP {} \u{2014} {detail}", res.status())
+        });
+    }
     serde_json::from_str(&text).map_err(|e| format!("forge decode {path}: {e}"))
 }
 

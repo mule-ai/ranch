@@ -173,6 +173,9 @@ function ProfileForm({
 }) {
   const [draft, setDraft] = useState<ProfileDraft>(initial);
   const [busy, setBusy] = useState(false);
+  // client-side validation: forge rejects (422) when required fields are
+  // missing — surface it here instead of a bare "422 /profiles" toast
+  const [saveErr, setSaveErr] = useState<string | null>(null);
   // pi model catalog via the daemon (empty when forge is unreachable —
   // then the model field falls back to free text)
   const [catalog, setCatalog] = useState<ModelChoice[]>([]);
@@ -223,7 +226,15 @@ function ProfileForm({
   }, [relay]);
 
   const save = () => {
-    if (!draft.name.trim() || !draft.model.trim()) return;
+    const missing = !draft.name.trim()
+      ? "name"
+      : !draft.model.trim()
+        ? "model"
+        : !draft.working_dir?.trim()
+          ? "working directory"
+          : null;
+    setSaveErr(missing ? `${missing} is required` : null);
+    if (missing) return;
     setBusy(true);
     const rid = nextId();
     relay.send({
@@ -317,6 +328,9 @@ function ProfileForm({
                 </Pressable>
               ))}
             </View>
+            {saveErr !== null && (
+              <Text style={{ color: "#f87171", fontSize: 13 }}>{saveErr}</Text>
+            )}
             <Pressable style={[s.newBtn, busy && { opacity: 0.5 }]} onPress={save} disabled={busy}>
               <Text style={s.newBtnText}>{busy ? "saving…" : "save profile"}</Text>
             </Pressable>

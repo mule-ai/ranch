@@ -22,6 +22,9 @@ ZIG_VER := 0.16.0
 ZIG_DIR := .tools/zig
 GHOSTTY_PIN := 82232ecde55405559dec29c5466cb9e39938cb41
 MUSL_TARGET := x86_64-unknown-linux-musl
+# Prefer rustup's cargo (bare `cargo` may be a broken mise shim on dev
+# hosts); fall back to PATH. Overridable: CARGO=… make …
+CARGO ?= $(shell test -x $(HOME)/.cargo/bin/cargo && echo $(HOME)/.cargo/bin/cargo || echo cargo)
 VT_STATIC := vendor/lib/libghostty-vt.a
 STATIC_BIN := target/$(MUSL_TARGET)/release/ranch
 
@@ -45,16 +48,17 @@ build: $(STATIC_BIN)
 # host-default build (used by tests / `make run`)
 .PHONY: build-native
 build-native: $(VT_STATIC)
-	cargo build --release
+	$(CARGO) build --release
 
-$(STATIC_BIN): $(VT_STATIC) $(ZIG_DIR)/zig crates/ranch-vt/build.rs
-	cargo build --release --target $(MUSL_TARGET)
+$(STATIC_BIN): $(VT_STATIC) $(ZIG_DIR)/zig $(shell find crates Cargo.toml -name '*.rs' 2>/dev/null)
+	env CC_$(MUSL_TARGET)=$(CURDIR)/.tools/zig-cc \
+	CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=$(CURDIR)/.tools/zig-link-x86_64-unknown-linux-musl \
+	$(CARGO) build --release --target $(MUSL_TARGET)
 	@file $$($(CARGO) metadata --no-deps --format-version 1 >/dev/null 2>&1; echo target/$(MUSL_TARGET)/release/ranch) | grep -q "statically linked" || \
 	  { echo "WARNING: binary is not statically linked"; }
 
 $(VT_STATIC): vendor/ghostty $(ZIG_DIR)/zig
-	@echo "building libghostty-vt STATIC archive (pinned $(GHOSTTY_PIN))…"
-	cd vendor/ghostty && \
+	@echo "building libghostty-vt STATIC archive (pinned $(GHOSTTY_PIN))…"	cd vendor/ghostty && \
 	  PATH="$(CURDIR)/$(ZIG_DIR):$$PATH" zig build -Demit-lib-vt=true -Dtarget=x86_64-linux-musl -Dcpu=baseline
 	mkdir -p vendor/lib
 	cp vendor/ghostty/zig-out/lib/libghostty-vt.a $(VT_STATIC)
@@ -66,7 +70,7 @@ $(VT_STATIC): vendor/ghostty $(ZIG_DIR)/zig
 build-aarch64: $(CROSS_BIN)
 	@echo "binary: $(CROSS_BIN) (static, aarch64)"
 
-$(CROSS_BIN): $(CROSS_VT_STATIC) $(ZIG_DIR)/zig crates/ranch-vt/build.rs
+$(CROSS_BIN): $(CROSS_VT_STATIC) $(ZIG_DIR)/zig $(shell find crates Cargo.toml -name '*.rs' 2>/dev/null)
 	@command -v rustup >/dev/null && rustup target add $(CROSS_TARGET) >/dev/null 2>&1 || true
 	@# Final link goes through tools/zig-link-aarch64 (zig cc -static for
 	@# aarch64-linux-musl): it strips rustc's aarch64 erratum flag and
@@ -74,7 +78,7 @@ $(CROSS_BIN): $(CROSS_VT_STATIC) $(ZIG_DIR)/zig crates/ranch-vt/build.rs
 	env CC_$(CROSS_TARGET)=$(CURDIR)/tools/zig-cc \
 		CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=$(CURDIR)/tools/zig-link-aarch64 \
 		RANCH_VT_LIB_DIR=$(CURDIR)/$(CROSS_VT_DIR) \
-		cargo build --release --target $(CROSS_TARGET)
+		$(CARGO) build --release --target $(CROSS_TARGET)
 	@file $(CROSS_BIN) | grep -q "statically linked" || \
 	  { echo "WARNING: cross binary is not statically linked"; }
 
@@ -149,19 +153,19 @@ run: build-native
 
 .PHONY: test
 test: build-native
-	cargo test
+	$(CARGO) test
 
 .PHONY: fmt
 fmt:
-	cargo fmt --all
+	$(CARGO) fmt --all
 
 .PHONY: lint
 lint:
-	cargo clippy --all-targets
+	$(CARGO) clippy --all-targets
 
 .PHONY: clean
 clean:
-	cargo clean
+	$(CARGO) clean
 
 .PHONY: help
 help:
