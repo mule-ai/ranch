@@ -391,6 +391,19 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
   const activeSnap = activePane ? panes.get(activePane) : undefined;
   const chatMode = activeSnap?.kind === "forge-chat";
   const chatMsgs = activeSnap?.chat ?? [];
+  // model picker: the focused pane's catalog, filtered by the search
+  // box (empty query = everything). Computed here so the sheet can
+  // render rows AND the empty-hint without one eating the other.
+  const paneModels = (activePane ? modelOpts[activePane] : undefined) ?? [];
+  const modelQuery_ = modelQuery.trim().toLowerCase();
+  const filteredModels = modelQuery_
+    ? paneModels.filter(
+        (m) =>
+          m.name.toLowerCase().includes(modelQuery_) ||
+          m.id.toLowerCase().includes(modelQuery_) ||
+          m.provider.toLowerCase().includes(modelQuery_),
+      )
+    : paneModels;
   // switching panes/sessions re-arms bottom-follow so the new
   // conversation opens at the newest message
   useEffect(() => {
@@ -695,36 +708,29 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
               spellCheck={false}
             />
             <ScrollView style={styles.pickerList} keyboardShouldPersistTaps="handled">
-              {(modelOpts[activePane] ?? []).length === 0 ? (
+              {paneModels.length === 0 ? (
                 <Text style={styles.dim}>loading models…</Text>
               ) : (
-                (modelOpts[activePane] ?? [])
-                  .filter((m) => {
-                    const q = modelQuery.trim().toLowerCase();
-                    if (!q) return true;
+                <>
+                  {filteredModels.map((m) => {
+                    const active = activeSnap?.model === m.name;
                     return (
-                      m.name.toLowerCase().includes(q) ||
-                      m.id.toLowerCase().includes(q) ||
-                      m.provider.toLowerCase().includes(q)
+                      <Pressable
+                        key={`${m.provider}/${m.id}`}
+                        style={[styles.pickerRow, active && styles.pickerRowActive]}
+                        onPress={() => pickModel(m)}
+                      >
+                        <Text style={[styles.pickerRowText, active && { color: "#4ade80" }]} numberOfLines={1}>
+                          {active ? "◈ " : "  "}{m.name}
+                          {m.provider ? ` · ${m.provider}` : ""}
+                        </Text>
+                      </Pressable>
                     );
-                  })
-                  .map((m) => {
-                  const active = activeSnap?.model === m.name;
-                  return (
-                    <Pressable
-                      key={`${m.provider}/${m.id}`}
-                      style={[styles.pickerRow, active && styles.pickerRowActive]}
-                      onPress={() => pickModel(m)}
-                    >
-                      <Text style={[styles.pickerRowText, active && { color: "#4ade80" }]} numberOfLines={1}>
-                        {active ? "◈ " : "  "}{m.name}
-                        {m.provider ? ` · ${m.provider}` : ""}
-                      </Text>
-                    </Pressable>
-                  );
-                }).length === 0 && (
-                  <Text style={styles.dim}>no models match "{modelQuery.trim()}"</Text>
-                )
+                  })}
+                  {filteredModels.length === 0 && (
+                    <Text style={styles.dim}>no models match "{modelQuery.trim()}"</Text>
+                  )}
+                </>
               )}
             </ScrollView>
           </View>

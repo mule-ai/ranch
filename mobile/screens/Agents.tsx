@@ -286,56 +286,10 @@ function ProfileForm({
                   </Text>
                   <Text style={s.pickerBtnChev}>▾</Text>
                 </Pressable>
-                {pickerOpen && (
-                  <View style={s.pickerOverlay}>
-                    <Pressable style={StyleSheet.absoluteFill} onPress={() => setPickerOpen(false)} />
-                    <View style={s.pickerSheet}>
-                      <View style={s.pickerHeader}>
-                        <Text style={s.pickerTitle}>
-                          model{providerModels.length > 0 ? ` · ${draft.provider}` : ""}
-                        </Text>
-                        <Pressable onPress={() => setPickerOpen(false)} hitSlop={8}>
-                          <Text style={s.pickerClose}>close ✕</Text>
-                        </Pressable>
-                      </View>
-                      <FlatList
-                        data={pickerModels}
-                        keyExtractor={(m) => m.provider + "/" + m.id}
-                        style={{ maxHeight: 380 }}
-                        renderItem={({ item: m }) => (
-                          <Pressable
-                            style={[s.pickerRow, draft.model === m.id && s.pickerRowOn]}
-                            onPress={() => {
-                              set({ model: m.id, provider: m.provider });
-                              setPickerOpen(false);
-                            }}
-                          >
-                            <Text style={s.pickerRowText} numberOfLines={1}>
-                              {draft.model === m.id ? "◈ " : "  "}
-                              {m.name !== m.id ? `${m.name} · ${m.id}` : m.id}
-                            </Text>
-                          </Pressable>
-                        )}
-                        ListEmptyComponent={
-                          <Text style={s.dim}>no models for this provider</Text>
-                        }
-                        ListFooterComponent={
-                          draft.model.trim() !== "" &&
-                          !pickerModels.some((m) => m.id === draft.model) ? (
-                            <Pressable
-                              style={[s.pickerRow, s.pickerRowOn]}
-                              onPress={() => setPickerOpen(false)}
-                            >
-                              <Text style={s.pickerRowText} numberOfLines={1}>
-                                ◈ {draft.model} (custom)
-                              </Text>
-                            </Pressable>
-                          ) : null
-                        }
-                      />
-                    </View>
-                  </View>
-                )}
+                {/* the sheet itself renders at the form root (below) —
+                    absoluteFill inside this inline row-sized View would
+                    anchor the modal to the button, squishing it into a
+                    sliver no models visible in */}
               </View>
             )}
             <Text style={s.label}>system prompt</Text>
@@ -370,6 +324,58 @@ function ProfileForm({
         }
         renderItem={() => null}
       />
+      {pickerOpen && (
+        // at the form ROOT so absoluteFill covers the whole screen —
+        // nested anywhere deeper it anchors to that parent's box
+        <View style={s.pickerOverlay}>
+          <Pressable style={StyleSheet.absoluteFill} onPress={() => setPickerOpen(false)} />
+          <View style={s.pickerSheet}>
+            <View style={s.pickerHeader}>
+              <Text style={s.pickerTitle}>
+                model{providerModels.length > 0 ? ` · ${draft.provider}` : ""}
+              </Text>
+              <Pressable onPress={() => setPickerOpen(false)} hitSlop={8}>
+                <Text style={s.pickerClose}>close ✕</Text>
+              </Pressable>
+            </View>
+            <FlatList
+              data={pickerModels}
+              keyExtractor={(m) => m.provider + "/" + m.id}
+              style={{ maxHeight: 380 }}
+              renderItem={({ item: m }) => (
+                <Pressable
+                  style={[s.pickerRow, draft.model === m.id && s.pickerRowOn]}
+                  onPress={() => {
+                    set({ model: m.id, provider: m.provider });
+                    setPickerOpen(false);
+                  }}
+                >
+                  <Text style={s.pickerRowText} numberOfLines={1}>
+                    {draft.model === m.id ? "◈ " : "  "}
+                    {m.name !== m.id ? `${m.name} · ${m.id}` : m.id}
+                  </Text>
+                </Pressable>
+              )}
+              ListEmptyComponent={
+                <Text style={s.dim}>no models for this provider</Text>
+              }
+              ListFooterComponent={
+                draft.model.trim() !== "" &&
+                !pickerModels.some((m) => m.id === draft.model) ? (
+                  <Pressable
+                    style={[s.pickerRow, s.pickerRowOn]}
+                    onPress={() => setPickerOpen(false)}
+                  >
+                    <Text style={s.pickerRowText} numberOfLines={1}>
+                      ◈ {draft.model} (custom)
+                    </Text>
+                  </Pressable>
+                ) : null
+              }
+            />
+          </View>
+        </View>
+      )}
     </View>
   );
 }
