@@ -1512,6 +1512,10 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
     // agent split anchoring hints
     let mut pane_cwds: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
+    // per-pane chat scroll distance from the bottom (0 = pinned to
+    // newest; PageUp/PageDown scroll the conversation in place)
+    let mut chat_scroll: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
     let mut pane_views: std::collections::HashMap<String, PaneView> =
         std::collections::HashMap::new();
     let mut layout: Option<ranch_protocol::Layout> = None;
@@ -2195,6 +2199,7 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
         let wins_ref = &windows;
         let curwin_ref = &cur_window;
         let chat_input_ref = chat_input.clone();
+        let chat_scroll_ref = &chat_scroll;
         let flash_ref = &err_flash;
         // expire old flashes (4s); Cell<Option<(Instant, String)>> is
         // non-Copy so expiry works by take + conditional restore
@@ -2393,8 +2398,26 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                             draft.drain(0..start);
                         }
                         let keep = r.height as usize - bh;
-                        let skip = li.len().saturating_sub(keep);
+                        // chat scrollback: scroll distance from the tail
+                        // (PageUp/PageDown; any higher delta shows older
+                        // messages, with a hint line at the top)
+                        let max_skip = li.len().saturating_sub(keep);
+                        let delta = chat_scroll_ref
+                            .get(pane_id)
+                            .copied()
+                            .unwrap_or(0)
+                            .min(max_skip);
+                        let skip = li.len().saturating_sub(keep) - delta;
                         let mut rows: Vec<Line> = li.iter().skip(skip).cloned().collect();
+                        if delta > 0 && !rows.is_empty() {
+                            // scrolled back: the top row becomes a hint
+                            rows[0] = Line::from(Span::styled(
+                                format!(
+                                    " ⋯ {skip} lines above · PgDn to return to latest",
+                                ),
+                                dim.add_modifier(Modifier::ITALIC),
+                            ));
+                        }
                         let border = if focused {
                             Style::default().fg(ratatui::style::Color::Green)
                         } else {
@@ -2979,6 +3002,7 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                     "  0-9        select window",
                     "  % / \"     split right / below",
                     "  o/l/arrows focus next / prev pane",
+                    "  PgUp/PgDn  scroll the agent conversation (chat panes)",
                     "  Ctrl-arrows resize split",
                     "  { / }      swap panes",
                     "  x          kill pane",
@@ -4118,7 +4142,7 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                                     if is_chat {
                                         err_flash.set(Some((
                                             std::time::Instant::now(),
-                                            "scrollback: chat panes hold the full conversation".into(),
+                                            "chat panes scroll in place: PageUp / PageDown".into(),
                                         )));
                                     } else {
                                         let rid = Uuid::new_v4().to_string();
@@ -4440,7 +4464,7 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                                                     if is_chat {
                                                         err_flash.set(Some((
                                                             std::time::Instant::now(),
-                                                            "scrollback: chat panes hold the full conversation".into(),
+                                                            "chat panes scroll in place: PageUp / PageDown".into(),
                                                         )));
                                                     } else {
                                                         let rid = Uuid::new_v4().to_string();
@@ -4586,6 +4610,22 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                                 {
                                     chat_input.push('\n');
                                 }
+                                KeyCode::PageUp => {
+                                    // scroll the conversation back in place
+                                    let e = chat_scroll
+                                        .entry(active_pane.clone())
+                                        .or_insert(0);
+                                    *e = e.saturating_add(10);
+                                }
+                                KeyCode::PageDown => {
+                                    let e = chat_scroll
+                                        .entry(active_pane.clone())
+                                        .or_insert(0);
+                                    *e = e.saturating_sub(10);
+                                }
+                                KeyCode::End | KeyCode::Char('G') => {
+                                    chat_scroll.insert(active_pane.clone(), 0);
+                                }
                                 KeyCode::Enter => {
                                     let text = chat_input.trim().to_string();
                                     if text == "/compact" {
@@ -4616,6 +4656,8 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                                         send_frame(&mut stream, &f).ok();
                                     }
                                     chat_input.clear();
+                                    // sending repins the view to the reply
+                                    chat_scroll.insert(active_pane.clone(), 0);
                                 }
                                 KeyCode::Backspace => {
                                     chat_input.pop();
