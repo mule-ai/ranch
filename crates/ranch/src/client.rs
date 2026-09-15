@@ -1651,6 +1651,10 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
         std::rc::Rc::new(std::cell::RefCell::new(None));
     let scroll_lines: std::rc::Rc<std::cell::RefCell<Vec<String>>> =
         std::rc::Rc::new(std::cell::RefCell::new(vec![]));
+    // prefix-c — new-pane modal: shell / agent (forge) / agent (pi) /
+    // editor. Panes split into the current window, no detach needed.
+    let newpane_open = std::cell::Cell::new(false);
+    let newpane_sel = std::cell::Cell::new(0usize);
     // :agents profile CRUD — guided edit (prompt-driven field sequence).
     // `a` new, `e` edit selected, `x` delete selected inside the modal.
     struct ProfEdit {
@@ -1685,6 +1689,7 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
         RenameWindow,
         Command,
         ProfileField,
+        EditorFile,
     }
     let prompt = std::cell::Cell::new(None::<Prompt>);
     let mut prompt_input = String::new();
@@ -1775,7 +1780,12 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                                     if let Some(np) = new_pane {
                                         let ed = std::env::var("EDITOR")
                                             .unwrap_or_else(|_| "vi".to_string());
-                                        let cmd = format!("{ed} {}\r", shell_quote(&file));
+                                        // empty file = new buffer: just $EDITOR
+                                        let cmd = if file.is_empty() {
+                                            format!("{ed}\r")
+                                        } else {
+                                            format!("{ed} {}\r", shell_quote(&file))
+                                        };
                                         let f = Frame::Input {
                                             id: Uuid::new_v4().to_string(),
                                             client: "attach".into(),
@@ -2998,7 +3008,8 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                     "  n / p      next / prev SESSION (sidebar list)",
                     "  N / P      next / prev window",
                     "  s          collapse/restore sidebar (machines)",
-                    "  c          new window",
+                    "  c          new pane: shell / agent / editor",
+                    "  C          new window",
                     "  0-9        select window",
                     "  % / \"     split right / below",
                     "  o/l/arrows focus next / prev pane",
@@ -3112,6 +3123,7 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                 let label = match kind {
                     Prompt::RenameWindow => "rename window: ".to_string(),
                     Prompt::Command => ": ".to_string(),
+                    Prompt::EditorFile => "file to edit (blank = new buffer): ".to_string(),
                     Prompt::ProfileField => match prof_edit.borrow().as_ref() {
                         Some(e) if e.step < PROF_FIELDS.len() => format!(
                             "profile {} [{}] (blank = keep): ",
@@ -3436,6 +3448,81 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                             }
                             continue;
                         }
+                        // prefix-c modal: new pane kind picker
+                        if newpane_open.get() {
+                            const KINDS: &[&str] = &[
+                                "shell — plain terminal split",
+                                "agent · forge — forge-backed agent chat",
+                                "agent · pi — local pi agent chat",
+                                "editor — $EDITOR in a split",
+                            ];
+                            match key.code {
+                                KeyCode::Esc | KeyCode::Char('q') => {
+                                    newpane_open.set(false);
+                                }
+                                KeyCode::Up | KeyCode::Char('k') => {
+                                    let sel = newpane_sel.get();
+                                    if sel > 0 {
+                                        newpane_sel.set(sel - 1);
+                                    }
+                                }
+                                KeyCode::Down | KeyCode::Char('j') => {
+                                    let sel = newpane_sel.get();
+                                    if sel + 1 < KINDS.len() {
+                                        newpane_sel.set(sel + 1);
+                                    }
+                                }
+                                KeyCode::Enter => {
+                                    let sel = newpane_sel.get();
+                                    newpane_open.set(false);
+                                    match sel {
+                                        0 => {
+                                            // shell split (right)
+                                            let f = Frame::PaneSplit {
+                                                req_id: Uuid::new_v4().to_string(),
+                                                session: session_id.clone(),
+                                                pane: active_pane.clone(),
+                                                dir: 1,
+                                                kind: None,
+                                            };
+                                            send_frame(&mut stream, &f).ok();
+                                        }
+                                        1 => {
+                                            // forge agent split
+                                            let f = Frame::PaneSplit {
+                                                req_id: Uuid::new_v4().to_string(),
+                                                session: session_id.clone(),
+                                                pane: active_pane.clone(),
+                                                dir: 1,
+                                                kind: Some("forge".into()),
+                                            };
+                                            send_frame(&mut stream, &f).ok();
+                                        }
+                                        2 => {
+                                            // local pi agent split (anchored
+                                            // to the focused pane's cwd)
+                                            let f = Frame::PaneSplit {
+                                                req_id: Uuid::new_v4().to_string(),
+                                                session: session_id.clone(),
+                                                pane: active_pane.clone(),
+                                                dir: 1,
+                                                kind: Some("pi".into()),
+                                            };
+                                            send_frame(&mut stream, &f).ok();
+                                        }
+                                        _ => {
+                                            // editor split: prompt for a file
+                                            // (blank = new buffer), then the
+                                            // snapshot handler types $EDITOR in
+                                            prompt_input.clear();
+                                            prompt.set(Some(Prompt::EditorFile));
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                            continue;
+                        }
                         // scrollback viewer: scroll + close
                         if scroll_open.get() {
                             let lines = scroll_lines.borrow().len();
@@ -3750,8 +3837,14 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                                     send_frame(&mut stream, &f).ok();
                                     continue;
                                 }
-                                // c → new window (tmux: one session, many windows)
+                                // c → new-pane modal (shell / agent /
+                                // editor); C → new window (tmux shift)
                                 KeyCode::Char('c') => {
+                                    newpane_open.set(true);
+                                    newpane_sel.set(0);
+                                    continue;
+                                }
+                                KeyCode::Char('C') => {
                                     let f = Frame::WindowNew {
                                         req_id: Uuid::new_v4().to_string(),
                                         session: session_id.clone(),
@@ -4496,6 +4589,22 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                                                     }
                                                     _ => {}
                                                 }
+                                            }
+                                            Prompt::EditorFile => {
+                                                // editor split: file to open
+                                                // (blank = new buffer)
+                                                let file = prompt_input.trim().to_string();
+                                                prompt_input.clear();
+                                                let f = Frame::PaneSplit {
+                                                    req_id: Uuid::new_v4().to_string(),
+                                                    session: session_id.clone(),
+                                                    pane: active_pane.clone(),
+                                                    dir: 1,
+                                                    kind: None,
+                                                };
+                                                send_frame(&mut stream, &f).ok();
+                                                *pending_editor_file.borrow_mut() =
+                                                    Some(file);
                                             }
                                             Prompt::ProfileField => {
                                                 // guided profile form: store the
