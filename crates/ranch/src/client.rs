@@ -2187,6 +2187,14 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
             let status_h = if area.height >= 2 { 1 } else { 0 };
             let term_area = Rect::new(0, 0, area.width, area.height - status_h);
 
+            // pane content starts right of the permanent sidebar
+            let x0 = if sidebar_on_now {
+                SIDEBAR_W.min(term_area.width)
+            } else {
+                0
+            };
+            let w0 = term_area.width.saturating_sub(x0);
+
             // Compute pane rects from the layout tree (50/50 splits).
             let mut rects: Vec<(String, Rect)> = Vec::new();
             if let Some(ly) = layout_ref {
@@ -2218,12 +2226,6 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                         },
                     }
                 }
-                let x0 = if sidebar_on_now {
-                    SIDEBAR_W.min(term_area.width)
-                } else {
-                    0
-                };
-                let w0 = term_area.width.saturating_sub(x0);
                 walk(ly, x0, 0, w0, term_area.height, &mut rects);
             }
 
@@ -2505,10 +2507,11 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
             };
 
             if rects.len() <= 1 {
-                // single pane: full-area render (no borders, matches old behavior)
+                // single pane: full-area render right of the sidebar
+                // (no borders, matches old behavior)
                 let pid = rects.first().map(|(p, _)| p.clone()).unwrap_or_default();
                 let focused = pid == *active_ref || pid.is_empty();
-                draw_pane(f, &pid, term_area, focused);
+                draw_pane(f, &pid, Rect::new(x0, 0, w0.max(1), term_area.height), focused);
             } else {
                 // multi-pane: 1-cell gutters around each rect, focused pane bordered
                 for (pid, r) in &rects {
