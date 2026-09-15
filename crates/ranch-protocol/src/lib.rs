@@ -912,6 +912,12 @@ pub struct PaneSnap {
     /// session/profile lookup, or after a model switch).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// For chat panes: latest context-window usage readout
+    /// (cached from `meta kind="context"` broadcasts; carried on the
+    /// snapshot so attaching clients see it without waiting for a
+    /// turn to end).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
     /// PTY panes only: current working directory of the child
     /// (/proc/<pid>/cwd), for the file browser's start dir and the
     /// `$EDITOR` split anchor. None for chat panes / unknown.
@@ -1257,6 +1263,7 @@ mod tests {
                 chat: None,
                 forge_session: None,
                 model: None,
+                context: None,
                 cwd: None,
             }],
             meta: vec![],

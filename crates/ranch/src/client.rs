@@ -482,6 +482,7 @@ impl PaneView {
             self.chat = chat.clone();
         }
         self.model = snap.model.clone();
+        self.context = snap.context.clone();
         // heuristic until the first meta arrives: a trailing user row
         // means the agent is on it
         self.agent_busy = self.chat.last().map(|m| m.role == "user").unwrap_or(false);
@@ -756,7 +757,7 @@ fn cmd_dashboard() -> Option<String> {
             }
             lines.push(Line::raw(""));
             lines.push(Line::raw(
-                " enter: attach   c: new   n: new (named)   a: new agent   x: kill   r: rename   q: quit",
+                " enter: attach   c: new   n: new (named)   a: new agent   p: new pi   x: kill   r: rename   q: quit",
             ));
             if !status_ref.is_empty() {
                 lines.push(Line::from(Span::styled(
@@ -768,6 +769,7 @@ fn cmd_dashboard() -> Option<String> {
                 let label = match kind {
                     "new" => "new session name (empty = auto): ",
                     "agent" => "agent name (runs pi via forge): ",
+                    "pi" => "pi session name + optional dir (name /path): ",
                     _ => "rename to: ",
                 };
                 lines.push(Line::from(Span::styled(
@@ -822,6 +824,28 @@ fn cmd_dashboard() -> Option<String> {
                                     name: if text.is_empty() { None } else { Some(text) },
                                     kind: Some("forge".into()),
                                     cwd: None,
+                                    profile_id: None,
+                                    forge_session: None,
+                                };
+                                send_frame(&mut stream, &f).ok();
+                                input = None;
+                                input_text.clear();
+                                // SessionsAck handler attaches
+                            }
+                            "pi" => {
+                                // "name /path" — the trailing /path (if any)
+                                // becomes the session's working dir
+                                let (name, dir) = match text.split_once(" /") {
+                                    Some((n, d)) if !d.is_empty() => {
+                                        (n.trim().to_string(), Some(format!("/{d}")))
+                                    }
+                                    _ => (text.clone(), None),
+                                };
+                                let f = Frame::SessionsCreate {
+                                    req_id: Uuid::new_v4().to_string(),
+                                    name: if name.is_empty() { None } else { Some(name) },
+                                    kind: Some("pi".into()),
+                                    cwd: dir,
                                     profile_id: None,
                                     forge_session: None,
                                 };
@@ -890,6 +914,10 @@ fn cmd_dashboard() -> Option<String> {
                 }
                 KeyCode::Char('a') => {
                     input = Some("agent");
+                    input_text.clear();
+                }
+                KeyCode::Char('p') => {
+                    input = Some("pi");
                     input_text.clear();
                 }
                 KeyCode::Char('x') | KeyCode::Char('k')
@@ -1088,10 +1116,43 @@ fn cmd_attach(ref_: &str) {
     let compact_pending: std::rc::Rc<std::cell::RefCell<Option<String>>> =
         std::rc::Rc::new(std::cell::RefCell::new(None));
     let _ = &model_sel;
+    // :help — command/key reference overlay (static lines, scroll + esc)
+    let help_open = std::cell::Cell::new(false);
+    let help_off = std::cell::Cell::new(0usize);
+    // :agents profile CRUD — guided edit (prompt-driven field sequence).
+    // `a` new, `e` edit selected, `x` delete selected inside the modal.
+    struct ProfEdit {
+        id: Option<String>,
+        /// current values, one per PROF_FIELDS entry
+        fields: Vec<String>,
+        step: usize,
+        /// preserved from ProfileGet on edit (not part of the guided
+        /// form; sent back unchanged so a save doesn't wipe them)
+        tools: Vec<String>,
+        git_url: Option<String>,
+        git_ref: Option<String>,
+        nix_shell: Option<String>,
+    }
+    const PROF_FIELDS: &[&str] = &[
+        "name",
+        "description",
+        "provider (openai/anthropic/proxy-anthropic/proxy/google/gemini/custom)",
+        "model",
+        "base_url",
+        "api key (blank = keep stored key)",
+        "working dir",
+        "system prompt",
+    ];
+    let prof_edit: std::rc::Rc<std::cell::RefCell<Option<ProfEdit>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(None));
+    let prof_get_pending: std::rc::Rc<std::cell::RefCell<Option<String>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(None));
+    let prof_del_confirm = std::cell::Cell::new(false);
     #[derive(Clone, Copy, PartialEq)]
     enum Prompt {
         RenameWindow,
         Command,
+        ProfileField,
     }
     let prompt = std::cell::Cell::new(None::<Prompt>);
     let mut prompt_input = String::new();
@@ -1340,6 +1401,66 @@ fn cmd_attach(ref_: &str) {
                                     agents_items.borrow_mut().extend(profiles);
                                     agents_sel.set(0);
                                     agents_open.set(true);
+                                }
+                            }
+                            Frame::ProfileGetOk { req_id, profile } => {
+                                // prefill the guided form for editing
+                                let matches_req = prof_get_pending
+                                    .borrow()
+                                    .as_deref()
+                                    == Some(req_id.as_str());
+                                if matches_req {
+                                    prof_get_pending.borrow_mut().take();
+                                    *prof_edit.borrow_mut() = Some(ProfEdit {
+                                        id: Some(profile.id.clone()),
+                                        fields: vec![
+                                            profile.name.clone(),
+                                            profile.description.clone().unwrap_or_default(),
+                                            profile.provider.clone(),
+                                            profile.model.clone(),
+                                            profile.base_url.clone().unwrap_or_default(),
+                                            // api_key arrives redacted — keep
+                                            // stored key unless the user types
+                                            String::new(),
+                                            profile.working_dir.clone().unwrap_or_default(),
+                                            profile.system_prompt.clone(),
+                                        ],
+                                        step: 0,
+                                        tools: profile.tools.clone(),
+                                        git_url: profile.git_url.clone(),
+                                        git_ref: profile.git_ref.clone(),
+                                        nix_shell: profile.nix_shell.clone(),
+                                    });
+                                    prompt_input.clear();
+                                    if let Some(e) = prof_edit.borrow().as_ref() {
+                                        prompt_input = e.fields[e.step.min(PROF_FIELDS.len() - 1)].clone();
+                                    }
+                                    prompt.set(Some(Prompt::ProfileField));
+                                }
+                            }
+                            Frame::ProfilePutOk { req_id, profile_id } => {
+                                let _ = req_id;
+                                let _ = profile_id;
+                                err_flash.set(Some((
+                                    std::time::Instant::now(),
+                                    "profile saved".into(),
+                                )));
+                                // refresh the list if the modal is open
+                                if agents_open.get() {
+                                    let rid = Uuid::new_v4().to_string();
+                                    *agents_pending.borrow_mut() = Some(rid.clone());
+                                    let f = Frame::ProfileList { req_id: rid };
+                                    send_frame(&mut stream, &f).ok();
+                                }
+                            }
+                            Frame::ProfileDeleteOk { req_id } => {
+                                let _ = req_id;
+                                // refresh the list if the modal is open
+                                if agents_open.get() {
+                                    let rid = Uuid::new_v4().to_string();
+                                    *agents_pending.borrow_mut() = Some(rid.clone());
+                                    let f = Frame::ProfileList { req_id: rid };
+                                    send_frame(&mut stream, &f).ok();
                                 }
                             }
                             Frame::DirListOk {
@@ -1942,10 +2063,21 @@ fn cmd_attach(ref_: &str) {
                     Some(v) => format!("  v{v}"),
                     None => String::new(),
                 };
+                // IDE-style status: active chat pane's model + context readout
+                let agent_txt = views_ref
+                    .get(active_ref)
+                    .filter(|pv| pv.is_chat())
+                    .map(|pv| {
+                        let m = pv.model.as_deref().unwrap_or("?");
+                        match &pv.context {
+                            Some(c) => format!("  ◈ {m} · {c}"),
+                            None => format!("  ◈ {m}"),
+                        }
+                    })
+                    .unwrap_or_default();
                 let status = format!(
-                    " ranch  {nowix}{winlist} {panes_n} pane{} {}{flash_txt}{version_txt}",
-                    if panes_n == 1 { "" } else { "s" },
-                    pfx
+                    " ranch  {nowix}{winlist} {panes_n} pane{} {pfx}{agent_txt}{flash_txt}{version_txt}",
+                    if panes_n == 1 { "" } else { "s" }
                 );
                 let bar_style = Style::default().add_modifier(Modifier::REVERSED);
                 let bar = Line::from(Span::styled(
@@ -2261,7 +2393,7 @@ fn cmd_attach(ref_: &str) {
                 let marea = Rect::new(mx, my, mw, mh);
                 f.render_widget(ratatui::widgets::Clear, marea);
                 let block = ratatui::widgets::Block::bordered()
-                    .title(" agent profiles · enter launch · esc close ")
+                    .title(" agents · enter launch · a new · e edit · x delete · esc close ")
                     .border_style(Style::default().fg(ratatui::style::Color::Green));
                 let inner = block.inner(marea);
                 f.render_widget(block, marea);
@@ -2286,11 +2418,92 @@ fn cmd_attach(ref_: &str) {
                 );
             }
 
-            // prompt line (rename / command)
+            // :help modal — command reference (static)
+            if help_open.get() {
+                const HELP: &[&str] = &[
+                    "prefix keys (Ctrl-B)",
+                    "  c/n/p/0-9  new · next · prev · select window",
+                    "  % / \"     split right / below",
+                    "  o/l/arrows focus next / prev pane",
+                    "  Ctrl-arrows resize split",
+                    "  { / }      swap panes",
+                    "  x          kill pane",
+                    "  & or k     kill window",
+                    "  ,          rename window",
+                    "  a          agent split (forge)",
+                    "  A          pi split (local agent)",
+                    "  E          open file in $EDITOR (from :files)",
+                    "  s          session sidebar",
+                    "  d          detach",
+                    "commands (type : to enter)",
+                    "  :files [dir]   file browser (enter view/edit)",
+                    "  :agents        agent profiles — a new · e edit · x delete",
+                    "  :agent <name>  new agent session (forge)",
+                    "  :resume        resume a forge conversation",
+                    "  :pi [dir]      pi split (dir = new session there)",
+                    "  :model         switch the agent's model",
+                    "  :compact       compact the agent's context now",
+                    "  :rename <name> rename this session",
+                    "  :kill-pane     kill the focused pane",
+                    "  :kill          kill this session",
+                    "  :upgrade       hot-upgrade the daemon",
+                    "  :detach        detach (also Ctrl-B d)",
+                    "  :help          this reference",
+                ];
+                let h = HELP.len() as u16;
+                let mh = (h + 2).min(term_area.height);
+                let mw = 58.min(term_area.width);
+                let mx = (term_area.width.saturating_sub(mw)) / 2;
+                let my = (term_area.height.saturating_sub(mh)) / 2;
+                let marea = Rect::new(mx, my, mw, mh);
+                f.render_widget(ratatui::widgets::Clear, marea);
+                let block = ratatui::widgets::Block::bordered()
+                    .title(" ranch help · esc close ")
+                    .border_style(Style::default().fg(ratatui::style::Color::Green));
+                let inner = block.inner(marea);
+                f.render_widget(block, marea);
+                // scroll from the bottom when the terminal is short
+                let vis = inner.height as usize;
+                let off = help_off
+                    .get()
+                    .min(HELP.len().saturating_sub(vis));
+                let lines: Vec<Line> = HELP
+                    .iter()
+                    .skip(off)
+                    .take(vis)
+                    .map(|l| {
+                        let is_hdr = !l.starts_with(" ");
+                        Line::from(Span::styled(
+                            (*l).to_string(),
+                            if is_hdr {
+                                Style::default()
+                                    .add_modifier(Modifier::BOLD)
+                                    .fg(ratatui::style::Color::Green)
+                            } else {
+                                Style::default()
+                            },
+                        ))
+                    })
+                    .collect();
+                f.render_widget(
+                    Paragraph::new(lines),
+                    Rect::new(inner.x, inner.y, inner.width, inner.height),
+                );
+            }
+
+            // prompt line (rename / command / profile form)
             if let Some(kind) = prompt_now {
                 let label = match kind {
-                    Prompt::RenameWindow => "rename window: ",
-                    Prompt::Command => ": ",
+                    Prompt::RenameWindow => "rename window: ".to_string(),
+                    Prompt::Command => ": ".to_string(),
+                    Prompt::ProfileField => match prof_edit.borrow().as_ref() {
+                        Some(e) if e.step < PROF_FIELDS.len() => format!(
+                            "profile {} [{}] (blank = keep): ",
+                            PROF_FIELDS[e.step],
+                            e.step + 1
+                        ),
+                        _ => "profile: ".to_string(),
+                    },
                 };
                 let pl = Line::from(Span::styled(
                     format!("{label}{}\u{2588}", prompt_input.clone()),
@@ -2607,11 +2820,31 @@ fn cmd_attach(ref_: &str) {
                             }
                             continue;
                         }
-                        // :agents modal: agent-profile picker (Phase B)
+                        // :help modal: scroll + close
+                        if help_open.get() {
+                            match key.code {
+                                KeyCode::Esc | KeyCode::Char('q') => {
+                                    help_open.set(false);
+                                }
+                                KeyCode::Up | KeyCode::Char('k') => {
+                                    let off = help_off.get();
+                                    if off > 0 {
+                                        help_off.set(off - 1);
+                                    }
+                                }
+                                KeyCode::Down | KeyCode::Char('j') => {
+                                    help_off.set(help_off.get() + 1);
+                                }
+                                _ => {}
+                            }
+                            continue;
+                        }
+                        // :agents modal: agent-profile picker + CRUD
                         if agents_open.get() {
                             match key.code {
                                 KeyCode::Esc | KeyCode::Char('q') => {
                                     agents_open.set(false);
+                                    prof_del_confirm.set(false);
                                 }
                                 KeyCode::Up | KeyCode::Char('k') => {
                                     let sel = agents_sel.get();
@@ -2623,6 +2856,75 @@ fn cmd_attach(ref_: &str) {
                                     let sel = agents_sel.get();
                                     if sel + 1 < agents_items.borrow().len() {
                                         agents_sel.set(sel + 1);
+                                    }
+                                }
+                                // a → new profile (guided form)
+                                KeyCode::Char('a') => {
+                                    agents_open.set(false);
+                                    *prof_edit.borrow_mut() = Some(ProfEdit {
+                                        id: None,
+                                        fields: vec![String::new(); PROF_FIELDS.len()],
+                                        step: 0,
+                                        tools: vec![
+                                            "bash".into(),
+                                            "read".into(),
+                                            "write".into(),
+                                            "edit".into(),
+                                        ],
+                                        git_url: None,
+                                        git_ref: None,
+                                        nix_shell: None,
+                                    });
+                                    prompt_input.clear();
+                                    prompt.set(Some(Prompt::ProfileField));
+                                }
+                                // e → edit the selected profile
+                                // (ProfileGet prefill arrives async)
+                                KeyCode::Char('e') => {
+                                    let picked = agents_items
+                                        .borrow()
+                                        .get(agents_sel.get())
+                                        .cloned();
+                                    if let Some(p) = picked {
+                                        let rid = Uuid::new_v4().to_string();
+                                        *prof_get_pending.borrow_mut() = Some(rid.clone());
+                                        let f = Frame::ProfileGet {
+                                            req_id: rid,
+                                            profile: p.id,
+                                        };
+                                        send_frame(&mut stream, &f).ok();
+                                        agents_open.set(false);
+                                    }
+                                }
+                                // x → delete the selected profile
+                                // (two-press confirm)
+                                KeyCode::Char('x') => {
+                                    let picked = agents_items
+                                        .borrow()
+                                        .get(agents_sel.get())
+                                        .cloned();
+                                    if let Some(p) = picked {
+                                        if prof_del_confirm.get() {
+                                            let f = Frame::ProfileDelete {
+                                                req_id: Uuid::new_v4().to_string(),
+                                                profile: p.id,
+                                            };
+                                            send_frame(&mut stream, &f).ok();
+                                            prof_del_confirm.set(false);
+                                            err_flash.set(Some((
+                                                std::time::Instant::now(),
+                                                format!("deleted profile {}", p.name),
+                                            )));
+                                        } else {
+                                            prof_del_confirm.set(true);
+                                            err_flash.set(Some((
+                                                std::time::Instant::now(),
+                                                format!(
+                                                    "press x again to delete {}",
+                                                    p.name
+                                                ),
+                                            )));
+                                        }
                                     }
                                 }
                                 KeyCode::Enter => {
@@ -3194,16 +3496,38 @@ fn cmd_attach(ref_: &str) {
                                                 if prompt_input.trim() == "pi"
                                                     || prompt_input.trim().starts_with("pi ")
                                                 {
-                                                    // (no dir arg: the split anchors
-                                                    // to the focused pane's cwd)
-                                                    let f = Frame::PaneSplit {
-                                                        req_id: Uuid::new_v4().to_string(),
-                                                        session: session_id.clone(),
-                                                        pane: active_pane.clone(),
-                                                        dir: 1,
-                                                        kind: Some("pi".into()),
-                                                    };
-                                                    send_frame(&mut stream, &f).ok();
+                                                    // no dir arg: the split anchors
+                                                    // to the focused pane's cwd.
+                                                    // With a dir arg, create a NEW
+                                                    // pi session rooted there (like
+                                                    // the web's dir picker).
+                                                    let dir = prompt_input
+                                                        .trim()
+                                                        .strip_prefix("pi")
+                                                        .unwrap_or("")
+                                                        .trim()
+                                                        .to_string();
+                                                    if dir.is_empty() {
+                                                        let f = Frame::PaneSplit {
+                                                            req_id: Uuid::new_v4().to_string(),
+                                                            session: session_id.clone(),
+                                                            pane: active_pane.clone(),
+                                                            dir: 1,
+                                                            kind: Some("pi".into()),
+                                                        };
+                                                        send_frame(&mut stream, &f).ok();
+                                                    } else {
+                                                        let f = Frame::SessionsCreate {
+                                                            req_id: Uuid::new_v4().to_string(),
+                                                            name: None,
+                                                            kind: Some("pi".into()),
+                                                            cwd: Some(dir),
+                                                            profile_id: None,
+                                                            forge_session: None,
+                                                        };
+                                                        send_frame(&mut stream, &f).ok();
+                                                        // SessionsAck attaches
+                                                    }
                                                     prompt_input.clear();
                                                     continue;
                                                 }
@@ -3284,6 +3608,60 @@ fn cmd_attach(ref_: &str) {
                                                     prompt_input.clear();
                                                     continue;
                                                 }
+                                                // :upgrade — hot-upgrade the daemon
+                                                // (same as the web "upgrade daemon"
+                                                // button / `ranch upgrade`)
+                                                if prompt_input.trim() == "upgrade" {
+                                                    let f = Frame::Upgrade {};
+                                                    send_frame(&mut stream, &f).ok();
+                                                    err_flash.set(Some((
+                                                        std::time::Instant::now(),
+                                                        "hot-upgrading daemon…".into(),
+                                                    )));
+                                                    prompt_input.clear();
+                                                    continue;
+                                                }
+                                                // :help — command reference
+                                                if prompt_input.trim() == "help"
+                                                    || prompt_input.trim() == "h"
+                                                {
+                                                    prompt_input.clear();
+                                                    prompt.set(None);
+                                                    help_open.set(true);
+                                                    help_off.set(0);
+                                                    continue;
+                                                }
+                                                // :kill-pane — kill the focused pane
+                                                if prompt_input.trim() == "kill-pane"
+                                                    || prompt_input.trim() == "killp"
+                                                {
+                                                    let f = Frame::PaneKill {
+                                                        session: session_id.clone(),
+                                                        pane: active_pane.clone(),
+                                                    };
+                                                    send_frame(&mut stream, &f).ok();
+                                                    prompt_input.clear();
+                                                    continue;
+                                                }
+                                                // :rename <name> — rename the session
+                                                if let Some(rest) =
+                                                    prompt_input.trim().strip_prefix("rename")
+                                                {
+                                                    let name = rest.trim().to_string();
+                                                    if !name.is_empty() {
+                                                        let f = Frame::SessionsRename {
+                                                            session: session_id.clone(),
+                                                            name,
+                                                        };
+                                                        send_frame(&mut stream, &f).ok();
+                                                        err_flash.set(Some((
+                                                            std::time::Instant::now(),
+                                                            "session renamed".into(),
+                                                        )));
+                                                        prompt_input.clear();
+                                                        continue;
+                                                    }
+                                                }
                                                 match prompt_input.trim() {
                                                     "kill" | "kill-session" => {
                                                         let f = Frame::SessionsKill {
@@ -3297,6 +3675,92 @@ fn cmd_attach(ref_: &str) {
                                                         break;
                                                     }
                                                     _ => {}
+                                                }
+                                            }
+                                            Prompt::ProfileField => {
+                                                // guided profile form: store the
+                                                // value, advance; on the last
+                                                // field send ProfilePut
+                                                let val = prompt_input.clone();
+                                                prompt_input.clear();
+                                                let finished = {
+                                                    let mut ed = prof_edit.borrow_mut();
+                                                    match ed.as_mut() {
+                                                        Some(e) if e.step < PROF_FIELDS.len() => {
+                                                            // blank on an edit keeps
+                                                            // the stored value
+                                                            if !val.is_empty()
+                                                                || e.id.is_none()
+                                                            {
+                                                                e.fields[e.step] = val;
+                                                            }
+                                                            e.step += 1;
+                                                            e.step >= PROF_FIELDS.len()
+                                                        }
+                                                        _ => true,
+                                                    }
+                                                };
+                                                if finished {
+                                                    if let Some(e) =
+                                                        prof_edit.borrow_mut().take()
+                                                    {
+                                                        let opt = |s: &String| {
+                                                            let t = s.trim();
+                                                            if t.is_empty() {
+                                                                None
+                                                            } else {
+                                                                Some(t.to_string())
+                                                            }
+                                                        };
+                                                        if e.fields[0].trim().is_empty()
+                                                            || e.fields[2].trim().is_empty()
+                                                            || e.fields[3].trim().is_empty()
+                                                        {
+                                                            err_flash.set(Some((
+                                                                std::time::Instant::now(),
+                                                                "profile needs name, provider, model".into(),
+                                                            )));
+                                                        } else {
+                                                            let rid =
+                                                                Uuid::new_v4().to_string();
+                                                            let f = Frame::ProfilePut {
+                                                                req_id: rid.clone(),
+                                                                profile_id: e.id.clone(),
+                                                                draft:
+                                                                    ranch_protocol::ProfileDraft {
+                                                                    name: e.fields[0].trim().to_string(),
+                                                                    description: opt(&e.fields[1]),
+                                                                    provider: e.fields[2].trim().to_string(),
+                                                                    model: e.fields[3].trim().to_string(),
+                                                                    base_url: opt(&e.fields[4]),
+                                                                    api_key: opt(&e.fields[5]),
+                                                                    working_dir: opt(&e.fields[6]),
+                                                                    git_url: e.git_url.clone(),
+                                                                    git_ref: e.git_ref.clone(),
+                                                                    nix_shell: e.nix_shell.clone(),
+                                                                    system_prompt: opt(&e.fields[7]),
+                                                                    tools: e.tools.clone(),
+                                                                },
+                                                            };
+                                                            send_frame(&mut stream, &f).ok();
+                                                            err_flash.set(Some((
+                                                                std::time::Instant::now(),
+                                                                "saving profile…".into(),
+                                                            )));
+                                                        }
+                                                    }
+                                                    prompt.set(None);
+                                                } else {
+                                                    // prefill the next field's
+                                                    // current value (edit mode)
+                                                    if let Some(v) = prof_edit
+                                                        .borrow()
+                                                        .as_ref()
+                                                        .filter(|e| e.step < PROF_FIELDS.len())
+                                                        .map(|e| e.fields[e.step].clone())
+                                                    {
+                                                        prompt_input = v;
+                                                    }
                                                 }
                                             }
                                         }

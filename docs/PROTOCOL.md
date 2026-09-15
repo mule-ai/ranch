@@ -77,12 +77,16 @@ per app install for mobile so reconnects are stable).
                  "lines":["…"], "cursor":{"x":12,"y":7,"visible":true},
                  "kind":"pty"|"forge-chat",
                  "chat":[…], "forge_session":"<uuid>",
-                 "model":"display name"} ]
+                 "model":"display name",
+                 "context":"ctx readout"} ]
 
   For chat panes, `model` carries the agent's active-model display name
   (daemon-known: pi `get_state` at spawn/restore, forge session
   `override_model` ?? profile `model`, or the last successful
-  switch).
+  switch). `context` carries the latest context-window readout
+  (cached from `meta {kind:"context"}`), so attaching clients see
+  the usage immediately instead of waiting for the next turn to
+  end.
   }
   ```
   Each pane runs at its own (cols, rows) computed by the daemon from
@@ -100,7 +104,9 @@ per app install for mobile so reconnects are stable).
   `{"kind":"forge","status":"running"|"done"|"error","preview":"last 240 chars"}`.
   Also `kind:"model"` on chat panes (`pane` set, `status` = the active
   model's display name): emitted when the daemon learns/reports a pane's
-  model and after every successful model switch.
+  model and after every successful model switch. `kind:"context"`
+  readouts are likewise cached on the pane so re-snapshots carry the
+  last known usage.
 
 ### Control (both directions)
 

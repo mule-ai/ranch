@@ -143,6 +143,9 @@ struct ChatPane {
     /// active-model display name, when known (filled by `meta
     /// kind="model"` broadcasts; surfaced in `PaneSnap.model`)
     model: Option<String>,
+    /// latest context-window readout (filled by `meta kind="context"`
+    /// broadcasts; surfaced in `PaneSnap.context`)
+    context: Option<String>,
     /// working dir (local-pi panes: where the rpc child was spawned;
     /// recorded so restore can respawn in the same place)
     cwd: Option<String>,
@@ -882,6 +885,7 @@ fn snapshot_session(s: &Session) -> Option<Frame> {
             chat: None,
             forge_session: None,
             model: None,
+            context: None,
             cwd: pane_cwd(p.child).map(|p| p.to_string_lossy().into_owned()),
         };
         if *pid == s.active {
@@ -902,6 +906,7 @@ fn snapshot_session(s: &Session) -> Option<Frame> {
             chat: Some(cp.chat.clone()),
             forge_session: Some(cp.forge_sid.to_string()),
             model: cp.model.clone(),
+            context: cp.context.clone(),
             cwd: None,
         });
     }
@@ -1282,8 +1287,9 @@ impl Daemon {
                         rows: 24,
                         chat: vec![],
                         model: None,
+                        context: None,
                         cwd: Some(dir_str),
-                    },
+                    }
                 );
             }
             "forge" => {
@@ -1302,8 +1308,9 @@ impl Daemon {
                         rows: 24,
                         chat: vec![],
                         model: None,
+                        context: None,
                         cwd: dir.map(|p| p.to_string_lossy().to_string()),
-                    },
+                    }
                 );
                 if let Some(tx) = &self.forge_tx {
                     let _ = tx.send(forge::ForgeJob::Watch { pane: pid, forge_sid });
@@ -1377,8 +1384,9 @@ impl Daemon {
                     rows: 24,
                     chat: vec![],
                     model: None,
+                    context: None,
                     cwd: Some(dir_str),
-                },
+                }
             );
         } else {
             s.chats.insert(
@@ -1389,8 +1397,9 @@ impl Daemon {
                     rows: 24,
                     chat: vec![],
                     model: None,
+                    context: None,
                     cwd,
-                },
+                }
             );
             if let Some(tx) = &self.forge_tx {
                 let _ = tx.send(forge::ForgeJob::Watch { pane: pid, forge_sid });
@@ -2086,8 +2095,9 @@ impl Daemon {
                             rows: 24,
                             chat: vec![],
                             model: None,
+                            context: None,
                             cwd: cwd.clone(),
-                        },
+                        }
                     );
                     if fsid.is_nil() {
                         if let Some((si, so, cpid)) = pi_fds.get(&pid.to_string()).copied() {
@@ -2260,8 +2270,9 @@ impl Daemon {
                             rows: 24,
                             chat: vec![],
                             model: None,
+                            context: None,
                             cwd: cwd.clone(),
-                        },
+                        }
                     );
                     chat_ids.push(pid);
                     let is_pi = fsid.is_nil();
@@ -3657,8 +3668,9 @@ impl Daemon {
                         rows: 24,
                         chat: vec![],
                         model: None,
+                        context: None,
                         cwd: None,
-                    },
+                    }
                 );
                 sess.active = pid;
                 self.sessions.insert(sid, sess);
@@ -3684,7 +3696,8 @@ impl Daemon {
                 kind,
                 status,
             } if session.is_empty()
-                && (kind == "agent" || kind == "model" || kind == "workflow") =>
+                && (kind == "agent" || kind == "model" || kind == "workflow"
+                    || kind == "context") =>
             {
                 let pid = Uuid::parse_str(pane.as_deref().unwrap_or("")).ok();
                 let found = pid.and_then(|pid| {
@@ -3700,6 +3713,17 @@ impl Daemon {
                             if let Some(s) = self.sessions.get_mut(&sid) {
                                 if let Some(cp) = s.chats.get_mut(&pid) {
                                     cp.model = Some(st.clone());
+                                }
+                            }
+                        }
+                    }
+                    // context readouts cache like model: re-snapshots carry
+                    // the last known usage so attaching clients see it
+                    if kind == "context" {
+                        if let Some(st) = status {
+                            if let Some(s) = self.sessions.get_mut(&sid) {
+                                if let Some(cp) = s.chats.get_mut(&pid) {
+                                    cp.context = Some(st.clone());
                                 }
                             }
                         }
@@ -4205,8 +4229,9 @@ impl Daemon {
                                     rows: 24,
                                     chat: vec![],
                                     model: None,
+                                    context: None,
                                     cwd: cwd.clone(),
-                                },
+                                }
                             );
                             s.windows[0].layout = Layout::Leaf {
                                 pane: pid.to_string(),
@@ -4479,8 +4504,9 @@ impl Daemon {
                                     rows: 24,
                                     chat: vec![],
                                     model: None,
+                                    context: None,
                                     cwd: None,
-                                },
+                                }
                             );
                             s.win_mut()
                                 .split_leaf(&target.to_string(), &pid.to_string(), dir);
@@ -4530,8 +4556,9 @@ impl Daemon {
                                 rows: 24,
                                 chat: vec![],
                                 model: None,
+                                context: None,
                                 cwd: None,
-                            },
+                            }
                         );
                         s.win_mut()
                             .split_leaf(&target.to_string(), &pid.to_string(), dir);

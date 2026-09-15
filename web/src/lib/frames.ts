@@ -30,6 +30,7 @@ export type PaneSnap = {
   chat?: ChatMsg[];
   forge_session?: string;
   agentBusy?: boolean;
+  model?: string; // active agent model display name (chat panes)
   context?: string; // context-window readout (chat panes)
 };
 
