@@ -2210,6 +2210,7 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
         let curwin_ref = &cur_window;
         let chat_input_ref = chat_input.clone();
         let chat_scroll_ref = &chat_scroll;
+        let newpane_sel_now = newpane_sel.get();
         let flash_ref = &err_flash;
         // expire old flashes (4s); Cell<Option<(Instant, String)>> is
         // non-Copy so expiry works by take + conditional restore
@@ -2379,19 +2380,17 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                         // usable text width: "│ text▊ pad│" → inner_w - 3
                         let text_w = inner_w.saturating_sub(3).max(1);
                         let mut draft: Vec<String> = if input_row.is_empty() {
-                            wrap(
+                            wrap_verbatim(
                                 "message the agent…  (⌃J newline, enter send)",
                                 text_w,
                             )
                         } else {
                             let mut out = Vec::new();
                             for part in input_row.split('\n') {
-                                if part.is_empty() {
-                                    out.push(String::new());
-                                } else {
-                                    for chunk in wrap(part, text_w) {
-                                        out.push(chunk);
-                                    }
+                                // verbatim: spaces must render exactly as
+                                // typed or backspacing looks broken
+                                for chunk in wrap_verbatim(part, text_w) {
+                                    out.push(chunk);
                                 }
                             }
                             out
@@ -3082,6 +3081,43 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                     .collect();
                 f.render_widget(
                     Paragraph::new(lines),
+                    Rect::new(inner.x, inner.y, inner.width, inner.height),
+                );
+            }
+
+            // prefix-c modal — new pane kind picker
+            if newpane_open.get() {
+                const KINDS: &[&str] = &[
+                    "shell — plain terminal split",
+                    "agent · forge — forge-backed agent chat",
+                    "agent · pi — local pi agent chat",
+                    "editor — $EDITOR in a split",
+                ];
+                let (mw, mh) = (56.min(term_area.width), 8.min(term_area.height));
+                let mx = (term_area.width.saturating_sub(mw)) / 2;
+                let my = (term_area.height.saturating_sub(mh)) / 2;
+                let marea = Rect::new(mx, my, mw, mh);
+                f.render_widget(ratatui::widgets::Clear, marea);
+                let block = ratatui::widgets::Block::bordered()
+                    .title(" new pane · enter create · esc close ")
+                    .border_style(Style::default().fg(ratatui::style::Color::Green));
+                let inner = block.inner(marea);
+                f.render_widget(block, marea);
+                let items: Vec<Line> = KINDS
+                    .iter()
+                    .enumerate()
+                    .map(|(i, k)| {
+                        let sel = i == newpane_sel_now;
+                        let mut style = Style::default();
+                        if sel {
+                            style = style.add_modifier(Modifier::REVERSED);
+                        }
+                        let mark = if sel { ">" } else { " " };
+                        Line::from(Span::styled(format!("{mark} {k}"), style))
+                    })
+                    .collect();
+                f.render_widget(
+                    Paragraph::new(items),
                     Rect::new(inner.x, inner.y, inner.width, inner.height),
                 );
             }
@@ -4999,6 +5035,22 @@ fn truncate_label(s: &str, w: usize) -> String {
     } else {
         s.chars().take(w.saturating_sub(1)).collect::<String>() + "…"
     }
+}
+
+/// Verbatim wrap for the draft input box: chunk at exactly `max`
+/// chars, preserving every space (word-wrap's space collapsing makes
+/// backspacing look broken). Explicit newlines must be split by the
+/// caller.
+fn wrap_verbatim(text: &str, max: usize) -> Vec<String> {
+    let max = max.max(1);
+    if text.is_empty() {
+        return vec![String::new()];
+    }
+    text.chars()
+        .collect::<Vec<_>>()
+        .chunks(max)
+        .map(|c| c.iter().collect::<String>())
+        .collect()
 }
 
 /// Word-aware wrap for chat text: explicit newlines always break,
