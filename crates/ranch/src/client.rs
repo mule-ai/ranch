@@ -2240,14 +2240,7 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                         let user_w = ((w as f32) * 0.55).max(10.0) as usize;
                         let agent_w = ((w as f32) * 0.78).max(14.0) as usize;
                         let wrap = |text: &str, max: usize| -> Vec<String> {
-                            if text.is_empty() {
-                                return vec![String::new()];
-                            }
-                            text.chars()
-                                .collect::<Vec<_>>()
-                                .chunks(max.max(1))
-                                .map(|c| c.iter().collect::<String>())
-                                .collect()
+                            wrap_text(text, max)
                         };
                         let user_style = Style::default()
                             .fg(ratatui::style::Color::Black)
@@ -4707,6 +4700,58 @@ fn truncate_label(s: &str, w: usize) -> String {
     }
 }
 
+/// Word-aware wrap for chat text: explicit newlines always break,
+/// lines break at spaces (never mid-word) and only hard-break a
+/// "word" that is longer than the whole line. Runs of spaces collapse
+/// to one, like most chat UIs.
+fn wrap_text(text: &str, max: usize) -> Vec<String> {
+    let max = max.max(1);
+    let mut out: Vec<String> = Vec::new();
+    for para in text.split('\n') {
+        if para.is_empty() {
+            out.push(String::new());
+            continue;
+        }
+        let mut line = String::new();
+        for word in para.split(' ') {
+            if word.is_empty() {
+                continue; // collapse double spaces
+            }
+            let wl = word.chars().count();
+            let fits = line.chars().count() + if line.is_empty() { 0 } else { 1 } + wl <= max;
+            if fits {
+                if !line.is_empty() {
+                    line.push(' ');
+                }
+                line.push_str(word);
+            } else if wl > max {
+                // a single "word" longer than the line: hard-break it
+                // (URLs, long paths, minified junk)
+                if !line.is_empty() {
+                    out.push(std::mem::take(&mut line));
+                }
+                let chars: Vec<char> = word.chars().collect();
+                let mut i = 0;
+                while i < chars.len() {
+                    let take = max.min(chars.len() - i);
+                    let piece: String = chars[i..i + take].iter().collect();
+                    if i + take < chars.len() {
+                        out.push(piece);
+                    } else {
+                        line = piece; // tail becomes the current line
+                    }
+                    i += take;
+                }
+            } else {
+                out.push(std::mem::take(&mut line));
+                line = word.to_string();
+            }
+        }
+        out.push(line);
+    }
+    out
+}
+
 fn b64url_decode(s: &str) -> Option<Vec<u8>> {
     const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let val = |b: u8| -> Option<u32> { A.iter().position(|&a| a == b).map(|p| p as u32) };
@@ -5339,5 +5384,41 @@ pub fn main_client() {
             _ => die("usage: ranch switch <session> <pane>"),
         },
         other => die(&format!("unknown command {other:?}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wrap_text;
+
+    #[test]
+    fn wrap_breaks_at_spaces_not_midword() {
+        assert_eq!(
+            wrap_text("the quick brown fox", 9),
+            vec!["the quick", "brown fox"]
+        );
+    }
+
+    #[test]
+    fn wrap_respects_explicit_newlines() {
+        assert_eq!(wrap_text("line one\nline two", 40), vec!["line one", "line two"]);
+        // trailing newline → trailing blank row
+        assert_eq!(wrap_text("hi\n", 40), vec!["hi", ""]);
+        // blank line preserved
+        assert_eq!(wrap_text("a\n\nb", 40), vec!["a", "", "b"]);
+    }
+
+    #[test]
+    fn wrap_hard_breaks_oversized_words() {
+        assert_eq!(wrap_text("abcdefghij", 4), vec!["abcd", "efgh", "ij"]);
+        // mixed: short word then oversized URL
+        assert_eq!(wrap_text("see https://example.com/aaaaaaaaaaa end", 10).len() > 2, true);
+    }
+
+    #[test]
+    fn wrap_empty_and_narrow() {
+        assert_eq!(wrap_text("", 10), vec![String::new()]);
+        // degenerate width: every char gets its own row
+        assert_eq!(wrap_text("hi there", 1), vec!["h", "i", "t", "h", "e", "r", "e"]);
     }
 }
