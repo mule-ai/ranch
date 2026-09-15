@@ -1,6 +1,7 @@
 import { useEffect, useState, useCallback, useRef } from "react";
 import {
   ActivityIndicator,
+  Alert,
   BackHandler,
   Keyboard,
   Pressable,
@@ -447,10 +448,24 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
               hitSlop={8}
               onPress={() => {
                 if (!activePane) return;
-                relay.send({
-                  t: "ChatCompact", id: nextId(), client: "mobile",
-                  session: sessionId, pane: activePane, req_id: `compact-${Date.now()}`,
-                } as Frame);
+                // compaction summarizes/drops older turns — confirm first
+                Alert.alert(
+                  "Compact context?",
+                  "Compaction summarizes the conversation so far and " +
+                    "frees context window. Older message detail is dropped.",
+                  [
+                    { text: "Cancel", style: "cancel" },
+                    {
+                      text: "Compact",
+                      onPress: () => {
+                        relay.send({
+                          t: "ChatCompact", id: nextId(), client: "mobile",
+                          session: sessionId, pane: activePane, req_id: `compact-${Date.now()}`,
+                        } as Frame);
+                      },
+                    },
+                  ],
+                );
               }}
             >
               <Text style={styles.ctxChipText} numberOfLines={1}>
