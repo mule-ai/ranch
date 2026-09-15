@@ -23,7 +23,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
@@ -589,6 +589,25 @@ fn default_socket_path() -> PathBuf {
 
 fn default_shell() -> String {
     std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string())
+}
+
+/// Returns true if a process is currently accepting connections on this
+/// unix socket path. A live listener completes the connect at the kernel
+/// level; a stale socket file left behind by a crashed/killed process
+/// yields ECONNREFUSED. Any other error is treated as occupied (safe
+/// default: never unlink a socket we can't prove is dead).
+fn socket_has_live_listener(path: &Path) -> bool {
+    match UnixStream::connect(path) {
+        Ok(stream) => {
+            // A live daemon accepted the probe. Dropping the stream makes
+            // the peer see a client that connected and immediately
+            // disconnected — harmless.
+            drop(stream);
+            true
+        }
+        Err(e) => e.kind() != std::io::ErrorKind::ConnectionRefused
+            && e.kind() != std::io::ErrorKind::NotFound,
+    }
 }
 
 /// `allow_local_pi = "false"` in ~/.config/ranch/daemon.toml disables
@@ -1804,6 +1823,19 @@ impl Daemon {
             std::fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
         }
         if socket_path.exists() {
+            if socket_has_live_listener(&socket_path) {
+                return Err(format!(
+                    "a ranch daemon is already listening on {} — refusing to start \
+                     a second instance (it would steal the socket path and orphan \
+                     the running daemon's listener). Stop the existing daemon \
+                     first (systemctl --user stop ranchd), or hot-upgrade it \
+                     (ranch upgrade).",
+                    socket_path.display()
+                ));
+            }
+            // No live listener: stale socket file from a crashed/killed
+            // daemon — safe to remove.
+            eprintln!("ranchd: removing stale socket {}", socket_path.display());
             std::fs::remove_file(&socket_path).ok();
         }
         let state_path = socket_path.parent().unwrap().join("state.json");
@@ -5395,5 +5427,40 @@ fn run(
     }
 
     eprintln!("ranchd: shutting down");
-    let _ = std::fs::remove_file(&daemon.socket_path);
+    // Only unlink if nobody is listening on the path. Our own listener is
+    // still open here (dropped at end of scope), so this skips removal in
+    // the normal case — leaving our stale file, which the next cold start
+    // probes (ECONNREFUSED) and reclaims. It also protects the
+    // stop→start race: if a newer generation already bound the path, we
+    // must not unlink its live socket.
+    if !socket_has_live_listener(&daemon.socket_path) {
+        let _ = std::fs::remove_file(&daemon.socket_path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn socket_has_live_listener_detects_live_and_stale_sockets() {
+        let dir = std::env::temp_dir().join(format!("ranch-sock-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("probe.sock");
+        let _ = std::fs::remove_file(&path);
+
+        // Live listener: connect succeeds → occupied.
+        let listener = UnixListener::bind(&path).unwrap();
+        assert!(socket_has_live_listener(&path));
+
+        // Drop the listener without unlinking: the file remains but is
+        // dead → connect refused → safe to reclaim.
+        drop(listener);
+        assert!(!socket_has_live_listener(&path));
+
+        let _ = std::fs::remove_file(&path);
+        // Missing file → not occupied.
+        assert!(!socket_has_live_listener(&path));
+        let _ = std::fs::remove_dir(&dir);
+    }
 }
