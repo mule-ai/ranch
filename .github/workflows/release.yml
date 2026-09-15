@@ -82,7 +82,15 @@ jobs:
         with:
           distribution: temurin
           java-version: "17"
-      - uses: android-actions/setup-android@v3
+      # android-actions/setup-android@v3 is broken: it installs the legacy
+      # `tools` package, which Google removed from the SDK repo.
+      # Set up the preinstalled runner SDK explicitly instead.
+      - name: Android SDK (licenses + components)
+        run: |
+          export ANDROID_HOME=/usr/local/lib/android/sdk
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "platform-tools" "platforms;android-36" "build-tools;36.0.0" "ndk;27.1.12297006"
       - uses: actions/setup-node@v4
         with:
           node-version: 22
