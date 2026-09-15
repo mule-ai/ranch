@@ -1637,6 +1637,16 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
     // :help — command/key reference overlay (static lines, scroll + esc)
     let help_open = std::cell::Cell::new(false);
     let help_off = std::cell::Cell::new(0usize);
+    // prefix-[ / :scrollback — history-ring viewer for the focused pane
+    // (the Scrollback reply has no req_id; the daemon echoes the
+    // request's `id`, so correlate on that)
+    let scroll_open = std::cell::Cell::new(false);
+    // distance from the newest line (0 = pinned to bottom)
+    let scroll_delta = std::cell::Cell::new(0usize);
+    let scroll_pending: std::rc::Rc<std::cell::RefCell<Option<String>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(None));
+    let scroll_lines: std::rc::Rc<std::cell::RefCell<Vec<String>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(vec![]));
     // :agents profile CRUD — guided edit (prompt-driven field sequence).
     // `a` new, `e` edit selected, `x` delete selected inside the modal.
     struct ProfEdit {
@@ -1979,6 +1989,22 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                                     *agents_pending.borrow_mut() = Some(rid.clone());
                                     let f = Frame::ProfileList { req_id: rid };
                                     send_frame(&mut stream, &f).ok();
+                                }
+                            }
+                            Frame::Scrollback {
+                                id,
+                                lines,
+                                ..
+                            } => {
+                                let matches = scroll_pending
+                                    .borrow()
+                                    .as_deref()
+                                    == Some(id.as_str());
+                                if matches {
+                                    scroll_pending.borrow_mut().take();
+                                    *scroll_lines.borrow_mut() = lines;
+                                    scroll_delta.set(0); // pin to newest
+                                    scroll_open.set(true);
                                 }
                             }
                             Frame::DirListOk {
@@ -2961,6 +2987,7 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                     "  a          agent split (forge)",
                     "  A          pi split (local agent)",
                     "  E          open file in $EDITOR (from :files)",
+                    "  [          scrollback of the focused pane",
                     "  d          detach",
                     "commands (type : to enter)",
                     "  :files [dir]   file browser (enter view/edit)",
@@ -2973,6 +3000,7 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                     "  (in chat, /compact works too)",
                     "  :rename <name> rename this session",
                     "  :kill-pane     kill the focused pane",
+                    "  :scrollback    pane history ring (also Ctrl-B [)",
                     "  :kill          kill this session",
                     "  :upgrade       hot-upgrade the daemon",
                     "  :detach        detach (also Ctrl-B d)",
@@ -3019,6 +3047,38 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                     .collect();
                 f.render_widget(
                     Paragraph::new(lines),
+                    Rect::new(inner.x, inner.y, inner.width, inner.height),
+                );
+            }
+
+            // scrollback viewer (prefix-[ / :scrollback) — the focused
+            // pane's history ring, pinned to the bottom
+            if scroll_open.get() {
+                let lines = scroll_lines.borrow();
+                let mw = term_area.width.saturating_sub(4).max(20);
+                let mh = term_area.height.saturating_sub(2).max(3);
+                let mx = (term_area.width.saturating_sub(mw)) / 2;
+                let my = (term_area.height.saturating_sub(mh)) / 2;
+                let marea = Rect::new(mx, my, mw, mh);
+                f.render_widget(ratatui::widgets::Clear, marea);
+                let vis = (mh as usize).saturating_sub(2);
+                let delta = scroll_delta.get().min(lines.len());
+                let end = lines.len() - delta;
+                let start = end.saturating_sub(vis);
+                let block = ratatui::widgets::Block::bordered().title(format!(
+                    " scrollback {}/{} · ↑↓ pgup/pgdn · esc close ",
+                    if lines.is_empty() { 0 } else { end },
+                    lines.len()
+                ))
+                .border_style(Style::default().fg(ratatui::style::Color::Green));
+                let inner = block.inner(marea);
+                f.render_widget(block, marea);
+                let items: Vec<Line> = lines[start..end]
+                    .iter()
+                    .map(|l| Line::from(l.clone()))
+                    .collect();
+                f.render_widget(
+                    Paragraph::new(items),
                     Rect::new(inner.x, inner.y, inner.width, inner.height),
                 );
             }
@@ -3347,6 +3407,42 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                                         send_frame(&mut stream, &f).ok();
                                         // WorkflowRunOk attaches
                                     }
+                                }
+                                _ => {}
+                            }
+                            continue;
+                        }
+                        // scrollback viewer: scroll + close
+                        if scroll_open.get() {
+                            let lines = scroll_lines.borrow().len();
+                            let vis = (rows as usize).saturating_sub(4);
+                            match key.code {
+                                KeyCode::Esc | KeyCode::Char('q') => {
+                                    scroll_open.set(false);
+                                }
+                                KeyCode::Up | KeyCode::Char('k') => {
+                                    let d = scroll_delta.get();
+                                    if d < lines {
+                                        scroll_delta.set(d + 1);
+                                    }
+                                }
+                                KeyCode::Down | KeyCode::Char('j') => {
+                                    let d = scroll_delta.get();
+                                    scroll_delta.set(d.saturating_sub(1));
+                                }
+                                KeyCode::PageUp => {
+                                    let d = scroll_delta.get();
+                                    scroll_delta.set((d + vis).min(lines));
+                                }
+                                KeyCode::PageDown => {
+                                    let d = scroll_delta.get();
+                                    scroll_delta.set(d.saturating_sub(vis));
+                                }
+                                KeyCode::Home | KeyCode::Char('g') => {
+                                    scroll_delta.set(lines);
+                                }
+                                KeyCode::End | KeyCode::Char('G') => {
+                                    scroll_delta.set(0);
                                 }
                                 _ => {}
                             }
@@ -4014,6 +4110,31 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                                     send_frame(&mut stream, &f).ok();
                                     continue;
                                 }
+                                // [ → scrollback viewer for the focused pane
+                                KeyCode::Char('[') => {
+                                    let is_chat = pane_views
+                                        .get(&active_pane)
+                                        .is_some_and(|pv| pv.is_chat());
+                                    if is_chat {
+                                        err_flash.set(Some((
+                                            std::time::Instant::now(),
+                                            "scrollback: chat panes hold the full conversation".into(),
+                                        )));
+                                    } else {
+                                        let rid = Uuid::new_v4().to_string();
+                                        *scroll_pending.borrow_mut() = Some(rid.clone());
+                                        let f = Frame::ScrollbackReq {
+                                            id: rid,
+                                            client: "attach".into(),
+                                            session: session_id.clone(),
+                                            pane: active_pane.clone(),
+                                            offset: 0,
+                                            limit: 2000,
+                                        };
+                                        send_frame(&mut stream, &f).ok();
+                                    }
+                                    continue;
+                                }
                                 // q → show pane numbers briefly (MVP: status flash)
                                 KeyCode::Char('q') => continue,
                                 // : → command prompt (rename etc.)
@@ -4307,6 +4428,35 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                                                         prompt_input.clear();
                                                         continue;
                                                     }
+                                                }
+                                                // :scrollback — history ring of the
+                                                // focused pane
+                                                if prompt_input.trim() == "scrollback" {
+                                                    prompt_input.clear();
+                                                    prompt.set(None);
+                                                    let is_chat = pane_views
+                                                        .get(&active_pane)
+                                                        .is_some_and(|pv| pv.is_chat());
+                                                    if is_chat {
+                                                        err_flash.set(Some((
+                                                            std::time::Instant::now(),
+                                                            "scrollback: chat panes hold the full conversation".into(),
+                                                        )));
+                                                    } else {
+                                                        let rid = Uuid::new_v4().to_string();
+                                                        *scroll_pending.borrow_mut() =
+                                                            Some(rid.clone());
+                                                        let f = Frame::ScrollbackReq {
+                                                            id: rid,
+                                                            client: "attach".into(),
+                                                            session: session_id.clone(),
+                                                            pane: active_pane.clone(),
+                                                            offset: 0,
+                                                            limit: 2000,
+                                                        };
+                                                        send_frame(&mut stream, &f).ok();
+                                                    }
+                                                    continue;
                                                 }
                                                 match prompt_input.trim() {
                                                     "kill" | "kill-session" => {
