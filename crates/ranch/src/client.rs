@@ -11,7 +11,7 @@
 //!
 //! Socket: $RANCH_SOCKET or ~/.local/state/ranch/daemon.sock
 
-use std::io::{Read, Write};
+use std::io::Read;
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
@@ -49,7 +49,10 @@ fn die(msg: &str) -> ! {
 }
 
 /// Encode a frame (chunking if needed) and write all lines to the stream.
-fn send_frame(stream: &mut UnixStream, frame: &Frame) -> Result<(), std::io::Error> {
+fn send_frame<W: std::io::Write>(
+    stream: &mut W,
+    frame: &Frame,
+) -> Result<(), std::io::Error> {
     let lines = ranch_protocol::encode_frame(frame, &Uuid::new_v4().to_string());
     let mut bytes = Vec::new();
     for line in &lines {
@@ -64,7 +67,7 @@ fn connect() -> UnixStream {
     UnixStream::connect(&path).unwrap_or_else(|e| die(&format!("connect {path:?}: {e}")))
 }
 
-fn hello(stream: &mut UnixStream, client: &str) {
+fn hello<W: std::io::Write>(stream: &mut W, client: &str) {
     let hello = Frame::Hello {
         id: Uuid::new_v4().to_string(),
         client: client.into(),
@@ -139,7 +142,7 @@ fn cmd_new(name: Option<String>, kind: Option<String>, cwd: Option<String>) {
     // (non-tty) keep getting the id printed
     if let Frame::SessionsAck { session, .. } = f {
         if libc_isatty() {
-            cmd_attach(&session);
+            attach_loop(Target::Local(session));
             return;
         }
         println!("session {session}");
@@ -240,7 +243,7 @@ fn cmd_resume(query: Option<String>) {
     );
     if let Frame::SessionsAck { session, .. } = f {
         if libc_isatty() {
-            cmd_attach(&session);
+            attach_loop(Target::Local(session));
             return;
         }
         println!("session {session}");
@@ -972,9 +975,514 @@ fn cmd_dashboard() -> Option<String> {
     }
 }
 
-fn cmd_attach(ref_: &str) {
-    let mut stream = connect();
-    stream.set_nonblocking(true).ok();
+fn cmd_attach(ref_: &str) -> AttachNext {
+    let link = Link::connect_local();
+    cmd_attach_link(link, ref_, None)
+}
+
+/// Attach to a session on a REMOTE machine via the Supabase Realtime
+/// channel (same transport the web client uses).
+fn cmd_attach_cloud(machine_id: &str, machine_name: &str, session: &str) -> AttachNext {
+    match CloudLink::connect(machine_id) {
+        Ok(c) => cmd_attach_link(Link::Cloud(Box::new(c)), session, Some(machine_name)),
+        Err(e) => {
+            eprintln!("ranch: {e}");
+            AttachNext::Detach
+        }
+    }
+}
+
+/// Where to go when an attach session ends: detach to the dashboard, or
+/// jump straight into another session (sidebar pick / prefix-n/p cycle).
+enum AttachNext {
+    Detach,
+    Cloud {
+        machine_id: String,
+        machine_name: String,
+        session: String,
+    },
+}
+
+enum Target {
+    Local(String),
+    Cloud {
+        machine_id: String,
+        machine_name: String,
+        session: String,
+    },
+}
+
+/// Run the attach loop, following jumps until a plain detach.
+fn attach_loop(t: Target) {
+    let mut t = t;
+    loop {
+        let next = match t {
+            Target::Local(id) => cmd_attach(&id),
+            Target::Cloud {
+                machine_id,
+                machine_name,
+                session,
+            } => cmd_attach_cloud(&machine_id, &machine_name, &session),
+        };
+        match next {
+            AttachNext::Detach => return,
+            AttachNext::Cloud {
+                machine_id,
+                machine_name,
+                session,
+            } => {
+                t = Target::Cloud {
+                    machine_id,
+                    machine_name,
+                    session,
+                };
+            }
+        }
+    }
+}
+
+/// The transport the TUI reads/writes ranch frames on: the local daemon
+/// socket, or a remote machine's realtime channel.
+enum Link {
+    Local(UnixStream),
+    Cloud(Box<CloudLink>),
+}
+
+impl Link {
+    fn connect_local() -> Link {
+        let s = connect();
+        s.set_nonblocking(true).ok();
+        Link::Local(s)
+    }
+}
+
+impl std::io::Read for Link {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Link::Local(s) => s.read(buf),
+            Link::Cloud(c) => c.read(buf),
+        }
+    }
+}
+
+impl std::io::Write for Link {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Link::Local(s) => s.write(buf),
+            Link::Cloud(c) => c.write(buf),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Link::Local(s) => s.flush(),
+            Link::Cloud(c) => c.flush(),
+        }
+    }
+}
+
+/// A realtime link to a remote machine's daemon: ranch frames ride as
+/// broadcast payloads on the machine's private channel (web-client
+/// transport, see web/src/lib/relay.ts + daemon relay.rs).
+struct CloudLink {
+    ws: tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>,
+    topic: String,
+    /// decoded ranch-frame bytes waiting for the caller's read
+    inbuf: std::collections::VecDeque<u8>,
+}
+
+impl CloudLink {
+    fn connect(machine_id: &str) -> Result<CloudLink, String> {
+        use tungstenite::Message;
+        let cfg = CloudCfg::load();
+        let Some(session) = try_user_session(&cfg) else {
+            return Err("cloud: not logged in — run `ranch login`".into());
+        };
+        let topic = format!("realtime:machines:{machine_id}");
+        let ws_url = format!(
+            "{}/realtime/v1?apikey={}&vsn=1.0.0",
+            cfg.supabase_url
+                .replacen("https://", "wss://", 1)
+                .replacen("http://", "ws://", 1),
+            cfg.anon_key
+        );
+        let (mut ws, _resp) =
+            tungstenite::connect(&ws_url).map_err(|e| format!("ws connect: {e}"))?;
+        let join = serde_json::json!({
+            "topic": topic,
+            "event": "phx_join",
+            "ref": "join",
+            "payload": {
+                "config": {
+                    "broadcast": {},
+                    "presence": {},
+                    "postgres_changes": [],
+                    "private": true,
+                },
+                "access_token": session.access_token,
+            },
+        });
+        ws.send(Message::Text(join.to_string().into()))
+            .map_err(|e| format!("ws join: {e}"))?;
+        // bounded wait for the join reply (blocking reads)
+        let mut joined = false;
+        for _ in 0..50 {
+            match ws.read() {
+                Ok(Message::Text(t)) => {
+                    let v: serde_json::Value = serde_json::from_str(&t).unwrap_or_default();
+                    let ev = v.get("event").and_then(|e| e.as_str()).unwrap_or("");
+                    if v.get("topic").and_then(|t| t.as_str()) == Some(topic.as_str())
+                        && ev == "phx_reply"
+                    {
+                        let ok = v.pointer("/payload/status").and_then(|s| s.as_str())
+                            == Some("ok");
+                        if ok {
+                            joined = true;
+                            break;
+                        }
+                        return Err(format!(
+                            "realtime join rejected: {}",
+                            v.pointer("/payload/response/reason")
+                                .and_then(|r| r.as_str())
+                                .unwrap_or("unknown")
+                        ));
+                    }
+                    if ev == "phx_heartbeat" {
+                        let reply = serde_json::json!({
+                            "topic": "phoenix", "event": "phx_heartbeat",
+                            "payload": {}, "ref": v.get("ref").cloned().unwrap_or_default(),
+                        });
+                        ws.send(Message::Text(reply.to_string().into())).ok();
+                    }
+                }
+                Ok(Message::Ping(p)) => {
+                    ws.send(Message::Pong(p)).ok();
+                }
+                Ok(_) => {}
+                Err(tungstenite::Error::Io(e))
+                    if e.kind() == std::io::ErrorKind::WouldBlock =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                Err(e) => return Err(format!("ws read: {e}")),
+            }
+        }
+        if !joined {
+            return Err("realtime join timed out".into());
+        }
+        // the TUI loop polls with nonblocking reads
+        match ws.get_ref() {
+            tungstenite::stream::MaybeTlsStream::Plain(t) => {
+                t.set_nonblocking(true).map_err(|e| e.to_string())?;
+            }
+            tungstenite::stream::MaybeTlsStream::Rustls(s) => {
+                s.get_ref().set_nonblocking(true).map_err(|e| e.to_string())?;
+            }
+            _ => return Err("unsupported tls backend".into()),
+        }
+        Ok(CloudLink {
+            ws,
+            topic,
+            inbuf: std::collections::VecDeque::new(),
+        })
+    }
+}
+
+impl std::io::Read for CloudLink {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        use tungstenite::Message;
+        loop {
+            // serve buffered ranch-frame bytes first
+            if !self.inbuf.is_empty() {
+                let n = buf.len().min(self.inbuf.len());
+                for slot in buf.iter_mut().take(n) {
+                    *slot = self.inbuf.pop_front().unwrap_or(0);
+                }
+                return Ok(n);
+            }
+            match self.ws.read() {
+                Ok(Message::Text(t)) => {
+                    let v: serde_json::Value = serde_json::from_str(&t).unwrap_or_default();
+                    let ev = v.get("event").and_then(|e| e.as_str()).unwrap_or("");
+                    match ev {
+                        "broadcast" => {
+                            if v.get("topic").and_then(|t| t.as_str()) != Some(self.topic.as_str())
+                            {
+                                continue;
+                            }
+                            if let Some(frame) = v.pointer("/payload/payload") {
+                                let mut line = serde_json::to_string(frame).unwrap_or_default();
+                                line.push('\n');
+                                self.inbuf.extend(line.as_bytes().iter().copied());
+                            }
+                        }
+                        "phx_heartbeat" => {
+                            let reply = serde_json::json!({
+                                "topic": "phoenix", "event": "phx_heartbeat",
+                                "payload": {},
+                                "ref": v.get("ref").cloned().unwrap_or_default(),
+                            });
+                            self.ws
+                                .send(Message::Text(reply.to_string().into()))
+                                .ok();
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(Message::Ping(p)) => {
+                    self.ws.send(Message::Pong(p)).ok();
+                }
+                Ok(Message::Binary(_)) | Ok(Message::Pong(_)) => {}
+                Ok(Message::Close(_) | Message::Frame(_)) => return Ok(0),
+                Err(tungstenite::Error::ConnectionClosed)
+                | Err(tungstenite::Error::AlreadyClosed) => return Ok(0),
+                Err(tungstenite::Error::Io(e))
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::Interrupted =>
+                {
+                    return Err(e);
+                }
+                Err(e) => {
+                    // hard ws failure: report the link as closed so the
+                    // TUI exits cleanly instead of spinning
+                    let _ = e;
+                    return Ok(0);
+                }
+            }
+        }
+    }
+}
+
+impl std::io::Write for CloudLink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        // send_frame does one write_all of complete newline-terminated
+        // frame lines; each line is one ranch frame
+        for line in buf.split(|&b| b == b'\n') {
+            if line.is_empty() {
+                continue;
+            }
+            let frame: ranch_protocol::Frame =
+                serde_json::from_slice(line).map_err(|e| std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("frame: {e}"),
+                ))?;
+            let msg = serde_json::json!({
+                "topic": self.topic,
+                "event": "broadcast",
+                "ref": Uuid::new_v4().to_string(),
+                "payload": { "event": "frame", "payload": frame },
+            });
+            self.ws
+                .send(tungstenite::Message::Text(msg.to_string().into()))
+                .map_err(|e| std::io::Error::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    format!("ws send: {e}"),
+                ))?;
+        }
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Session refresh that never dies (unlike `ensure_session`): returns
+/// None when not logged in or the refresh token is dead.
+fn try_user_session(cfg: &CloudCfg) -> Option<UserSession> {
+    let mut s = UserSession::load()?;
+    if !s.valid() {
+        let (status, body) = http_json(
+            "POST",
+            &format!(
+                "{}/auth/v1/token?grant_type=refresh_token",
+                cfg.supabase_url
+            ),
+            &[
+                ("apikey", &cfg.anon_key),
+                ("Content-Type", "application/json"),
+            ],
+            Some(serde_json::json!({ "refresh_token": s.refresh_token })),
+        )
+        .ok()?;
+        if status != 200 {
+            return None;
+        }
+        s.access_token = body["access_token"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        s.refresh_token = body["refresh_token"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        s.expires_at = body["expires_at"].as_u64().unwrap_or(0);
+        s.save().ok();
+    }
+    Some(s)
+}
+
+/// One machine's cloud mirror (for the TUI sidebar).
+#[derive(Clone, Default)]
+struct CloudMachine {
+    id: String,
+    name: String,
+    online: bool,
+    /// (session id, name, kind)
+    sessions: Vec<(String, String, String)>,
+}
+
+/// Refresh the cloud machine list in the background (REST mirror).
+fn spawn_cloud_refresh(cloud: std::sync::Arc<std::sync::Mutex<Vec<CloudMachine>>>) {
+    std::thread::spawn(move || {
+        let cfg = CloudCfg::load();
+        let Some(s) = try_user_session(&cfg) else {
+            return;
+        };
+        let auth = [
+            ("apikey", cfg.anon_key.as_str()),
+            ("Authorization", &*format!("Bearer {}", s.access_token)),
+        ];
+        let (st, body) = match http_json(
+            "GET",
+            &format!(
+                "{}/rest/v1/machines_info?select=id,name,last_seen_at&order=name",
+                cfg.supabase_url
+            ),
+            &auth,
+            None,
+        ) {
+            Ok(x) => x,
+            Err(_) => return,
+        };
+        if st != 200 {
+            return;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let mut machines: Vec<CloudMachine> = body
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(|m| {
+                let last = m["last_seen_at"].as_str().unwrap_or("");
+                CloudMachine {
+                    id: m["id"].as_str().unwrap_or("").to_string(),
+                    name: m["name"].as_str().unwrap_or("?").to_string(),
+                    online: last.contains('T')
+                        && epoch_from_iso(last)
+                            .map(|t| now.saturating_sub(t) < 90)
+                            .unwrap_or(false),
+                    sessions: vec![],
+                }
+            })
+            .filter(|m| !m.id.is_empty())
+            .collect();
+        let (st2, body2) = match http_json(
+            "GET",
+            &format!(
+                "{}/rest/v1/sessions?select=id,name,kind,machine_id,machines_info!inner(name)&order=name",
+                cfg.supabase_url
+            ),
+            &auth,
+            None,
+        ) {
+            Ok(x) => x,
+            Err(_) => return,
+        };
+        if st2 == 200 {
+            for row in body2.as_array().cloned().unwrap_or_default() {
+                let mid = row["machine_id"].as_str().unwrap_or("");
+                if let Some(m) = machines.iter_mut().find(|m| m.id == mid) {
+                    m.sessions.push((
+                        row["id"].as_str().unwrap_or("").to_string(),
+                        row["name"].as_str().unwrap_or("?").to_string(),
+                        row["kind"].as_str().unwrap_or("shell").to_string(),
+                    ));
+                }
+            }
+        }
+        if let Ok(mut guard) = cloud.lock() {
+            *guard = machines;
+        }
+    });
+}
+
+/// One row of the machines/sessions sidebar.
+struct SbRow {
+    label: String,
+    header: bool,
+    current: bool,
+    online: bool,
+    target: Option<SbTarget>,
+}
+
+#[derive(Clone)]
+enum SbTarget {
+    Local(String),
+    Cloud {
+        machine_id: String,
+        machine_name: String,
+        session_id: String,
+    },
+}
+
+/// Build the sidebar's row list: this machine's sessions first, then
+/// each cloud machine with its sessions.
+fn sidebar_rows(
+    meta: &[ranch_protocol::SessionMeta],
+    cloud: &[CloudMachine],
+    cur_session: &str,
+    local_label: &str,
+) -> Vec<SbRow> {
+    let mut rows: Vec<SbRow> = Vec::new();
+    rows.push(SbRow {
+        label: format!("● {local_label}"),
+        header: true,
+        current: false,
+        online: true,
+        target: None,
+    });
+    for s in meta {
+        rows.push(SbRow {
+            label: format!("  {} ({}p)", s.name, s.panes.len()),
+            header: false,
+            current: s.id == cur_session,
+            online: true,
+            target: Some(SbTarget::Local(s.id.clone())),
+        });
+    }
+    for m in cloud {
+        rows.push(SbRow {
+            label: format!("{} {}", if m.online { "●" } else { "○" }, m.name),
+            header: true,
+            current: false,
+            online: m.online,
+            target: None,
+        });
+        for (sid, sname, kind) in &m.sessions {
+            rows.push(SbRow {
+                label: format!("  {sname} ({kind})"),
+                header: false,
+                current: sid == cur_session,
+                online: true,
+                target: Some(SbTarget::Cloud {
+                    machine_id: m.id.clone(),
+                    machine_name: m.name.clone(),
+                    session_id: sid.clone(),
+                }),
+            });
+        }
+    }
+    rows
+}
+
+fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> AttachNext {
+    let mut stream = stream;
+    // when attached to a cloud machine, label the sidebar's local
+    // section with that machine's name instead of "this machine"
+    let local_label = cloud_machine.unwrap_or("this machine");
 
     let client_id = format!("cli-{}", Uuid::new_v4().as_simple());
     hello(&mut stream, &client_id);
@@ -1013,6 +1521,9 @@ fn cmd_attach(ref_: &str) {
     // draft for the focused forge-chat pane (M8) — can hold newlines
     // (Ctrl-J / Shift+Enter), Enter sends
     let mut chat_input = String::new();
+    // pending machine/session jump (sidebar enter / prefix-n/p on a
+    // cloud target): set + break out of the loop, returned below
+    let mut cloud_jump: Option<AttachNext> = None;
     // daemon build version (HelloOk) — shown in the status bar so the
     // user always knows which binary the daemon is running
     let mut daemon_version: Option<String> = None;
@@ -1027,13 +1538,20 @@ fn cmd_attach(ref_: &str) {
     let prefix_mode = std::cell::Cell::new(false);
     let session_list: std::rc::Rc<std::cell::RefCell<Vec<String>>> =
         std::rc::Rc::new(std::cell::RefCell::new(vec![]));
-    // prefix-s toggles the docked-left session sidebar (modal for keys:
-    // up/down select, enter attaches, esc closes). While open the
-    // terminal area shrinks by SIDEBAR_W columns and the session is
-    // resized to fit.
+    // prefix-s toggles the docked-left machines/sessions sidebar
+    // (PERMANENT by default, collapsible; focused with up/down/enter —
+    // esc/q unfocuses but keeps it visible). While focused the sidebar
+    // captures keys; the terminal area shrinks by SIDEBAR_W whenever
+    // visible.
     const SIDEBAR_W: u16 = 26;
+    let sidebar_on = std::cell::Cell::new(true);
     let picker = std::cell::Cell::new(false);
     let picker_sel = std::cell::Cell::new(0usize);
+    // cloud machines (REST mirror) — refreshed in a background thread
+    // at attach + each time the sidebar is focused
+    let cloud: std::sync::Arc<std::sync::Mutex<Vec<CloudMachine>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    spawn_cloud_refresh(cloud.clone());
     // :resume — forge-session picker (modal; j/k/enter/esc). Items land
     // asynchronously via ForgeListOk (matched on req_id).
     let resume_open = std::cell::Cell::new(false);
@@ -1273,7 +1791,7 @@ fn cmd_attach(ref_: &str) {
                                 got_snapshot.set(true);
                                 // tell the daemon our real terminal size once
                                 if !sent_resize.get() && !session.is_empty() {
-                                    let sb = if picker.get() { SIDEBAR_W } else { 0 };
+                                    let sb = if sidebar_on.get() { SIDEBAR_W } else { 0 };
                                     let rf = Frame::Resize {
                                         id: Uuid::new_v4().to_string(),
                                         client: "attach".into(),
@@ -1641,8 +2159,10 @@ fn cmd_attach(ref_: &str) {
         // render
         let screen_ref = &screen;
         let prefix_now = prefix_mode.get();
+        let sidebar_on_now = sidebar_on.get();
         let picker_now = picker.get();
         let picker_sel_now = picker_sel.get();
+        let cloud_lock = cloud.clone();
         let prompt_now = prompt.get();
         let meta_ref = &sessions_meta;
         let panes_n = panes.len();
@@ -1698,7 +2218,7 @@ fn cmd_attach(ref_: &str) {
                         },
                     }
                 }
-                let x0 = if picker_now {
+                let x0 = if sidebar_on_now {
                     SIDEBAR_W.min(term_area.width)
                 } else {
                     0
@@ -2090,43 +2610,51 @@ fn cmd_attach(ref_: &str) {
                 );
             }
 
-            // docked session sidebar (prefix-s): sessions with their pane
-            // trees; the selected session highlights, enter attaches
-            if picker_now {
+            // docked machines/sessions sidebar (PERMANENT, collapsible
+            // via prefix-s): this machine's sessions first, then cloud
+            // machines with theirs; selected row highlights, enter
+            // attaches (local in-place, cloud via the realtime link)
+            if sidebar_on_now {
                 let sbw = SIDEBAR_W.min(area.width);
+                let cloud_ref = cloud_lock
+                    .lock()
+                    .map(|g| g.clone())
+                    .unwrap_or_default();
+                let rows = sidebar_rows(meta_ref, &cloud_ref, sess_id_ref, local_label);
                 let mut items: Vec<Line> = Vec::new();
-                for (i, s2) in meta_ref.iter().enumerate() {
-                    let cur = s2.id == *sess_id_ref;
-                    let sel = i == picker_sel_now;
+                // scroll window so the selected row stays visible
+                let vis = (term_area.height as usize).saturating_sub(2);
+                let sel = picker_sel_now.min(rows.len().saturating_sub(1));
+                let off = if vis == 0 {
+                    0
+                } else if sel >= vis {
+                    sel + 1 - vis
+                } else {
+                    0
+                };
+                for (i, row) in rows.iter().enumerate().skip(off).take(vis) {
+                    let sel = i == sel;
                     let mut style = Style::default();
                     if sel {
                         style = style.add_modifier(Modifier::REVERSED);
-                    } else if cur {
+                    } else if row.current {
                         style = style.add_modifier(Modifier::BOLD);
+                    } else if row.header && !row.online {
+                        style = style.add_modifier(Modifier::DIM);
                     }
-                    let marker = if cur { "*" } else { " " };
+                    let marker = if row.current { "*" } else { " " };
                     items.push(Line::from(Span::styled(
-                        format!("{marker} {} ({}p)", s2.name, s2.panes.len()),
+                        format!("{marker}{}", truncate_label(&row.label, sbw as usize - 2)),
                         style,
                     )));
-                    // pane tree under the current session
-                    if cur {
-                        for (pi, p2) in s2.panes.iter().enumerate() {
-                            let active = *p2 == s2.active_pane;
-                            let st = if active {
-                                Style::default().fg(ratatui::style::Color::Green)
-                            } else {
-                                Style::default().add_modifier(Modifier::DIM)
-                            };
-                            items.push(Line::from(Span::styled(
-                                format!("  {} pane {}", if active { ">" } else { "·" }, pi + 1),
-                                st,
-                            )));
-                        }
-                    }
                 }
+                let title = if picker_now {
+                    " machines · enter attach · esc "
+                } else {
+                    " machines · Ctrl-B s focus "
+                };
                 let block = ratatui::widgets::Block::bordered()
-                    .title("sessions")
+                    .title(title)
                     .border_style(Style::default().fg(ratatui::style::Color::Green));
                 f.render_widget(block, Rect::new(0, 0, sbw, term_area.height));
                 f.render_widget(
@@ -2422,7 +2950,11 @@ fn cmd_attach(ref_: &str) {
             if help_open.get() {
                 const HELP: &[&str] = &[
                     "prefix keys (Ctrl-B)",
-                    "  c/n/p/0-9  new · next · prev · select window",
+                    "  n / p      next / prev SESSION (sidebar list)",
+                    "  N / P      next / prev window",
+                    "  s          collapse/restore sidebar (machines)",
+                    "  c          new window",
+                    "  0-9        select window",
                     "  % / \"     split right / below",
                     "  o/l/arrows focus next / prev pane",
                     "  Ctrl-arrows resize split",
@@ -2433,7 +2965,6 @@ fn cmd_attach(ref_: &str) {
                     "  a          agent split (forge)",
                     "  A          pi split (local agent)",
                     "  E          open file in $EDITOR (from :files)",
-                    "  s          session sidebar",
                     "  d          detach",
                     "commands (type : to enter)",
                     "  :files [dir]   file browser (enter view/edit)",
@@ -2443,12 +2974,17 @@ fn cmd_attach(ref_: &str) {
                     "  :pi [dir]      pi split (dir = new session there)",
                     "  :model         switch the agent's model",
                     "  :compact       compact the agent's context now",
+                    "  (in chat, /compact works too)",
                     "  :rename <name> rename this session",
                     "  :kill-pane     kill the focused pane",
                     "  :kill          kill this session",
                     "  :upgrade       hot-upgrade the daemon",
                     "  :detach        detach (also Ctrl-B d)",
                     "  :help          this reference",
+                    "sidebar (machines + sessions)",
+                    "  always visible; Ctrl-B s collapses it",
+                    "  focused: up/down select · enter attach",
+                    "  cloud machines attach over realtime",
                 ];
                 let h = HELP.len() as u16;
                 let mh = (h + 2).min(term_area.height);
@@ -2521,7 +3057,7 @@ fn cmd_attach(ref_: &str) {
             if let Ok(event) = read_event() {
                 match event {
                     CEvent::Resize(c, r) => {
-                        let sb = if picker.get() { SIDEBAR_W } else { 0 };
+                        let sb = if sidebar_on.get() { SIDEBAR_W } else { 0 };
                         let f = Frame::Resize {
                             id: Uuid::new_v4().to_string(),
                             client: "attach".into(),
@@ -2993,19 +3529,19 @@ fn cmd_attach(ref_: &str) {
                             }
                             continue;
                         }
-                        // sidebar modal: navigation + attach while open
+                        // sidebar (machines/sessions): navigation +
+                        // attach while focused. Esc/q unfocuses but
+                        // KEEPS the sidebar visible (prefix-s collapses).
                         if picker.get() {
+                            let cloud_ref = cloud
+                                .lock()
+                                .map(|g| g.clone())
+                                .unwrap_or_default();
+                            let rows = sidebar_rows(&sessions_meta, &cloud_ref, &session_id, local_label);
+                            let n_targets = rows.len();
                             match key.code {
                                 KeyCode::Char('q') | KeyCode::Esc => {
                                     picker.set(false);
-                                    let rf = Frame::Resize {
-                                        id: Uuid::new_v4().to_string(),
-                                        client: "attach".into(),
-                                        session: session_id.clone(),
-                                        cols: screen.cols,
-                                        rows: screen.rows,
-                                    };
-                                    send_frame(&mut stream, &rf).ok();
                                 }
                                 KeyCode::Up | KeyCode::Char('k') => {
                                     let sel = picker_sel.get();
@@ -3015,32 +3551,56 @@ fn cmd_attach(ref_: &str) {
                                 }
                                 KeyCode::Down | KeyCode::Char('j') => {
                                     let sel = picker_sel.get();
-                                    if sel + 1 < sessions_meta.len() {
+                                    if sel + 1 < n_targets {
                                         picker_sel.set(sel + 1);
                                     }
                                 }
                                 KeyCode::Enter => {
-                                    if let Some(target) =
-                                        sessions_meta.get(picker_sel.get()).map(|m| m.id.clone())
-                                    {
-                                        picker.set(false);
-                                        let rf = Frame::Resize {
-                                            id: Uuid::new_v4().to_string(),
-                                            client: "attach".into(),
-                                            session: session_id.clone(),
-                                            cols: screen.cols,
-                                            rows: screen.rows,
-                                        };
-                                        send_frame(&mut stream, &rf).ok();
-                                        let af = Frame::Attach {
-                                            id: Uuid::new_v4().to_string(),
-                                            client: "attach".into(),
-                                            session: target,
-                                            pane: None,
-                                        };
-                                        send_frame(&mut stream, &af).ok();
-                                        screen.reset_blank();
-                                        sent_resize.set(false);
+                                    let sel = picker_sel.get().min(n_targets.saturating_sub(1));
+                                    if let Some(row) = rows.get(sel) {
+                                        match &row.target {
+                                            Some(SbTarget::Local(target)) => {
+                                                picker.set(false);
+                                                let rf = Frame::Resize {
+                                                    id: Uuid::new_v4().to_string(),
+                                                    client: "attach".into(),
+                                                    session: session_id.clone(),
+                                                    cols: screen.cols,
+                                                    rows: screen.rows,
+                                                };
+                                                send_frame(&mut stream, &rf).ok();
+                                                let af = Frame::Attach {
+                                                    id: Uuid::new_v4().to_string(),
+                                                    client: "attach".into(),
+                                                    session: target.clone(),
+                                                    pane: None,
+                                                };
+                                                send_frame(&mut stream, &af).ok();
+                                                screen.reset_blank();
+                                                sent_resize.set(false);
+                                            }
+                                            Some(SbTarget::Cloud {
+                                                machine_id,
+                                                machine_name,
+                                                session_id: target,
+                                            }) => {
+                                                // jump to a remote machine:
+                                                // tear this attach down and
+                                                // reconnect over realtime
+                                                cloud_jump = Some(AttachNext::Cloud {
+                                                    machine_id: machine_id.clone(),
+                                                    machine_name: machine_name.clone(),
+                                                    session: target.clone(),
+                                                });
+                                                let df = Frame::Detach {
+                                                    id: Uuid::new_v4().to_string(),
+                                                    client: "attach".into(),
+                                                };
+                                                send_frame(&mut stream, &df).ok();
+                                                break;
+                                            }
+                                            None => {}
+                                        }
                                     }
                                 }
                                 _ => {}
@@ -3084,18 +3644,96 @@ fn cmd_attach(ref_: &str) {
                                     send_frame(&mut stream, &f).ok();
                                     continue;
                                 }
-                                // n / p → next / previous window (tmux semantics;
-                                // session switching lives in the sidebar)
-                                KeyCode::Char('n') | KeyCode::Char('p') => {
+                                // n / p → next / previous session across the
+                                // sidebar list (this machine first, then
+                                // cloud machines). N / P → next / previous
+                                // window (tmux shift binding).
+                                KeyCode::Char('N') | KeyCode::Char('P') => {
                                     let f = Frame::WindowNext {
                                         session: session_id.clone(),
-                                        delta: if key.code == KeyCode::Char('n') {
+                                        delta: if key.code == KeyCode::Char('N') {
                                             1
                                         } else {
                                             -1
                                         },
                                     };
                                     send_frame(&mut stream, &f).ok();
+                                    continue;
+                                }
+                                KeyCode::Char('n') | KeyCode::Char('p') => {
+                                    let cloud_ref = cloud
+                                        .lock()
+                                        .map(|g| g.clone())
+                                        .unwrap_or_default();
+                                    let rows = sidebar_rows(
+                                        &sessions_meta,
+                                        &cloud_ref,
+                                        &session_id,
+                                        local_label,
+                                    );
+                                    let cur = rows
+                                        .iter()
+                                        .position(|r| r.current);
+                                    let n = rows.len();
+                                    if n == 0 {
+                                        continue;
+                                    }
+                                    // step ±1 from the current row, wrap
+                                    // around, land on the next row with a
+                                    // jumpable target
+                                    let dir: i64 = if key.code == KeyCode::Char('n') {
+                                        1
+                                    } else {
+                                        -1
+                                    };
+                                    let start = cur.map(|c| c as i64).unwrap_or(if dir > 0 {
+                                        -1
+                                    } else {
+                                        0
+                                    });
+                                    let mut picked = None;
+                                    for step in 1..=(n as i64) {
+                                        let i = ((start + dir * step).rem_euclid(n as i64))
+                                            as usize;
+                                        if rows[i].target.is_some() && Some(i) != cur {
+                                            picked = Some(i);
+                                            break;
+                                        }
+                                    }
+                                    let Some(i) = picked else {
+                                        continue;
+                                    };
+                                    match rows[i].target.clone() {
+                                        Some(SbTarget::Local(id)) => {
+                                            let af = Frame::Attach {
+                                                id: Uuid::new_v4().to_string(),
+                                                client: "attach".into(),
+                                                session: id,
+                                                pane: None,
+                                            };
+                                            send_frame(&mut stream, &af).ok();
+                                            screen.reset_blank();
+                                            sent_resize.set(false);
+                                        }
+                                        Some(SbTarget::Cloud {
+                                            machine_id,
+                                            machine_name,
+                                            session_id: target,
+                                        }) => {
+                                            cloud_jump = Some(AttachNext::Cloud {
+                                                machine_id,
+                                                machine_name,
+                                                session: target,
+                                            });
+                                            let df = Frame::Detach {
+                                                id: Uuid::new_v4().to_string(),
+                                                client: "attach".into(),
+                                            };
+                                            send_frame(&mut stream, &df).ok();
+                                            break;
+                                        }
+                                        None => {}
+                                    }
                                     continue;
                                 }
                                 // 0-9 → select window by index
@@ -3162,8 +3800,22 @@ fn cmd_attach(ref_: &str) {
                                 }
                                 // s → toggle the docked session sidebar
                                 KeyCode::Char('s') => {
-                                    picker.set(!picker.get());
-                                    let sb = if picker.get() { SIDEBAR_W } else { 0 };
+                                    // collapse → expand+focus → focus again
+                                    // collapses (sidebar is visible by
+                                    // default; esc just unfocuses)
+                                    if picker.get() {
+                                        sidebar_on.set(false);
+                                        picker.set(false);
+                                    } else if sidebar_on.get() {
+                                        picker.set(true);
+                                        spawn_cloud_refresh(cloud.clone());
+                                    } else {
+                                        sidebar_on.set(true);
+                                        picker.set(true);
+                                        spawn_cloud_refresh(cloud.clone());
+                                    }
+                                    picker_sel.set(0);
+                                    let sb = if sidebar_on.get() { SIDEBAR_W } else { 0 };
                                     let rf = Frame::Resize {
                                         id: Uuid::new_v4().to_string(),
                                         client: "attach".into(),
@@ -3172,8 +3824,6 @@ fn cmd_attach(ref_: &str) {
                                         rows: screen.rows,
                                     };
                                     send_frame(&mut stream, &rf).ok();
-                                    picker_sel.set(0);
-                                    refresh_sessions(&mut stream);
                                     continue;
                                 }
                                 // Ctrl+arrows → resize the focused pane's split
@@ -3792,7 +4442,24 @@ fn cmd_attach(ref_: &str) {
                                 }
                                 KeyCode::Enter => {
                                     let text = chat_input.trim().to_string();
-                                    if !text.is_empty() {
+                                    if text == "/compact" {
+                                        // same as the :compact command /
+                                        // web's composer shortcut
+                                        let rid = Uuid::new_v4().to_string();
+                                        *compact_pending.borrow_mut() = Some(rid.clone());
+                                        let f = Frame::ChatCompact {
+                                            id: Uuid::new_v4().to_string(),
+                                            client: "attach".into(),
+                                            session: session_id.clone(),
+                                            pane: active_pane.clone(),
+                                            req_id: rid,
+                                        };
+                                        send_frame(&mut stream, &f).ok();
+                                        err_flash.set(Some((
+                                            std::time::Instant::now(),
+                                            "compacting…".into(),
+                                        )));
+                                    } else if !text.is_empty() {
                                         let f = Frame::ChatSend {
                                             id: Uuid::new_v4().to_string(),
                                             client: "attach".into(),
@@ -3853,7 +4520,11 @@ fn cmd_attach(ref_: &str) {
 
     restore();
     drop(term);
+    if let Some(jump) = cloud_jump {
+        return jump;
+    }
     println!("detached");
+    AttachNext::Detach
 }
 
 // ---------- main ----------
@@ -4021,6 +4692,16 @@ fn files_view_pending_read(req_id: &str, files_pending: &std::rc::Rc<std::cell::
 /// POSIX single-quote shell quoting (file names into shell commands).
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Clip a sidebar label to the given cell width (char-count based;
+/// enough for the ASCII-ish labels used here).
+fn truncate_label(s: &str, w: usize) -> String {
+    if s.chars().count() <= w {
+        s.to_string()
+    } else {
+        s.chars().take(w.saturating_sub(1)).collect::<String>() + "…"
+    }
 }
 
 fn b64url_decode(s: &str) -> Option<Vec<u8>> {
@@ -4573,7 +5254,7 @@ pub fn main_client() {
         if libc_isatty() {
             loop {
                 match cmd_dashboard() {
-                    Some(ref_) => cmd_attach(&ref_), // detach returns here
+                    Some(ref_) => attach_loop(Target::Local(ref_)), // detach returns here
                     None => break,
                 }
             }
@@ -4635,7 +5316,7 @@ pub fn main_client() {
             println!("ranch {}", crate::daemon::build_version());
         }
         "attach" => match args.get(1) {
-            Some(r) => cmd_attach(r),
+            Some(r) => attach_loop(Target::Local(r.clone())),
             None => die("usage: ranch attach <session>"),
         },
         "kill" => match args.get(1) {
