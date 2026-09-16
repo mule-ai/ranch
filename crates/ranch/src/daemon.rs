@@ -2373,19 +2373,14 @@ impl Daemon {
                                     // switching into the old session.  Retry a
                                     // few times because pi's init can be slow
                                     // on a loaded host.
+                                    let mut switched = false;
                                     for attempt in 0..5u32 {
                                         std::thread::sleep(std::time::Duration::from_millis(400));
                                         if let Some(agent) = self.pi_agents.get(&pid) {
                                             match agent.switch_session(sf) {
                                                 Ok(()) => {
                                                     eprintln!("ranchd: pi switch_session ok (attempt {}): {sf}", attempt + 1);
-                                                    // Replay conversation history so the
-                                                    // chat pane isn't empty after restart.
-                                                    if let Err(e) = agent.request_messages() {
-                                                        eprintln!("ranchd: pi request_messages failed: {e}");
-                                                    } else {
-                                                        eprintln!("ranchd: pi request_messages sent for {sf}");
-                                                    }
+                                                    switched = true;
                                                     break;
                                                 }
                                                 Err(e) if attempt < 4 => {
@@ -2394,6 +2389,27 @@ impl Daemon {
                                                 Err(e) => {
                                                     eprintln!("ranchd: pi switch_session failed after retries: {e}");
                                                 }
+                                            }
+                                        }
+                                    }
+                                    // Read the session file directly from disk to
+                                    // populate chat history.  switch_session only
+                                    // tells pi where to write; get_messages returns
+                                    // empty because pi hasn't loaded history into
+                                    // memory yet.
+                                    if switched {
+                                        match pilocal::LocalPi::read_session_messages(sf) {
+                                            Ok(msgs) if !msgs.is_empty() => {
+                                                eprintln!("ranchd: pi history: loaded {} rows from {sf}", msgs.len());
+                                                if let Some(cp) = self.sessions.get_mut(&sid).and_then(|s| s.chats.get_mut(&pid)) {
+                                                    cp.chat = msgs;
+                                                }
+                                            }
+                                            Ok(_) => {
+                                                eprintln!("ranchd: pi history: session file {sf} had no messages");
+                                            }
+                                            Err(e) => {
+                                                eprintln!("ranchd: pi history: failed to read {sf}: {e}");
                                             }
                                         }
                                     }

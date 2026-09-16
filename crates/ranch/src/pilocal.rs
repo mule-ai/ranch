@@ -431,14 +431,193 @@ impl LocalPi {
         }))
     }
 
-    /// Ask pi to replay its full conversation history so the daemon's
-    /// chat vec is populated on restore (daemon restart path).  The
-    /// reader thread handles the `get_messages` response and emits
-    /// Chat frames into the pipe, which the main loop appends to the
-    /// pane's chat buffer.
-    pub fn request_messages(&self) -> Result<(), String> {
-        self.send_rpc(&serde_json::json!({"type": "get_messages"}))
+
+/// Read a pi session JSONL file from disk and parse it into chat messages.
+///
+/// `switch_session` tells pi to use a session file for future writes but
+/// does NOT load historical messages into its in-memory state, so
+/// `get_messages` returns empty on a freshly-spawned process.  This
+/// function bypasses the RPC entirely and reads the file directly.
+pub fn read_session_messages(path: &str) -> Result<Vec<ChatMsg>, String> {
+    use std::io::BufRead;
+
+    let file = std::fs::File::open(path)
+        .map_err(|e| format!("cannot open session file {path}: {e}"))?;
+    let reader = std::io::BufReader::new(file);
+
+    let mut msgs: Vec<ChatMsg> = Vec::new();
+    // toolCall id -> row index, so a toolResult row attaches its output
+    // to the matching tool row instead of piling on at the end
+    let mut tool_rows: std::collections::BTreeMap<String, usize> =
+        std::collections::BTreeMap::new();
+
+    for line in reader.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let v: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        // Only process lines that are conversation messages
+        if v.get("type").and_then(|t| t.as_str()) != Some("message") {
+            continue;
+        }
+
+        let msg = match v.get("message") {
+            Some(m) => m,
+            None => continue,
+        };
+
+        let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+        let c = msg.get("content");
+        let ts = msg
+            .get("timestamp")
+            .or_else(|| v.get("timestamp"))
+            .and_then(|t| t.as_str())
+            .map(|s| {
+                // "2026-09-02T13:29:33.190Z" -> "2026-09-02T13:29:33Z"
+                if s.len() >= 19 {
+                    format!("{}Z", &s[..19])
+                } else {
+                    s.to_string()
+                }
+            });
+
+        let push = |msgs: &mut Vec<ChatMsg>,
+                    role: &str,
+                    text: String,
+                    tool_name: Option<String>,
+                    tool_output: Option<String>,
+                    created_at: Option<String>,
+                    next_seq: &AtomicU64| {
+            msgs.push(ChatMsg {
+                seq: next_seq.fetch_add(1, Ordering::Relaxed) as i64,
+                role: role.to_string(),
+                text,
+                tool_name,
+                tool_call_id: None,
+                tool_output,
+                duration_ms: None,
+                created_at,
+                attachments: None,
+            });
+        };
+
+        match role {
+            "user" => {
+                let t = match c {
+                    Some(serde_json::Value::String(s)) => s.clone(),
+                    Some(serde_json::Value::Array(arr)) => arr
+                        .iter()
+                        .filter(|x| {
+                            x.get("type").and_then(|t| t.as_str())
+                                == Some("text")
+                        })
+                        .filter_map(|x| x.get("text").and_then(|t| t.as_str()))
+                        .collect::<Vec<_>>()
+                        .join(""),
+                    _ => String::new(),
+                };
+                let t = t.trim().to_string();
+                if !t.is_empty() {
+                    push(
+                        &mut msgs, "user", t, None, None, ts.clone(), &SEQ,
+                    );
+                }
+            }
+            "assistant" => {
+                if let Some(serde_json::Value::Array(arr)) = c {
+                    for blk in arr {
+                        match blk.get("type").and_then(|t| t.as_str()) {
+                            Some("text") => {
+                                if let Some(text) =
+                                    blk.get("text").and_then(|t| t.as_str())
+                                {
+                                    let t = text.trim();
+                                    if !t.is_empty() {
+                                        push(
+                                            &mut msgs, "assistant",
+                                            t.to_string(), None, None,
+                                            ts.clone(), &SEQ,
+                                        );
+                                    }
+                                }
+                            }
+                            Some("toolCall") => {
+                                let name = blk
+                                    .get("name")
+                                    .and_then(|n| n.as_str())
+                                    .unwrap_or("tool")
+                                    .to_string();
+                                let call_id = blk
+                                    .get("id")
+                                    .and_then(|i| i.as_str())
+                                    .map(String::from);
+                                let idx = msgs.len();
+                                push(
+                                    &mut msgs, "tool", String::new(),
+                                    Some(name), None, ts.clone(), &SEQ,
+                                );
+                                if let Some(id) = call_id {
+                                    tool_rows.insert(id, idx);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            "toolResult" => {
+                let out = match c {
+                    Some(serde_json::Value::Array(arr)) => arr
+                        .iter()
+                        .filter(|x| {
+                            x.get("type").and_then(|t| t.as_str())
+                                == Some("text")
+                        })
+                        .filter_map(|x| x.get("text").and_then(|t| t.as_str()))
+                        .collect::<Vec<_>>()
+                        .join(""),
+                    _ => String::new(),
+                };
+                let call_id = msg
+                    .get("toolCallId")
+                    .or_else(|| msg.get("tool_call_id"))
+                    .and_then(|i| i.as_str())
+                    .map(String::from);
+                let idx = call_id.as_ref().and_then(|cid| {
+                    tool_rows.get(cid).copied()
+                });
+                if let Some(idx) = idx {
+                    if msgs[idx].tool_output.is_none() {
+                        msgs[idx].tool_output = Some(out);
+                    }
+                } else {
+                    let name = msg
+                        .get("toolName")
+                        .or_else(|| msg.get("tool_name"))
+                        .and_then(|n| n.as_str())
+                        .unwrap_or("tool")
+                        .to_string();
+                    push(
+                        &mut msgs, "tool", String::new(),
+                        Some(name), Some(out), ts.clone(), &SEQ,
+                    );
+                }
+            }
+            _ => {}
+        }
     }
+
+    Ok(msgs)
+}
 
     /// Send a user prompt: write the RPC prompt to pi's stdin first,
     /// then record the user row + flip the working indicator (so a
