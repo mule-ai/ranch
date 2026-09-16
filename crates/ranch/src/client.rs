@@ -431,7 +431,7 @@ fn cmd_upgrade() {
     let mut stream = connect();
     hello(&mut stream, "cli");
     let f = Frame::Upgrade {};
-    send_frame(&mut stream, &f);
+    send_frame(&mut stream, &f).ok();
     use std::io::Read as _;
     let mut decoder = Decoder::new();
     let mut buf = [0u8; 65536];
@@ -2220,7 +2220,7 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                             Frame::FileWriteOk {
                                 id: _,
                                 req_id,
-                                path: ref path,
+                                ref path,
                                 mtime,
                             } => {
                                 let matches_req =
@@ -2700,7 +2700,6 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                             " ".to_string(),
                             Style::default().add_modifier(Modifier::REVERSED),
                         ));
-                        cursor_done = true;
                     }
                     // pad to full width so the pane background is uniform
                     while col < r.width as usize {

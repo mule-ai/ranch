@@ -97,6 +97,7 @@ pub enum ForgeJob {
     },
     /// Fetch the session's context-window usage (GET /sessions/:id/context)
     /// and broadcast it as `meta { kind: "context" }`.
+    #[allow(dead_code)]
     Context { pane: Uuid, forge_sid: Uuid },
     /// Manually compact the session's pi context (POST /sessions/:id/compact).
     /// Success → a `meta { kind: "context" }` with the new usage (plus a

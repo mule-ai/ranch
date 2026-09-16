@@ -186,6 +186,7 @@ pub fn cron_next(expr: &str, from: i64) -> Option<i64> {
 
 /// Previous fire time (unix secs) at or before `from` — used by
 /// catch_up-on-reconnect.
+#[allow(dead_code)]
 pub fn cron_prev(expr: &str, at: i64) -> Option<i64> {
     let at_min = at.div_euclid(60) * 60;
     for i in 0..=(366 * 24 * 60) {
@@ -261,6 +262,7 @@ impl Scheduler {
 
     /// Catch-up on boot: fire crons whose due time passed while offline
     /// (only `catch_up: true` triggers; once each).
+    #[allow(dead_code)]
     pub fn catch_up(&mut self) {
         let now = Self::now();
         let ids: Vec<Uuid> = self.triggers.keys().copied().collect();

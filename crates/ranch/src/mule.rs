@@ -18,7 +18,7 @@
 //! as `Authorization: Bearer` for when upstream grows auth.
 
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::sync::mpsc;
 use uuid::Uuid;
 
@@ -80,6 +80,7 @@ pub enum MuleJob {
         pane: Uuid,
     },
     /// Stop teeing a pane's job stream (pane killed).
+    #[allow(dead_code)]
     Unwatch { pane: Uuid },
 }
 

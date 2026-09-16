@@ -20,7 +20,7 @@
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
-use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -92,6 +92,7 @@ pub struct LocalPi {
     /// own read-only RPCs (`get_session_stats` after each turn).
     stdin: Arc<Mutex<Option<Box<dyn std::io::Write + Send>>>>,
     /// Read end of the rpc child's stdout (same).
+    #[allow(dead_code)]
     stdout: Mutex<Option<Box<dyn std::io::Read + Send>>>,
     /// Raw fds backing stdin/stdout — kept separately so the hot-upgrade
     /// path can hand them to the next generation (trait objects can't
@@ -382,12 +383,14 @@ impl LocalPi {
     }
 
     /// Current model display name (None when unknown).
+    #[allow(dead_code)]
     pub fn model_display(&self) -> Option<String> {
         self.model.lock().ok()?.clone().map(|m| m.name)
     }
 
     /// Ask pi for its configured model list; the reader thread emits a
     /// `ModelListOk` (echoing `req_id`) when the response arrives.
+    #[allow(dead_code)]
     pub fn request_model_list(&self, req_id: &str) -> Result<(), String> {
         *self.model_list_req.lock().unwrap() = Some(req_id.to_string());
         self.send_rpc(&serde_json::json!({"type": "get_available_models"}))
@@ -415,6 +418,7 @@ impl LocalPi {
 
     /// Ask pi for its context-window usage; the reader thread emits
     /// `meta kind="context"` when the response arrives.
+    #[allow(dead_code)]
     pub fn request_stats(&self) -> Result<(), String> {
         self.send_rpc(&serde_json::json!({"type": "get_session_stats"}))
     }

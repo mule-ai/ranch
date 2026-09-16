@@ -840,18 +840,18 @@ fn spawn_pane(session: &mut Session, pane_kind: &str, cwd: Option<&str>) -> Resu
                 let dir = cwd.map(std::path::PathBuf::from).unwrap_or_else(home_dir);
                 let d_c =
                     std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()).unwrap_or_default();
-                if unsafe { libc::chdir(d_c.as_ptr()) } != 0 {
+                if libc::chdir(d_c.as_ptr()) != 0 {
                     eprintln!("ranchd: chdir {:?} failed", dir);
                 }
                 let arg = b"exec pi\0";
                 let argv: [*const u8; 4] =
                     [shell_p, b"-lc\0".as_ptr(), arg.as_ptr(), std::ptr::null()];
-                if unsafe { execvp(shell_p, argv.as_ptr()) } != 0 {
+                if execvp(shell_p, argv.as_ptr()) != 0 {
                     eprintln!("ranchd: execvp {shell:?} failed: {:?}", std::io::Error::last_os_error());
                 }
             } else {
                 let argv: [*const u8; 2] = [shell_p, std::ptr::null()];
-                if unsafe { execvp(shell_p, argv.as_ptr()) } != 0 {
+                if execvp(shell_p, argv.as_ptr()) != 0 {
                     eprintln!("ranchd: execvp {shell:?} failed: {:?}", std::io::Error::last_os_error());
                 }
             }
@@ -1063,7 +1063,7 @@ impl Daemon {
     }
 
     /// Resolve which session/pane a chat pane id lives in.
-    fn find_chat(&self, pid: Uuid) -> Option<(Uuid)> {
+    fn find_chat(&self, pid: Uuid) -> Option<Uuid> {
         self.sessions
             .iter()
             .find_map(|(sid, s)| s.chats.contains_key(&pid).then_some(*sid))
@@ -1644,7 +1644,7 @@ impl Daemon {
         // extension re-sends the prompt as AgentSend after the ack. This
         // keeps the approval payload small (no prompt in every client's
         // face).
-        let pid = Uuid::new_v4();
+        let _pid = Uuid::new_v4();
         let kind = "pi".to_string(); // approved spawns use the local runtime
         // NOTE: approval re-dispatch: create in the caller's session
         let caller_session = self
@@ -1886,7 +1886,7 @@ impl Daemon {
         let manifest_path = self.state_path.with_extension("manifest.json");
 
         let mut fds = serde_json::json!({ "panes": {}, "pi": [] });
-        for (sid, s) in &self.sessions {
+        for (_sid, s) in &self.sessions {
             for (pid, p) in &s.panes {
                 if p.dead {
                     continue;
@@ -3621,7 +3621,7 @@ impl Daemon {
             }
             Frame::WebhookPut {
                 req_id,
-                webhook_id,
+                webhook_id: _,
                 name,
                 sources,
             } => {
@@ -5063,7 +5063,7 @@ pub fn run_daemon_with_args(args: Vec<String>) {
         let listen_fd = args
             .iter()
             .find_map(|a| a.strip_prefix("--listen-fd=").map(|v| v.to_string()));
-        let mut daemon = match Daemon::inherit(&args[2], listen_fd) {
+        let daemon = match Daemon::inherit(&args[2], listen_fd) {
             Ok(d) => d,
             Err(e) => {
                 eprintln!("ranchd: inherit failed: {e} — falling back to cold start");
@@ -5084,7 +5084,7 @@ pub fn run_daemon_with_args(args: Vec<String>) {
         std::process::exit(2);
     }
     let control_rx = spawn_control_api();
-    let mut daemon = match Daemon::new() {
+    let daemon = match Daemon::new() {
         Ok(d) => d,
         Err(e) => {
             eprintln!("ranchd: {e}");

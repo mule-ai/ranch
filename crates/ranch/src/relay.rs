@@ -120,7 +120,7 @@ pub fn machine_jwt_blocking(cfg: &RelayConfig) -> String {
 fn rest_common<B>(
     cfg: &RelayConfig,
     jwt: &str,
-    url: &str,
+    _url: &str,
     base: ureq::RequestBuilder<B>,
 ) -> ureq::RequestBuilder<B> {
     let r = base.header("apikey", &cfg.anon_key);
