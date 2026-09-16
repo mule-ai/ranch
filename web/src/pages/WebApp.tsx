@@ -447,9 +447,10 @@ function CreateRow({ relay, pendingProfile, onProfileLaunched }: { relay: Relay 
   const [kind, setKind] = useState<(typeof kinds)[number]>("shell");
   const [piDir, setPiDir] = useState<string | null>(null);
   const [dirBrowse, setDirBrowse] = useState<{ path: string; parent: string | null; dirs: string[] } | null>(null);
-  const [resumeList, setResumeList] = useState<{ id: string; title: string; updated: string; ended?: string | null }[] | null>(null);
+  const [resumeList, setResumeList] = useState<{ kind: "forge" | "pi"; id: string; title: string; session_file?: string; updated?: string; ended?: string | null; active?: boolean }[] | null>(null);
   const dirReqRef = useRef<string | null>(null);
   const resumeReqRef = useRef<string | null>(null);
+  const piResumeReqRef = useRef<string | null>(null);
 
   // frame listener for DirListOk / ForgeListOk
   useEffect(() => {
@@ -460,7 +461,10 @@ function CreateRow({ relay, pendingProfile, onProfileLaunched }: { relay: Relay 
         setDirBrowse({ path: f.path, parent: f.parent ?? null, dirs: f.dirs });
       } else if (f.t === "ForgeListOk" && f.req_id === resumeReqRef.current) {
         resumeReqRef.current = null;
-        setResumeList(f.sessions);
+        setResumeList((prev) => [...(prev ?? []), ...f.sessions.map((s) => ({ kind: "forge" as const, ...s }))]);
+      } else if (f.t === "PiListOk" && f.req_id === piResumeReqRef.current) {
+        piResumeReqRef.current = null;
+        setResumeList((prev) => [...(prev ?? []), ...f.sessions.map((s) => ({ kind: "pi" as const, id: s.id, title: s.title, session_file: s.session_file, active: s.active }))]);
       }
     });
     return un;
@@ -505,8 +509,12 @@ function CreateRow({ relay, pendingProfile, onProfileLaunched }: { relay: Relay 
             onClick={() => {
               if (!relay) return;
               const rid = nextId();
+              const prid = nextId();
+              setResumeList([]);
               resumeReqRef.current = rid;
+              piResumeReqRef.current = prid;
               relay.send({ t: "ForgeList", id: nextId(), client: "web", req_id: rid } as Frame);
+              relay.send({ t: "PiList", id: nextId(), client: "web", req_id: prid } as Frame);
             }}
           >
             resume…
@@ -543,22 +551,32 @@ function CreateRow({ relay, pendingProfile, onProfileLaunched }: { relay: Relay 
 
       {resumeList !== null && (
         <div className="sheet">
-          <b>forge sessions</b>
+          <b>sessions to resume</b>
           {resumeList.map((item) => (
             <button
               key={item.id}
               className="machrow"
               onClick={() => {
                 setResumeList(null);
-                relay?.send({
-                  t: "SessionsCreate", req_id: nextId(), kind: "forge",
-                  forge_session: item.id,
-                } as Frame);
+                if (item.kind === "forge") {
+                  relay?.send({
+                    t: "SessionsCreate", req_id: nextId(), kind: "forge",
+                    forge_session: item.id,
+                  } as Frame);
+                } else {
+                  relay?.send({
+                    t: "SessionsCreate", req_id: nextId(), kind: "pi",
+                    pi_session_file: item.session_file,
+                  } as Frame);
+                }
               }}
             >
-              <span className="machname">{item.title || item.id.slice(0, 8)}</span>
+              <span className="machname">[{item.kind}] {item.title || item.id.slice(0, 8)}</span>
               <span className="dim">
-                {item.ended ? "ended" : "active"} · {item.updated?.slice(0, 16).replace("T", " ") ?? ""}
+                {item.kind === "forge"
+                  ? `${item.ended ? "ended" : "active"} · ${item.updated?.slice(0, 16).replace("T", " ") ?? ""}`
+                  : (item.active ? "running" : "idle")
+                }
               </span>
             </button>
           ))}

@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use libc::{SIGINT, WNOHANG, c_int, pollfd};
-use ranch_protocol::{ChatMsg, Cursor, Decoder, Frame, Layout, PaneSnap, SessionMeta};
+use ranch_protocol::{ChatMsg, Cursor, Decoder, Frame, Layout, PaneSnap, PiSessionInfo, SessionMeta};
 use ranch_vt::Vt;
 use uuid::Uuid;
 
@@ -3176,6 +3176,29 @@ impl Daemon {
                     );
                 }
             }
+            // client -> daemon: list resumable local pi sessions
+            Frame::PiList { req_id, .. } => {
+                let sessions: Vec<PiSessionInfo> = self.pi_agents.iter().map(|(pid, lp)| {
+                    let title = lp.cwd.clone();
+                    let session_file = lp.session_file.lock().ok().and_then(|g| g.clone()).unwrap_or_default();
+                    PiSessionInfo {
+                        id: pid.to_string(),
+                        title,
+                        session_file,
+                        active: true,
+                    }
+                }).collect();
+                if let Some(c) = self.clients.get_mut(&from) {
+                    send_frame(
+                        c,
+                        &Frame::PiListOk {
+                            id: String::new(),
+                            req_id: req_id.clone(),
+                            sessions,
+                        },
+                    );
+                }
+            }
             // ----- agent builder (Phase B): profile CRUD proxy -----
             Frame::ModelCatalog { req_id } => {
                 match &self.forge_tx {
@@ -4163,6 +4186,7 @@ impl Daemon {
                 cwd,
                 profile_id,
                 forge_session,
+                pi_session_file,
             } => {
                 let kind = kind.clone().unwrap_or_else(|| "shell".into());
                 // Local-pi kill switch: `allow_local_pi = "false"` in
@@ -4294,6 +4318,16 @@ impl Daemon {
                                                 );
                                             }
                                             return;
+                                        }
+                                        // Resume an existing pi session file if provided.
+                                        if let Some(sf) = &pi_session_file {
+                                            if let Some(agent) = self.pi_agents.get(&pid) {
+                                                if let Err(e) = agent.switch_session(sf) {
+                                                    eprintln!("ranchd: pi switch_session failed: {e}");
+                                                } else {
+                                                    eprintln!("ranchd: resumed pi session from {sf}");
+                                                }
+                                            }
                                         }
                                     }
                                     None => {

@@ -8,6 +8,13 @@ export type ForgeSessionInfo = {
   ended?: string | null;
 };
 
+export type PiSessionInfo = {
+  id: string;
+  title: string;
+  session_file: string;
+  active: boolean;
+};
+
 export type SessionMeta = {
   id: string;
   name: string;
@@ -193,8 +200,9 @@ export type Frame =
   | { t: "Resize"; id: string; client: string; session: string; cols: number; rows: number }
   | { t: "ScrollbackReq"; id: string; client: string; session: string; pane: string; offset: number; limit: number }
   | { t: "Scrollback"; id: string; client: string; session: string; pane: string; offset: number; lines: string[] }
-  | { t: "SessionsCreate"; req_id: string; name?: string; kind?: "shell" | "forge" | "pi"; cwd?: string; forge_session?: string }
+  | { t: "SessionsCreate"; req_id: string; name?: string; kind?: "shell" | "forge" | "pi"; cwd?: string; forge_session?: string; pi_session_file?: string }
   | { t: "ForgeList"; id: string; client: string; req_id: string }
+  | { t: "PiList"; id: string; client: string; req_id: string }
   | { t: "DirList"; id: string; client: string; req_id: string; path?: string }
   | { t: "DirListOk"; id: string; req_id: string; path: string; parent?: string | null; dirs: string[]; files?: string[] }
   | { t: "FileRead"; id: string; client: string; req_id: string; path: string }
@@ -203,6 +211,7 @@ export type Frame =
   | { t: "FileWriteOk"; id: string; req_id: string; path: string; mtime: number }
   | { t: "FileChanged"; path: string; mtime: number }
   | { t: "ForgeListOk"; id: string; req_id: string; sessions: ForgeSessionInfo[] }
+  | { t: "PiListOk"; id: string; req_id: string; sessions: PiSessionInfo[] }
   | { t: "ChatSend"; id: string; client: string; session: string; pane: string; text: string }
   | { t: "ChatCompact"; id: string; client: string; session: string; pane: string; req_id: string }
   | { t: "Chat"; id: string; session: string; pane: string; msgs: ChatMsg[]; reset?: boolean }

@@ -17,7 +17,7 @@ import { supabase } from "./lib/supabase";
 import { checkUpdate, type UpdateInfo } from "./lib/version";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { Relay } from "./lib/relay";
-import { Frame, ForgeSessionInfo, ProfileSummary, SessionMeta, nextId } from "./lib/frames";
+import { Frame, ForgeSessionInfo, PiSessionInfo, ProfileSummary, SessionMeta, nextId } from "./lib/frames";
 import { LoginScreen, EmailFallback } from "./screens/Login";
 import { MachinesScreen } from "./screens/Machines";
 import { TerminalScreen } from "./screens/Terminal";
@@ -54,7 +54,7 @@ export default function App() {
   // session kind for the create row: shell or forge (agent running pi)
   const [newKind, setNewKind] = useState<"shell" | "forge" | "pi">("shell");
   // forge session picker (resume); null = closed
-  const [resumeList, setResumeList] = useState<ForgeSessionInfo[] | null>(null);
+  const [resumeList, setResumeList] = useState<{ kind: "forge" | "pi"; id: string; title: string; session_file?: string; updated?: string; ended?: string | null; active?: boolean }[] | null>(null);
   // local-pi working dir (null = daemon default $HOME)
   const [piDir, setPiDir] = useState<string | null>(null);
   // directory browser sheet for picking piDir
@@ -68,6 +68,7 @@ export default function App() {
   const kindRef = useRef(newKind);
   kindRef.current = newKind;
   const resumeReqRef = useRef<string | null>(null);
+  const piResumeReqRef = useRef<string | null>(null);
   const dirReqRef = useRef<string | null>(null);
   const browseDir = (r: Relay | null, path?: string) => {
     if (!r) return;
@@ -188,7 +189,13 @@ export default function App() {
           case "ForgeListOk":
             if (f.req_id === resumeReqRef.current) {
               resumeReqRef.current = null;
-              setResumeList(f.sessions);
+              setResumeList((prev) => [...(prev ?? []), ...f.sessions.map((s) => ({ kind: "forge" as const, ...s }))]);
+            }
+            break;
+          case "PiListOk":
+            if (f.req_id === piResumeReqRef.current) {
+              piResumeReqRef.current = null;
+              setResumeList((prev) => [...(prev ?? []), ...f.sessions.map((s) => ({ kind: "pi" as const, id: s.id, title: s.title, session_file: s.session_file, active: s.active }))]);
             }
             break;
           case "DirListOk":
@@ -410,7 +417,7 @@ export default function App() {
         )}
         {resumeList !== null && (
           <View style={[s.resumeSheet]}>
-            <Text style={s.rowTitle}>forge sessions</Text>
+            <Text style={s.rowTitle}>sessions to resume</Text>
             <FlatList
               data={resumeList}
               keyExtractor={(item) => item.id}
@@ -420,18 +427,26 @@ export default function App() {
                   style={s.row}
                   onPress={() => {
                     setResumeList(null);
-                    relay?.send({
-                      t: "SessionsCreate", req_id: nextId(), kind: "forge",
-                      forge_session: item.id,
-                    } as Frame);
+                    if (item.kind === "forge") {
+                      relay?.send({
+                        t: "SessionsCreate", req_id: nextId(), kind: "forge",
+                        forge_session: item.id,
+                      } as Frame);
+                    } else {
+                      relay?.send({
+                        t: "SessionsCreate", req_id: nextId(), kind: "pi",
+                        pi_session_file: item.session_file,
+                      } as Frame);
+                    }
                   }}
                 >
                   <Text style={s.rowTitle} numberOfLines={1}>
-                    {item.title || item.id.slice(0, 8)}
+                    [{item.kind}] {item.title || item.id.slice(0, 8)}
                   </Text>
                   <Text style={s.dim}>
-                    {item.ended ? "ended" : "active"} ·{" "}
-                    {item.updated ? item.updated.slice(0, 16).replace("T", " ") : ""}
+                    {item.kind === "forge"
+                      ? `${item.ended ? "ended" : "active"} · ${item.updated ? item.updated.slice(0, 16).replace("T", " ") : ""}`
+                      : (item.active ? "running" : "idle")}
                   </Text>
                 </Pressable>
               )}
@@ -458,8 +473,12 @@ export default function App() {
             style={s.kindChip}
             onPress={() => {
               const rid = nextId();
+              const prid = nextId();
+              setResumeList([]);
               resumeReqRef.current = rid;
+              piResumeReqRef.current = prid;
               relay?.send({ t: "ForgeList", id: nextId(), client: "mobile", req_id: rid } as Frame);
+              relay?.send({ t: "PiList", id: nextId(), client: "mobile", req_id: prid } as Frame);
             }}
           >
             <Text style={s.kindText}>resume…</Text>

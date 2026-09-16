@@ -122,6 +122,23 @@ fn frame_matches(f: &Frame, tag: &str) -> bool {
 
 // ---------- commands ----------
 
+/// Unified resume entry: either a forge or a local pi session.
+#[derive(Debug, Clone)]
+enum ResumeKind {
+    Forge,
+    Pi,
+}
+
+#[derive(Debug, Clone)]
+struct ResumeEntry {
+    kind: ResumeKind,
+    id: String,
+    title: String,
+    session_file: Option<String>,
+    ended: Option<String>,
+    active: bool,
+}
+
 fn cmd_new(name: Option<String>, kind: Option<String>, cwd: Option<String>) {
     let f = one_shot(
         |req_id| Frame::SessionsCreate {
@@ -131,6 +148,7 @@ fn cmd_new(name: Option<String>, kind: Option<String>, cwd: Option<String>) {
             cwd,
             profile_id: None,
             forge_session: None,
+            pi_session_file: None,
         },
         "ack",
         |f| match f {
@@ -153,67 +171,112 @@ fn cmd_resume(query: Option<String>) {
     use std::io::Read as _;
     let mut stream = connect();
     hello(&mut stream, "cli");
-    let rid = Uuid::new_v4().to_string();
+    let rid_f = Uuid::new_v4().to_string();
+    let rid_p = Uuid::new_v4().to_string();
     send_frame(
         &mut stream,
         &Frame::ForgeList {
             id: Uuid::new_v4().to_string(),
             client: "cli".into(),
-            req_id: rid.clone(),
+            req_id: rid_f.clone(),
+        },
+    )
+    .ok();
+    send_frame(
+        &mut stream,
+        &Frame::PiList {
+            id: Uuid::new_v4().to_string(),
+            client: "cli".into(),
+            req_id: rid_p.clone(),
         },
     )
     .ok();
     let mut decoder = Decoder::new();
     let mut buf = [0u8; 65536];
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
-    let mut found = None;
+    let mut forge_sessions: Option<Vec<ranch_protocol::ForgeSessionInfo>> = None;
+    let mut pi_sessions: Option<Vec<ranch_protocol::PiSessionInfo>> = None;
     while std::time::Instant::now() < deadline {
         let n = match stream.read(&mut buf) {
             Ok(0) | Err(_) => break,
             Ok(n) => n,
         };
         for f in decoder.feed(&buf[..n]) {
-            if let Frame::ForgeListOk {
-                req_id, sessions, ..
-            } = f
-            {
-                if req_id == rid.as_str() {
-                    found = Some(sessions.clone());
-                    break;
+            match f {
+                Frame::ForgeListOk { req_id, sessions, .. } if req_id == rid_f.as_str() => {
+                    forge_sessions = Some(sessions);
                 }
+                Frame::PiListOk { req_id, sessions, .. } if req_id == rid_p.as_str() => {
+                    pi_sessions = Some(sessions);
+                }
+                _ => {}
             }
         }
-        if found.is_some() {
+        if forge_sessions.is_some() && pi_sessions.is_some() {
             break;
         }
     }
-    let sessions = match found {
-        Some(s) if !s.is_empty() => s,
-        Some(_) => die("no forge sessions to resume"),
-        None => die("forge did not answer (forge down?)"),
-    };
-    // filter by query (title/id substring) when given
-    let candidates: Vec<_> = match &query {
-        Some(q) => {
+    let forge = forge_sessions.unwrap_or_default();
+    let pi = pi_sessions.unwrap_or_default();
+    if forge.is_empty() && pi.is_empty() {
+        die("no sessions to resume");
+    }
+    // Build unified candidate list
+    #[derive(Debug, Clone)]
+    struct Candidate {
+        kind: ResumeKind,
+        id: String,
+        title: String,
+        session_file: Option<String>,
+        ended: Option<String>,
+        active: bool,
+    }
+    let mut candidates: Vec<Candidate> = Vec::new();
+    for fs in &forge {
+        if let Some(q) = &query {
             let ql = q.to_lowercase();
-            let hits: Vec<_> = sessions
-                .iter()
-                .filter(|f| f.title.to_lowercase().contains(&ql) || f.id.starts_with(&ql))
-                .collect();
-            if hits.is_empty() {
-                die(&format!("no forge session matches {q:?}"));
+            if !fs.title.to_lowercase().contains(&ql) && !fs.id.starts_with(&ql) {
+                continue;
             }
-            hits
         }
-        None => sessions.iter().collect(),
-    };
+        candidates.push(Candidate {
+            kind: ResumeKind::Forge,
+            id: fs.id.clone(),
+            title: fs.title.clone(),
+            session_file: None,
+            ended: fs.ended.clone(),
+            active: fs.ended.is_none(),
+        });
+    }
+    for ps in &pi {
+        if let Some(q) = &query {
+            let ql = q.to_lowercase();
+            let display = ps.title.rsplit('/').next().unwrap_or(&ps.title);
+            if !display.to_lowercase().contains(&ql) && !ps.id.starts_with(&ql) {
+                continue;
+            }
+        }
+        let display = ps.title.rsplit('/').next().unwrap_or(&ps.title).to_string();
+        candidates.push(Candidate {
+            kind: ResumeKind::Pi,
+            id: ps.id.clone(),
+            title: display,
+            session_file: Some(ps.session_file.clone()),
+            ended: None,
+            active: ps.active,
+        });
+    }
+    if candidates.is_empty() {
+        die(&format!("no session matches {:?}", query.unwrap_or_default()));
+    }
     // single hit + query: resume directly; otherwise show a menu
     let pick = if candidates.len() == 1 && query.is_some() {
         0
     } else {
-        for (i, f) in candidates.iter().enumerate() {
-            let ended = if f.ended.is_some() { " (ended)" } else { "" };
-            println!("{:>3}. {}{} [{}]", i + 1, f.title, ended, &f.id[..8]);
+        for (i, c) in candidates.iter().enumerate() {
+            let tag = match c.kind { ResumeKind::Forge => "forge", ResumeKind::Pi => "pi" };
+            let ended = if c.ended.is_some() { " (ended)" } else if !c.active { " (idle)" } else { "" };
+            println!(">{:>3}. [{:<5}] {}{} [{}]", i + 1, tag, c.title, ended, &c.id[..8.min(c.id.len())]);
         }
         print!("resume #> ");
         use std::io::Write as _;
@@ -225,22 +288,41 @@ fn cmd_resume(query: Option<String>) {
             _ => die("cancelled"),
         }
     };
-    let fsid = candidates[pick].id.clone();
-    let f = one_shot(
-        |req_id| Frame::SessionsCreate {
-            req_id: req_id.to_string(),
-            name: None,
-            kind: Some("forge".into()),
-            cwd: None,
-            profile_id: None,
-            forge_session: Some(fsid),
-        },
-        "ack",
-        |f| match f {
-            Frame::Error { message, .. } => eprintln!("error: {message}"),
-            _ => {}
-        },
-    );
+    let sel = &candidates[pick];
+    let f = match sel.kind {
+        ResumeKind::Forge => one_shot(
+            |req_id| Frame::SessionsCreate {
+                req_id: req_id.to_string(),
+                name: None,
+                kind: Some("forge".into()),
+                cwd: None,
+                profile_id: None,
+                forge_session: Some(sel.id.clone()),
+                pi_session_file: None,
+            },
+            "ack",
+            |f| match f {
+                Frame::Error { message, .. } => eprintln!("error: {message}"),
+                _ => {}
+            },
+        ),
+        ResumeKind::Pi => one_shot(
+            |req_id| Frame::SessionsCreate {
+                req_id: req_id.to_string(),
+                name: None,
+                kind: Some("pi".into()),
+                cwd: None,
+                profile_id: None,
+                forge_session: None,
+                pi_session_file: sel.session_file.clone(),
+            },
+            "ack",
+            |f| match f {
+                Frame::Error { message, .. } => eprintln!("error: {message}"),
+                _ => {}
+            },
+        ),
+    };
     if let Frame::SessionsAck { session, .. } = f {
         if libc_isatty() {
             attach_loop(Target::Local(session));
@@ -815,6 +897,7 @@ fn cmd_dashboard() -> Option<String> {
                                     cwd: None,
                                     profile_id: None,
                                     forge_session: None,
+                                    pi_session_file: None,
                                 };
                                 send_frame(&mut stream, &f).ok();
                                 input = None;
@@ -829,6 +912,7 @@ fn cmd_dashboard() -> Option<String> {
                                     cwd: None,
                                     profile_id: None,
                                     forge_session: None,
+                                    pi_session_file: None,
                                 };
                                 send_frame(&mut stream, &f).ok();
                                 input = None;
@@ -851,6 +935,7 @@ fn cmd_dashboard() -> Option<String> {
                                     cwd: dir,
                                     profile_id: None,
                                     forge_session: None,
+                                    pi_session_file: None,
                                 };
                                 send_frame(&mut stream, &f).ok();
                                 input = None;
@@ -907,6 +992,7 @@ fn cmd_dashboard() -> Option<String> {
                         cwd: None,
                         profile_id: None,
                         forge_session: None,
+                        pi_session_file: None,
                     };
                     send_frame(&mut stream, &f).ok();
                     // SessionsAck handler attaches
@@ -1556,15 +1642,18 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
     let cloud: std::sync::Arc<std::sync::Mutex<Vec<CloudMachine>>> =
         std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     spawn_cloud_refresh(cloud.clone());
-    // :resume — forge-session picker (modal; j/k/enter/esc). Items land
-    // asynchronously via ForgeListOk (matched on req_id).
+    // :resume — unified session picker (modal; j/k/enter/esc). Items land
+    // asynchronously via ForgeListOk + PiListOk (matched on req_id).
     let resume_open = std::cell::Cell::new(false);
     let resume_sel = std::cell::Cell::new(0usize);
     let resume_pending: std::rc::Rc<std::cell::RefCell<Option<String>>> =
         std::rc::Rc::new(std::cell::RefCell::new(None));
-    let resume_items: std::rc::Rc<std::cell::RefCell<Vec<ranch_protocol::ForgeSessionInfo>>> =
+    let pi_resume_pending: std::rc::Rc<std::cell::RefCell<Option<String>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(None));
+    let resume_items: std::rc::Rc<std::cell::RefCell<Vec<ResumeEntry>>> =
         std::rc::Rc::new(std::cell::RefCell::new(vec![]));
     let _ = &resume_sel;
+    let _ = &pi_resume_pending;
     // :agents — agent-profile picker (Phase B): j/k/enter/esc. Enter
     // launches an agent session bound to the picked profile. Editing
     // happens on the web/mobile surfaces.
@@ -1928,8 +2017,43 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                                     resume_pending.borrow().as_deref() == Some(req_id.as_str());
                                 if matches_req {
                                     *resume_pending.borrow_mut() = None;
-                                    resume_items.borrow_mut().clear();
-                                    resume_items.borrow_mut().extend(sessions);
+                                    for fs in sessions {
+                                        let active = fs.ended.is_none();
+                                        resume_items.borrow_mut().push(ResumeEntry {
+                                            kind: ResumeKind::Forge,
+                                            id: fs.id,
+                                            title: fs.title,
+                                            session_file: None,
+                                            ended: fs.ended,
+                                            active,
+                                        });
+                                    }
+                                    resume_sel.set(0);
+                                    resume_open.set(true);
+                                }
+                            }
+                            Frame::PiListOk {
+                                req_id, sessions, ..
+                            } => {
+                                let matches_req =
+                                    pi_resume_pending.borrow().as_deref() == Some(req_id.as_str());
+                                if matches_req {
+                                    *pi_resume_pending.borrow_mut() = None;
+                                    for ps in sessions {
+                                        let title = if ps.title.contains('/') {
+                                            ps.title.rsplit('/').next().unwrap_or(&ps.title).to_string()
+                                        } else {
+                                            ps.title.clone()
+                                        };
+                                        resume_items.borrow_mut().push(ResumeEntry {
+                                            kind: ResumeKind::Pi,
+                                            id: ps.id,
+                                            title,
+                                            session_file: Some(ps.session_file),
+                                            ended: None,
+                                            active: ps.active,
+                                        });
+                                    }
                                     resume_sel.set(0);
                                     resume_open.set(true);
                                 }
@@ -2730,7 +2854,7 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                 let marea = Rect::new(mx, my, mw, mh);
                 f.render_widget(ratatui::widgets::Clear, marea);
                 let block = ratatui::widgets::Block::bordered()
-                    .title(" resume forge session ")
+                    .title(" resume session · forge + pi ")
                     .border_style(Style::default().fg(ratatui::style::Color::Green));
                 let inner = block.inner(marea);
                 f.render_widget(block, marea);
@@ -2738,21 +2862,25 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                     .borrow()
                     .iter()
                     .enumerate()
-                    .map(|(i, fs)| {
+                    .map(|(i, item)| {
                         let sel = i == resume_sel.get();
                         let mut style = Style::default();
                         if sel {
                             style = style.add_modifier(Modifier::REVERSED);
-                        } else if fs.ended.is_some() {
+                        } else if item.ended.is_some() || !item.active {
                             style = style.add_modifier(Modifier::DIM);
                         }
                         let mark = if sel { ">" } else { " " };
-                        let title = if fs.title.is_empty() {
-                            fs.id[..8.min(fs.id.len())].to_string()
-                        } else {
-                            fs.title.clone()
+                        let tag = match item.kind {
+                            ResumeKind::Forge => "forge",
+                            ResumeKind::Pi => "pi   ",
                         };
-                        Line::from(Span::styled(format!("{mark} {:.52}", title), style))
+                        let display = if item.title.is_empty() {
+                            format!("{}", &item.id[..8.min(item.id.len())])
+                        } else {
+                            item.title.clone()
+                        };
+                        Line::from(Span::styled(format!("{mark} [{:<5}] {:.44}", tag, display), style))
                     })
                     .collect();
                 f.render_widget(
@@ -3027,7 +3155,7 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                     "  :files [dir]   file browser (enter view/edit)",
                     "  :agents        agent profiles — a new · e edit · x delete",
                     "  :agent <name>  new agent session (forge)",
-                    "  :resume        resume a forge conversation",
+                    "  :resume        resume a session (forge + pi)",
                     "  :pi [dir]      pi split (dir = new session there)",
                     "  :model         switch the agent's model",
                     "  :compact       compact the agent's context now",
@@ -3221,16 +3349,28 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                                     let picked = resume_items
                                         .borrow()
                                         .get(resume_sel.get())
-                                        .map(|f| f.id.clone());
-                                    if let Some(fsid) = picked {
+                                        .cloned();
+                                    if let Some(entry) = picked {
                                         resume_open.set(false);
-                                        let f = Frame::SessionsCreate {
-                                            req_id: Uuid::new_v4().to_string(),
-                                            name: None,
-                                            kind: Some("forge".into()),
-                                            cwd: None,
-                                            profile_id: None,
-                                            forge_session: Some(fsid),
+                                        let f = match entry.kind {
+                                            ResumeKind::Forge => Frame::SessionsCreate {
+                                                req_id: Uuid::new_v4().to_string(),
+                                                name: None,
+                                                kind: Some("forge".into()),
+                                                cwd: None,
+                                                profile_id: None,
+                                                forge_session: Some(entry.id.clone()),
+                                                pi_session_file: None,
+                                            },
+                                            ResumeKind::Pi => Frame::SessionsCreate {
+                                                req_id: Uuid::new_v4().to_string(),
+                                                name: None,
+                                                kind: Some("pi".into()),
+                                                cwd: None,
+                                                profile_id: None,
+                                                forge_session: None,
+                                                pi_session_file: entry.session_file,
+                                            },
                                         };
                                         send_frame(&mut stream, &f).ok();
                                         // SessionsAck attaches
@@ -3716,6 +3856,7 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                                             cwd: None,
                                             profile_id: Some(p.id),
                                             forge_session: None,
+                                            pi_session_file: None,
                                         };
                                         send_frame(&mut stream, &f).ok();
                                         // SessionsAck attaches
@@ -4402,14 +4543,25 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                                                 }
                                                 if prompt_input.trim() == "resume" {
                                                     let rid = Uuid::new_v4().to_string();
+                                                    let prid = Uuid::new_v4().to_string();
                                                     *resume_pending.borrow_mut() =
                                                         Some(rid.clone());
+                                                    *pi_resume_pending.borrow_mut() =
+                                                        Some(prid.clone());
+                                                    resume_items.borrow_mut().clear();
+                                                    resume_sel.set(0);
                                                     let f = Frame::ForgeList {
                                                         id: Uuid::new_v4().to_string(),
                                                         client: "attach".into(),
                                                         req_id: rid,
                                                     };
                                                     send_frame(&mut stream, &f).ok();
+                                                    let f2 = Frame::PiList {
+                                                        id: Uuid::new_v4().to_string(),
+                                                        client: "attach".into(),
+                                                        req_id: prid,
+                                                    };
+                                                    send_frame(&mut stream, &f2).ok();
                                                     prompt_input.clear();
                                                     continue;
                                                 }
@@ -4444,6 +4596,7 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                                                             cwd: Some(dir),
                                                             profile_id: None,
                                                             forge_session: None,
+                                                            pi_session_file: None,
                                                         };
                                                         send_frame(&mut stream, &f).ok();
                                                         // SessionsAck attaches
@@ -4523,6 +4676,7 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                                                         cwd: None,
                                                         profile_id: None,
                                                         forge_session: None,
+                                                        pi_session_file: None,
                                                     };
                                                     send_frame(&mut stream, &f).ok();
                                                     prompt_input.clear();

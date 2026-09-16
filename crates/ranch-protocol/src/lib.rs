@@ -141,6 +141,10 @@ pub enum Frame {
         /// replays history.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         forge_session: Option<String>,
+        /// kind="pi" only: path to an existing pi session file to resume.
+        /// The daemon spawns a new pi child and calls switch_session into it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pi_session_file: Option<String>,
     },
     /// Client -> daemon: list directories at `path` (None = $HOME).
     /// Local-machine filesystem access for mobile dir pickers.
@@ -228,6 +232,19 @@ pub enum Frame {
         id: String,
         req_id: String,
         sessions: Vec<ForgeSessionInfo>,
+    },
+    /// Client -> daemon: list resumable local pi sessions on this machine.
+    PiList {
+        id: String,
+        client: String,
+        /// echoed back in PiListOk so clients match the reply
+        req_id: String,
+    },
+    /// Daemon -> client: local pi sessions available for resume.
+    PiListOk {
+        id: String,
+        req_id: String,
+        sessions: Vec<PiSessionInfo>,
     },
     /// Daemon -> client: ack a create/split with the new ids.
     SessionsAck {
@@ -719,6 +736,19 @@ pub struct WindowSnap {
     pub id: String,
     pub name: String,
     pub layout: Layout,
+}
+
+/// A resumable local pi session (PiListOk row).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PiSessionInfo {
+    /// The pane id that owns this pi session (used to attach).
+    pub id: String,
+    /// Session name or working directory.
+    pub title: String,
+    /// The pi session file path on disk.
+    pub session_file: String,
+    /// Whether the pi process is currently alive.
+    pub active: bool,
 }
 
 /// A resumable forge session (ForgeListOk row).
