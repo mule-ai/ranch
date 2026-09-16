@@ -1060,7 +1060,8 @@ function renderMarkdown(text: string, baseStyle: any) {
       const bullet = listMatch[1] === "*" || listMatch[1] === "-" ? "•" : `${listMatch[1].replace(".", "")} `;
       elements.push(
         <Text key={`li-${i}`} style={[baseStyle, { paddingLeft: 12 }]}>
-          {`${bullet} ${inline(listMatch[2], `li${i}`)}`}
+          {`${bullet} `}
+          {inline(listMatch[2], `li${i}`)}
         </Text>
       );
       continue;

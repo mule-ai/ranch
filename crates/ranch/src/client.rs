@@ -1885,6 +1885,7 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
             let h = Frame::Hello {
                 id: Uuid::new_v4().to_string(),
                 client: "attach".into(),
+                caps: vec![],
             };
             send_frame(&mut stream, &h).ok();
             last_hello = std::time::Instant::now();
@@ -3252,6 +3253,7 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                     "  A          pi split (local agent)",
                     "  E          open file in $EDITOR (from :files)",
                     "  [          scrollback of the focused pane",
+                    "  y          copy last agent response to clipboard",
                     "  d          detach",
                     "commands (type : to enter)",
                     "  :files [dir]   file browser (enter view/edit)",
@@ -4239,6 +4241,62 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                                 }
                                 // d → detach
                                 KeyCode::Char('d') => break,
+                                // y → copy last agent response to clipboard
+                                KeyCode::Char('y') => {
+                                    let text = pane_views
+                                        .get(&active_pane)
+                                        .and_then(|pv| {
+                                            if !pv.is_chat() {
+                                                return None;
+                                            }
+                                            pv.chat
+                                                .iter()
+                                                .filter(|m| m.role != "user" && m.role != "tool")
+                                                .last()
+                                                .map(|m| m.text.clone())
+                                        });
+                                    match text {
+                                        Some(t) if !t.is_empty() => {
+                                            let mut ok = false;
+                                            for (cmd, args) in [
+                                                ("wl-copy", vec!["-p"]),
+                                                ("xclip", vec!["-selection", "clipboard"]),
+                                                ("xsel", vec!["--clipboard", "--input"]),
+                                            ] {
+                                                if let Ok(mut child) = std::process::Command::new(cmd)
+                                                    .args(&args)
+                                                    .stdin(std::process::Stdio::piped())
+                                                    .stderr(std::process::Stdio::null())
+                                                    .spawn()
+                                                {
+                                                    use std::io::Write;
+                                                    let w = child.stdin.as_mut().unwrap();
+                                                    if w.write_all(t.as_bytes()).is_ok()
+                                                        && child.wait().is_ok()
+                                                    {
+                                                        ok = true;
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                            err_flash.set(Some((
+                                                std::time::Instant::now(),
+                                                if ok {
+                                                    "copied last agent response to clipboard".into()
+                                                } else {
+                                                    "clipboard copy failed".into()
+                                                },
+                                            )));
+                                        }
+                                        _ => {
+                                            err_flash.set(Some((
+                                                std::time::Instant::now(),
+                                                "no agent response to copy".into(),
+                                            )));
+                                        }
+                                    }
+                                    continue;
+                                },
                                 // o / l → next pane in session
                                 KeyCode::Char('o') | KeyCode::Char('l') => {
                                     if panes.len() > 1 {
