@@ -443,7 +443,11 @@ impl LocalPi {
     /// Send a user prompt: write the RPC prompt to pi's stdin first,
     /// then record the user row + flip the working indicator (so a
     /// failed write doesn't leave phantom rows).
-    pub fn prompt(&self, pipe: &PipeWriter, text: &str) -> Result<(), String> {
+    ///
+    /// `agent_text` is what pi receives (may include inlined attachment
+    /// content); `display_text` is what the user sees in the chat row;
+    /// `attachments` are file paths shown as badges on the user row.
+    pub fn prompt(&self, pipe: &PipeWriter, agent_text: &str, display_text: &str, attachments: &[String]) -> Result<(), String> {
         let mut g = self
             .stdin
             .lock()
@@ -451,14 +455,15 @@ impl LocalPi {
         let s = g
             .as_mut()
             .ok_or_else(|| "pi stdin already taken".to_string())?;
-        let line = serde_json::json!({"type": "prompt", "message": text}).to_string();
+        let line = serde_json::json!({"type": "prompt", "message": agent_text}).to_string();
         s.write_all(line.as_bytes())
             .and_then(|_| s.write_all(b"\n"))
             .and_then(|_| s.flush())
             .map_err(|e| format!("pi stdin: {e}"))?;
         // rows AFTER the write succeeded (a failed write emits the
         // error row + clears the indicator instead)
-        emit_chat(pipe, self.pane, "user", text, now_iso());
+        let att = if attachments.is_empty() { None } else { Some(attachments.to_vec()) };
+        emit_chat_with(pipe, self.pane, "user", display_text, att, now_iso());
         write_status(pipe, "working");
         Ok(())
     }
@@ -683,6 +688,7 @@ fn run_pi_reader(
                                     tool_output,
                                     duration_ms: None,
                                     created_at: ts.clone(),
+                                    attachments: None,
                                 });
                             };
                             match role {
@@ -908,6 +914,38 @@ fn emit_chat(pipe: &PipeWriter, pane: Uuid, role: &str, text: &str, created_at: 
                 tool_output: None,
                 duration_ms: None,
                 created_at: Some(created_at),
+                attachments: None,
+            }],
+            reset: false,
+        },
+    );
+}
+
+/// Like `emit_chat` but carries attachment file paths on the row.
+fn emit_chat_with(
+    pipe: &PipeWriter,
+    pane: Uuid,
+    role: &str,
+    text: &str,
+    attachments: Option<Vec<String>>,
+    created_at: String,
+) {
+    write_frame(
+        pipe,
+        &Frame::Chat {
+            id: String::new(),
+            session: String::new(),
+            pane: pane.to_string(),
+            msgs: vec![ChatMsg {
+                seq: next_seq(),
+                role: role.to_string(),
+                text: text.to_string(),
+                tool_name: None,
+                tool_call_id: None,
+                tool_output: None,
+                duration_ms: None,
+                created_at: Some(created_at),
+                attachments,
             }],
             reset: false,
         },
@@ -930,6 +968,7 @@ fn emit_tool(pipe: &PipeWriter, pane: Uuid, name: &str, dur_ms: i64, out: &str, 
                 tool_output: Some(out.to_string()),
                 duration_ms: Some(dur_ms),
                 created_at: Some(created_at),
+                attachments: None,
             }],
             reset: false,
         },

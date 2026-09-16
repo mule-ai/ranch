@@ -226,6 +226,11 @@ footer { text-align: center; color: var(--dim); font-size: 0.85rem; padding: 24p
 .bubble-user { align-self: flex-end; background: var(--accent); color: #052e16; }
 .bubble-agent { align-self: flex-start; background: #1e1e26; border: 1px solid #2c2c36; }
 .bubble-ts { margin-left: 8px; font-size: 0.7em; opacity: 0.65; }
+.attach-chips { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 4px; }
+.attach-chip {
+  display: inline-block; background: rgba(0,0,0,0.2); border: 1px solid rgba(255,255,255,0.15);
+  border-radius: 12px; padding: 2px 8px; font-size: 0.72rem; white-space: nowrap;
+}
 .toolrow {
   align-self: flex-start; background: #14141a; border: 1px solid var(--border);
   border-radius: 8px; padding: 6px 10px; font-size: 0.8rem; color: var(--dim);

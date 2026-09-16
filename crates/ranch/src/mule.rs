@@ -133,6 +133,7 @@ fn write_row(w: &PipeWriter, pane: Uuid, text: &str) {
                 tool_output: None,
                 duration_ms: None,
                 created_at: Some(now_iso()),
+                attachments: None,
             }],
             reset: false,
         },

@@ -653,6 +653,9 @@ function Terminal({
   const panesRef = useRef(panes);
   panesRef.current = panes;
   const [chatDraft, setChatDraft] = useState("");
+  const [chatAttachments, setChatAttachments] = useState<string[]>([]);
+  const [attachBrowse, setAttachBrowse] = useState<{ path: string; parent: string | null; dirs: string[]; files: string[] } | null>(null);
+  const attachDirReqRef = useRef<string | null>(null);
   const chatScrollRef = useRef<HTMLDivElement | null>(null);
   // sticky-bottom chat: auto-follow new messages only while the user is
   // at the bottom; if they've scrolled up, leave the view alone until
@@ -751,6 +754,13 @@ function Terminal({
         case "Error":
           setConn(`error: ${f.message}`);
           break;
+        case "DirListOk": {
+          if (f.req_id === attachDirReqRef.current) {
+            attachDirReqRef.current = null;
+            setAttachBrowse({ path: f.path, parent: f.parent ?? null, dirs: f.dirs, files: f.files ?? [] });
+          }
+          break;
+        }
       }
     });
     relay.onStatus = setConn;
@@ -806,6 +816,23 @@ function Terminal({
       t: "Input", id: nextId(), client: "web",
       session: sessionId, pane: activePane, data: b64(text),
     } as Frame);
+  };
+
+  // attachment file browser (separate from the session-create dir browse)
+  const attachBrowseDir = (path?: string) => {
+    if (!relay) return;
+    const rid = nextId();
+    attachDirReqRef.current = rid;
+    relay.send({ t: "DirList", id: nextId(), client: "web", req_id: rid, path } as Frame);
+  };
+
+  const openAttachPicker = () => {
+    setAttachBrowse(null);
+    attachBrowseDir(undefined); // default $HOME
+  };
+
+  const removeAttachment = (path: string) => {
+    setChatAttachments(prev => prev.filter(p => p !== path));
   };
 
   const onKey = (e: React.KeyboardEvent) => {
@@ -943,6 +970,13 @@ function Terminal({
                   </details>
                 ) : (
                   <div key={i} className={"bubble " + (m.role === "user" ? "bubble-user" : "bubble-agent")}>
+                    {m.attachments && m.attachments.length > 0 && (
+                      <div className="attach-chips">
+                        {m.attachments.map((a, j) => (
+                          <span key={j} className="attach-chip">📎 {a.split('/').pop()}</span>
+                        ))}
+                      </div>
+                    )}
                     {m.text}
                     {tsOf(m.created_at) && (
                       <span className="bubble-ts">{tsOf(m.created_at)}</span>
@@ -954,30 +988,72 @@ function Terminal({
             {activeSnap?.agentBusy && <div className="bubble bubble-agent">● ● ●</div>}
           </div>
           <div className="chat-inputrow">
-            <input
-              value={chatDraft}
-              onChange={(e) => setChatDraft(e.target.value)}
-              placeholder="message the agent"
-              onKeyDown={(e) => {
-                if (e.key === "Enter" && chatDraft.trim()) {
-                  const text = chatDraft.trim();
-                  if (text === "/compact") {
-                    relay.send({
-                      t: "ChatCompact", id: nextId(), client: "web",
-                      session: sessionId, pane: activePane, req_id: `compact-${Date.now()}`,
-                    } as Frame);
-                  } else {
-                    relay.send({
-                      t: "ChatSend", id: nextId(), client: "web",
-                      session: sessionId, pane: activePane, text,
-                    } as Frame);
+            {chatAttachments.length > 0 && (
+              <div className="attach-chips" style={{ marginBottom: 4 }}>
+                {chatAttachments.map((a) => (
+                  <span key={a} className="attach-chip" onClick={() => removeAttachment(a)} style={{ cursor: 'pointer' }}>
+                    📎 {a.split('/').pop()} ✕
+                  </span>
+                ))}
+              </div>
+            )}
+            <div style={{ display: 'flex', gap: 6 }}>
+              <button
+                onClick={openAttachPicker}
+                title="Attach file"
+                style={{ background: 'transparent', border: '1px solid #444', borderRadius: 4, color: '#aaa', cursor: 'pointer', fontSize: '1rem', padding: '2px 8px' }}
+              >📎</button>
+              <input
+                value={chatDraft}
+                onChange={(e) => setChatDraft(e.target.value)}
+                placeholder="message the agent"
+                style={{ flex: 1 }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && (chatDraft.trim() || chatAttachments.length > 0)) {
+                    const text = chatDraft.trim() || "(see attached files)";
+                    if (text === "/compact") {
+                      relay.send({
+                        t: "ChatCompact", id: nextId(), client: "web",
+                        session: sessionId, pane: activePane, req_id: `compact-${Date.now()}`,
+                      } as Frame);
+                    } else {
+                      relay.send({
+                        t: "ChatSend", id: nextId(), client: "web",
+                        session: sessionId, pane: activePane, text,
+                        attachments: chatAttachments.length > 0 ? chatAttachments : undefined,
+                      } as Frame);
+                    }
+                    chatAtBottomRef.current = true;
+                    setChatDraft("");
+                    setChatAttachments([]);
                   }
-                  chatAtBottomRef.current = true; // our own send ⇒ follow
-                  setChatDraft("");
-                }
-              }}
-            />
+                }}
+              />
+            </div>
           </div>
+          {attachBrowse !== undefined && attachBrowse !== null && chatMode && (
+            <div style={{ position: 'absolute', bottom: '60px', left: 10, right: 10, maxHeight: '40vh', overflow: 'auto', background: '#1a1a2e', border: '1px solid #444', borderRadius: 8, padding: 8, zIndex: 100 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
+                <span className="dim" style={{ fontSize: '0.8rem' }}>{attachBrowse.path}</span>
+                <div style={{ display: 'flex', gap: 8 }}>
+                  {attachBrowse.parent && (
+                    <button onClick={() => attachBrowseDir(attachBrowse.parent!)} style={{ background: 'transparent', border: 'none', color: '#88f', cursor: 'pointer' }}>← up</button>
+                  )}
+                  <button onClick={() => { setAttachBrowse(null); }} style={{ background: 'transparent', border: 'none', color: '#f66', cursor: 'pointer' }}>✕ close</button>
+                </div>
+              </div>
+              {attachBrowse.dirs.map((d) => (
+                <div key={d} onClick={() => attachBrowseDir(`${attachBrowse.path}/${d}`)} style={{ cursor: 'pointer', padding: '2px 0', fontSize: '0.85rem' }}>
+                  📁 {d}
+                </div>
+              ))}
+              {attachBrowse.files.map((f) => (
+                <div key={f} onClick={() => { setChatAttachments(prev => prev.includes(`${attachBrowse.path}/${f}`) ? prev : [...prev, `${attachBrowse.path}/${f}`]); }} style={{ cursor: 'pointer', padding: '2px 0', fontSize: '0.85rem', color: '#8f8' }}>
+                  📄 {f}
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       ) : (
         <div className="term-wrap" ref={wrapRef}>

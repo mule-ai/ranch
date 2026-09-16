@@ -150,14 +150,19 @@ per app install for mobile so reconnects are stable).
   pane (used when attaching without a pane, and for UI)
 - **`mule.run`** `{workflow_id, params?}` → spawns/streams a workflow
   pane (§SPEC 8)
-- **`chat.send`** `{session, pane, text}` — send a user message to a
-  **forge-chat pane**. The daemon POSTs to the forge API
-  (`POST /messages`) on its worker thread.
+- **`chat.send`** `{session, pane, text, attachments?}` — send a user
+  message to a **forge-chat pane**. `attachments` is an optional list of
+  absolute file paths on the daemon host; the daemon reads each file
+  (capped at 50 KiB, lossy for non-UTF-8) and prepends its content to
+  the prompt so the agent sees it without a tool call. The daemon POSTs
+  to the forge API on its worker thread.
 - **`chat`** `{pane, msgs, reset?}` (daemon → client) — conversation
   rows for a forge-chat pane: appends in sequence order, or a full
   replacement when `reset` (snapshot semantics). Rows mirror forge
   `messages`: `{seq, role: "user"|"assistant"|"tool", text,
-  tool_name?, tool_output?, duration_ms?, created_at?}`.
+  tool_name?, tool_output?, duration_ms?, created_at?, attachments?}`.
+  `attachments` (user rows only) carries the file paths the client
+  attached, so UIs can render them as badges without parsing the text.
 - **`error`** — `{"of": "<frame id>", "message": "..."}` for any failed
   request.
 

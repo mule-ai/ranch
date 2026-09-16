@@ -196,6 +196,7 @@ fn to_chat_msg(r: &serde_json::Value) -> Option<ChatMsg> {
         tool_output,
         duration_ms,
         created_at,
+        attachments: None,
     })
 }
 

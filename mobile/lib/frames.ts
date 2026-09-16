@@ -59,6 +59,7 @@ export type ChatMsg = {
   tool_output?: string;
   duration_ms?: number;
   created_at?: string;
+  attachments?: string[];
 };
 
 
@@ -218,7 +219,7 @@ export type Frame =
   | { t: "PiListOk"; id: string; req_id: string; sessions: PiSessionInfo[] }
   | { t: "PiMonitor"; enabled: boolean; req_id: string }
   | { t: "PiMonitorOk"; req_id: string; enabled: boolean }
-  | { t: "ChatSend"; id: string; client: string; session: string; pane: string; text: string }
+  | { t: "ChatSend"; id: string; client: string; session: string; pane: string; text: string; attachments?: string[] }
   | { t: "ChatCompact"; id: string; client: string; session: string; pane: string; req_id: string }
   | { t: "ChatCompact"; id: string; client: string; session: string; pane: string; req_id: string }
   | { t: "Chat"; id: string; session: string; pane: string; msgs: ChatMsg[]; reset?: boolean }

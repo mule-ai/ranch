@@ -671,6 +671,42 @@ pub fn build_version() -> String {
         .unwrap_or_else(|| "dev".into())
 }
 
+/// Read each attached file (capped at 50 KiB per file) and build an
+/// augmented prompt: the file contents are prepended so the agent can
+/// see them immediately without a tool call.
+fn build_attached_prompt(text: &str, attachments: &[String]) -> String {
+    if attachments.is_empty() {
+        return text.to_string();
+    }
+    let mut out = String::new();
+    for path in attachments {
+        let p = std::path::Path::new(path);
+        match std::fs::read(p) {
+            Ok(bytes) => {
+                let cap = 50 * 1024; // 50 KiB
+                let content = if bytes.len() > cap {
+                    let mut truncated = String::from_utf8_lossy(&bytes[..cap]).into_owned();
+                    truncated.push_str("\n… [truncated at 50 KiB]");
+                    truncated
+                } else {
+                    String::from_utf8_lossy(&bytes).into_owned()
+                };
+                let name = p.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_else(|| path.clone());
+                out.push_str(&format!("[Attached file: {} ({} bytes)]\n```
+{}
+```
+\n", name, bytes.len(), content));
+            }
+            Err(e) => {
+                out.push_str(&format!("[Attached file: {} — read error: {}]
+\n", path, e));
+            }
+        }
+    }
+    out.push_str(text);
+    out
+}
+
 fn home_dir_string() -> String {
     home_dir().to_string_lossy().into_owned()
 }
@@ -1447,7 +1483,7 @@ impl Daemon {
             Some(fsid) if fsid.is_nil() => {
                 if let Some(lp) = self.pi_agents.get(&pid) {
                     if let Some(pipe_w) = &self.forge_pipe_w {
-                        if let Err(e) = lp.prompt(pipe_w, text) {
+                        if let Err(e) = lp.prompt(pipe_w, text, text, &[]) {
                             eprintln!("ranchd: pi prompt failed: {e}");
                         }
                     }
@@ -2608,6 +2644,7 @@ impl Daemon {
                 session,
                 pane,
                 text,
+                attachments,
                 ..
             } => {
                 let sid = match self.resolve_session(session).map(|s| s.id) {
@@ -2617,13 +2654,16 @@ impl Daemon {
                 let Ok(pid) = Uuid::parse_str(pane) else {
                     return;
                 };
+                // Inline attached file content into the agent's prompt so
+                // the agent can act on it without an extra read round-trip.
+                let augmented = build_attached_prompt(&text, &attachments);
                 if let Some(s) = self.sessions.get(&sid) {
                     if let Some(cp) = s.chats.get(&pid) {
                         if cp.forge_sid.is_nil() {
                             // local pi backing: prompt the child directly
                             if let Some(lp) = self.pi_agents.get(&pid) {
                                 if let Some(pipe_w) = &self.forge_pipe_w {
-                                    if let Err(e) = lp.prompt(pipe_w, &text.clone()) {
+                                    if let Err(e) = lp.prompt(pipe_w, &augmented, &text, &attachments) {
                                         eprintln!("ranchd: pi prompt failed: {e}");
                                     }
                                 }
@@ -2632,7 +2672,7 @@ impl Daemon {
                             let _ = tx.send(forge::ForgeJob::Send {
                                 pane: pid,
                                 forge_sid: cp.forge_sid,
-                                text: text.clone(),
+                                text: augmented,
                             });
                         }
                     }

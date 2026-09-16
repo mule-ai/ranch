@@ -190,6 +190,7 @@ pub fn agent_done_row(spawn: &SpawnRecord, pane: Uuid, outcome: &str, last: Opti
         tool_output: None,
         duration_ms: None,
         created_at: Some(now_iso()),
+        attachments: None,
     }
 }
 

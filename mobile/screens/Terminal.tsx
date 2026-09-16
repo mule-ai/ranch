@@ -214,6 +214,13 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
           modelSetReq.current = null;
           setConn(`error: ${f.message}`);
           break;
+        case "DirListOk": {
+          if (f.req_id === attachDirReqRef.current) {
+            attachDirReqRef.current = null;
+            setAttachBrowse({ path: f.path, parent: f.parent ?? null, dirs: f.dirs, files: f.files ?? [] });
+          }
+          break;
+        }
       }
     });
     relay.onStatus = setConn;
@@ -294,6 +301,11 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
 
   // forge-chat pane draft (the focused pane is a chat pane when set)
   const [chatDraft, setChatDraft] = useState("");
+  // attachments: file paths selected for the next chat message
+  const [chatAttachments, setChatAttachments] = useState<string[]>([]);
+  // file browser state for the attachment picker
+  const [attachBrowse, setAttachBrowse] = useState<{ path: string; parent: string | null; dirs: string[]; files: string[] } | null>(null);
+  const attachDirReqRef = useRef<string | null>(null);
   // agent model picker (chat panes): catalog per pane + open/closed.
   // The pane's active model lives on the PaneSnap (`model`).
   const [modelOpts, setModelOpts] = useState<Record<string, ModelChoice[]>>({});
@@ -518,31 +530,92 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
             )}
           </ScrollView>
           <View style={styles.chatInputRow}>
-            <TextInput
-              ref={chatRef}
-              style={styles.chatInput}
-              value={chatDraft}
-              onChangeText={setChatDraft}
-              placeholder="message the agent"
-              placeholderTextColor="#4b5563"
-              multiline
-            />
-            <Pressable
-              style={styles.chatSend}
-              onPress={() => {
-                const text = chatDraft.trim();
-                if (!text || !activePane) return;
-                chatAtBottomRef.current = true; // our own send ⇒ follow
-                relay.send({
-                  t: "ChatSend", id: nextId(), client: "mobile",
-                  session: sessionId, pane: activePane, text,
-                } as Frame);
-                setChatDraft("");
-              }}
-            >
-              <Text style={styles.chatSendText}>send</Text>
-            </Pressable>
+            {chatAttachments.length > 0 && (
+              <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 4, paddingHorizontal: 8, paddingVertical: 4 }}>
+                {chatAttachments.map((a) => (
+                  <Pressable key={a} onPress={() => setChatAttachments(prev => prev.filter(p => p !== a))} style={{ backgroundColor: 'rgba(0,0,0,0.3)', borderRadius: 12, paddingHorizontal: 8, paddingVertical: 3 }}>
+                    <Text style={{ color: '#8f8', fontSize: 11 }}>📎 {a.split('/').pop()} ✕</Text>
+                  </Pressable>
+                ))}
+              </View>
+            )}
+            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+              <Pressable
+                style={{ paddingHorizontal: 10, paddingVertical: 6, backgroundColor: '#1e1e26', borderRadius: 6 }}
+                onPress={() => {
+                  setAttachBrowse(null);
+                  const rid = nextId();
+                  attachDirReqRef.current = rid;
+                  relay.send({ t: "DirList", id: nextId(), client: "mobile", req_id: rid } as Frame);
+                }}
+              >
+                <Text style={{ color: '#888', fontSize: 16 }}>📎</Text>
+              </Pressable>
+              <TextInput
+                ref={chatRef}
+                style={styles.chatInput}
+                value={chatDraft}
+                onChangeText={setChatDraft}
+                placeholder="message the agent"
+                placeholderTextColor="#4b5563"
+                multiline
+              />
+              <Pressable
+                style={styles.chatSend}
+                onPress={() => {
+                  const text = chatDraft.trim() || (chatAttachments.length > 0 ? "(see attached files)" : "");
+                  if (!text || !activePane) return;
+                  chatAtBottomRef.current = true;
+                  relay.send({
+                    t: "ChatSend", id: nextId(), client: "mobile",
+                    session: sessionId, pane: activePane, text,
+                    attachments: chatAttachments.length > 0 ? chatAttachments : undefined,
+                  } as Frame);
+                  setChatDraft("");
+                  setChatAttachments([]);
+                }}
+              >
+                <Text style={styles.chatSendText}>send</Text>
+              </Pressable>
+            </View>
           </View>
+          {attachBrowse !== null && chatMode && (
+            <View style={{ position: 'absolute', bottom: 56, left: 8, right: 8, maxHeight: 250, backgroundColor: '#1a1a2e', borderRadius: 8, borderWidth: 1, borderColor: '#444', padding: 8, zIndex: 100 }}>
+              <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginBottom: 6 }}>
+                <Text style={{ color: '#888', fontSize: 12 }}>{attachBrowse.path}</Text>
+                <View style={{ flexDirection: 'row', gap: 12 }}>
+                  {attachBrowse.parent ? (
+                    <Pressable onPress={() => {
+                      const rid = nextId();
+                      attachDirReqRef.current = rid;
+                      relay.send({ t: "DirList", id: nextId(), client: "mobile", req_id: rid, path: attachBrowse.parent } as Frame);
+                    }}>
+                      <Text style={{ color: '#88f' }}>← up</Text>
+                    </Pressable>
+                  ) : null}
+                  <Pressable onPress={() => setAttachBrowse(null)}>
+                    <Text style={{ color: '#f66' }}>✕ close</Text>
+                  </Pressable>
+                </View>
+              </View>
+              <ScrollView style={{ maxHeight: 180 }}>
+                {attachBrowse.dirs.map((d) => (
+                  <Pressable key={d} onPress={() => {
+                    const rid = nextId();
+                    attachDirReqRef.current = rid;
+                    relay.send({ t: "DirList", id: nextId(), client: "mobile", req_id: rid, path: `${attachBrowse.path}/${d}` } as Frame);
+                  }} style={{ paddingVertical: 4 }}>
+                    <Text style={{ color: '#ccc', fontSize: 13 }}>📁 {d}</Text>
+                  </Pressable>
+                ))}
+                {attachBrowse.files.map((f) => (
+                  <Pressable key={f} onPress={() => setChatAttachments(prev => prev.includes(`${attachBrowse.path}/${f}`) ? prev : [...prev, `${attachBrowse.path}/${f}`])} style={{ paddingVertical: 4 }}>
+                    <Text style={{ color: '#8f8', fontSize: 13 }}>📄 {f}</Text>
+                  </Pressable>
+                ))}
+              </ScrollView>
+            </View>
+          )}
         </View>
       ) : (
       <View
@@ -1047,7 +1120,18 @@ function ChatBubble({ msg }: { msg: ChatMsg }) {
   return (
     <View style={[styles.bubble, isUser ? styles.bubbleUser : styles.bubbleAgent]}>
       {isUser
-        ? <Text style={baseTextStyle}>{msg.text}</Text>
+        ? (
+          <View style={{ gap: 4 }}>
+            {msg.attachments && msg.attachments.length > 0 && (
+              <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 4 }}>
+                {msg.attachments.map((a, i) => (
+                  <Text key={i} style={{ color: '#052e16', fontSize: 11, backgroundColor: 'rgba(255,255,255,0.3)', borderRadius: 8, paddingHorizontal: 6, paddingVertical: 2 }}>📎 {a.split('/').pop()}</Text>
+                ))}
+              </View>
+            )}
+            <Text style={baseTextStyle}>{msg.text}</Text>
+          </View>
+        )
         : renderMarkdown(msg.text, styles.bubbleText)}
       {ts ? (
         <Text style={[styles.bubbleTs, { color: isUser ? "#052e16" : "#9ca3af" }]}>{ts}</Text>

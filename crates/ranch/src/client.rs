@@ -97,6 +97,55 @@ fn connect() -> UnixStream {
     UnixStream::connect(&path).unwrap_or_else(|e| die(&format!("connect {path:?}: {e}")))
 }
 
+/// Extract `@/path/to/file` (or `@~/path`) references from a chat string.
+/// Returns the remaining text (with the @refs removed and whitespace
+/// collapsed) plus the list of extracted paths.
+fn extract_attach_paths(raw: &str) -> (String, Vec<String>) {
+    let mut attachments = Vec::new();
+    let mut clean = String::with_capacity(raw.len());
+    let chars: Vec<char> = raw.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '@' {
+            // find the start of a path (next char is / or ~)
+            if i + 1 < chars.len() && (chars[i + 1] == '/' || chars[i + 1] == '~') {
+                // collect the path: run of non-whitespace chars after @
+                let start = i + 1;
+                let mut end = start;
+                while end < chars.len() && !chars[end].is_whitespace() {
+                    end += 1;
+                }
+                let path: String = chars[start..end].iter().collect();
+                // expand ~ to $HOME
+                let expanded = if path.starts_with('~') {
+                    home_dir_string() + &path[1..]
+                } else {
+                    path
+                };
+                attachments.push(expanded);
+                i = end; // skip past the path
+            } else {
+                clean.push(chars[i]);
+                i += 1;
+            }
+        } else {
+            clean.push(chars[i]);
+            i += 1;
+        }
+    }
+    // collapse multiple spaces/newlines left by removal
+    let clean: String = clean
+        .split(' ')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    (clean, attachments)
+}
+
+fn home_dir_string() -> String {
+    std::env::var("HOME").unwrap_or_else(|_| "/root".into())
+}
+
 fn hello<W: std::io::Write>(stream: &mut W, client: &str) {
     let hello = Frame::Hello {
         id: Uuid::new_v4().to_string(),
@@ -1824,7 +1873,23 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
         execute!(std::io::stdout(), LeaveAlternateScreen).ok();
     };
 
+    // Periodic Hello re-send so the sidebar picks up sessions created by
+    // other clients (mobile, web) without a TUI restart.  Mirrors the
+    // web app's 3 s heartbeat; 5 s is enough for the TUI.
+    let hello_interval = std::time::Duration::from_secs(5);
+    let mut last_hello = std::time::Instant::now();
+
     loop {
+        // periodic session-list refresh
+        if last_hello.elapsed() >= hello_interval {
+            let h = Frame::Hello {
+                id: Uuid::new_v4().to_string(),
+                client: "attach".into(),
+            };
+            send_frame(&mut stream, &h).ok();
+            last_hello = std::time::Instant::now();
+        }
+
         // drain socket
         loop {
             match stream.read(&mut buf) {
@@ -4977,8 +5042,8 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                                     chat_scroll.insert(active_pane.clone(), 0);
                                 }
                                 KeyCode::Enter => {
-                                    let text = chat_input.trim().to_string();
-                                    if text == "/compact" {
+                                    let raw = chat_input.trim().to_string();
+                                    if raw == "/compact" {
                                         // same as the :compact command /
                                         // web's composer shortcut
                                         let rid = Uuid::new_v4().to_string();
@@ -4995,13 +5060,24 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                                             std::time::Instant::now(),
                                             "compacting…".into(),
                                         )));
-                                    } else if !text.is_empty() {
+                                    } else if !raw.is_empty() {
+                                        // Extract @/path/to/file references as
+                                        // attachments; the remaining text is
+                                        // sent as the display message.
+                                        let (clean, attachments) =
+                                            extract_attach_paths(&raw);
+                                        let text = if clean.is_empty() {
+                                            "(see attached files)".to_string()
+                                        } else {
+                                            clean
+                                        };
                                         let f = Frame::ChatSend {
                                             id: Uuid::new_v4().to_string(),
                                             client: "attach".into(),
                                             session: session_id.clone(),
                                             pane: active_pane.clone(),
                                             text,
+                                            attachments,
                                         };
                                         send_frame(&mut stream, &f).ok();
                                     }

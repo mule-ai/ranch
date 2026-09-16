@@ -348,12 +348,19 @@ pub enum Frame {
     /// Client -> daemon: send a chat message to a forge-chat pane.
     /// The daemon POSTs to the forge API on its worker thread; the
     /// resulting rows come back as `chat` broadcasts.
+    ///
+    /// `attachments` (optional) is a list of absolute file paths the
+    /// user has attached. The daemon reads each file (capped at
+    /// 50 KiB) and prepends its content to the prompt so the agent
+    /// can see it immediately without a tool call.
     ChatSend {
         id: String,
         client: String,
         session: String,
         pane: String,
         text: String,
+        #[serde(default)]
+        attachments: Vec<String>,
     },
     /// Daemon -> client: conversation rows for a forge-chat pane.
     /// `reset` replaces whatever the client has (snapshot semantics);
@@ -742,6 +749,9 @@ pub struct ChatMsg {
     pub duration_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at: Option<String>,
+    /// File paths attached to this message (user role only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachments: Option<Vec<String>>,
 }
 
 /// One window in a session's window stack (M5). A window is a named
@@ -1483,6 +1493,7 @@ mod tests {
                     tool_output: None,
                     duration_ms: None,
                     created_at: None,
+                    attachments: None,
                 }],
             },
             Frame::AgentClose {
