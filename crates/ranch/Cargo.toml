@@ -21,3 +21,4 @@ ratatui = "0.29"
 sha2 = "0.10"
 rpassword = "7"
 ansi-to-tui = "7"
+chrono = { workspace = true }

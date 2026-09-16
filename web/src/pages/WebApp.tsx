@@ -147,6 +147,7 @@ function MachineClient({ machine, onBack }: { machine: Machine; onBack: () => vo
   // update banner (stale client vs the published release)
   const [update, setUpdate] = useState<UpdateInfo | null>(null);
   const [daemonVersion, setDaemonVersion] = useState<string | null>(null);
+  const [monitorPi, setMonitorPi] = useState<boolean>(false);
   useEffect(() => {
     checkUpdate().then(setUpdate).catch(() => {});
   }, []);
@@ -201,6 +202,7 @@ function MachineClient({ machine, onBack }: { machine: Machine; onBack: () => vo
             setSessions(f.sessions);
             setConn("online");
             if (f.version) setDaemonVersion(f.version);
+            setMonitorPi(!!f.monitor_external_pi);
             // hot upgrade: daemon is back with the new binary
             setUpgrading(false);
             break;
@@ -334,7 +336,7 @@ function MachineClient({ machine, onBack }: { machine: Machine; onBack: () => vo
         />
       ))}
 
-      <CreateRow relay={relay} pendingProfile={pendingProfile} onProfileLaunched={() => setPendingProfile(null)} />
+      <CreateRow relay={relay} pendingProfile={pendingProfile} onProfileLaunched={() => setPendingProfile(null)} monitorPi={monitorPi} setMonitorPi={setMonitorPi} />
       </>
       )}
       {view === null && (
@@ -434,7 +436,7 @@ function SessionRow({
   );
 }
 
-function CreateRow({ relay, pendingProfile, onProfileLaunched }: { relay: Relay | null; pendingProfile?: ProfileSummary | null; onProfileLaunched?: () => void }) {
+function CreateRow({ relay, pendingProfile, onProfileLaunched, monitorPi, setMonitorPi }: { relay: Relay | null; pendingProfile?: ProfileSummary | null; onProfileLaunched?: () => void; monitorPi: boolean; setMonitorPi: (v: boolean) => void }) {
   const [name, setName] = useState("");
   // Demo build: the agent is forge-backed with no tools (the demo API
   // key is restricted server-side — profile CRUD, working_dir anchors,
@@ -447,7 +449,7 @@ function CreateRow({ relay, pendingProfile, onProfileLaunched }: { relay: Relay 
   const [kind, setKind] = useState<(typeof kinds)[number]>("shell");
   const [piDir, setPiDir] = useState<string | null>(null);
   const [dirBrowse, setDirBrowse] = useState<{ path: string; parent: string | null; dirs: string[] } | null>(null);
-  const [resumeList, setResumeList] = useState<{ kind: "forge" | "pi"; id: string; title: string; session_file?: string; updated?: string; ended?: string | null; active?: boolean }[] | null>(null);
+  const [resumeList, setResumeList] = useState<{ kind: "forge" | "pi"; id: string; title: string; session_file?: string; updated?: string; ended?: string | null; active?: boolean; external?: boolean }[] | null>(null);
   const dirReqRef = useRef<string | null>(null);
   const resumeReqRef = useRef<string | null>(null);
   const piResumeReqRef = useRef<string | null>(null);
@@ -464,7 +466,9 @@ function CreateRow({ relay, pendingProfile, onProfileLaunched }: { relay: Relay 
         setResumeList((prev) => [...(prev ?? []), ...f.sessions.map((s) => ({ kind: "forge" as const, ...s }))]);
       } else if (f.t === "PiListOk" && f.req_id === piResumeReqRef.current) {
         piResumeReqRef.current = null;
-        setResumeList((prev) => [...(prev ?? []), ...f.sessions.map((s) => ({ kind: "pi" as const, id: s.id, title: s.title, session_file: s.session_file, active: s.active }))]);
+        setResumeList((prev) => [...(prev ?? []), ...f.sessions.map((s) => ({ kind: "pi" as const, id: s.id, title: s.title, session_file: s.session_file, active: s.active, external: s.external }))]);
+      } else if (f.t === "PiMonitorOk") {
+        setMonitorPi(f.enabled);
       }
     });
     return un;
@@ -520,6 +524,19 @@ function CreateRow({ relay, pendingProfile, onProfileLaunched }: { relay: Relay 
             resume…
           </button>
         )}
+        {!demoAvailable && monitorPi !== null && (
+          <button
+            className={"chip" + (monitorPi ? " chip-on" : "")}
+            onClick={() => {
+              if (!relay) return;
+              const enabled = !monitorPi;
+              relay.send({ t: "PiMonitor", enabled, req_id: nextId() } as Frame);
+              setMonitorPi(enabled);
+            }}
+          >
+            pi-watch: {monitorPi ? "on" : "off"}
+          </button>
+        )}
       </div>
 
       {kind === "pi" && (
@@ -571,7 +588,7 @@ function CreateRow({ relay, pendingProfile, onProfileLaunched }: { relay: Relay 
                 }
               }}
             >
-              <span className="machname">[{item.kind}] {item.title || item.id.slice(0, 8)}</span>
+              <span className="machname">[{item.kind}{item.external ? "·ext" : ""}] {item.title || item.id.slice(0, 8)}</span>
               <span className="dim">
                 {item.kind === "forge"
                   ? `${item.ended ? "ended" : "active"} · ${item.updated?.slice(0, 16).replace("T", " ") ?? ""}`

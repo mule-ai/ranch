@@ -837,16 +837,191 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
   );
 }
 
+// --- Helpers ---
+function formatDuration(ms: number): string {
+  if (ms < 1000) return `${ms}ms`;
+  if (ms < 60000) {
+    const s = ms / 1000;
+    return s < 10 ? `${s.toFixed(1)}s` : `${Math.round(s)}s`;
+  }
+  if (ms < 3600000) {
+    const m = Math.floor(ms / 60000);
+    const s = Math.floor((ms % 60000) / 1000);
+    return s > 0 ? `${m}m ${s}s` : `${m}m`;
+  }
+  const h = Math.floor(ms / 3600000);
+  const m = Math.floor((ms % 3600000) / 60000);
+  return m > 0 ? `${h}h ${m}m` : `${h}h`;
+}
+
+function localTime(iso: string | null | undefined): string | null {
+  if (!iso) return null;
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return null;
+  return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+// Simple markdown renderer: handles headers, bold, italic, inline code,
+// fenced code blocks, and list items. Returns an array of styled <Text>/fragments.
+function renderMarkdown(text: string, baseStyle: any) {
+  const elements: any[] = [];
+  let codeBlock = false;
+  const lines = text.split("\n");
+  let codeBuffer: string[] = [];
+
+  // Inline formatter for a single line
+  function inline(line: string, keyPrefix: string): any[] {
+    const parts: any[] = [];
+    let remaining = line;
+    let k = 0;
+    while (remaining.length > 0) {
+      // Check for inline code
+      const codeIdx = remaining.indexOf("`");
+      // Check for bold
+      const boldIdx = remaining.indexOf("**");
+      // Check for italic (single *)
+      let italicIdx = -1;
+      let searchFrom = 0;
+      while (searchFrom < remaining.length) {
+        const idx = remaining.indexOf("*", searchFrom);
+        if (idx === -1) break;
+        // skip if it's part of **
+        if (remaining[idx + 1] === "*") { searchFrom = idx + 2; continue; }
+        if (remaining[idx - 1] === "*") { searchFrom = idx + 1; continue; }
+        italicIdx = idx;
+        break;
+      }
+
+      // Find the earliest special token
+      let earliest = -1;
+      let earliestType = "";
+      if (codeIdx !== -1 && (earliest === -1 || codeIdx < earliest)) { earliest = codeIdx; earliestType = "code"; }
+      if (boldIdx !== -1 && (earliest === -1 || boldIdx < earliest)) { earliest = boldIdx; earliestType = "bold"; }
+      if (italicIdx !== -1 && (earliest === -1 || italicIdx < earliest)) { earliest = italicIdx; earliestType = "italic"; }
+
+      if (earliest === -1) {
+        parts.push(<Text key={`${keyPrefix}-${k++}`} style={baseStyle}>{remaining}</Text>);
+        break;
+      }
+
+      if (earliest > 0) {
+        parts.push(<Text key={`${keyPrefix}-${k++}`} style={baseStyle}>{remaining.slice(0, earliest)}</Text>);
+      }
+
+      if (earliestType === "code") {
+        const endIdx = remaining.indexOf("`", earliest + 1);
+        if (endIdx !== -1) {
+          const code = remaining.slice(earliest + 1, endIdx);
+          parts.push(<Text key={`${keyPrefix}-${k++}`} style={[baseStyle, { fontFamily: "monospace", backgroundColor: "#1e1e26", color: "#e879f9", paddingHorizontal: 3 }]}>{code}</Text>);
+          remaining = remaining.slice(endIdx + 1);
+        } else {
+          parts.push(<Text key={`${keyPrefix}-${k++}`} style={baseStyle}>{remaining}</Text>);
+          break;
+        }
+      } else if (earliestType === "bold") {
+        const endIdx = remaining.indexOf("**", earliest + 2);
+        if (endIdx !== -1) {
+          const bold = remaining.slice(earliest + 2, endIdx);
+          parts.push(<Text key={`${keyPrefix}-${k++}`} style={[baseStyle, { fontWeight: "700" }]}>{bold}</Text>);
+          remaining = remaining.slice(endIdx + 2);
+        } else {
+          parts.push(<Text key={`${keyPrefix}-${k++}`} style={baseStyle}>{remaining}</Text>);
+          break;
+        }
+      } else { // italic
+        const endIdx = remaining.indexOf("*", earliest + 1);
+        if (endIdx !== -1 && remaining[earliest + 1] !== "*") {
+          const italic = remaining.slice(earliest + 1, endIdx);
+          parts.push(<Text key={`${keyPrefix}-${k++}`} style={[baseStyle, { fontStyle: "italic" }]}>{italic}</Text>);
+          remaining = remaining.slice(endIdx + 1);
+        } else {
+          parts.push(<Text key={`${keyPrefix}-${k++}`} style={baseStyle}>{remaining}</Text>);
+          break;
+        }
+      }
+    }
+    return parts;
+  }
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+
+    // Handle fenced code blocks
+    const fenceMatch = line.match(/^```(\w*)/);
+    if (fenceMatch) {
+      if (!codeBlock) {
+        codeBlock = true;
+        codeBuffer = [];
+      } else {
+        codeBlock = false;
+        elements.push(
+          <Text key={`code-${i}`} style={[baseStyle, { fontFamily: "monospace", backgroundColor: "#14141a", color: "#a5b4fc", paddingHorizontal: 6, paddingVertical: 4, borderRadius: 4 }]}>
+            {codeBuffer.join("\n")}
+          </Text>
+        );
+        codeBuffer = [];
+      }
+      continue;
+    }
+    if (codeBlock) {
+      codeBuffer.push(line);
+      continue;
+    }
+
+    // Headers
+    const headerMatch = line.match(/^(#{1,6})\s+(.*)/);
+    if (headerMatch) {
+      const level = headerMatch[1].length;
+      const fontSize = level <= 1 ? 18 : level === 2 ? 16 : level === 3 ? 15 : 14;
+      elements.push(
+        <Text key={`h-${i}`} style={[baseStyle, { fontWeight: "700", fontSize, marginBottom: 2 }]}>
+          {inline(headerMatch[2], `h${i}`)}
+        </Text>
+      );
+      continue;
+    }
+
+    // List items
+    const listMatch = line.match(/^\s*(-|\*|\d+\.)\s+(.*)/);
+    if (listMatch) {
+      const bullet = listMatch[1] === "*" || listMatch[1] === "-" ? "•" : `${listMatch[1].replace(".", "")} `;
+      elements.push(
+        <Text key={`li-${i}`} style={[baseStyle, { paddingLeft: 12 }]}>
+          {`${bullet} ${inline(listMatch[2], `li${i}`)}`}
+        </Text>
+      );
+      continue;
+    }
+
+    // Regular line
+    elements.push(
+      <Text key={`p-${i}`} style={baseStyle}>
+        {inline(line, `p${i}`)}
+      </Text>
+    );
+  }
+
+  // Flush any unclosed code block
+  if (codeBlock && codeBuffer.length > 0) {
+    elements.push(
+      <Text key={`code-open`} style={[baseStyle, { fontFamily: "monospace", backgroundColor: "#14141a", color: "#a5b4fc", paddingHorizontal: 6, paddingVertical: 4, borderRadius: 4 }]}>
+        {codeBuffer.join("\n")}
+      </Text>
+    );
+  }
+
+  return elements;
+}
+
 function ChatBubble({ msg }: { msg: ChatMsg }) {
   const isUser = msg.role === "user";
   const isTool = msg.role === "tool";
-  // HH:MM from the agent-side UTC timestamp ("YYYY-MM-DDTHH:MM:SSZ")
-  const ts = msg.created_at && msg.created_at.length >= 16 ? msg.created_at.slice(11, 16) : null;
+  const ts = localTime(msg.created_at);
   // tool rows: collapsed to one line, tap to expand the full output
   const [open, setOpen] = useState(false);
   if (isTool) {
     const label = msg.tool_name || "tool";
-    const dur = msg.duration_ms != null ? ` · ${msg.duration_ms}ms` : "";
+    const dur = msg.duration_ms != null ? ` · ${formatDuration(msg.duration_ms)}` : "";
     return (
       <Pressable
         style={styles.toolRow}
@@ -868,9 +1043,12 @@ function ChatBubble({ msg }: { msg: ChatMsg }) {
       </Pressable>
     );
   }
+  const baseTextStyle = [styles.bubbleText, isUser && { color: "#052e16" }];
   return (
     <View style={[styles.bubble, isUser ? styles.bubbleUser : styles.bubbleAgent]}>
-      <Text style={[styles.bubbleText, isUser && { color: "#052e16" }]}>{msg.text}</Text>
+      {isUser
+        ? <Text style={baseTextStyle}>{msg.text}</Text>
+        : renderMarkdown(msg.text, styles.bubbleText)}
       {ts ? (
         <Text style={[styles.bubbleTs, { color: isUser ? "#052e16" : "#9ca3af" }]}>{ts}</Text>
       ) : null}

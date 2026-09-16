@@ -13,6 +13,8 @@ export type PiSessionInfo = {
   title: string;
   session_file: string;
   active: boolean;
+  external?: boolean;
+  updated?: string;
 };
 
 export type SessionMeta = {
@@ -171,7 +173,7 @@ export type PaneMeta = {
 
 export type Frame =
   | { t: "Hello"; id: string; client: string; caps?: string[] }
-  | { t: "HelloOk"; id: string; machine: string; sessions: SessionMeta[]; version?: string | null }
+  | { t: "HelloOk"; id: string; machine: string; sessions: SessionMeta[]; version?: string | null; monitor_external_pi?: boolean }
   | { t: "Attach"; id: string; client: string; session: string; pane?: string }
   | { t: "Detach"; id: string; client: string }
   | {
@@ -214,6 +216,8 @@ export type Frame =
   | { t: "FileChanged"; path: string; mtime: number }
   | { t: "ForgeListOk"; id: string; req_id: string; sessions: ForgeSessionInfo[] }
   | { t: "PiListOk"; id: string; req_id: string; sessions: PiSessionInfo[] }
+  | { t: "PiMonitor"; enabled: boolean; req_id: string }
+  | { t: "PiMonitorOk"; req_id: string; enabled: boolean }
   | { t: "ChatSend"; id: string; client: string; session: string; pane: string; text: string }
   | { t: "ChatCompact"; id: string; client: string; session: string; pane: string; req_id: string }
   | { t: "ChatCompact"; id: string; client: string; session: string; pane: string; req_id: string }

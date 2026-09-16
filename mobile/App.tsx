@@ -54,7 +54,8 @@ export default function App() {
   // session kind for the create row: shell or forge (agent running pi)
   const [newKind, setNewKind] = useState<"shell" | "forge" | "pi">("shell");
   // forge session picker (resume); null = closed
-  const [resumeList, setResumeList] = useState<{ kind: "forge" | "pi"; id: string; title: string; session_file?: string; updated?: string; ended?: string | null; active?: boolean }[] | null>(null);
+  const [resumeList, setResumeList] = useState<{ kind: "forge" | "pi"; id: string; title: string; session_file?: string; updated?: string; ended?: string | null; active?: boolean; external?: boolean }[] | null>(null);
+  const [monitorPi, setMonitorPi] = useState<boolean>(false);
   // local-pi working dir (null = daemon default $HOME)
   const [piDir, setPiDir] = useState<string | null>(null);
   // directory browser sheet for picking piDir
@@ -175,6 +176,7 @@ export default function App() {
             }
             setSessions(f.sessions);
             if (f.version) setDaemonVersion(f.version);
+            setMonitorPi(!!f.monitor_external_pi);
             // hot upgrade: the daemon is back with the new binary
             setUpgrading(false);
             break;
@@ -195,8 +197,11 @@ export default function App() {
           case "PiListOk":
             if (f.req_id === piResumeReqRef.current) {
               piResumeReqRef.current = null;
-              setResumeList((prev) => [...(prev ?? []), ...f.sessions.map((s) => ({ kind: "pi" as const, id: s.id, title: s.title, session_file: s.session_file, active: s.active }))]);
+              setResumeList((prev) => [...(prev ?? []), ...f.sessions.map((s) => ({ kind: "pi" as const, id: s.id, title: s.title, session_file: s.session_file, active: s.active, external: s.external }))]);
             }
+            break;
+          case "PiMonitorOk":
+            setMonitorPi(f.enabled);
             break;
           case "DirListOk":
             if (f.req_id === dirReqRef.current) {
@@ -441,7 +446,7 @@ export default function App() {
                   }}
                 >
                   <Text style={s.rowTitle} numberOfLines={1}>
-                    [{item.kind}] {item.title || item.id.slice(0, 8)}
+                    [{item.kind}{item.external ? "·ext" : ""}] {item.title || item.id.slice(0, 8)}
                   </Text>
                   <Text style={s.dim}>
                     {item.kind === "forge"
@@ -482,6 +487,17 @@ export default function App() {
             }}
           >
             <Text style={s.kindText}>resume…</Text>
+          </Pressable>
+          <Pressable
+            style={[s.kindChip, monitorPi && s.kindChipOn]}
+            onPress={() => {
+              relay?.send({ t: "PiMonitor", enabled: !monitorPi, req_id: nextId() } as Frame);
+              setMonitorPi(!monitorPi);
+            }}
+          >
+            <Text style={[s.kindText, monitorPi && s.kindTextOn]}>
+              pi-watch: {monitorPi ? "on" : "off"}
+            </Text>
           </Pressable>
         </View>
         <View style={s.newRow}>

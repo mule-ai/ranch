@@ -34,6 +34,9 @@ pub enum Frame {
         /// version + the dist release index to surface update banners.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         version: Option<String>,
+        /// Whether the daemon is monitoring external pi sessions.
+        #[serde(default)]
+        monitor_external_pi: bool,
     },
     /// Client -> daemon: attach to a session (and optionally a pane).
     Attach {
@@ -245,6 +248,18 @@ pub enum Frame {
         id: String,
         req_id: String,
         sessions: Vec<PiSessionInfo>,
+    },
+    /// Client -> daemon: toggle whether to monitor all pi sessions on the system
+    /// (including those started outside ranch).
+    PiMonitor {
+        enabled: bool,
+        /// echoed back in PiMonitorOk so clients match the reply
+        req_id: String,
+    },
+    /// Daemon -> client: ack the pi monitor toggle.
+    PiMonitorOk {
+        req_id: String,
+        enabled: bool,
     },
     /// Daemon -> client: ack a create/split with the new ids.
     SessionsAck {
@@ -742,6 +757,7 @@ pub struct WindowSnap {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PiSessionInfo {
     /// The pane id that owns this pi session (used to attach).
+    /// For external sessions this is the session UUID from the .jsonl file.
     pub id: String,
     /// Session name or working directory.
     pub title: String,
@@ -749,6 +765,12 @@ pub struct PiSessionInfo {
     pub session_file: String,
     /// Whether the pi process is currently alive.
     pub active: bool,
+    /// True if this session was started outside ranch (external pi session).
+    #[serde(default)]
+    pub external: bool,
+    /// Last-modified timestamp (ISO 8601) for sorting.
+    #[serde(default)]
+    pub updated: String,
 }
 
 /// A resumable forge session (ForgeListOk row).

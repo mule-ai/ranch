@@ -43,6 +43,36 @@ fn socket_path() -> std::path::PathBuf {
         })
 }
 
+/// Format a millisecond duration for display.
+fn human_duration_ms(ms: i64) -> String {
+    if ms < 1_000 {
+        format!("{ms}ms")
+    } else if ms < 60_000 {
+        let s = ms as f64 / 1_000.0;
+        if s < 10.0 {
+            format!("{s:.1}s")
+        } else {
+            format!("{}s", ms / 1_000)
+        }
+    } else if ms < 3_600_000 {
+        let m = ms / 60_000;
+        let s = (ms % 60_000) / 1_000;
+        if s > 0 {
+            format!("{m}m {s}s")
+        } else {
+            format!("{m}m")
+        }
+    } else {
+        let h = ms / 3_600_000;
+        let m = (ms % 3_600_000) / 60_000;
+        if m > 0 {
+            format!("{h}h {m}m")
+        } else {
+            format!("{h}h")
+        }
+    }
+}
+
 fn die(msg: &str) -> ! {
     eprintln!("ranch: {msg}");
     std::process::exit(1)
@@ -137,6 +167,7 @@ struct ResumeEntry {
     session_file: Option<String>,
     ended: Option<String>,
     active: bool,
+    external: bool,
 }
 
 fn cmd_new(name: Option<String>, kind: Option<String>, cwd: Option<String>) {
@@ -2026,6 +2057,7 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                                             session_file: None,
                                             ended: fs.ended,
                                             active,
+                                            external: false,
                                         });
                                     }
                                     resume_sel.set(0);
@@ -2052,6 +2084,7 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                                             session_file: Some(ps.session_file),
                                             ended: None,
                                             active: ps.active,
+                                            external: ps.external,
                                         });
                                     }
                                     resume_sel.set(0);
@@ -2432,12 +2465,15 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                             ))),
                         }
                         for m in &pv.chat {
-                            let ts = m
-                                .created_at
-                                .as_deref()
-                                .filter(|c| c.len() >= 16)
-                                .and_then(|c| c.get(11..16))
-                                .unwrap_or("");
+                            // created_at is a UTC ISO string; render as
+                            // local wall-clock "HH:MM" so the timestamp
+                            // matches what the user sees on their watch.
+                            let ts = m.created_at.as_deref().and_then(|c| {
+                                let parsed = chrono::DateTime::parse_from_rfc3339(c)
+                                    .map(|dt| dt.with_timezone(&chrono::Local))
+                                    .ok()?;
+                                Some(parsed.format("%H:%M").to_string())
+                            }).unwrap_or_default();
                             match m.role.as_str() {
                                 "user" => {
                                     // right-aligned green bubble
@@ -2457,7 +2493,9 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                                 }
                                 "tool" => {
                                     let label = match (&m.tool_name, m.duration_ms) {
-                                        (Some(n), Some(d)) => format!("{n} · {d}ms"),
+                                        (Some(n), Some(d)) => {
+                                            format!("{n} · {}", human_duration_ms(d))
+                                        }
                                         (Some(n), None) => n.clone(),
                                         _ => "tool".into(),
                                     };
@@ -2873,7 +2911,7 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                         let mark = if sel { ">" } else { " " };
                         let tag = match item.kind {
                             ResumeKind::Forge => "forge",
-                            ResumeKind::Pi => "pi   ",
+                            ResumeKind::Pi => if item.external { "pi*  " } else { "pi   " },
                         };
                         let display = if item.title.is_empty() {
                             format!("{}", &item.id[..8.min(item.id.len())])
@@ -3156,6 +3194,7 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                     "  :agents        agent profiles — a new · e edit · x delete",
                     "  :agent <name>  new agent session (forge)",
                     "  :resume        resume a session (forge + pi)",
+                    "  :pi-monitor    monitor external pi sessions (on/off)",
                     "  :pi [dir]      pi split (dir = new session there)",
                     "  :model         switch the agent's model",
                     "  :compact       compact the agent's context now",
@@ -4691,6 +4730,19 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                                                     err_flash.set(Some((
                                                         std::time::Instant::now(),
                                                         "hot-upgrading daemon…".into(),
+                                                    )));
+                                                    prompt_input.clear();
+                                                    continue;
+                                                }
+                                                // :pi-monitor on/off — toggle external pi session monitoring
+                                                if prompt_input.trim() == "pi-monitor on" || prompt_input.trim() == "pi-monitor off" {
+                                                    let enabled = prompt_input.trim() == "pi-monitor on";
+                                                    let rid = Uuid::new_v4().to_string();
+                                                    let f = Frame::PiMonitor { enabled, req_id: rid };
+                                                    send_frame(&mut stream, &f).ok();
+                                                    err_flash.set(Some((
+                                                        std::time::Instant::now(),
+                                                        format!("external pi monitoring: {}", if enabled { "ON" } else { "OFF" }),
                                                     )));
                                                     prompt_input.clear();
                                                     continue;

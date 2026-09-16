@@ -20,7 +20,7 @@
 
 
 use std::collections::{BTreeMap, VecDeque};
-use std::io::{Read, Write};
+use std::io::{BufRead, Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -555,6 +555,9 @@ struct Daemon {
     /// trigger scheduler (Phase D): owns the trigger registry; fires
     /// workflows via mule_tx
     triggers: triggers::Scheduler,
+    /// Whether to monitor external pi sessions (started outside ranch)
+    /// and include them in PiList responses.
+    monitor_external_pi: bool,
 }
 
 // ---------- helpers ----------
@@ -679,9 +682,11 @@ fn state_value(
     pi_agents: &BTreeMap<Uuid, std::sync::Arc<pilocal::LocalPi>>,
     spawns: Option<&agenttools::SpawnRegistry>,
     triggers: Option<&triggers::Scheduler>,
+    monitor_external_pi: bool,
 ) -> serde_json::Value {
     let mut v = serde_json::json!({
         "machine": hostname(),
+        "monitor_external_pi": monitor_external_pi,
         "sessions": sessions.iter().map(|(id, s)| serde_json::json!({
             "id": id.to_string(),
             "name": s.name,
@@ -1742,6 +1747,7 @@ impl Daemon {
             spawn_policy,
             mule_tx: None,
             triggers: triggers::Scheduler::new(None),
+            monitor_external_pi: false,
         };
         // register the relay as a client keyed by its read-pipe fd; remote
         // frames arrive there and daemon->remote frames go out via relay_out
@@ -1849,7 +1855,7 @@ impl Daemon {
     }
 
     fn write_state(&self) {
-        let v = state_value(&self.sessions, &self.pi_agents, Some(&self.spawns), Some(&self.triggers));
+        let v = state_value(&self.sessions, &self.pi_agents, Some(&self.spawns), Some(&self.triggers), self.monitor_external_pi);
         if let Ok(json) = serde_json::to_string_pretty(&v) {
             std::fs::write(&self.state_path, json).ok();
         }
@@ -1905,7 +1911,7 @@ impl Daemon {
         }
 
         // manifest: Tier-1 state (same shape as state.json) + the fd map
-        let state = state_value(&self.sessions, &self.pi_agents, Some(&self.spawns), Some(&self.triggers));
+        let state = state_value(&self.sessions, &self.pi_agents, Some(&self.spawns), Some(&self.triggers), self.monitor_external_pi);
         let manifest = serde_json::json!({ "state": state, "fds": fds });
         std::fs::write(
             &manifest_path,
@@ -2235,6 +2241,8 @@ impl Daemon {
         self.spawns = agenttools::registry_from_value(&v);
         // trigger registry (Phase D)
         self.triggers = triggers::Scheduler::from_value(&v, self.mule_tx.clone());
+        // pi monitor external sessions toggle
+        self.monitor_external_pi = v.get("monitor_external_pi").and_then(|x| x.as_bool()).unwrap_or(false);
         let Some(sessions) = v.get("sessions").and_then(|s| s.as_array()) else {
             return;
         };
@@ -3178,7 +3186,23 @@ impl Daemon {
             }
             // client -> daemon: list resumable local pi sessions
             Frame::PiList { req_id, .. } => {
-                let sessions: Vec<PiSessionInfo> = self.pi_agents.iter().map(|(pid, lp)| {
+                // Collect all ranch-tracked pi session file paths
+                let mut known_files: std::collections::HashSet<String> = std::collections::HashSet::new();
+                for (_, s) in &self.sessions {
+                    for (_pid, cp) in &s.chats {
+                        if cp.forge_sid.is_nil() {
+                            if let Some(a) = self.pi_agents.get(&_pid) {
+                                if let Ok(g) = a.session_file.lock() {
+                                    if let Some(sf) = g.clone() {
+                                        known_files.insert(sf);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // Live pi agents
+                let mut sessions: Vec<PiSessionInfo> = self.pi_agents.iter().map(|(pid, lp)| {
                     let title = lp.cwd.clone();
                     let session_file = lp.session_file.lock().ok().and_then(|g| g.clone()).unwrap_or_default();
                     PiSessionInfo {
@@ -3186,8 +3210,64 @@ impl Daemon {
                         title,
                         session_file,
                         active: true,
+                        external: false,
+                        updated: String::new(),
                     }
                 }).collect();
+                // External pi sessions: scan ~/.pi/agent/sessions/ when enabled
+                if self.monitor_external_pi {
+                    let sessions_dir = home_dir().join(".pi/agent/sessions");
+                    if let Ok(entries) = std::fs::read_dir(&sessions_dir) {
+                        for entry in entries.flatten() {
+                            let sub_dir = entry.path();
+                            if !sub_dir.is_dir() { continue; }
+                            if let Ok(files) = std::fs::read_dir(&sub_dir) {
+                                for file_entry in files.flatten() {
+                                    let fpath = file_entry.path();
+                                    if fpath.extension().and_then(|e| e.to_str()) != Some("jsonl") { continue; }
+                                    let path_str = fpath.to_string_lossy().to_string();
+                                    if known_files.contains(&path_str) { continue; }
+                                    // Read first line for session id and cwd
+                                    let (sid, cwd) = {
+                                        let mut id = String::new();
+                                        let mut cwd = String::new();
+                                        if let Ok(f) = std::fs::File::open(&fpath) {
+                                            let reader = std::io::BufReader::new(f);
+                                            for line in reader.lines().take(1) {
+                                                if let Ok(line) = line {
+                                                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(line.trim()) {
+                                                        if json.get("type").and_then(|t| t.as_str()) == Some("session") {
+                                                            id = json.get("id").and_then(|x| x.as_str()).unwrap_or_default().to_string();
+                                                            cwd = json.get("cwd").and_then(|x| x.as_str()).unwrap_or_default().to_string();
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        (if id.is_empty() { path_str.clone() } else { id }, cwd)
+                                    };
+                                    // mtime as unix timestamp string
+                                    let mtime = file_entry.metadata()
+                                        .and_then(|m| m.modified())
+                                        .ok()
+                                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                                        .map(|d| d.as_secs().to_string())
+                                        .unwrap_or_default();
+                                    // Use directory name as title hint
+                                    let dir_name = sub_dir.file_name().and_then(|n| n.to_str()).unwrap_or("unknown");
+                                    sessions.push(PiSessionInfo {
+                                        id: sid,
+                                        title: if cwd.is_empty() { dir_name.to_string() } else { cwd },
+                                        session_file: path_str,
+                                        active: false,
+                                        external: true,
+                                        updated: mtime,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
                 if let Some(c) = self.clients.get_mut(&from) {
                     send_frame(
                         c,
@@ -3195,6 +3275,20 @@ impl Daemon {
                             id: String::new(),
                             req_id: req_id.clone(),
                             sessions,
+                        },
+                    );
+                }
+            }
+            // client -> daemon: toggle external pi monitoring
+            Frame::PiMonitor { enabled, req_id } => {
+                self.monitor_external_pi = *enabled;
+                self.write_state();
+                if let Some(c) = self.clients.get_mut(&from) {
+                    send_frame(
+                        c,
+                        &Frame::PiMonitorOk {
+                            req_id: req_id.clone(),
+                            enabled: self.monitor_external_pi,
                         },
                     );
                 }
@@ -4023,6 +4117,7 @@ impl Daemon {
                             machine: self.machine.clone(),
                             sessions,
                             version: Some(crate::daemon::build_version()),
+                            monitor_external_pi: self.monitor_external_pi,
                         },
                     );
                 }
