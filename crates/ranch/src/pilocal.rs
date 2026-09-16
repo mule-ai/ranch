@@ -431,6 +431,15 @@ impl LocalPi {
         }))
     }
 
+    /// Ask pi to replay its full conversation history so the daemon's
+    /// chat vec is populated on restore (daemon restart path).  The
+    /// reader thread handles the `get_messages` response and emits
+    /// Chat frames into the pipe, which the main loop appends to the
+    /// pane's chat buffer.
+    pub fn request_messages(&self) -> Result<(), String> {
+        self.send_rpc(&serde_json::json!({"type": "get_messages"}))
+    }
+
     /// Send a user prompt: write the RPC prompt to pi's stdin first,
     /// then record the user row + flip the working indicator (so a
     /// failed write doesn't leave phantom rows).

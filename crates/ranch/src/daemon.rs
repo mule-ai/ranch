@@ -2319,9 +2319,6 @@ impl Daemon {
                     if is_pi {
                         // respawn the local rpc child in the recorded cwd
                         let dir = cwd.clone().unwrap_or_else(home_dir_string);
-                        // switch_session races pi's own init on a brand-new
-                        // child; give it a moment to boot the RPC loop
-                        std::thread::sleep(std::time::Duration::from_millis(300));
                         let spawn_res = match &self.forge_pipe_w {
                             Some(pipe_w) => pilocal::LocalPi::spawn(
                                 pid,
@@ -2336,9 +2333,32 @@ impl Daemon {
                             Ok(()) => {
                                 eprintln!("ranchd: restored local pi pane {pid} in {dir}");
                                 if let Some(sf) = &pi_file {
-                                    if let Some(agent) = self.pi_agents.get(&pid) {
-                                        if let Err(e) = agent.switch_session(sf) {
-                                            eprintln!("ranchd: pi switch_session failed: {e}");
+                                    // Give pi's RPC loop a moment to boot before
+                                    // switching into the old session.  Retry a
+                                    // few times because pi's init can be slow
+                                    // on a loaded host.
+                                    for attempt in 0..5u32 {
+                                        std::thread::sleep(std::time::Duration::from_millis(400));
+                                        if let Some(agent) = self.pi_agents.get(&pid) {
+                                            match agent.switch_session(sf) {
+                                                Ok(()) => {
+                                                    eprintln!("ranchd: pi switch_session ok (attempt {}): {sf}", attempt + 1);
+                                                    // Replay conversation history so the
+                                                    // chat pane isn't empty after restart.
+                                                    if let Err(e) = agent.request_messages() {
+                                                        eprintln!("ranchd: pi request_messages failed: {e}");
+                                                    } else {
+                                                        eprintln!("ranchd: pi request_messages sent for {sf}");
+                                                    }
+                                                    break;
+                                                }
+                                                Err(e) if attempt < 4 => {
+                                                    eprintln!("ranchd: pi switch_session attempt {}/5 failed: {e} — retrying", attempt + 1);
+                                                }
+                                                Err(e) => {
+                                                    eprintln!("ranchd: pi switch_session failed after retries: {e}");
+                                                }
+                                            }
                                         }
                                     }
                                 }
