@@ -437,7 +437,12 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
         // active-model chip: tap to open the model picker
         <View style={styles.modelBar}>
           <Pressable style={styles.modelChip} onPress={openModelPicker} hitSlop={8}>
-            <Text style={styles.modelChipText} numberOfLines={1}>
+            <Text
+              style={styles.modelChipText}
+              numberOfLines={1}
+              adjustsFontSizeToFit
+              minimumFontScale={0.8}
+            >
               ◈ {activeSnap?.model ?? "pick a model…"}
             </Text>
           </Pressable>
@@ -468,7 +473,12 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
                 );
               }}
             >
-              <Text style={styles.ctxChipText} numberOfLines={1}>
+              <Text
+                style={styles.ctxChipText}
+                numberOfLines={1}
+                adjustsFontSizeToFit
+                minimumFontScale={0.8}
+              >
                 {activeSnap.context} · tap to compact
               </Text>
             </Pressable>
@@ -910,10 +920,12 @@ const styles = StyleSheet.create({
   modelChip: {
     backgroundColor: "#16161c", borderRadius: 8, borderWidth: 1,
     borderColor: "#2c2c36", paddingHorizontal: 10, paddingVertical: 5,
+    flexShrink: 1, // let the model name yield space to the ctx chip
   },
   modelChipText: { color: "#4ade80", fontSize: 12, fontFamily: "JetBrainsMono NF Mono" },
   modelHint: { color: "#4b5563", fontSize: 11 },
-  ctxChip: { marginLeft: 8, borderColor: "#3f3f46" },
+  // row already has gap:10 — shrink instead of pushing off-screen
+  ctxChip: { flexShrink: 1, borderColor: "#3f3f46" },
   ctxChipText: { color: "#fbbf24", fontSize: 11, fontFamily: "JetBrainsMono NF Mono" },
   pickerOverlay: {
     ...StyleSheet.absoluteFill, backgroundColor: "rgba(0,0,0,0.6)",
