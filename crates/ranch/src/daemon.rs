@@ -2396,12 +2396,14 @@ impl Daemon {
                                     // populate chat history.  switch_session only
                                     // tells pi where to write; get_messages returns
                                     // empty because pi hasn't loaded history into
-                                    // memory yet.
+                                    // memory yet.  Note: the session isn't in
+                                    // self.sessions yet — insert happens later —
+                                    // so write to the local `s`.
                                     if switched {
                                         match pilocal::LocalPi::read_session_messages(sf) {
                                             Ok(msgs) if !msgs.is_empty() => {
                                                 eprintln!("ranchd: pi history: loaded {} rows from {sf}", msgs.len());
-                                                if let Some(cp) = self.sessions.get_mut(&sid).and_then(|s| s.chats.get_mut(&pid)) {
+                                                if let Some(cp) = s.chats.get_mut(&pid) {
                                                     cp.chat = msgs;
                                                 }
                                             }
