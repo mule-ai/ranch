@@ -6,6 +6,7 @@ export type ForgeSessionInfo = {
   title: string;
   updated: string;
   ended?: string | null;
+  working_dir?: string | null;
 };
 
 export type PiSessionInfo = {
@@ -15,6 +16,7 @@ export type PiSessionInfo = {
   active: boolean;
   external?: boolean;
   updated?: string;
+  path?: string;
 };
 
 export type SessionMeta = {

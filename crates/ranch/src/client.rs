@@ -213,6 +213,8 @@ struct ResumeEntry {
     kind: ResumeKind,
     id: String,
     title: String,
+    /// Working directory / path hint (pi sessions).
+    path: Option<String>,
     session_file: Option<String>,
     ended: Option<String>,
     active: bool,
@@ -1878,6 +1880,8 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
     // web app's 3 s heartbeat; 5 s is enough for the TUI.
     let hello_interval = std::time::Duration::from_secs(5);
     let mut last_hello = std::time::Instant::now();
+    // set when our session ended and there is nothing left to hop to
+    let mut session_gone = false;
 
     loop {
         // periodic session-list refresh
@@ -2064,6 +2068,37 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                                             compact_pending.borrow_mut().take();
                                         }
                                     }
+                                } else if mkind == "exited" {
+                                    // a session ended (last pane closed /
+                                    // killed). Drop it from the sidebar; if
+                                    // it was ours, hop to the next live
+                                    // session instead of sitting on a dead
+                                    // blank screen (or exit when none).
+                                    sessions_meta.retain(|s| s.id != msess);
+                                    session_list.borrow_mut().retain(|s| *s != msess);
+                                    if msess == session_id {
+                                        match sessions_meta.first().map(|s| s.id.clone()) {
+                                            Some(next) => {
+                                                let af = Frame::Attach {
+                                                    id: Uuid::new_v4().to_string(),
+                                                    client: "attach".into(),
+                                                    session: next,
+                                                    pane: None,
+                                                };
+                                                send_frame(&mut stream, &af).ok();
+                                                screen.reset_blank();
+                                                sent_resize.set(false);
+                                                err_flash.set(Some((
+                                                    std::time::Instant::now(),
+                                                    "session ended — switched to next".into(),
+                                                )));
+                                            }
+                                            None => {
+                                                session_gone = true;
+                                                break;
+                                            }
+                                        }
+                                    }
                                 } else if mkind != "agent" {
                                     if let Some(st) = mstat {
                                         eprintln!("ranch: {st}");
@@ -2120,6 +2155,7 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                                             kind: ResumeKind::Forge,
                                             id: fs.id,
                                             title: fs.title,
+                                            path: fs.working_dir.clone(),
                                             session_file: None,
                                             ended: fs.ended,
                                             active,
@@ -2138,15 +2174,11 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                                 if matches_req {
                                     *pi_resume_pending.borrow_mut() = None;
                                     for ps in sessions {
-                                        let title = if ps.title.contains('/') {
-                                            ps.title.rsplit('/').next().unwrap_or(&ps.title).to_string()
-                                        } else {
-                                            ps.title.clone()
-                                        };
                                         resume_items.borrow_mut().push(ResumeEntry {
                                             kind: ResumeKind::Pi,
                                             id: ps.id,
-                                            title,
+                                            title: ps.title,
+                                            path: Some(ps.path),
                                             session_file: Some(ps.session_file),
                                             ended: None,
                                             active: ps.active,
@@ -2418,6 +2450,9 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                 Err(_) => break,
             }
         }
+        if session_gone {
+            break;
+        }
 
         // render
         let screen_ref = &screen;
@@ -2494,6 +2529,7 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                 walk(ly, x0, 0, w0, term_area.height, &mut rects);
             }
 
+            let multi_pane = rects.len() > 1;
             let draw_pane = |f: &mut RFrame, pane_id: &str, r: Rect, focused: bool| {
                 let pv = views_ref.get(pane_id);
                 if let Some(pv) = pv {
@@ -2520,13 +2556,21 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                             Some(c) => format!(" · {c}"),
                             None => String::new(),
                         };
+                        // multi-pane: say how to get rid of this pane
+                        // right in the header (the gutter alone was not
+                        // discoverable)
+                        let close_txt = if multi_pane {
+                            "  ·  Ctrl-B x closes this pane"
+                        } else {
+                            ""
+                        };
                         match &pv.model {
                             Some(m) => li.push(Line::from(Span::styled(
-                                format!(" ◈ {m}  ·  :model to switch{ctx_txt}"),
+                                format!(" ◈ {m}  ·  :model to switch{ctx_txt}{close_txt}"),
                                 dim,
                             ))),
                             None => li.push(Line::from(Span::styled(
-                                format!(" ◈ :model to pick a model{ctx_txt}"),
+                                format!(" ◈ :model to pick a model{ctx_txt}{close_txt}"),
                                 dim.add_modifier(Modifier::DIM),
                             ))),
                         }
@@ -2603,13 +2647,25 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                         // multiple rows for wrapped / explicit-newline
                         // drafts, showing the tail (cursor is always at
                         // the end of the input)
-                        let input_row = chat_input_ref.clone();
+                        // the draft belongs to the FOCUSED chat pane only
+                        // (keys route there). Unfocused chat panes must
+                        // not echo it, or a 2-pane agent session looks
+                        // like typing goes into both.
+                        let input_row = if focused {
+                            chat_input_ref.clone()
+                        } else {
+                            String::new()
+                        };
                         let inner_w = w.saturating_sub(2).max(1);
                         // usable text width: "│ text▊ pad│" → inner_w - 3
                         let text_w = inner_w.saturating_sub(3).max(1);
                         let mut draft: Vec<String> = if input_row.is_empty() {
                             wrap_verbatim(
-                                "message the agent…  (⌃J newline, enter send)",
+                                if focused {
+                                    "message the agent…  (⌃J newline, enter send)"
+                                } else {
+                                    "not focused · Ctrl-B o to focus · Ctrl-B x to close"
+                                },
                                 text_w,
                             )
                         } else {
@@ -2949,9 +3005,9 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                 );
             }
 
-            // :resume modal — centered forge session list
+            // :resume modal — centered forge + pi session list
             if resume_open.get() {
-                let (mw, mh) = (62.min(term_area.width), 18.min(term_area.height));
+                let (mw, mh) = (76.min(term_area.width), 18.min(term_area.height));
                 let mx = (term_area.width.saturating_sub(mw)) / 2;
                 let my = (term_area.height.saturating_sub(mh)) / 2;
                 let marea = Rect::new(mx, my, mw, mh);
@@ -2983,7 +3039,23 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                         } else {
                             item.title.clone()
                         };
-                        Line::from(Span::styled(format!("{mark} [{:<5}] {:.44}", tag, display), style))
+                        let main = Span::styled(
+                            format!("{mark} [{:<5}] {:.34}", tag, display),
+                            style,
+                        );
+                        // cwd hint appended dim, so same-titled sessions of
+                        // the same agent stay distinguishable.
+                        if let Some(p) = &item.path {
+                            Line::from(vec![
+                                main,
+                                Span::styled(
+                                    format!("  {}", p),
+                                    Style::default().add_modifier(Modifier::DIM),
+                                ),
+                            ])
+                        } else {
+                            Line::from(main)
+                        }
                     })
                     .collect();
                 f.render_widget(
@@ -3246,7 +3318,7 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                     "  PgUp/PgDn  scroll the agent conversation (chat panes)",
                     "  Ctrl-arrows resize split",
                     "  { / }      swap panes",
-                    "  x          kill pane",
+                    "  x          close pane (shell or agent) · :kill-pane",
                     "  & or k     kill window",
                     "  ,          rename window",
                     "  a          agent split (forge)",
@@ -3266,7 +3338,7 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                     "  :compact       compact the agent's context now",
                     "  (in chat, /compact works too)",
                     "  :rename <name> rename this session",
-                    "  :kill-pane     kill the focused pane",
+                    "  :kill-pane     close the focused pane (also Ctrl-B x)",
                     "  :scrollback    pane history ring (also Ctrl-B [)",
                     "  :kill          kill this session",
                     "  :upgrade       hot-upgrade the daemon",
@@ -5195,7 +5267,11 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
     if let Some(jump) = cloud_jump {
         return jump;
     }
-    println!("detached");
+    if session_gone {
+        println!("session ended");
+    } else {
+        println!("detached");
+    }
     AttachNext::Detach
 }
 

@@ -28,6 +28,10 @@ import { TriggersScreen } from "./screens/Triggers";
 
 type Machine = { id: string; name: string };
 
+// /home/user/src/lab -> ~/src/lab ; otherwise keep the path as-is
+const shortPath = (p?: string) =>
+  p ? p.replace(/^\/home\/[^/]+(\/|$)/, "~$1") : undefined;
+
 export default function App() {
   const insets = useSafeAreaInsets();
   const [fontsLoaded] = useFonts({
@@ -54,7 +58,7 @@ export default function App() {
   // session kind for the create row: shell or forge (agent running pi)
   const [newKind, setNewKind] = useState<"shell" | "forge" | "pi">("shell");
   // forge session picker (resume); null = closed
-  const [resumeList, setResumeList] = useState<{ kind: "forge" | "pi"; id: string; title: string; session_file?: string; updated?: string; ended?: string | null; active?: boolean; external?: boolean }[] | null>(null);
+  const [resumeList, setResumeList] = useState<{ kind: "forge" | "pi"; id: string; title: string; session_file?: string; updated?: string; ended?: string | null; active?: boolean; external?: boolean; path?: string; working_dir?: string | null }[] | null>(null);
   const [monitorPi, setMonitorPi] = useState<boolean>(false);
   // local-pi working dir (null = daemon default $HOME)
   const [piDir, setPiDir] = useState<string | null>(null);
@@ -197,7 +201,7 @@ export default function App() {
           case "PiListOk":
             if (f.req_id === piResumeReqRef.current) {
               piResumeReqRef.current = null;
-              setResumeList((prev) => [...(prev ?? []), ...f.sessions.map((s) => ({ kind: "pi" as const, id: s.id, title: s.title, session_file: s.session_file, active: s.active, external: s.external }))]);
+              setResumeList((prev) => [...(prev ?? []), ...f.sessions.map((s) => ({ kind: "pi" as const, id: s.id, title: s.title, session_file: s.session_file, active: s.active, external: s.external, path: s.path }))]);
             }
             break;
           case "PiMonitorOk":
@@ -422,7 +426,16 @@ export default function App() {
         )}
         {resumeList !== null && (
           <View style={[s.resumeSheet]}>
-            <Text style={s.rowTitle}>sessions to resume</Text>
+            <View style={s.sheetHeader}>
+              <Text style={s.rowTitle}>sessions to resume</Text>
+              <Pressable
+                accessibilityLabel="close"
+                style={s.sheetClose}
+                onPress={() => setResumeList(null)}
+              >
+                <Text style={s.sheetCloseText}>✕</Text>
+              </Pressable>
+            </View>
             <FlatList
               data={resumeList}
               keyExtractor={(item) => item.id}
@@ -448,18 +461,15 @@ export default function App() {
                   <Text style={s.rowTitle} numberOfLines={1}>
                     [{item.kind}{item.external ? "·ext" : ""}] {item.title || item.id.slice(0, 8)}
                   </Text>
-                  <Text style={s.dim}>
+                  <Text style={s.dim} numberOfLines={1}>
                     {item.kind === "forge"
-                      ? `${item.ended ? "ended" : "active"} · ${item.updated ? item.updated.slice(0, 16).replace("T", " ") : ""}`
-                      : (item.active ? "running" : "idle")}
+                      ? [shortPath(item.working_dir ?? undefined), item.ended ? "ended" : "active", item.updated ? item.updated.slice(0, 16).replace("T", " ") : ""].filter(Boolean).join(" · ")
+                      : [shortPath(item.path), item.active ? "running" : "idle"].filter(Boolean).join(" · ")}
                   </Text>
                 </Pressable>
               )}
               ListEmptyComponent={<Text style={s.dim}>nothing to resume</Text>}
             />
-            <Pressable style={s.kindChip} onPress={() => setResumeList(null)}>
-              <Text style={s.kindText}>close</Text>
-            </Pressable>
           </View>
         )}
         <View style={s.kindRow}>
@@ -694,6 +704,12 @@ const s = StyleSheet.create({
     backgroundColor: "#16161c", borderRadius: 12, padding: 10,
     borderWidth: 1, borderColor: "#2a2a34", maxHeight: 420,
   },
+  sheetHeader: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginBottom: 4 },
+  sheetClose: {
+    minWidth: 40, minHeight: 40, borderRadius: 10, alignItems: "center", justifyContent: "center",
+    borderWidth: 1, borderColor: "#374151", backgroundColor: "#1f2430",
+  },
+  sheetCloseText: { color: "#f3f4f6", fontSize: 16, fontWeight: "700", lineHeight: 20 },
   kindRow: { flexDirection: "row", gap: 8, paddingBottom: 4 },
   kindChip: {
     borderWidth: 1, borderColor: "#374151", borderRadius: 999,

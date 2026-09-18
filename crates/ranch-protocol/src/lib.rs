@@ -769,10 +769,15 @@ pub struct PiSessionInfo {
     /// The pane id that owns this pi session (used to attach).
     /// For external sessions this is the session UUID from the .jsonl file.
     pub id: String,
-    /// Session name or working directory.
+    /// Human-readable title (first user message of the session, truncated).
+    /// Falls back to the working directory if the session has no messages yet.
+    #[serde(default)]
     pub title: String,
     /// The pi session file path on disk.
     pub session_file: String,
+    /// Working directory of the session.
+    #[serde(default)]
+    pub path: String,
     /// Whether the pi process is currently alive.
     pub active: bool,
     /// True if this session was started outside ranch (external pi session).
@@ -793,6 +798,9 @@ pub struct ForgeSessionInfo {
     /// forge's ended_at, when the session was severed/ended
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ended: Option<String>,
+    /// The session's working directory, when forge has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_dir: Option<String>,
 }
 
 /// Forge agent-profile summary (agent builder, Phase B). Secrets are

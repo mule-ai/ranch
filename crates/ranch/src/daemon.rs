@@ -580,6 +580,79 @@ fn fd_inherit(fd: RawFd) -> RawFd {
     fd
 }
 
+/// Read a pi session JSONL and return (id, first_user_message_title, cwd).
+/// Bounded read (512 KB) so a PiList request stays cheap on long sessions.
+fn pi_session_meta(path: &str) -> (Option<String>, Option<String>, Option<String>) {
+    use std::io::BufRead as _;
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return (None, None, None),
+    };
+
+    let mut reader = std::io::BufReader::new(file);
+    let mut bytes_read = 0u64;
+    let mut line = String::new();
+    let mut sid: Option<String> = None;
+    let mut cwd: Option<String> = None;
+    let mut title: Option<String> = None;
+    while bytes_read < 512 * 1024 {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(n) => bytes_read += n as u64,
+            Err(_) => break,
+        }
+        let json: serde_json::Value = match serde_json::from_str(line.trim()) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let typ = json.get("type").and_then(|t| t.as_str());
+        let role = json
+            .get("message")
+            .and_then(|m| m.get("role"))
+            .and_then(|r| r.as_str());
+        match (typ, role) {
+            (Some("session"), _) if sid.is_none() => {
+                if let Some(id) = json.get("id").and_then(|x| x.as_str()) {
+                    sid = Some(id.to_string());
+                }
+                if cwd.is_none() {
+                    cwd = json.get("cwd").and_then(|c| c.as_str()).map(String::from);
+                }
+            }
+            (Some("message"), Some("user")) if title.is_none() => {
+                let text = json
+                    .get("message")
+                    .and_then(|m| m.get("content"))
+                    .and_then(|c| {
+                        if let Some(arr) = c.as_array() {
+                            arr.iter()
+                                .find_map(|b| b.get("text").and_then(|t| t.as_str()))
+                        } else {
+                            c.as_str()
+                        }
+                    })
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if !text.is_empty() {
+                    let truncated: String = text.chars().take(48).collect();
+                    title = Some(if text.chars().count() > 48 {
+                        format!("{truncated}…")
+                    } else {
+                        truncated
+                    });
+                }
+            }
+            _ => {}
+        }
+        if sid.is_some() && title.is_some() && cwd.is_some() {
+            break;
+        }
+    }
+    (sid, title, cwd)
+}
+
 fn home_dir() -> PathBuf {
     std::env::var("HOME")
         .map(PathBuf::from)
@@ -1596,7 +1669,9 @@ impl Daemon {
         if let Some(s) = self.sessions.get_mut(&sid) {
             if s.chats.remove(&pid).is_some() {
                 if let Some(lp) = self.pi_agents.remove(&pid) {
-                    lp.kill();
+                    if let Some(pid) = lp.kill() {
+                        self.orphans.push(pid);
+                    }
                 }
                 if let Some(tx) = &self.forge_tx {
                     let _ = tx.send(forge::ForgeJob::Unwatch { pane: pid });
@@ -1617,7 +1692,9 @@ impl Daemon {
                 }
                 for cpid in s.chats.keys() {
                     if let Some(lp) = self.pi_agents.remove(cpid) {
-                        lp.kill();
+                        if let Some(pid) = lp.kill() {
+                            self.orphans.push(pid);
+                        }
                     }
                     if let Some(tx) = &self.forge_tx {
                         let _ = tx.send(forge::ForgeJob::Unwatch { pane: *cpid });
@@ -2368,7 +2445,19 @@ impl Daemon {
                         match spawn_res {
                             Ok(()) => {
                                 eprintln!("ranchd: restored local pi pane {pid} in {dir}");
-                                if let Some(sf) = &pi_file {
+                                // recorded file may not exist (pi lazy-creates
+                                // session files; an idle pane's path was never
+                                // written) — then it's a fresh conversation, and
+                                // switch_session below would only point pi at a
+                                // path that doesn't exist yet
+                                let restore_file =
+                                    pilocal::LocalPi::resolve_restore_file(pi_file.as_deref());
+                                if let (Some(rec), None) = (&pi_file, &restore_file) {
+                                    eprintln!(
+                                        "ranchd: pi restore: recorded {rec} was never written (no messages); fresh conversation"
+                                    );
+                                }
+                                if let Some(sf) = &restore_file {
                                     // Give pi's RPC loop a moment to boot before
                                     // switching into the old session.  Retry a
                                     // few times because pi's init can be slow
@@ -2398,8 +2487,14 @@ impl Daemon {
                                     // empty because pi hasn't loaded history into
                                     // memory yet.  Note: the session isn't in
                                     // self.sessions yet — insert happens later —
-                                    // so write to the local `s`.
-                                    if switched {
+                                    // so write to the local `s`. Done even when
+                                    // the RPC switch failed: the rows are what the
+                                    // user sees, and the next successful switch
+                                    // (or fresh prompt) reconciles pi's side.
+                                    if !switched {
+                                        eprintln!("ranchd: pi history: loading rows from {sf} despite switch failure");
+                                    }
+                                    {
                                         match pilocal::LocalPi::read_session_messages(sf) {
                                             Ok(msgs) if !msgs.is_empty() => {
                                                 eprintln!("ranchd: pi history: loaded {} rows from {sf}", msgs.len());
@@ -3281,11 +3376,20 @@ impl Daemon {
                 }
                 // Live pi agents
                 let mut sessions: Vec<PiSessionInfo> = self.pi_agents.iter().map(|(pid, lp)| {
-                    let title = lp.cwd.clone();
+                    let cwd = lp.cwd.clone();
                     let session_file = lp.session_file.lock().ok().and_then(|g| g.clone()).unwrap_or_default();
+                    // Prefer a title derived from the first user message; fall
+                    // back to the working directory while the session file
+                    // hasn't been created yet (pi writes it lazily).
+                    let title = if !session_file.is_empty() {
+                        pi_session_meta(&session_file).1.unwrap_or(cwd.clone())
+                    } else {
+                        cwd.clone()
+                    };
                     PiSessionInfo {
                         id: pid.to_string(),
                         title,
+                        path: cwd,
                         session_file,
                         active: true,
                         external: false,
@@ -3305,24 +3409,57 @@ impl Daemon {
                                     if fpath.extension().and_then(|e| e.to_str()) != Some("jsonl") { continue; }
                                     let path_str = fpath.to_string_lossy().to_string();
                                     if known_files.contains(&path_str) { continue; }
-                                    // Read first line for session id and cwd
-                                    let (sid, cwd) = {
+                                    // Read first lines for session id, cwd, and
+                                    // the first user message (title).
+                                    let (sid, cwd, title) = {
                                         let mut id = String::new();
                                         let mut cwd = String::new();
+                                        let mut title = String::new();
                                         if let Ok(f) = std::fs::File::open(&fpath) {
                                             let reader = std::io::BufReader::new(f);
-                                            for line in reader.lines().take(1) {
+                                            for line in reader.lines().take(200) {
                                                 if let Ok(line) = line {
                                                     if let Ok(json) = serde_json::from_str::<serde_json::Value>(line.trim()) {
-                                                        if json.get("type").and_then(|t| t.as_str()) == Some("session") {
-                                                            id = json.get("id").and_then(|x| x.as_str()).unwrap_or_default().to_string();
-                                                            cwd = json.get("cwd").and_then(|x| x.as_str()).unwrap_or_default().to_string();
+                                                        match json.get("type").and_then(|t| t.as_str()) {
+                                                            Some("session") => {
+                                                                if id.is_empty() {
+                                                                    id = json.get("id").and_then(|x| x.as_str()).unwrap_or_default().to_string();
+                                                                }
+                                                                if cwd.is_empty() {
+                                                                    cwd = json.get("cwd").and_then(|x| x.as_str()).unwrap_or_default().to_string();
+                                                                }
+                                                            }
+                                                            Some("message") => {
+                                                                if title.is_empty()
+                                                                    && json.get("message").and_then(|m| m.get("role")).and_then(|r| r.as_str()) == Some("user")
+                                                                {
+                                                                    let text = json.get("message")
+                                                                        .and_then(|m| m.get("content"))
+                                                                        .and_then(|c| {
+                                                                            if let Some(arr) = c.as_array() {
+                                                                                arr.iter().find_map(|b| b.get("text").and_then(|t| t.as_str()))
+                                                                            } else {
+                                                                                c.as_str()
+                                                                            }
+                                                                        })
+                                                                        .unwrap_or("")
+                                                                        .trim()
+                                                                        .to_string();
+                                                                    let truncated: String = text.chars().take(48).collect();
+                                                                    title = if text.chars().count() > 48 {
+                                                                        format!("{truncated}…")
+                                                                    } else {
+                                                                        truncated
+                                                                    };
+                                                                }
+                                                            }
+                                                            _ => {}
                                                         }
                                                     }
                                                 }
                                             }
                                         }
-                                        (if id.is_empty() { path_str.clone() } else { id }, cwd)
+                                        (if id.is_empty() { path_str.clone() } else { id }, cwd, title)
                                     };
                                     // mtime as unix timestamp string
                                     let mtime = file_entry.metadata()
@@ -3331,11 +3468,13 @@ impl Daemon {
                                         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                                         .map(|d| d.as_secs().to_string())
                                         .unwrap_or_default();
-                                    // Use directory name as title hint
-                                    let dir_name = sub_dir.file_name().and_then(|n| n.to_str()).unwrap_or("unknown");
+                                    // Use directory name as a path fallback; prefer
+                                    // the first user message as the title.
+                                    let dir_name = sub_dir.file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string();
                                     sessions.push(PiSessionInfo {
                                         id: sid,
-                                        title: if cwd.is_empty() { dir_name.to_string() } else { cwd },
+                                        title: if title.is_empty() { dir_name.clone() } else { title },
+                                        path: if cwd.is_empty() { dir_name } else { cwd },
                                         session_file: path_str,
                                         active: false,
                                         external: true,
@@ -4499,6 +4638,13 @@ impl Daemon {
                                                     eprintln!("ranchd: pi switch_session failed: {e}");
                                                 } else {
                                                     eprintln!("ranchd: resumed pi session from {sf}");
+                                                    // show the resumed history, same as restore
+                                                    // (session `s` isn't in self.sessions yet)
+                                                    if let Ok(msgs) = pilocal::LocalPi::read_session_messages(sf) {
+                                                        if let Some(cp) = s.chats.get_mut(&pid) {
+                                                            cp.chat = msgs;
+                                                        }
+                                                    }
                                                 }
                                             }
                                         }
@@ -4619,7 +4765,9 @@ impl Daemon {
                         // stop the chat panes' backing agents
                         for pid in s.chats.keys() {
                             if let Some(lp) = self.pi_agents.remove(pid) {
-                                lp.kill();
+                                if let Some(pid) = lp.kill() {
+                                    self.orphans.push(pid);
+                                }
                             }
                             if let Some(tx) = &self.forge_tx {
                                 let _ = tx.send(forge::ForgeJob::Unwatch { pane: *pid });
@@ -5073,7 +5221,9 @@ impl Daemon {
                     // chat pane kill: stop its backing agent
                     if s.chats.remove(&pid).is_some() {
                         if let Some(lp) = self.pi_agents.remove(&pid) {
-                            lp.kill();
+                            if let Some(pid) = lp.kill() {
+                                self.orphans.push(pid);
+                            }
                         }
                         if let Some(tx) = &self.forge_tx {
                             let _ = tx.send(forge::ForgeJob::Unwatch { pane: pid });
@@ -5081,10 +5231,35 @@ impl Daemon {
                     }
                     let dead = s.remove_pane_everywhere(&pid.to_string());
                     s.apply_sizes();
-                    if dead || s.panes.is_empty() {
+                    // the session dies when NOTHING is left — count chat
+                    // panes too. `s.panes` is PTY panes only, so an agent
+                    // session (all chat panes) used to be torn down on the
+                    // first Ctrl-B x even with another chat pane still open.
+                    if dead || (s.panes.is_empty() && s.chats.is_empty()) {
                         need_snap = None;
-                        eprintln!("ranchd: last window closed, killing session {}", s.name);
+                        eprintln!("ranchd: last pane closed, killing session {}", s.name);
                         self.sessions.remove(&sid);
+                        // tell everyone, same as a pane exit / :kill —
+                        // otherwise attached TUIs sit on a dead session
+                        self.mirror(relay::RelayOut::DeleteSession {
+                            id: sid.to_string(),
+                        });
+                        let gone = Frame::Meta {
+                            session: sid.to_string(),
+                            pane: None,
+                            kind: "exited".into(),
+                            status: Some("session ended".into()),
+                        };
+                        let recipients: Vec<RawFd> =
+                            self.clients.iter().map(|(f, _)| *f).collect();
+                        for rfd in recipients {
+                            if let Some(c) = self.clients.get_mut(&rfd) {
+                                if c.attach == Some(sid) {
+                                    c.attach = None;
+                                }
+                                send_frame(c, &gone);
+                            }
+                        }
                     } else {
                         need_snap = Some(sid);
                     }
@@ -5585,7 +5760,9 @@ fn run(
             }
             let gone_last = s.remove_pane_everywhere(&pid.to_string());
             s.apply_sizes();
-            if gone_last || s.panes.is_empty() {
+            // chat panes count as alive too (a shell exiting next to an
+            // agent pane must not kill the agent)
+            if gone_last || (s.panes.is_empty() && s.chats.is_empty()) {
                 eprintln!("ranchd: last pane exited, killing session {}", s.name);
                 daemon.sessions.remove(&sid);
                 daemon.write_state();
@@ -5648,6 +5825,37 @@ fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pi_session_meta_extracts_cwd_and_first_user_message() {
+        let dir = std::env::temp_dir().join(format!("ranch-pi-meta-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sess.jsonl");
+        let content = [
+            r#"{"type":"session","id":"abc","cwd":"/home/u/src/lab"}"#,
+            r#"{"type":"model_change","id":"m1"}"#,
+            r#"{"type":"message","id":"1","message":{"role":"user","content":[{"type":"text","text":"fix the build please"}],"timestamp":1}}"#,
+            r#"{"type":"message","id":"2","message":{"role":"assistant","content":[{"type":"text","text":"ok"}]},"timestamp":2}}"#,
+            r#"{"type":"message","id":"3","message":{"role":"user","content":[{"type":"text","text":"and more"}],"timestamp":3}}"#,
+        ]
+        .join("\n");
+        std::fs::write(&path, content).unwrap();
+
+        let (sid, title, cwd) = pi_session_meta(&path.to_string_lossy());
+        assert_eq!(sid.as_deref(), Some("abc"));
+        assert_eq!(cwd.as_deref(), Some("/home/u/src/lab"));
+        assert_eq!(title.as_deref(), Some("fix the build please"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pi_session_meta_missing_file_is_none() {
+        let (sid, title, cwd) = pi_session_meta("/nonexistent/path.jsonl");
+        assert_eq!(sid, None);
+        assert_eq!(title, None);
+        assert_eq!(cwd, None);
+    }
 
     #[test]
     fn socket_has_live_listener_detects_live_and_stale_sockets() {

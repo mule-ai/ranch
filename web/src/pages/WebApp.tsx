@@ -24,6 +24,10 @@ import type { ProfileSummary } from "../lib/frames";
 
 type Machine = { id: string; name: string; last_seen_at: string | null };
 
+// /home/user/src/lab -> ~/src/lab ; otherwise keep the path as-is
+const shortPath = (p?: string | null) =>
+  p ? p.replace(/^\/home\/[^/]+(\/|$)/, "~$1") : undefined;
+
 // HH:MM from a UTC ISO timestamp ("YYYY-MM-DDTHH:MM:SSZ"); null if absent.
 function tsOf(s?: string) {
   return s && s.length >= 16 ? s.slice(11, 16) : null;
@@ -449,7 +453,7 @@ function CreateRow({ relay, pendingProfile, onProfileLaunched, monitorPi, setMon
   const [kind, setKind] = useState<(typeof kinds)[number]>("shell");
   const [piDir, setPiDir] = useState<string | null>(null);
   const [dirBrowse, setDirBrowse] = useState<{ path: string; parent: string | null; dirs: string[] } | null>(null);
-  const [resumeList, setResumeList] = useState<{ kind: "forge" | "pi"; id: string; title: string; session_file?: string; updated?: string; ended?: string | null; active?: boolean; external?: boolean }[] | null>(null);
+  const [resumeList, setResumeList] = useState<{ kind: "forge" | "pi"; id: string; title: string; session_file?: string; updated?: string; ended?: string | null; active?: boolean; external?: boolean; path?: string; working_dir?: string | null }[] | null>(null);
   const dirReqRef = useRef<string | null>(null);
   const resumeReqRef = useRef<string | null>(null);
   const piResumeReqRef = useRef<string | null>(null);
@@ -466,7 +470,7 @@ function CreateRow({ relay, pendingProfile, onProfileLaunched, monitorPi, setMon
         setResumeList((prev) => [...(prev ?? []), ...f.sessions.map((s) => ({ kind: "forge" as const, ...s }))]);
       } else if (f.t === "PiListOk" && f.req_id === piResumeReqRef.current) {
         piResumeReqRef.current = null;
-        setResumeList((prev) => [...(prev ?? []), ...f.sessions.map((s) => ({ kind: "pi" as const, id: s.id, title: s.title, session_file: s.session_file, active: s.active, external: s.external }))]);
+        setResumeList((prev) => [...(prev ?? []), ...f.sessions.map((s) => ({ kind: "pi" as const, id: s.id, title: s.title, session_file: s.session_file, active: s.active, external: s.external, path: s.path }))]);
       } else if (f.t === "PiMonitorOk") {
         setMonitorPi(f.enabled);
       }
@@ -568,7 +572,10 @@ function CreateRow({ relay, pendingProfile, onProfileLaunched, monitorPi, setMon
 
       {resumeList !== null && (
         <div className="sheet">
-          <b>sessions to resume</b>
+          <div className="sheet-header">
+            <b>sessions to resume</b>
+            <button className="sheet-close" aria-label="close" onClick={() => setResumeList(null)}>✕</button>
+          </div>
           {resumeList.map((item) => (
             <button
               key={item.id}
@@ -591,14 +598,12 @@ function CreateRow({ relay, pendingProfile, onProfileLaunched, monitorPi, setMon
               <span className="machname">[{item.kind}{item.external ? "·ext" : ""}] {item.title || item.id.slice(0, 8)}</span>
               <span className="dim">
                 {item.kind === "forge"
-                  ? `${item.ended ? "ended" : "active"} · ${item.updated?.slice(0, 16).replace("T", " ") ?? ""}`
-                  : (item.active ? "running" : "idle")
-                }
+                  ? [shortPath(item.working_dir ?? undefined), item.ended ? "ended" : "active", item.updated?.slice(0, 16).replace("T", " ")].filter(Boolean).join(" · ")
+                  : [shortPath(item.path ?? undefined), item.active ? "running" : "idle"].filter(Boolean).join(" · ")}
               </span>
             </button>
           ))}
           {resumeList.length === 0 && <p className="dim">nothing to resume</p>}
-          <button className="chip" onClick={() => setResumeList(null)}>close</button>
         </div>
       )}
 

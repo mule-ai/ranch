@@ -532,11 +532,16 @@ pub fn spawn_worker(cfg: ForgeConfig, pipe_w: std::fs::File, rx: mpsc::Receiver<
                                         .get("ended_at")
                                         .and_then(|t| t.as_str())
                                         .map(|t| t.to_string());
+                                    let working_dir = s
+                                        .get("working_dir")
+                                        .and_then(|t| t.as_str())
+                                        .map(|t| t.to_string());
                                     Some(ranch_protocol::ForgeSessionInfo {
                                         id,
                                         title,
                                         updated,
                                         ended,
+                                        working_dir,
                                     })
                                 })
                                 .collect();

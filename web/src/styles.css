@@ -343,6 +343,14 @@ footer { text-align: center; color: var(--dim); font-size: 0.85rem; padding: 24p
   max-height: 340px; overflow-y: auto;
 }
 .sheet .machrow { margin: 0; }
+.sheet-header { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.sheet-close {
+  min-width: 36px; min-height: 36px; border-radius: 8px;
+  background: var(--bg-panel, #1f2430); border: 1px solid var(--border);
+  color: var(--fg, #f3f4f6); font-size: 15px; font-weight: 700;
+  line-height: 1; cursor: pointer;
+}
+.sheet-close:hover { border-color: var(--accent); color: var(--accent); }
 .btn-agent { background: var(--purple); border-color: var(--purple); color: #fff; }
 .btn-agent:hover { background: #b96fff; border-color: #b96fff; }
 .keybtn-on { border-color: var(--accent); color: var(--accent); }
