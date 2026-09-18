@@ -106,7 +106,16 @@ Rust workspace: edition 2024, stable toolchain (rustc 1.98 era).
   (`Layout::Split {dir, pct}`) per **window**; every pane's PTY is sized to
   its leaf (`TIOCSWINSZ` → SIGWINCH). Canonical size follows the
   most-recent-active client. Panes keep their PTY/VT state across swaps;
-  only the rectangle trades.
+  only the rectangle trades. A session dies when its LAST pane closes —
+  PTY *and* chat panes count (`s.panes.is_empty() && s.chats.is_empty()`);
+  `s.panes` alone is always empty for agent sessions, so checking only it
+  kills a 2-pane agent session on the first `Ctrl-B x`. Session death
+  broadcasts `Meta kind="exited"` (TUI hops to the next session or
+  exits). Killed pi children go on `orphans` for reaping
+  (`LocalPi::kill` returns the pid) or they zombie for the daemon's life.
+- **Local `pi` panes:** the daemon resolves the `pi` binary via
+  `pi_bin`/`RANCH_PI_BIN`, then `~/.local/bin/pi` / mise shims, then PATH
+  — needed because the systemd daemon's PATH is minimal.
 - **Agent panes** (kind `forge` / `pi`): no PTY for chat panes. Forge
   conversation lives in forge's `messages` table, polled/streamed by the
   `forge.rs` worker and emitted as `chat` frames. Local `pi` panes spawn
@@ -129,6 +138,14 @@ Rust workspace: edition 2024, stable toolchain (rustc 1.98 era).
     and `switch_session` into the recorded conversation, shell panes get
     fresh shells in their last cwd. Session/pane ids are kept. Running
     programs + PTY scrollback are inherently lost.
+    **pi session-file gotcha:** pi lazy-creates its session JSONL on the
+    first message and answers RPCs in order, so the spawn-time
+    `get_state` can reply *after* our `switch_session` with the fresh
+    auto-created path. `LocalPi::switch_session` pins the target path
+    and the reader ignores a differing `get_state` reply until pi has
+    echoed the pin (`pin_unconfirmed`). `resolve_restore_file` drops
+    recorded paths that don't exist on disk rather than switching pi
+    into a phantom file.
   - **Tier 2 (hot upgrade, zero pane death):** `ranch upgrade` (CLI) or
     the `Upgrade` frame (phone: "upgrade" on the sessions screen) makes
     the running daemon execve ITSELF with `--inherit <manifest>` — PTY

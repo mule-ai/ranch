@@ -11,6 +11,7 @@ import {
   TextInput,
   View,
 } from "react-native";
+import * as Clipboard from "expo-clipboard";
 import { ChatMsg, Frame, Layout, ModelChoice, PaneSnap, b64, nextId } from "../lib/frames";
 import { Relay } from "../lib/relay";
 import { parseSgrRow, Span as SgrSpan } from "../lib/sgr";
@@ -1093,6 +1094,14 @@ function ChatBubble({ msg }: { msg: ChatMsg }) {
   const ts = localTime(msg.created_at);
   // tool rows: collapsed to one line, tap to expand the full output
   const [open, setOpen] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const handleCopy = async () => {
+    const text = isTool ? (msg.tool_output || msg.tool_name || "") : msg.text;
+    if (!text.trim()) return;
+    await Clipboard.setStringAsync(text);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 1500);
+  };
   if (isTool) {
     const label = msg.tool_name || "tool";
     const dur = msg.duration_ms != null ? ` · ${formatDuration(msg.duration_ms)}` : "";
@@ -1100,10 +1109,11 @@ function ChatBubble({ msg }: { msg: ChatMsg }) {
       <Pressable
         style={styles.toolRow}
         onPress={() => msg.tool_output && setOpen((o) => !o)}
+        onLongPress={handleCopy}
         disabled={!msg.tool_output}
       >
         <Text style={styles.toolText}>
-          ⚙ {label}{dur}{ts ? ` · ${ts}` : ""}{msg.tool_output ? (open ? " ▲" : " ▼") : ""}
+          ⚙ {label}{dur}{ts ? ` · ${ts}` : ""}{msg.tool_output ? (open ? " ▲" : " ▼") : ""}{copied ? " · copied" : ""}
         </Text>
         {msg.tool_output ? (
           open ? (
@@ -1119,7 +1129,10 @@ function ChatBubble({ msg }: { msg: ChatMsg }) {
   }
   const baseTextStyle = [styles.bubbleText, isUser && { color: "#052e16" }];
   return (
-    <View style={[styles.bubble, isUser ? styles.bubbleUser : styles.bubbleAgent]}>
+    <Pressable
+      style={[styles.bubble, isUser ? styles.bubbleUser : styles.bubbleAgent]}
+      onLongPress={handleCopy}
+    >
       {isUser
         ? (
           <View style={{ gap: 4 }}>
@@ -1134,10 +1147,18 @@ function ChatBubble({ msg }: { msg: ChatMsg }) {
           </View>
         )
         : renderMarkdown(msg.text, styles.bubbleText)}
-      {ts ? (
-        <Text style={[styles.bubbleTs, { color: isUser ? "#052e16" : "#9ca3af" }]}>{ts}</Text>
-      ) : null}
-    </View>
+      <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center", marginTop: 2 }}>
+        <View style={{ flex: 1 }} />
+        {copied ? (
+          <Text style={{ fontSize: 10, color: isUser ? "#052e16" : "#4ade80" }}>copied ✓</Text>
+        ) : (
+          <Text style={{ fontSize: 10, color: isUser ? "#052e16" : "#4b5563", opacity: 0.5 }}>hold to copy</Text>
+        )}
+        {ts ? (
+          <Text style={[styles.bubbleTs, { color: isUser ? "#052e16" : "#9ca3af" }]}>{ts}</Text>
+        ) : null}
+      </View>
+    </Pressable>
   );
 }
 

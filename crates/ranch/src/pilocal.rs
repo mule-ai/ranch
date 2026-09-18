@@ -115,6 +115,12 @@ pub struct LocalPi {
     /// req_id of an in-flight `compact`; the reader thread echoes it in
     /// the `error` frame when the compaction fails.
     compact_req: Arc<Mutex<Option<String>>>,
+    /// Set by `switch_session`: `session_file` holds the switch TARGET,
+    /// not yet echoed back by pi. While set, a `get_state` reply naming a
+    /// different path is a stale in-flight answer (the spawn-time
+    /// get_state racing the switch) and is ignored instead of clobbering
+    /// the pin. Cleared once pi reports the pinned path.
+    pin_unconfirmed: Arc<AtomicBool>,
 }
 
 /// `pi_no_tools = "true"` in ~/.config/ranch/daemon.toml disables all
@@ -172,6 +178,64 @@ impl LocalPi {
         None
     }
 
+    /// Locate the `pi` binary. systemd-launched daemons run with a minimal
+    /// PATH (`/usr/local/bin:/usr/bin`) that usually omits mise's install
+    /// dirs, so a bare `Command::new("pi")` fails with
+    /// "No such file or directory" even when the user's shell can run `pi`.
+    ///
+    /// Resolution order:
+    ///   1. `pi_bin = "..."` in ~/.config/ranch/daemon.toml (explicit override)
+    ///   2. `RANCH_PI_BIN` env var
+    ///   3. `~/.local/bin/pi` (mise shim wrapper, always on user PATH)
+    ///   4. `~/.local/share/mise/shims/pi`
+    ///   5. `pi` (fall back to PATH lookup)
+    ///
+    /// Returns a path string to hand to `Command::new`.
+    fn pi_bin() -> String {
+        // 1. daemon.toml `pi_bin = "..."`
+        if let Ok(home) = std::env::var("HOME") {
+            if let Ok(text) =
+                std::fs::read_to_string(
+                    std::path::PathBuf::from(&home).join(".config/ranch/daemon.toml"),
+                )
+            {
+                for line in text.lines() {
+                    let line = line.trim();
+                    let rest = match line.strip_prefix("pi_bin") {
+                        Some(r) => r.trim_start(),
+                        None => continue,
+                    };
+                    if rest.is_empty() || !rest.starts_with('=') {
+                        continue; // e.g. `pi_binary`
+                    }
+                    let v = rest[1..].trim().trim_matches('"').to_string();
+                    if !v.is_empty() {
+                        return v;
+                    }
+                }
+            }
+        }
+        // 2. env override
+        if let Ok(p) = std::env::var("RANCH_PI_BIN") {
+            if !p.is_empty() {
+                return p;
+            }
+        }
+        // 3 + 4. well-known mise locations
+        if let Ok(home) = std::env::var("HOME") {
+            for cand in [
+                format!("{home}/.local/bin/pi"),
+                format!("{home}/.local/share/mise/shims/pi"),
+            ] {
+                if std::path::Path::new(&cand).exists() {
+                    return cand;
+                }
+            }
+        }
+        // 5. rely on PATH
+        "pi".to_string()
+    }
+
     /// Spawn `pi --mode rpc` in `cwd`. Registers itself in `panes`;
     /// the stdout reader thread starts immediately and emits
     /// Chat/Meta frames into `pipe` (session left blank — the main
@@ -183,7 +247,8 @@ impl LocalPi {
         pipe: PipeWriter,
         panes: &mut BTreeMap<Uuid, Arc<LocalPi>>,
     ) -> Result<(), String> {
-        let mut child = Command::new("pi");
+        let bin = Self::pi_bin();
+        let mut child = Command::new(&bin);
         child.arg("--mode").arg("rpc");
         if no_tools {
             child.arg("--no-tools");
@@ -242,6 +307,7 @@ impl LocalPi {
             model_list_req: Arc::new(Mutex::new(None)),
             model_set_req: Arc::new(Mutex::new(None)),
             compact_req: Arc::new(Mutex::new(None)),
+            pin_unconfirmed: Arc::new(AtomicBool::new(false)),
         });
         panes.insert(pane, lp.clone());
         lp.start_reader(pipe);
@@ -321,6 +387,7 @@ impl LocalPi {
             model_list_req: Arc::new(Mutex::new(None)),
             model_set_req: Arc::new(Mutex::new(None)),
             compact_req: Arc::new(Mutex::new(None)),
+            pin_unconfirmed: Arc::new(AtomicBool::new(false)),
         });
         panes.insert(pane, lp.clone());
         lp.start_reader(pipe);
@@ -348,6 +415,7 @@ impl LocalPi {
         let model_list_req = self.model_list_req.clone();
         let model_set_req = self.model_set_req.clone();
         let compact_req = self.compact_req.clone();
+        let pin_unconfirmed = self.pin_unconfirmed.clone();
         let stdin = self.stdin.clone();
         std::thread::spawn(move || {
             run_pi_reader(
@@ -359,6 +427,7 @@ impl LocalPi {
                 model_list_req,
                 model_set_req,
                 compact_req,
+                pin_unconfirmed,
                 stdin,
                 pipe,
             );
@@ -424,11 +493,40 @@ impl LocalPi {
     }
 
     /// Switch pi to a previously-recorded session file (restore path).
+    ///
+    /// Also records `path` as the pane's session file immediately and
+    /// re-queries `get_state`. Without this, the `get_state` fired at
+    /// spawn wins the race: pi answers with the fresh (empty) session it
+    /// auto-created, that path lands in `session_file` → `state.json`,
+    /// and the NEXT restart points at a file that was never written
+    /// (pi lazy-creates session files on first message).
     pub fn switch_session(&self, path: &str) -> Result<(), String> {
         self.send_rpc(&serde_json::json!({
             "type": "switch_session",
             "sessionPath": path,
-        }))
+        }))?;
+        if let Ok(mut g) = self.session_file.lock() {
+            *g = Some(path.to_string());
+            self.pin_unconfirmed.store(true, Ordering::Relaxed);
+            STATE_DIRTY.store(true, Ordering::Relaxed);
+        }
+        // re-read so the recorded path tracks whatever pi actually
+        // settled on (and the model label refreshes)
+        self.send_rpc(&serde_json::json!({"type": "get_state"}))
+    }
+
+    /// Pick the session file to restore into: the recorded path, only
+    /// if it exists on disk. A recorded path can be missing because pi
+    /// lazy-creates session files on the first message — a pane that was
+    /// restored and then never prompted has a path that was never
+    /// written. Deliberately NO "newest file for this cwd" fallback:
+    /// that file is very likely another live pi's conversation (a
+    /// terminal `pi` in the same dir), and switching into it would put
+    /// two writers on one JSONL. Fresh beats hijacked.
+    pub fn resolve_restore_file(recorded: Option<&str>) -> Option<String> {
+        recorded
+            .filter(|r| std::path::Path::new(r).is_file())
+            .map(str::to_string)
     }
 
 
@@ -649,20 +747,26 @@ pub fn read_session_messages(path: &str) -> Result<Vec<ChatMsg>, String> {
 
     /// Kill the child (pane close). Best-effort. On the inherit path the
     /// pid is signaled directly (no Child handle).
-    pub fn kill(&self) {
+    /// Kill the rpc child. Returns its pid so the caller can reap it
+    /// (push onto the daemon's `orphans` list) — dropping a `Child`
+    /// without `wait` leaves a zombie for the daemon's lifetime.
+    pub fn kill(&self) -> Option<libc::pid_t> {
         self.stop.store(true, Ordering::Relaxed);
         if let Ok(mut guard) = self.child.lock() {
             if let Some(c) = guard.as_mut() {
+                let pid = c.id() as libc::pid_t;
                 let _ = c.kill();
                 *guard = None;
-                return;
+                return Some(pid);
             }
         }
         if let Ok(g) = self.inherited_pid.lock() {
             if let Some(pid) = *g {
                 unsafe { libc::kill(pid, libc::SIGKILL) };
+                return Some(pid);
             }
         }
+        None
     }
 }
 
@@ -679,6 +783,7 @@ fn run_pi_reader(
     model_list_req: Arc<Mutex<Option<String>>>,
     model_set_req: Arc<Mutex<Option<String>>>,
     compact_req: Arc<Mutex<Option<String>>>,
+    pin_unconfirmed: Arc<AtomicBool>,
     stdin: Arc<Mutex<Option<Box<dyn std::io::Write + Send>>>>,
     pipe: PipeWriter,
 ) {
@@ -711,10 +816,30 @@ fn run_pi_reader(
             "response" => {
                 if v.get("command").and_then(|c| c.as_str()) == Some("get_state") {
                     if let Some(sf) = v.pointer("/data/sessionFile").and_then(|s| s.as_str()) {
-                        eprintln!("ranchd: local pi {t_pane} session file: {sf}");
                         if let Ok(mut g) = session_file.lock() {
-                            *g = Some(sf.to_string());
-                            STATE_DIRTY.store(true, Ordering::Relaxed);
+                            // After a switch_session we pin the target path.
+                            // pi answers RPCs in order, but the spawn-time
+                            // get_state may still be in flight when the switch
+                            // is sent — its late reply carries the FRESH
+                            // auto-created path and must not clobber the pin.
+                            // Accept a different path only once pi has
+                            // confirmed the pinned one at least once (a
+                            // genuine later change, e.g. /new).
+                            let pinned = g.as_ref().filter(|cur| {
+                                pin_unconfirmed.load(Ordering::Relaxed) && cur.as_str() != sf
+                            });
+                            if pinned.is_some() {
+                                eprintln!("ranchd: local pi {t_pane} ignoring stale session file {sf} (pinned to {})", g.as_deref().unwrap_or(""));
+                            } else {
+                                if g.as_deref() == Some(sf) {
+                                    pin_unconfirmed.store(false, Ordering::Relaxed);
+                                }
+                                if g.as_deref() != Some(sf) {
+                                    eprintln!("ranchd: local pi {t_pane} session file: {sf}");
+                                    *g = Some(sf.to_string());
+                                    STATE_DIRTY.store(true, Ordering::Relaxed);
+                                }
+                            }
                         }
                     }
                     // capture the active model and tell clients what the
