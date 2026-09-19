@@ -493,7 +493,7 @@ export default function App() {
             </View>
           )}
           {dirBrowse !== null && (
-            <View style={s.resumeSheet}>
+            <View style={s.sheetBase}>
               <Text style={s.rowTitle} numberOfLines={1}>
                 {dirBrowse.path}
               </Text>
@@ -784,6 +784,12 @@ const s = StyleSheet.create({
   err: { color: "#f87171", marginBottom: 8 },
   newRow: { flexDirection: "row", gap: 8, paddingBottom: 30, paddingTop: 8 },
   dirChip: { flex: 1, alignItems: "flex-start" },
+  sheetBase: {
+    backgroundColor: "#16161c", borderRadius: 12, padding: 10,
+    borderWidth: 1, borderColor: "#3a3a46",
+    shadowColor: "#000", shadowOpacity: 0.5, shadowRadius: 12,
+    elevation: 8,
+  },
   resumeSheet: {
     position: "absolute", left: 16, right: 16, zIndex: 50,
     backgroundColor: "#16161c", borderRadius: 12, padding: 10,
