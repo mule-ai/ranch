@@ -45,6 +45,12 @@ pub enum Frame {
         session: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         pane: Option<String>,
+        /// When set, snapshots sent to this client truncate each chat
+        /// pane's `chat` array to the last N rows; older rows are
+        /// paged on demand via `ChatHistory`. Remote/mobile clients use
+        /// this to avoid shipping megabyte snapshots over Realtime.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chat_limit: Option<usize>,
     },
     /// Client -> daemon: stop receiving updates.
     Detach {
@@ -372,6 +378,30 @@ pub enum Frame {
         msgs: Vec<ChatMsg>,
         #[serde(default)]
         reset: bool,
+    },
+    /// Client -> daemon: page back through a chat pane's history
+    /// (mobile/web scrollback). Returns up to `limit` rows with
+    /// `seq < before` (all rows when `before` is None), oldest first.
+    /// `limit` is clamped to 200 server-side.
+    ChatHistory {
+        id: String,
+        client: String,
+        session: String,
+        pane: String,
+        /// echoed back in `ChatHistoryOk` so clients match the reply
+        req_id: String,
+        limit: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        before: Option<i64>,
+    },
+    /// Daemon -> client: requested slice of a chat pane's history,
+    /// oldest first. `has_more` = rows older than `msgs[0]` still exist.
+    ChatHistoryOk {
+        req_id: String,
+        pane: String,
+        msgs: Vec<ChatMsg>,
+        #[serde(default)]
+        has_more: bool,
     },
     /// Client -> daemon: list the agent models available to a chat pane
     /// plus the currently active one (pi: `get_available_models` +
@@ -988,6 +1018,11 @@ pub struct PaneSnap {
     /// turn to end).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<String>,
+    /// For chat panes when the attaching client set `chat_limit`: true
+    /// when `chat` was truncated and older rows exist (page back via
+    /// `ChatHistory`). Absent when the full history was sent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_has_more: Option<bool>,
     /// PTY panes only: current working directory of the child
     /// (/proc/<pid>/cwd), for the file browser's start dir and the
     /// `$EDITOR` split anchor. None for chat panes / unknown.
@@ -1258,6 +1293,7 @@ mod tests {
             client: "py".into(),
             session: "s1".into(),
             pane: None,
+            chat_limit: None,
         };
         let mut buf = Vec::new();
         for line in encode_frame(&hello, "py") {
@@ -1334,6 +1370,7 @@ mod tests {
                 forge_session: None,
                 model: None,
                 context: None,
+                chat_has_more: None,
                 cwd: None,
             }],
             meta: vec![],

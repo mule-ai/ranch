@@ -15,6 +15,11 @@ import * as Clipboard from "expo-clipboard";
 import { ChatMsg, Frame, Layout, ModelChoice, PaneSnap, b64, nextId } from "../lib/frames";
 import { Relay } from "../lib/relay";
 import { parseSgrRow, Span as SgrSpan } from "../lib/sgr";
+import {
+  getCachedChat,
+  mergeChat,
+  saveCachedChat,
+} from "../lib/chatCache";
 
 // Compute screen rects from the split tree (mirrors the desktop client).
 export type Rect = { pane: string; x: number; y: number; w: number; h: number };
@@ -39,6 +44,9 @@ type Props = { relay: Relay; sessionId: string; sessionName: string; onExit: () 
 
 const FONT_SIZE = 10; // px; JetBrainsMono advance is 0.6em
 const LINE_HEIGHT = 13;
+// how many chat rows to load on attach; older rows page in on scrollback
+const CHAT_TAIL = 25;
+const CHAT_PAGE = 50;
 
 export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props) {
   const [panes, setPanes] = useState<Map<string, PaneSnap>>(new Map());
@@ -67,6 +75,12 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
   const [pred, setPred] = useState<{ row: number; col: number; text: string } | null>(null);
   const predRef = useRef(pred);
   predRef.current = pred;
+  // chat scrollback pagination (chat panes): pending ChatHistory request,
+  // scroll position + content height captured at request time so the
+  // view doesn't jump when older rows are prepended
+  const chatHistReq = useRef<string | null>(null);
+  const [chatLoadingOlder, setChatLoadingOlder] = useState(false);
+  const chatScrollAnchor = useRef<{ y: number; contentH: number } | null>(null);
   // per-pane update sequence: a gap means updates were lost (mobile
   // networks drop WS connections; broadcast has no replay) — re-attach
   // so the daemon re-snapshots
@@ -91,10 +105,20 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
             // rows and must always land
             const pad = [...p0.lines];
             while (pad.length < p0.rows) pad.push("");
+            // chat panes: the snapshot only carries the last CHAT_TAIL
+            // rows (Attach.chat_limit) — merge in any older rows we
+            // already paged in so scrollback survives re-open
+            let chat = p0.chat ?? [];
+            let chatHasMore = !!p0.chat_has_more;
+            if (p0.kind === "forge-chat") {
+              const merged = mergeChat(getCachedChat(sessionId, p0.id), chat, chatHasMore);
+              chat = merged.msgs;
+              chatHasMore = merged.hasMore;
+              saveCachedChat(sessionId, p0.id, chat, chatHasMore);
+            }
             // heuristic: a trailing user row means the agent is on it
-            const chat = p0.chat ?? [];
             const busy = chat[chat.length - 1]?.role === "user";
-            m.set(p0.id, { ...p0, lines: pad, agentBusy: busy });
+            m.set(p0.id, { ...p0, lines: pad, agentBusy: busy, chat: p0.kind === "forge-chat" ? chat : p0.chat, chat_has_more: chatHasMore ? true : undefined });
             // seed dedup tracking from the pane's seq at snapshot time:
             // updates at/below this are duplicates or reordered stragglers
             if (p0.seq) lastSeq.current.set(p0.id, p0.seq);
@@ -128,6 +152,7 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
             lastSeq.current.delete(f.pane);
             relay.send({
               t: "Attach", id: nextId(), client: "mobile", session: sessionId,
+              chat_limit: CHAT_TAIL,
             } as Frame);
             break;
           }
@@ -161,6 +186,34 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
           const next = new Map(panesRef.current);
           next.set(f.pane, { ...cur, chat });
           setPanes(next);
+          // keep the on-device cache in step: a reset (e.g. post-compact
+          // history) wipes it, appends extend it
+          const cached = getCachedChat(sessionId, f.pane) ?? { msgs: [], hasMore: false };
+          saveCachedChat(sessionId, f.pane, f.reset ? chat : [...cached.msgs, ...chat.filter((m) => !cached.msgs.some((c) => c.seq === m.seq))], f.reset ? false : cached.hasMore);
+          break;
+        }
+        case "ChatHistoryOk": {
+          // older chat rows paged in via scrollback — only act on OUR
+          // request, only if the pane still exists
+          if (chatHistReq.current !== f.req_id) break;
+          chatHistReq.current = null;
+          setChatLoadingOlder(false);
+          const anchor = chatScrollAnchor.current;
+          chatScrollAnchor.current = null;
+          const cur = panesRef.current.get(f.pane);
+          if (!cur || f.msgs.length === 0) break;
+          const existing = new Set((cur.chat ?? []).map((m) => m.seq));
+          const add = f.msgs.filter((m) => !existing.has(m.seq));
+          if (add.length === 0) break;
+          const chat = [...add, ...(cur.chat ?? [])];
+          const next = new Map(panesRef.current);
+          next.set(f.pane, { ...cur, chat, chat_has_more: f.has_more });
+          setPanes(next);
+          saveCachedChat(sessionId, f.pane, chat, f.has_more);
+          // hold the view in place: shift down by the content that was
+          // just prepended (fires from onContentSizeChange once the
+          // layout settles)
+          if (anchor) chatScrollAnchor.current = anchor;
           break;
         }
         case "Scrollback":
@@ -233,6 +286,7 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
       relay.send({ t: "Hello", id: nextId(), client: "mobile" } as Frame);
       relay.send({
         t: "Attach", id: nextId(), client: "mobile", session: sessionId,
+        chat_limit: CHAT_TAIL,
       } as Frame);
       relay.send({
         t: "Resize", id: nextId(), client: "mobile", session: sessionId,
@@ -246,7 +300,7 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
     // so the daemon re-snapshots and any divergence self-heals.
     const resyncTimer = setInterval(() => {
       if (predRef.current) return; // don't disturb in-flight predictions
-      relay.send({ t: "Attach", id: nextId(), client: "mobile", session: sessionId } as Frame);
+      relay.send({ t: "Attach", id: nextId(), client: "mobile", session: sessionId, chat_limit: CHAT_TAIL } as Frame);
     }, 15000);
     return () => {
       clearInterval(retryTimer);
@@ -380,6 +434,25 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
     } as Frame);
   };
 
+  // chat scrollback: page in older rows when the user nears the top.
+  // Captures the scroll position so the view doesn't jump when the
+  // older rows are prepended (see onContentSizeChange).
+  const loadOlder = (offY: number, contentH: number) => {
+    if (!activePane || chatHistReq.current) return;
+    const snap = panesRef.current.get(activePane);
+    const msgs = snap?.chat ?? [];
+    if (msgs.length === 0 || !snap?.chat_has_more) return;
+    const rid = nextId();
+    chatHistReq.current = rid;
+    setChatLoadingOlder(true);
+    chatScrollAnchor.current = { y: offY, contentH };
+    relay.send({
+      t: "ChatHistory", id: nextId(), client: "mobile",
+      session: sessionId, pane: activePane, req_id: rid,
+      limit: CHAT_PAGE, before: msgs[0].seq,
+    } as Frame);
+  };
+
   // agent model picker: open the overlay; fetch the catalog from the
   // daemon on first use (ModelListOk lands into modelOpts[pane])
   const openModelPicker = () => {
@@ -505,21 +578,43 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
           <ScrollView
             contentContainerStyle={styles.chatList}
             onContentSizeChange={(_, h) => {
+              const anchor = chatScrollAnchor.current;
+              if (anchor) {
+                // a scrollback page was just prepended: shift the view
+                // down by the new content height so the user stays put
+                chatScrollAnchor.current = null;
+                const dy = h - anchor.contentH;
+                if (dy > 0)
+                  chatScrollRef.current?.scrollTo({ x: 0, y: anchor.y + dy, animated: false });
+                return;
+              }
               if (chatAtBottomRef.current)
                 chatScrollRef.current?.scrollToEnd({ animated: false });
             }}
             onScroll={(e) => {
               const { contentOffset, contentSize, layoutMeasurement } = e.nativeEvent;
-              chatAtBottomRef.current =
+              const atBottom =
                 contentSize.height - contentOffset.y - layoutMeasurement.height < 24;
+              chatAtBottomRef.current = atBottom;
+              if (!atBottom && contentOffset.y < 60) loadOlder(contentOffset.y, contentSize.height);
             }}
             scrollEventThrottle={16}
             ref={chatScrollRef}
           >
+            {chatLoadingOlder && (
+              <View style={{ flexDirection: "row", justifyContent: "center", paddingVertical: 4 }}>
+                <ActivityIndicator size="small" color="#6b7280" />
+              </View>
+            )}
+            {!chatLoadingOlder && !activeSnap?.chat_has_more && chatMsgs.length > 0 && (
+              <Text style={{ ...styles.dim, textAlign: "center", fontSize: 11 }}>
+                — beginning of conversation —
+              </Text>
+            )}
             {chatMsgs
               .filter((m) => !(m.role !== "tool" && !m.text?.trim()))
               .map((m, i) => (
-                <ChatBubble key={i} msg={m} />
+                <ChatBubble key={m.seq ?? i} msg={m} />
               ))}
             {chatMsgs.length === 0 && (
               <Text style={styles.dim}>say something to the agent…</Text>

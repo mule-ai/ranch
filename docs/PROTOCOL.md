@@ -50,7 +50,7 @@ Addressing rules:
 |---|---|---|---|
 | connect | `hello` | client → daemon | `{proto:0, client_name, caps:[...]}` |
 | | `hello-ok` | daemon → client | `{machine, sessions:[session-meta]}` — the session list is piggybacked |
-| attach | `attach` | client → daemon | `{session, pane}` (pane omitted → active pane) |
+| attach | `attach` | client → daemon | `{session, pane, chat_limit?}` (pane omitted → active pane; `chat_limit` caps the chat rows in this client's snapshots) |
 | | `snapshot` | daemon → client | chunked; see §5 |
 | live | `update` | daemon → client | coalesced dirty rows, see §4 |
 | input | `input` | client → daemon | `{data: <base64 bytes>}` — already-encoded terminal input (Kitty/SGR sequences) |
@@ -76,7 +76,8 @@ per app install for mobile so reconnects are stable).
     "panes": [ {"id":"<uuid>", "cols":48, "rows":29,
                  "lines":["…"], "cursor":{"x":12,"y":7,"visible":true},
                  "kind":"pty"|"forge-chat",
-                 "chat":[…], "forge_session":"<uuid>",
+                 "chat":[…], "chat_has_more":true,
+                 "forge_session":"<uuid>",
                  "model":"display name",
                  "context":"ctx readout"} ]
 
@@ -163,6 +164,16 @@ per app install for mobile so reconnects are stable).
   tool_name?, tool_output?, duration_ms?, created_at?, attachments?}`.
   `attachments` (user rows only) carries the file paths the client
   attached, so UIs can render them as badges without parsing the text.
+- **`attach.chat_limit`** — when set (remote clients set 25), snapshots
+  for that client carry only the last N rows of each chat pane and
+  `pane_snap.chat_has_more` is true when older rows exist. Full
+  history stays available via `chat-history`.
+- **`chat-history`** `{session, pane, req_id, limit, before?}` →
+  **`chat-history-ok`** `{req_id, pane, msgs[], has_more}` — paged
+  scrollback for chat panes. Returns up to `limit` rows (clamped to
+  200) with `seq < before` (all rows when `before` is absent), oldest
+  first; `has_more` = true when rows older than `msgs[0]` exist. Sent
+  to the requesting client only.
 - **`error`** — `{"of": "<frame id>", "message": "..."}` for any failed
   request.
 

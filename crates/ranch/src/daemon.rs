@@ -520,6 +520,11 @@ struct Client {
     name: String,
     /// Session currently attached; None = not attached.
     attach: Option<Uuid>,
+    /// When set (via `Attach.chat_limit`), snapshots for this client
+    /// truncate each chat pane's history to the last N rows; the client
+    /// pages back with `ChatHistory`. Set by mobile to keep remote
+    /// snapshots small.
+    chat_limit: Option<usize>,
     scrollback_mode: bool,
     /// Editor file watches (M10 ph3): path -> last seen mtime, seeded by
     /// FileRead/FileWriteOk. The tick loop stats these and pushes
@@ -991,7 +996,7 @@ fn spawn_pane(session: &mut Session, pane_kind: &str, cwd: Option<&str>) -> Resu
 }
 
 /// Build a full snapshot frame for a session (client field filled per-recipient).
-fn snapshot_session(s: &Session) -> Option<Frame> {
+fn snapshot_session(s: &Session, chat_limit: Option<usize>) -> Option<Frame> {
     let sizes: std::collections::HashMap<Uuid, (u16, u16)> = s
         .pane_sizes()
         .into_iter()
@@ -1019,6 +1024,7 @@ fn snapshot_session(s: &Session) -> Option<Frame> {
             forge_session: None,
             model: None,
             context: None,
+            chat_has_more: None,
             cwd: pane_cwd(p.child).map(|p| p.to_string_lossy().into_owned()),
         };
         if *pid == s.active {
@@ -1028,6 +1034,19 @@ fn snapshot_session(s: &Session) -> Option<Frame> {
     }
     for (pid, cp) in &s.chats {
         let (cols, rows) = sizes.get(pid).copied().unwrap_or((cp.cols, cp.rows));
+        // Remote clients (mobile/web) attach with a chat_limit so the
+        // snapshot carries only the last N rows — long conversations
+        // would otherwise ship as megabytes over Realtime. Older rows
+        // are paged back with `ChatHistory`.
+        let chat_has_more = chat_limit
+            .map(|n| cp.chat.len() > n)
+            .unwrap_or(false);
+        let chat = match chat_limit {
+            Some(n) if n > 0 => {
+                cp.chat.iter().rev().take(n).collect::<Vec<_>>().into_iter().rev().cloned().collect()
+            }
+            _ => cp.chat.clone(),
+        };
         snaps.push(PaneSnap {
             id: pid.to_string(),
             cols,
@@ -1036,10 +1055,11 @@ fn snapshot_session(s: &Session) -> Option<Frame> {
             seq: 0,
             cursor: None,
             kind: Some("forge-chat".into()),
-            chat: Some(cp.chat.clone()),
+            chat: Some(chat),
             forge_session: Some(cp.forge_sid.to_string()),
             model: cp.model.clone(),
             context: cp.context.clone(),
+            chat_has_more: if chat_has_more { Some(true) } else { None },
             cwd: None,
         });
     }
@@ -1832,6 +1852,7 @@ impl Daemon {
                         decoder: Decoder::new(),
                         name: "relay".into(),
                         attach: None,
+                        chat_limit: None,
                         scrollback_mode: false,
                         file_watches: BTreeMap::new(),
                     });
@@ -1892,6 +1913,7 @@ impl Daemon {
                     decoder: Decoder::new(),
                     name: "forge".into(),
                     attach: None,
+                    chat_limit: None,
                     scrollback_mode: false,
                     file_watches: BTreeMap::new(),
                 };
@@ -2690,16 +2712,20 @@ impl Daemon {
     }
 
     /// Deliver a full snapshot to every client attached to a session.
+    /// Each recipient gets its own copy: clients that attached with a
+    /// `chat_limit` receive truncated chat histories (their `Attach`
+    /// frame carries it), the rest get the full conversation.
     fn resnap(&mut self, sid: &Uuid) {
         if let Some(s) = self.sessions.get(sid) {
-            if let Some(mut snap) = snapshot_session(s) {
-                let recipients: Vec<RawFd> = self
-                    .clients
-                    .iter()
-                    .filter(|(_, c)| c.attach == Some(*sid))
-                    .map(|(f, _)| *f)
-                    .collect();
-                for rfd in recipients {
+            let recipients: Vec<RawFd> = self
+                .clients
+                .iter()
+                .filter(|(_, c)| c.attach == Some(*sid))
+                .map(|(f, _)| *f)
+                .collect();
+            for rfd in recipients {
+                let limit = self.clients.get(&rfd).and_then(|c| c.chat_limit);
+                if let Some(mut snap) = snapshot_session(s, limit) {
                     if let Frame::Snapshot { client, .. } = &mut snap {
                         *client = rfd.to_string();
                     }
@@ -4237,6 +4263,51 @@ impl Daemon {
                 }
                 return;
             }
+            // client -> daemon: paged chat history (mobile/web scrollback)
+            Frame::ChatHistory { session, pane, req_id, limit, before, .. } => {
+                let pid = match Uuid::parse_str(pane) {
+                    Ok(p) => p,
+                    Err(_) => return,
+                };
+                let page = self
+                    .resolve_session(session)
+                    .and_then(|s| s.chats.get(&pid))
+                    .map(|cp| {
+                        let lim = (*limit).clamp(1, 200) as usize;
+                        let rows: Vec<&ChatMsg> = cp
+                            .chat
+                            .iter()
+                            .filter(|m| before.map_or(true, |b| m.seq < b))
+                            .collect();
+                        let start = rows.len().saturating_sub(lim);
+                        (
+                            rows[start..].iter().cloned().cloned().collect(),
+                            start > 0,
+                        )
+                    });
+                if let Some(c) = self.clients.get_mut(&from) {
+                    match page {
+                        Some((msgs, has_more)) => {
+                            send_frame(
+                                c,
+                                &Frame::ChatHistoryOk {
+                                    req_id: req_id.clone(),
+                                    pane: pid.to_string(),
+                                    msgs,
+                                    has_more,
+                                },
+                            );
+                        }
+                        None => send_frame(
+                            c,
+                            &Frame::Error {
+                                req_id: Some(req_id.clone()),
+                                message: format!("chat pane {pane} not found"),
+                            },
+                        ),
+                    }
+                }
+            }
             // pi reader / forge worker -> clients: model catalog for a
             // chat pane. Stamp the pane's model in the cache, then
             // broadcast (clients match on req_id).
@@ -4343,6 +4414,7 @@ impl Daemon {
                 id,
                 client,
                 session,
+                chat_limit,
                 ..
             } => {
                 let sid = match self.resolve_session(session).map(|s| s.id) {
@@ -4363,6 +4435,7 @@ impl Daemon {
                 eprintln!("ranchd: {client} attached to session {sid}");
                 if let Some(c) = self.clients.get_mut(&from) {
                     c.attach = Some(sid);
+                    c.chat_limit = *chat_limit;
                     c.scrollback_mode = false;
                 }
                 self.resnap(&sid);
@@ -5451,6 +5524,7 @@ fn run(
                         decoder: Decoder::new(),
                         name: format!("cli-{fd}"),
                         attach: None,
+                        chat_limit: None,
                         scrollback_mode: false,
                         file_watches: BTreeMap::new(),
                     },
@@ -5541,6 +5615,7 @@ fn run(
                                 decoder: Decoder::new(),
                                 name: format!("ctl-{}", req.caller_pane),
                                 attach: None,
+                                chat_limit: None,
                                 scrollback_mode: false,
                                 file_watches: BTreeMap::new(),
                             },

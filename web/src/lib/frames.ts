@@ -39,6 +39,7 @@ export type PaneSnap = {
   cursor?: Cursor;
   kind?: "pty" | "forge-chat";
   chat?: ChatMsg[];
+  chat_has_more?: boolean; // true when `chat` is a limited tail (scrollback for older)
   forge_session?: string;
   agentBusy?: boolean;
   model?: string; // active agent model display name (chat panes)
@@ -175,7 +176,7 @@ export type PaneMeta = {
 export type Frame =
   | { t: "Hello"; id: string; client: string; caps?: string[] }
   | { t: "HelloOk"; id: string; machine: string; sessions: SessionMeta[]; version?: string | null; monitor_external_pi?: boolean }
-  | { t: "Attach"; id: string; client: string; session: string; pane?: string }
+  | { t: "Attach"; id: string; client: string; session: string; pane?: string; chat_limit?: number }
   | { t: "Detach"; id: string; client: string }
   | {
       t: "Snapshot";
@@ -222,6 +223,8 @@ export type Frame =
   | { t: "ChatSend"; id: string; client: string; session: string; pane: string; text: string; attachments?: string[] }
   | { t: "ChatCompact"; id: string; client: string; session: string; pane: string; req_id: string }
   | { t: "Chat"; id: string; session: string; pane: string; msgs: ChatMsg[]; reset?: boolean }
+  | { t: "ChatHistory"; id: string; client: string; session: string; pane: string; req_id: string; limit: number; before?: number | null }
+  | { t: "ChatHistoryOk"; req_id: string; pane: string; msgs: ChatMsg[]; has_more: boolean }
   | { t: "SessionsAck"; req_id: string; session: string; pane: string }
   | { t: "SessionsRename"; session: string; name: string }
   | { t: "SessionsKill"; session: string }

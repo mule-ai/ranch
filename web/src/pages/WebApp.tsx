@@ -21,8 +21,13 @@ import { AgentsPage } from "./AgentsPage";
 import { WorkflowsPage } from "./WorkflowsPage";
 import { TriggersPage } from "./TriggersPage";
 import type { ProfileSummary } from "../lib/frames";
+import { clearSessionChat, getCachedChat, mergeChat, saveCachedChat } from "../lib/chatCache";
 
 type Machine = { id: string; name: string; last_seen_at: string | null };
+
+// how many chat rows to load on attach; older rows page in on scrollback
+const CHAT_TAIL = 25;
+const CHAT_PAGE = 50;
 
 // /home/user/src/lab -> ~/src/lab ; otherwise keep the path as-is
 const shortPath = (p?: string | null) =>
@@ -426,6 +431,7 @@ function SessionRow({
           <button
             className="danger"
             onClick={() => {
+              clearSessionChat(session.id);
               relay?.send({ t: "SessionsKill", session: session.id } as Frame);
               onKilled();
               setMenu(false);
@@ -666,6 +672,12 @@ function Terminal({
   // at the bottom; if they've scrolled up, leave the view alone until
   // they scroll back to the bottom
   const chatAtBottomRef = useRef(true);
+  // chat scrollback pagination (chat panes): pending ChatHistory request +
+  // scroll anchor captured at request time so the view doesn't jump when
+  // older rows are prepended
+  const chatHistReq = useRef<string | null>(null);
+  const [chatLoadingOlder, setChatLoadingOlder] = useState(false);
+  const chatScrollAnchor = useRef<{ y: number; contentH: number } | null>(null);
   const [history, setHistory] = useState<string[] | null>(null);
 
   useEffect(() => {
@@ -681,8 +693,17 @@ function Terminal({
           for (const p0 of f.panes) {
             const pad = [...p0.lines];
             while (pad.length < p0.rows) pad.push("");
-            const chat = p0.chat ?? [];
-            m.set(p0.id, { ...p0, lines: pad, agentBusy: chat[chat.length - 1]?.role === "user" });
+            // chat panes: snapshot only carries the last CHAT_TAIL rows
+            // (Attach.chat_limit) — merge in older rows we already paged in
+            let chat = p0.chat ?? [];
+            let chatHasMore = !!p0.chat_has_more;
+            if (p0.kind === "forge-chat") {
+              const merged = mergeChat(getCachedChat(sessionId, p0.id), chat, chatHasMore);
+              chat = merged.msgs;
+              chatHasMore = merged.hasMore;
+              saveCachedChat(sessionId, p0.id, chat, chatHasMore);
+            }
+            m.set(p0.id, { ...p0, lines: pad, agentBusy: chat[chat.length - 1]?.role === "user", chat: p0.kind === "forge-chat" ? chat : p0.chat, chat_has_more: chatHasMore ? true : undefined });
             if (p0.seq) lastSeq.current.set(p0.id, p0.seq);
           }
           setPanes(m);
@@ -699,7 +720,7 @@ function Terminal({
           if (prevSeq > 0 && f.seq !== prevSeq + 1) {
             if (f.seq <= prevSeq) break;
             lastSeq.current.delete(f.pane);
-            relay.send({ t: "Attach", id: nextId(), client: "web", session: sessionId } as Frame);
+            relay.send({ t: "Attach", id: nextId(), client: "web", session: sessionId, chat_limit: CHAT_TAIL } as Frame);
             break;
           }
           lastSeq.current.set(f.pane, f.seq);
@@ -727,6 +748,33 @@ function Terminal({
           const next = new Map(panesRef.current);
           next.set(f.pane, { ...cur, chat });
           setPanes(next);
+          // keep the on-device cache in step: a reset (e.g. post-compact
+          // history) wipes it, appends extend it
+          const cached = getCachedChat(sessionId, f.pane) ?? { msgs: [], hasMore: false };
+          saveCachedChat(
+            sessionId, f.pane,
+            f.reset ? chat : [...cached.msgs, ...chat.filter((m) => !cached.msgs.some((c) => c.seq === m.seq))],
+            f.reset ? false : cached.hasMore,
+          );
+          break;
+        }
+        case "ChatHistoryOk": {
+          // older chat rows paged in via scrollback — only act on OUR
+          // request, only if the pane still exists
+          if (chatHistReq.current !== f.req_id) break;
+          chatHistReq.current = null;
+          setChatLoadingOlder(false);
+          chatScrollAnchor.current = null;
+          const cur = panesRef.current.get(f.pane);
+          if (!cur || f.msgs.length === 0) break;
+          const existing = new Set((cur.chat ?? []).map((m) => m.seq));
+          const add = f.msgs.filter((m) => !existing.has(m.seq));
+          if (add.length === 0) break;
+          const chat = [...add, ...(cur.chat ?? [])];
+          const next = new Map(panesRef.current);
+          next.set(f.pane, { ...cur, chat, chat_has_more: f.has_more });
+          setPanes(next);
+          saveCachedChat(sessionId, f.pane, chat, f.has_more);
           break;
         }
         case "Scrollback":
@@ -737,6 +785,7 @@ function Terminal({
             // the session died under us (killed from the list page,
             // daily reset, another client) — leave the dead view
             setConn("session ended");
+            clearSessionChat(sessionId);
             onKilled();
           }
           if (f.kind === "agent" && f.pane) {
@@ -774,7 +823,7 @@ function Terminal({
     const poke = () => {
       if (gotSnap) return;
       relay.send({ t: "Hello", id: nextId(), client: "web" } as Frame);
-      relay.send({ t: "Attach", id: nextId(), client: "web", session: sessionId } as Frame);
+      relay.send({ t: "Attach", id: nextId(), client: "web", session: sessionId, chat_limit: CHAT_TAIL } as Frame);
       relay.send({
         t: "Resize", id: nextId(), client: "web", session: sessionId,
         cols: geomRef.current.cols, rows: geomRef.current.rows,
@@ -783,7 +832,7 @@ function Terminal({
     poke();
     const retryTimer = setInterval(poke, 3000);
     const resyncTimer = setInterval(() => {
-      relay.send({ t: "Attach", id: nextId(), client: "web", session: sessionId } as Frame);
+      relay.send({ t: "Attach", id: nextId(), client: "web", session: sessionId, chat_limit: CHAT_TAIL } as Frame);
     }, 15000);
     setTimeout(() => focusRef.current?.focus(), 100);
     return () => {
@@ -814,6 +863,25 @@ function Terminal({
     return () => ro.disconnect();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId]);
+
+  // chat scrollback: page in older rows when the user nears the top.
+  // Captures the scroll position so the view doesn't jump when older
+  // rows are prepended (applied in the post-render scroll effect).
+  const loadOlder = (y: number, contentH: number) => {
+    if (!activePane || chatHistReq.current) return;
+    const snap = panesRef.current.get(activePane);
+    const msgs = snap?.chat ?? [];
+    if (msgs.length === 0 || !snap?.chat_has_more) return;
+    const rid = nextId();
+    chatHistReq.current = rid;
+    setChatLoadingOlder(true);
+    chatScrollAnchor.current = { y, contentH };
+    relay.send({
+      t: "ChatHistory", id: nextId(), client: "web",
+      session: sessionId, pane: activePane, req_id: rid,
+      limit: CHAT_PAGE, before: msgs[0].seq,
+    } as Frame);
+  };
 
   const send = (text: string) => {
     if (!activePane || text === "") return;
@@ -883,7 +951,17 @@ function Terminal({
   // they scroll back to the bottom
   useEffect(() => {
     const el = chatScrollRef.current;
-    if (el && chatAtBottomRef.current) el.scrollTop = el.scrollHeight;
+    if (!el) return;
+    const anchor = chatScrollAnchor.current;
+    if (anchor) {
+      // a scrollback page was just prepended: shift down by the new
+      // content height so the view stays where the user left it
+      chatScrollAnchor.current = null;
+      const dy = el.scrollHeight - anchor.contentH;
+      if (dy > 0) el.scrollTop = anchor.y + dy;
+      return;
+    }
+    if (chatAtBottomRef.current) el.scrollTop = el.scrollHeight;
   });
   // switching to a different chat pane re-arms bottom-follow so the new
   // conversation opens at the newest message
@@ -905,6 +983,7 @@ function Terminal({
           className="keybtn keybtn-danger"
           title="kill session"
           onClick={() => {
+            clearSessionChat(sessionId);
             relay.send({ t: "SessionsKill", session: sessionId } as Frame);
             onKilled();
           }}
@@ -961,10 +1040,22 @@ function Terminal({
             ref={chatScrollRef}
             onScroll={(e) => {
               const el = e.currentTarget;
-              chatAtBottomRef.current =
+              const atBottom =
                 el.scrollHeight - el.scrollTop - el.clientHeight < 24;
+              chatAtBottomRef.current = atBottom;
+              if (!atBottom && el.scrollTop < 60) loadOlder(el.scrollTop, el.scrollHeight);
             }}
           >
+            {chatLoadingOlder && (
+              <div className="dim" style={{ textAlign: 'center', padding: '4px 0', fontSize: '0.8rem' }}>
+                loading older messages…
+              </div>
+            )}
+            {!chatLoadingOlder && !activeSnap?.chat_has_more && chatMsgs.length > 0 && (
+              <div className="dim" style={{ textAlign: 'center', fontSize: '0.75rem', opacity: 0.6 }}>
+                — beginning of conversation —
+              </div>
+            )}
             {chatMsgs
               .filter((m: ChatMsg) => m.role === "tool" || m.text?.trim() !== "")
               .map((m, i) =>

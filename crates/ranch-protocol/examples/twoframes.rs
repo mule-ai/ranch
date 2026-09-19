@@ -6,6 +6,7 @@ fn main() {
         client: "c".into(),
         session: "s".into(),
         pane: None,
+        chat_limit: None,
     };
     let f2 = Frame::Detach {
         id: "b".into(),

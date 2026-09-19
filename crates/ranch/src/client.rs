@@ -1660,6 +1660,7 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
         client: client_id,
         session: ref_.to_string(),
         pane: None,
+        chat_limit: None,
     };
     if send_frame(&mut stream, &attach).is_err() {
         die("failed to send attach");
@@ -1924,6 +1925,7 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                                     client: "attach".into(),
                                     session: new_sess.clone(),
                                     pane: None,
+                                    chat_limit: None,
                                 };
                                 send_frame(&mut stream, &af).ok();
                                 screen.reset_blank();
@@ -2084,6 +2086,7 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                                                     client: "attach".into(),
                                                     session: next,
                                                     pane: None,
+                                                    chat_limit: None,
                                                 };
                                                 send_frame(&mut stream, &af).ok();
                                                 screen.reset_blank();
@@ -2391,6 +2394,7 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                                     client: "attach".into(),
                                     session,
                                     pane: None,
+                                    chat_limit: None,
                                 };
                                 send_frame(&mut stream, &f).ok();
                             }
@@ -4131,6 +4135,7 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                                                     client: "attach".into(),
                                                     session: target.clone(),
                                                     pane: None,
+                                                    chat_limit: None,
                                                 };
                                                 send_frame(&mut stream, &af).ok();
                                                 screen.reset_blank();
@@ -4273,6 +4278,7 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                                                 client: "attach".into(),
                                                 session: id,
                                                 pane: None,
+                                                chat_limit: None,
                                             };
                                             send_frame(&mut stream, &af).ok();
                                             screen.reset_blank();

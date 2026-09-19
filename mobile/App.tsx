@@ -25,6 +25,7 @@ import { EditorScreen } from "./screens/Editor";
 import { AgentsScreen } from "./screens/Agents";
 import { WorkflowsScreen } from "./screens/Workflows";
 import { TriggersScreen } from "./screens/Triggers";
+import { clearSessionChat } from "./lib/chatCache";
 
 type Machine = { id: string; name: string };
 
@@ -400,6 +401,7 @@ export default function App() {
                       text: "kill",
                       style: "destructive",
                       onPress: () => {
+                        clearSessionChat(item.id);
                         relay?.send({ t: "SessionsKill", session: item.id } as Frame);
                         setSessions(
                           (sessions ?? []).filter((x) => x.id !== item.id)
