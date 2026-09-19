@@ -221,6 +221,36 @@ struct ResumeEntry {
     external: bool,
 }
 
+/// Does a resume entry match the type-to-filter query (case-insensitive)?
+/// Matched against title, path, agent kind, and session id.
+fn resume_matches(e: &ResumeEntry, q: &str) -> bool {
+    if q.is_empty() {
+        return true;
+    }
+    let q = q.to_lowercase();
+    e.title.to_lowercase().contains(&q)
+        || e.path
+            .as_deref()
+            .map(|p| p.to_lowercase().contains(&q))
+            .unwrap_or(false)
+        || e.id.to_lowercase().contains(&q)
+        || match e.kind {
+            ResumeKind::Forge => "forge".contains(&q),
+            ResumeKind::Pi => "pi".contains(&q),
+        }
+}
+
+/// Indices into `items` matching the filter query. Shared by navigation and
+/// rendering so the selection stays consistent while filtering.
+fn resume_filtered_indices(items: &[ResumeEntry], q: &str) -> Vec<usize> {
+    items
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| resume_matches(e, q))
+        .map(|(i, _)| i)
+        .collect()
+}
+
 fn cmd_new(name: Option<String>, kind: Option<String>, cwd: Option<String>) {
     let f = one_shot(
         |req_id| Frame::SessionsCreate {
@@ -1735,6 +1765,9 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
         std::rc::Rc::new(std::cell::RefCell::new(None));
     let resume_items: std::rc::Rc<std::cell::RefCell<Vec<ResumeEntry>>> =
         std::rc::Rc::new(std::cell::RefCell::new(vec![]));
+    // :resume filter text (type-to-filter while the modal is open)
+    let resume_filter: std::rc::Rc<std::cell::RefCell<String>> =
+        std::rc::Rc::new(std::cell::RefCell::new(String::new()));
     let _ = &resume_sel;
     let _ = &pi_resume_pending;
     // :agents — agent-profile picker (Phase B): j/k/enter/esc. Enter
@@ -3017,50 +3050,70 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                 let marea = Rect::new(mx, my, mw, mh);
                 f.render_widget(ratatui::widgets::Clear, marea);
                 let block = ratatui::widgets::Block::bordered()
-                    .title(" resume session · forge + pi ")
+                    .title(" resume session · forge + pi · type to filter · esc close ")
                     .border_style(Style::default().fg(ratatui::style::Color::Green));
                 let inner = block.inner(marea);
                 f.render_widget(block, marea);
-                let items: Vec<Line> = resume_items
-                    .borrow()
-                    .iter()
-                    .enumerate()
-                    .map(|(i, item)| {
-                        let sel = i == resume_sel.get();
-                        let mut style = Style::default();
-                        if sel {
-                            style = style.add_modifier(Modifier::REVERSED);
-                        } else if item.ended.is_some() || !item.active {
-                            style = style.add_modifier(Modifier::DIM);
-                        }
-                        let mark = if sel { ">" } else { " " };
-                        let tag = match item.kind {
-                            ResumeKind::Forge => "forge",
-                            ResumeKind::Pi => if item.external { "pi*  " } else { "pi   " },
-                        };
-                        let display = if item.title.is_empty() {
-                            format!("{}", &item.id[..8.min(item.id.len())])
-                        } else {
-                            item.title.clone()
-                        };
-                        let main = Span::styled(
-                            format!("{mark} [{:<5}] {:.34}", tag, display),
-                            style,
-                        );
-                        // cwd hint appended dim, so same-titled sessions of
-                        // the same agent stay distinguishable.
-                        if let Some(p) = &item.path {
-                            Line::from(vec![
-                                main,
-                                Span::styled(
-                                    format!("  {}", p),
-                                    Style::default().add_modifier(Modifier::DIM),
-                                ),
-                            ])
-                        } else {
-                            Line::from(main)
-                        }
-                    })
+                let filter = resume_filter.borrow().clone();
+                let indices = resume_filtered_indices(&resume_items.borrow(), &filter);
+                // filter status line: "filter: <q> · n/m" when active,
+                // dim usage hint otherwise
+                let hint: Line = if filter.is_empty() {
+                    Line::from(Span::styled(
+                        format!("  ({}/{} matching)", indices.len(), resume_items.borrow().len()),
+                        Style::default().add_modifier(Modifier::DIM),
+                    ))
+                } else {
+                    Line::from(Span::styled(
+                        format!("  filter: {filter} · {} match",
+                            indices.len()),
+                        Style::default(),
+                    ))
+                };
+                let items: Vec<Line> = std::iter::once(hint)
+                    .chain(
+                        indices
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(pos, &orig)| {
+                                resume_items.borrow().get(orig).map(|item| {
+                                    let sel = pos == resume_sel.get();
+                                    let mut style = Style::default();
+                                    if sel {
+                                        style = style.add_modifier(Modifier::REVERSED);
+                                    } else if item.ended.is_some() || !item.active {
+                                        style = style.add_modifier(Modifier::DIM);
+                                    }
+                                    let mark = if sel { ">" } else { " " };
+                                    let tag = match item.kind {
+                                        ResumeKind::Forge => "forge",
+                                        ResumeKind::Pi => if item.external { "pi*  " } else { "pi   " },
+                                    };
+                                    let display = if item.title.is_empty() {
+                                        format!("{}", &item.id[..8.min(item.id.len())])
+                                    } else {
+                                        item.title.clone()
+                                    };
+                                    let main = Span::styled(
+                                        format!("{mark} [{:<5}] {:.34}", tag, display),
+                                        style,
+                                    );
+                                    // cwd hint appended dim, so same-titled sessions of
+                                    // the same agent stay distinguishable.
+                                    if let Some(p) = &item.path {
+                                        Line::from(vec![
+                                            main,
+                                            Span::styled(
+                                                format!("  {}", p),
+                                                Style::default().add_modifier(Modifier::DIM),
+                                            ),
+                                        ])
+                                    } else {
+                                        Line::from(main)
+                                    }
+                                })
+                            })
+                    )
                     .collect();
                 f.render_widget(
                     Paragraph::new(items),
@@ -3508,11 +3561,45 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                         if key.kind != KeyEventKind::Press {
                             continue;
                         }
-                        // :resume modal: forge session picker
+                        // :resume modal: forge session picker + type-to-filter.
+                        // j/k/arrows navigate the FILTERED list; printable
+                        // chars (except j/k) extend the filter; Backspace
+                        // shortens it; Esc clears the filter, then closes.
                         if resume_open.get() {
+                            let filter = resume_filter.borrow().clone();
+                            let indices =
+                                resume_filtered_indices(&resume_items.borrow(), &filter);
                             match key.code {
-                                KeyCode::Esc | KeyCode::Char('q') => {
-                                    resume_open.set(false);
+                                KeyCode::Esc => {
+                                    if filter.is_empty() {
+                                        resume_open.set(false);
+                                        resume_filter.borrow_mut().clear();
+                                    } else {
+                                        resume_filter.borrow_mut().clear();
+                                        resume_sel.set(0);
+                                    }
+                                }
+                                KeyCode::Backspace => {
+                                    resume_filter.borrow_mut().pop();
+                                    let n = resume_filtered_indices(
+                                        &resume_items.borrow(),
+                                        &resume_filter.borrow(),
+                                    )
+                                    .len();
+                                    if resume_sel.get() >= n {
+                                        resume_sel.set(n.saturating_sub(1));
+                                    }
+                                }
+                                KeyCode::Char(c) if c.is_ascii() && c != 'j' && c != 'k' => {
+                                    resume_filter.borrow_mut().push(c);
+                                    let n = resume_filtered_indices(
+                                        &resume_items.borrow(),
+                                        &resume_filter.borrow(),
+                                    )
+                                    .len();
+                                    if resume_sel.get() >= n {
+                                        resume_sel.set(n.saturating_sub(1));
+                                    }
                                 }
                                 KeyCode::Up | KeyCode::Char('k') => {
                                     let sel = resume_sel.get();
@@ -3522,15 +3609,15 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                                 }
                                 KeyCode::Down | KeyCode::Char('j') => {
                                     let sel = resume_sel.get();
-                                    if sel + 1 < resume_items.borrow().len() {
+                                    if sel + 1 < indices.len() {
                                         resume_sel.set(sel + 1);
                                     }
                                 }
                                 KeyCode::Enter => {
-                                    let picked = resume_items
-                                        .borrow()
+                                    let picked = indices
                                         .get(resume_sel.get())
-                                        .cloned();
+                                        .copied()
+                                        .and_then(|orig| resume_items.borrow().get(orig).cloned());
                                     if let Some(entry) = picked {
                                         resume_open.set(false);
                                         let f = match entry.kind {
@@ -4788,6 +4875,7 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                                                     *pi_resume_pending.borrow_mut() =
                                                         Some(prid.clone());
                                                     resume_items.borrow_mut().clear();
+                                                    resume_filter.borrow_mut().clear();
                                                     resume_sel.set(0);
                                                     let f = Frame::ForgeList {
                                                         id: Uuid::new_v4().to_string(),

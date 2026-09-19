@@ -460,6 +460,8 @@ function CreateRow({ relay, pendingProfile, onProfileLaunched, monitorPi, setMon
   const [piDir, setPiDir] = useState<string | null>(null);
   const [dirBrowse, setDirBrowse] = useState<{ path: string; parent: string | null; dirs: string[] } | null>(null);
   const [resumeList, setResumeList] = useState<{ kind: "forge" | "pi"; id: string; title: string; session_file?: string; updated?: string; ended?: string | null; active?: boolean; external?: boolean; path?: string; working_dir?: string | null }[] | null>(null);
+  const [resumeQuery, setResumeQuery] = useState("");
+  const [resumeFolder, setResumeFolder] = useState<string | null>(null);
   const dirReqRef = useRef<string | null>(null);
   const resumeReqRef = useRef<string | null>(null);
   const piResumeReqRef = useRef<string | null>(null);
@@ -525,6 +527,8 @@ function CreateRow({ relay, pendingProfile, onProfileLaunched, monitorPi, setMon
               const rid = nextId();
               const prid = nextId();
               setResumeList([]);
+              setResumeQuery("");
+              setResumeFolder(null);
               resumeReqRef.current = rid;
               piResumeReqRef.current = prid;
               relay.send({ t: "ForgeList", id: nextId(), client: "web", req_id: rid } as Frame);
@@ -576,13 +580,53 @@ function CreateRow({ relay, pendingProfile, onProfileLaunched, monitorPi, setMon
         </div>
       )}
 
-      {resumeList !== null && (
+      {resumeList !== null && (() => {
+        const folderOf = (i: { kind: string; path?: string; working_dir?: string | null }) =>
+          i.kind === "forge" ? (i.working_dir ?? undefined) : (i.path ?? undefined);
+        const folders = Array.from(new Set(resumeList.map(folderOf).filter((f): f is string => !!f))).sort();
+        const q = resumeQuery.trim().toLowerCase();
+        const filtered = resumeList.filter((i) => {
+          const f = folderOf(i);
+          if (resumeFolder !== null && f !== resumeFolder) return false;
+          if (q && !`${i.title}\n${i.id}\n${f ?? ""}`.toLowerCase().includes(q)) return false;
+          return true;
+        });
+        return (
         <div className="sheet">
           <div className="sheet-header">
             <b>sessions to resume</b>
-            <button className="sheet-close" aria-label="close" onClick={() => setResumeList(null)}>✕</button>
+            <button className="sheet-close" aria-label="close" onClick={() => { setResumeList(null); setResumeQuery(""); setResumeFolder(null); }}>✕</button>
           </div>
-          {resumeList.map((item) => (
+          <input
+            className="resume-search"
+            placeholder="search title, path…"
+            value={resumeQuery}
+            onChange={(e) => setResumeQuery(e.target.value)}
+          />
+          {folders.length > 1 && (
+            <div className="resume-chips">
+              <button
+                className={resumeFolder === null ? "chip chip-on" : "chip"}
+                onClick={() => setResumeFolder(null)}
+              >
+                all ({resumeList.length})
+              </button>
+              {folders.map((f) => {
+                const on = resumeFolder === f;
+                const n = resumeList.filter((i) => folderOf(i) === f).length;
+                return (
+                  <button
+                    key={f}
+                    className={on ? "chip chip-on" : "chip"}
+                    onClick={() => setResumeFolder(on ? null : f)}
+                  >
+                    {shortPath(f)} · {n}
+                  </button>
+                );
+              })}
+            </div>
+          )}
+          {filtered.map((item) => (
             <button
               key={item.id}
               className="machrow"
@@ -609,9 +653,12 @@ function CreateRow({ relay, pendingProfile, onProfileLaunched, monitorPi, setMon
               </span>
             </button>
           ))}
-          {resumeList.length === 0 && <p className="dim">nothing to resume</p>}
+          {filtered.length === 0 && (
+            <p className="dim">{resumeList.length === 0 ? "nothing to resume" : "no matches"}</p>
+          )}
         </div>
-      )}
+        );
+      })()}
 
       <div className="createrow-inner">
         <input
