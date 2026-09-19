@@ -585,77 +585,108 @@ fn fd_inherit(fd: RawFd) -> RawFd {
     fd
 }
 
-/// Read a pi session JSONL and return (id, first_user_message_title, cwd).
-/// Bounded read (512 KB) so a PiList request stays cheap on long sessions.
+/// Read a pi session JSONL and return (id, title, cwd).
+///
+/// Title is the session's LAST user message (48-char truncate) so long,
+/// continued sessions keep a current, identifying title instead of a stale
+/// first prompt. Bounded reads: 64 KB head (session header) + 512 KB tail
+/// (recent messages) so huge session files stay cheap.
 fn pi_session_meta(path: &str) -> (Option<String>, Option<String>, Option<String>) {
-    use std::io::BufRead as _;
-    let file = match std::fs::File::open(path) {
+    use std::io::{BufRead as _, Seek as _, SeekFrom};
+    let mut file = match std::fs::File::open(path) {
         Ok(f) => f,
         Err(_) => return (None, None, None),
     };
+    let size = file.metadata().ok().map(|m| m.len()).unwrap_or(0);
 
-    let mut reader = std::io::BufReader::new(file);
-    let mut bytes_read = 0u64;
-    let mut line = String::new();
     let mut sid: Option<String> = None;
     let mut cwd: Option<String> = None;
-    let mut title: Option<String> = None;
-    while bytes_read < 512 * 1024 {
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) => break,
-            Ok(n) => bytes_read += n as u64,
-            Err(_) => break,
-        }
-        let json: serde_json::Value = match serde_json::from_str(line.trim()) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let typ = json.get("type").and_then(|t| t.as_str());
-        let role = json
-            .get("message")
-            .and_then(|m| m.get("role"))
-            .and_then(|r| r.as_str());
-        match (typ, role) {
-            (Some("session"), _) if sid.is_none() => {
-                if let Some(id) = json.get("id").and_then(|x| x.as_str()) {
-                    sid = Some(id.to_string());
-                }
-                if cwd.is_none() {
-                    cwd = json.get("cwd").and_then(|c| c.as_str()).map(String::from);
+
+    // Pass 1: session header (id + cwd) from the head.
+    {
+        let mut reader = std::io::BufReader::new(&file);
+        let mut bytes_read = 0u64;
+        let mut line = String::new();
+        while bytes_read < 64 * 1024 {
+            line.clear();
+            let n = match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n as u64,
+            };
+            bytes_read += n;
+            if sid.is_some() && cwd.is_some() {
+                break;
+            }
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(line.trim()) {
+                if json.get("type").and_then(|t| t.as_str()) == Some("session") {
+                    if sid.is_none() {
+                        sid = json.get("id").and_then(|x| x.as_str()).map(String::from);
+                    }
+                    if cwd.is_none() {
+                        cwd = json.get("cwd").and_then(|c| c.as_str()).map(String::from);
+                    }
                 }
             }
-            (Some("message"), Some("user")) if title.is_none() => {
-                let text = json
-                    .get("message")
-                    .and_then(|m| m.get("content"))
-                    .and_then(|c| {
-                        if let Some(arr) = c.as_array() {
-                            arr.iter()
-                                .find_map(|b| b.get("text").and_then(|t| t.as_str()))
-                        } else {
-                            c.as_str()
-                        }
-                    })
-                    .unwrap_or("")
-                    .trim()
-                    .to_string();
-                if !text.is_empty() {
-                    let truncated: String = text.chars().take(48).collect();
-                    title = Some(if text.chars().count() > 48 {
-                        format!("{truncated}…")
-                    } else {
-                        truncated
-                    });
-                }
-            }
-            _ => {}
-        }
-        if sid.is_some() && title.is_some() && cwd.is_some() {
-            break;
         }
     }
+
+    // Pass 2: last user message from the tail (last 512 KB).
+    let mut title: Option<String> = None;
+    if file.seek(SeekFrom::Start(size.saturating_sub(512 * 1024))).is_ok() {
+        let mut reader = std::io::BufReader::new(file);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            // A partial first line (seek mid-line) fails JSON parse; skipped.
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(line.trim()) {
+                if json.get("type").and_then(|t| t.as_str()) == Some("message")
+                    && json
+                        .get("message")
+                        .and_then(|m| m.get("role"))
+                        .and_then(|r| r.as_str())
+                        == Some("user")
+                {
+                    let text = json
+                        .get("message")
+                        .and_then(|m| m.get("content"))
+                        .and_then(|c| {
+                            if let Some(arr) = c.as_array() {
+                                arr.iter().find_map(|b| b.get("text").and_then(|t| t.as_str()))
+                            } else {
+                                c.as_str()
+                            }
+                        })
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    if !text.is_empty() {
+                        let truncated: String = text.chars().take(48).collect();
+                        title = Some(if text.chars().count() > 48 {
+                            format!("{truncated}…")
+                        } else {
+                            truncated
+                        });
+                    }
+                }
+            }
+        }
+    }
+
     (sid, title, cwd)
+}
+
+/// mtime of a file as a unix-seconds string (empty when unavailable).
+fn file_mtime_secs(path: &str) -> String {
+    std::fs::metadata(path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs().to_string())
+        .unwrap_or_default()
 }
 
 fn home_dir() -> PathBuf {
@@ -3404,13 +3435,16 @@ impl Daemon {
                 let mut sessions: Vec<PiSessionInfo> = self.pi_agents.iter().map(|(pid, lp)| {
                     let cwd = lp.cwd.clone();
                     let session_file = lp.session_file.lock().ok().and_then(|g| g.clone()).unwrap_or_default();
-                    // Prefer a title derived from the first user message; fall
+                    // Prefer a title derived from the last user message; fall
                     // back to the working directory while the session file
                     // hasn't been created yet (pi writes it lazily).
-                    let title = if !session_file.is_empty() {
-                        pi_session_meta(&session_file).1.unwrap_or(cwd.clone())
+                    let (title, updated) = if session_file.is_empty() {
+                        (cwd.clone(), String::new())
                     } else {
-                        cwd.clone()
+                        (
+                            pi_session_meta(&session_file).1.unwrap_or(cwd.clone()),
+                            file_mtime_secs(&session_file),
+                        )
                     };
                     PiSessionInfo {
                         id: pid.to_string(),
@@ -3419,7 +3453,7 @@ impl Daemon {
                         session_file,
                         active: true,
                         external: false,
-                        updated: String::new(),
+                        updated,
                     }
                 }).collect();
                 // External pi sessions: scan ~/.pi/agent/sessions/ when enabled
@@ -3435,72 +3469,18 @@ impl Daemon {
                                     if fpath.extension().and_then(|e| e.to_str()) != Some("jsonl") { continue; }
                                     let path_str = fpath.to_string_lossy().to_string();
                                     if known_files.contains(&path_str) { continue; }
-                                    // Read first lines for session id, cwd, and
-                                    // the first user message (title).
-                                    let (sid, cwd, title) = {
-                                        let mut id = String::new();
-                                        let mut cwd = String::new();
-                                        let mut title = String::new();
-                                        if let Ok(f) = std::fs::File::open(&fpath) {
-                                            let reader = std::io::BufReader::new(f);
-                                            for line in reader.lines().take(200) {
-                                                if let Ok(line) = line {
-                                                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(line.trim()) {
-                                                        match json.get("type").and_then(|t| t.as_str()) {
-                                                            Some("session") => {
-                                                                if id.is_empty() {
-                                                                    id = json.get("id").and_then(|x| x.as_str()).unwrap_or_default().to_string();
-                                                                }
-                                                                if cwd.is_empty() {
-                                                                    cwd = json.get("cwd").and_then(|x| x.as_str()).unwrap_or_default().to_string();
-                                                                }
-                                                            }
-                                                            Some("message") => {
-                                                                if title.is_empty()
-                                                                    && json.get("message").and_then(|m| m.get("role")).and_then(|r| r.as_str()) == Some("user")
-                                                                {
-                                                                    let text = json.get("message")
-                                                                        .and_then(|m| m.get("content"))
-                                                                        .and_then(|c| {
-                                                                            if let Some(arr) = c.as_array() {
-                                                                                arr.iter().find_map(|b| b.get("text").and_then(|t| t.as_str()))
-                                                                            } else {
-                                                                                c.as_str()
-                                                                            }
-                                                                        })
-                                                                        .unwrap_or("")
-                                                                        .trim()
-                                                                        .to_string();
-                                                                    let truncated: String = text.chars().take(48).collect();
-                                                                    title = if text.chars().count() > 48 {
-                                                                        format!("{truncated}…")
-                                                                    } else {
-                                                                        truncated
-                                                                    };
-                                                                }
-                                                            }
-                                                            _ => {}
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        (if id.is_empty() { path_str.clone() } else { id }, cwd, title)
-                                    };
+                                    // (id, last-user-message title, cwd) from
+                                    // the session file; falls back below.
+                                    let (sid, title, cwd) = pi_session_meta(&path_str);
                                     // mtime as unix timestamp string
-                                    let mtime = file_entry.metadata()
-                                        .and_then(|m| m.modified())
-                                        .ok()
-                                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                                        .map(|d| d.as_secs().to_string())
-                                        .unwrap_or_default();
-                                    // Use directory name as a path fallback; prefer
-                                    // the first user message as the title.
+                                    let mtime = file_mtime_secs(&path_str);
+                                    // Use directory name as a path fallback;
+                                    // prefer the last user message as the title.
                                     let dir_name = sub_dir.file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string();
                                     sessions.push(PiSessionInfo {
-                                        id: sid,
-                                        title: if title.is_empty() { dir_name.clone() } else { title },
-                                        path: if cwd.is_empty() { dir_name } else { cwd },
+                                        id: sid.unwrap_or(path_str.clone()),
+                                        title: title.filter(|t| !t.is_empty()).unwrap_or(dir_name.clone()),
+                                        path: cwd.filter(|c| !c.is_empty()).unwrap_or(dir_name.clone()),
                                         session_file: path_str,
                                         active: false,
                                         external: true,
@@ -5902,7 +5882,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pi_session_meta_extracts_cwd_and_first_user_message() {
+    fn pi_session_meta_extracts_cwd_and_last_user_message() {
         let dir = std::env::temp_dir().join(format!("ranch-pi-meta-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("sess.jsonl");
@@ -5919,7 +5899,7 @@ mod tests {
         let (sid, title, cwd) = pi_session_meta(&path.to_string_lossy());
         assert_eq!(sid.as_deref(), Some("abc"));
         assert_eq!(cwd.as_deref(), Some("/home/u/src/lab"));
-        assert_eq!(title.as_deref(), Some("fix the build please"));
+        assert_eq!(title.as_deref(), Some("and more"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -799,7 +799,7 @@ pub struct PiSessionInfo {
     /// The pane id that owns this pi session (used to attach).
     /// For external sessions this is the session UUID from the .jsonl file.
     pub id: String,
-    /// Human-readable title (first user message of the session, truncated).
+    /// Human-readable title (last user message of the session, truncated).
     /// Falls back to the working directory if the session has no messages yet.
     #[serde(default)]
     pub title: String,

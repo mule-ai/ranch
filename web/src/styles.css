@@ -358,13 +358,6 @@ footer { text-align: center; color: var(--dim); font-size: 0.85rem; padding: 24p
 }
 .resume-search:focus { outline: none; border-color: var(--accent); }
 .resume-chips { display: flex; flex-wrap: wrap; gap: 6px; }
-.resume-search {
-  width: 100%; box-sizing: border-box; background: var(--bg-panel, #1f2430);
-  border: 1px solid var(--border); border-radius: 8px;
-  color: var(--fg, #f3f4f6); padding: 7px 10px; margin-bottom: 8px;
-}
-.resume-search:focus { outline: none; border-color: var(--accent); }
-.resume-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
 .btn-agent { background: var(--purple); border-color: var(--purple); color: #fff; }
 .btn-agent:hover { background: #b96fff; border-color: #b96fff; }
 .keybtn-on { border-color: var(--accent); color: var(--accent); }

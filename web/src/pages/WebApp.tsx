@@ -478,7 +478,7 @@ function CreateRow({ relay, pendingProfile, onProfileLaunched, monitorPi, setMon
         setResumeList((prev) => [...(prev ?? []), ...f.sessions.map((s) => ({ kind: "forge" as const, ...s }))]);
       } else if (f.t === "PiListOk" && f.req_id === piResumeReqRef.current) {
         piResumeReqRef.current = null;
-        setResumeList((prev) => [...(prev ?? []), ...f.sessions.map((s) => ({ kind: "pi" as const, id: s.id, title: s.title, session_file: s.session_file, active: s.active, external: s.external, path: s.path }))]);
+        setResumeList((prev) => [...(prev ?? []), ...f.sessions.map((s) => ({ kind: "pi" as const, id: s.id, title: s.title, session_file: s.session_file, active: s.active, external: s.external, path: s.path, updated: s.updated }))]);
       } else if (f.t === "PiMonitorOk") {
         setMonitorPi(f.enabled);
       }
@@ -603,6 +603,9 @@ function CreateRow({ relay, pendingProfile, onProfileLaunched, monitorPi, setMon
             value={resumeQuery}
             onChange={(e) => setResumeQuery(e.target.value)}
           />
+          <p className="dim" style={{ marginBottom: 4 }}>
+            showing {filtered.length} of {resumeList.length} session{resumeList.length === 1 ? "" : "s"}
+          </p>
           {folders.length > 1 && (
             <div className="resume-chips">
               <button
@@ -649,7 +652,7 @@ function CreateRow({ relay, pendingProfile, onProfileLaunched, monitorPi, setMon
               <span className="dim">
                 {item.kind === "forge"
                   ? [shortPath(item.working_dir ?? undefined), item.ended ? "ended" : "active", item.updated?.slice(0, 16).replace("T", " ")].filter(Boolean).join(" · ")
-                  : [shortPath(item.path ?? undefined), item.active ? "running" : "idle"].filter(Boolean).join(" · ")}
+                  : [shortPath(item.path ?? undefined), item.active ? "running" : "idle", item.updated ? new Date(parseInt(item.updated,10)*1000).toLocaleString("en-US",{month:"short",day:"numeric",hour:"2-digit",minute:"2-digit"}) : ""].filter(Boolean).join(" · ")}
               </span>
             </button>
           ))}

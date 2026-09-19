@@ -34,6 +34,15 @@ type Machine = { id: string; name: string };
 const shortPath = (p?: string) =>
   p ? p.replace(/^\/home\/[^/]+(\/|$)/, "~$1") : undefined;
 
+// unix-seconds string (daemon file mtime) -> "Sep 19 10:47" local
+const fmtUnix = (u?: string | null) => {
+  const n = parseInt(u || "", 10);
+  if (!n) return "";
+  const d = new Date(n * 1000);
+  const M = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  return `${M[d.getMonth()]} ${d.getDate()} ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+};
+
 export default function App() {
   const insets = useSafeAreaInsets();
   const [fontsLoaded] = useFonts({
@@ -206,7 +215,7 @@ export default function App() {
           case "PiListOk":
             if (f.req_id === piResumeReqRef.current) {
               piResumeReqRef.current = null;
-              setResumeList((prev) => [...(prev ?? []), ...f.sessions.map((s) => ({ kind: "pi" as const, id: s.id, title: s.title, session_file: s.session_file, active: s.active, external: s.external, path: s.path }))]);
+              setResumeList((prev) => [...(prev ?? []), ...f.sessions.map((s) => ({ kind: "pi" as const, id: s.id, title: s.title, session_file: s.session_file, active: s.active, external: s.external, path: s.path, updated: s.updated }))]);
             }
             break;
           case "PiMonitorOk":
@@ -463,13 +472,16 @@ export default function App() {
               </Pressable>
             </View>
             <TextInput
-              style={s.input}
+              style={s.searchInput}
               placeholder="search title, path…"
               placeholderTextColor="#6b7280"
               autoCapitalize="none"
               value={resumeQuery}
               onChangeText={setResumeQuery}
             />
+            <Text style={s.dim}>
+              showing {filtered.length} of {resumeList.length} session{resumeList.length === 1 ? "" : "s"}
+            </Text>
             {folders.length > 1 && (
               <ScrollView
                 horizontal
@@ -527,7 +539,7 @@ export default function App() {
                   <Text style={s.dim} numberOfLines={1}>
                     {item.kind === "forge"
                       ? [shortPath(item.working_dir ?? undefined), item.ended ? "ended" : "active", item.updated ? item.updated.slice(0, 16).replace("T", " ") : ""].filter(Boolean).join(" · ")
-                      : [shortPath(item.path), item.active ? "running" : "idle"].filter(Boolean).join(" · ")}
+                      : [shortPath(item.path), item.active ? "running" : "idle", fmtUnix(item.updated)].filter(Boolean).join(" · ")}
                   </Text>
                 </Pressable>
               )}
@@ -794,6 +806,12 @@ const s = StyleSheet.create({
   input: {
     flex: 1, backgroundColor: "#1a1b23", borderRadius: 8,
     paddingHorizontal: 12, paddingVertical: 8, color: "#f3f4f6",
+  },
+  searchInput: {
+    backgroundColor: "#1a1b23", borderRadius: 8,
+    borderWidth: 1, borderColor: "#374151",
+    paddingHorizontal: 12, paddingVertical: 8, color: "#f3f4f6",
+    fontSize: 14, marginBottom: 6,
   },
   sendBtn: { backgroundColor: "#16a34a", borderRadius: 8, paddingHorizontal: 16, justifyContent: "center" },
   btnText: { color: "#fff", fontWeight: "700" },
