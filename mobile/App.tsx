@@ -439,121 +439,6 @@ export default function App() {
             </Text>
           </View>
         )}
-        {resumeList !== null && (() => {
-          // filter helpers: one folder per distinct working dir + free text
-          const folderOf = (i: { kind: string; path?: string; working_dir?: string | null }) =>
-            i.kind === "forge" ? i.working_dir ?? undefined : i.path ?? undefined;
-          const folders = Array.from(new Set(resumeList.map(folderOf).filter((f): f is string => !!f)))
-            .sort();
-          const q = resumeQuery.trim().toLowerCase();
-          const filtered = resumeList.filter((i) => {
-            const f = folderOf(i);
-            if (resumeFolder !== null && f !== resumeFolder) return false;
-            if (q) {
-              const hay = `${i.title}\n${i.id}\n${f ?? ""}`.toLowerCase();
-              if (!hay.includes(q)) return false;
-            }
-            return true;
-          });
-          return (
-          <View style={[s.resumeSheet]}>
-            <View style={s.sheetHeader}>
-              <Text style={s.rowTitle}>sessions to resume</Text>
-              <Pressable
-                accessibilityLabel="close"
-                style={s.sheetClose}
-                onPress={() => {
-                  setResumeList(null);
-                  setResumeQuery("");
-                  setResumeFolder(null);
-                }}
-              >
-                <Text style={s.sheetCloseText}>✕</Text>
-              </Pressable>
-            </View>
-            <TextInput
-              style={s.searchInput}
-              placeholder="search title, path…"
-              placeholderTextColor="#6b7280"
-              autoCapitalize="none"
-              value={resumeQuery}
-              onChangeText={setResumeQuery}
-            />
-            <Text style={s.dim}>
-              showing {filtered.length} of {resumeList.length} session{resumeList.length === 1 ? "" : "s"}
-            </Text>
-            {folders.length > 1 && (
-              <ScrollView
-                horizontal
-                showsHorizontalScrollIndicator={false}
-                style={{ paddingBottom: 4 }}
-              >
-                <View style={s.kindRow}>
-                  <Pressable
-                    style={[s.kindChip, resumeFolder === null && s.kindChipOn]}
-                    onPress={() => setResumeFolder(null)}
-                  >
-                    <Text style={resumeFolder === null ? s.kindTextOn : s.kindText}>
-                      all ({resumeList.length})
-                    </Text>
-                  </Pressable>
-                  {folders.map((f) => {
-                    const on = resumeFolder === f;
-                    const n = resumeList.filter((i) => folderOf(i) === f).length;
-                    return (
-                      <Pressable key={f} style={[s.kindChip, on && s.kindChipOn]} onPress={() => setResumeFolder(on ? null : f)}>
-                        <Text style={on ? s.kindTextOn : s.kindText} numberOfLines={1}>
-                          {shortPath(f)} · {n}
-                        </Text>
-                      </Pressable>
-                    );
-                  })}
-                </View>
-              </ScrollView>
-            )}
-            <FlatList
-              data={filtered}
-              keyExtractor={(item) => item.id}
-              style={{ maxHeight: 320 }}
-              renderItem={({ item }) => (
-                <Pressable
-                  style={s.row}
-                  onPress={() => {
-                    setResumeList(null);
-                    if (item.kind === "forge") {
-                      relay?.send({
-                        t: "SessionsCreate", req_id: nextId(), kind: "forge",
-                        forge_session: item.id,
-                      } as Frame);
-                    } else {
-                      relay?.send({
-                        t: "SessionsCreate", req_id: nextId(), kind: "pi",
-                        pi_session_file: item.session_file,
-                      } as Frame);
-                    }
-                  }}
-                >
-                  <Text style={s.rowTitle} numberOfLines={1}>
-                    [{item.kind}{item.external ? "·ext" : ""}] {item.title || item.id.slice(0, 8)}
-                  </Text>
-                  <Text style={s.dim} numberOfLines={1}>
-                    {item.kind === "forge"
-                      ? [shortPath(item.working_dir ?? undefined), item.ended ? "ended" : "active", item.updated ? item.updated.slice(0, 16).replace("T", " ") : ""].filter(Boolean).join(" · ")
-                      : [shortPath(item.path), item.active ? "running" : "idle", fmtUnix(item.updated)].filter(Boolean).join(" · ")}
-                  </Text>
-                </Pressable>
-              )}
-              ListEmptyComponent={
-                <Text style={s.dim}>
-                  {resumeList.length === 0
-                    ? "nothing to resume"
-                    : "no matches"}
-                </Text>
-              }
-            />
-          </View>
-          );
-        })()}
         <View style={s.kindRow}>
           {(["shell", "forge", "pi"] as const).map((k) => (
             <Pressable
@@ -693,6 +578,121 @@ export default function App() {
         />
       )}
       {tab === "automation" && <AutomationScreen relay={relay} />}
+        {resumeList !== null && (() => {
+          // filter helpers: one folder per distinct working dir + free text
+          const folderOf = (i: { kind: string; path?: string; working_dir?: string | null }) =>
+            i.kind === "forge" ? i.working_dir ?? undefined : i.path ?? undefined;
+          const folders = Array.from(new Set(resumeList.map(folderOf).filter((f): f is string => !!f)))
+            .sort();
+          const q = resumeQuery.trim().toLowerCase();
+          const filtered = resumeList.filter((i) => {
+            const f = folderOf(i);
+            if (resumeFolder !== null && f !== resumeFolder) return false;
+            if (q) {
+              const hay = `${i.title}\n${i.id}\n${f ?? ""}`.toLowerCase();
+              if (!hay.includes(q)) return false;
+            }
+            return true;
+          });
+          return (
+          <View style={[s.resumeSheet, { bottom: kbHeight + 64 + insets.bottom, height: kbHeight > 0 ? "42%" : "62%" }]}>
+            <View style={s.sheetHeader}>
+              <Text style={s.rowTitle}>sessions to resume</Text>
+              <Pressable
+                accessibilityLabel="close"
+                style={s.sheetClose}
+                onPress={() => {
+                  setResumeList(null);
+                  setResumeQuery("");
+                  setResumeFolder(null);
+                }}
+              >
+                <Text style={s.sheetCloseText}>✕</Text>
+              </Pressable>
+            </View>
+            <TextInput
+              style={s.searchInput}
+              placeholder="search title, path…"
+              placeholderTextColor="#6b7280"
+              autoCapitalize="none"
+              value={resumeQuery}
+              onChangeText={setResumeQuery}
+            />
+            <Text style={s.dim}>
+              showing {filtered.length} of {resumeList.length} session{resumeList.length === 1 ? "" : "s"}
+            </Text>
+            {folders.length > 1 && (
+              <ScrollView
+                horizontal
+                showsHorizontalScrollIndicator={false}
+                style={{ paddingBottom: 4 }}
+              >
+                <View style={s.kindRow}>
+                  <Pressable
+                    style={[s.kindChip, resumeFolder === null && s.kindChipOn]}
+                    onPress={() => setResumeFolder(null)}
+                  >
+                    <Text style={resumeFolder === null ? s.kindTextOn : s.kindText}>
+                      all ({resumeList.length})
+                    </Text>
+                  </Pressable>
+                  {folders.map((f) => {
+                    const on = resumeFolder === f;
+                    const n = resumeList.filter((i) => folderOf(i) === f).length;
+                    return (
+                      <Pressable key={f} style={[s.kindChip, on && s.kindChipOn]} onPress={() => setResumeFolder(on ? null : f)}>
+                        <Text style={on ? s.kindTextOn : s.kindText} numberOfLines={1}>
+                          {shortPath(f)} · {n}
+                        </Text>
+                      </Pressable>
+                    );
+                  })}
+                </View>
+              </ScrollView>
+            )}
+            <FlatList
+              data={filtered}
+              keyExtractor={(item) => item.id}
+              style={{ flex: 1 }}
+              renderItem={({ item }) => (
+                <Pressable
+                  style={s.row}
+                  onPress={() => {
+                    setResumeList(null);
+                    if (item.kind === "forge") {
+                      relay?.send({
+                        t: "SessionsCreate", req_id: nextId(), kind: "forge",
+                        forge_session: item.id,
+                      } as Frame);
+                    } else {
+                      relay?.send({
+                        t: "SessionsCreate", req_id: nextId(), kind: "pi",
+                        pi_session_file: item.session_file,
+                      } as Frame);
+                    }
+                  }}
+                >
+                  <Text style={s.rowTitle} numberOfLines={1}>
+                    [{item.kind}{item.external ? "·ext" : ""}] {item.title || item.id.slice(0, 8)}
+                  </Text>
+                  <Text style={s.dim} numberOfLines={1}>
+                    {item.kind === "forge"
+                      ? [shortPath(item.working_dir ?? undefined), item.ended ? "ended" : "active", item.updated ? item.updated.slice(0, 16).replace("T", " ") : ""].filter(Boolean).join(" · ")
+                      : [shortPath(item.path), item.active ? "running" : "idle", fmtUnix(item.updated)].filter(Boolean).join(" · ")}
+                  </Text>
+                </Pressable>
+              )}
+              ListEmptyComponent={
+                <Text style={s.dim}>
+                  {resumeList.length === 0
+                    ? "nothing to resume"
+                    : "no matches"}
+                </Text>
+              }
+            />
+          </View>
+          );
+        })()}
       <TabBar tab={tab} onPick={setTab} />
     </View>
   );
@@ -785,8 +785,12 @@ const s = StyleSheet.create({
   newRow: { flexDirection: "row", gap: 8, paddingBottom: 30, paddingTop: 8 },
   dirChip: { flex: 1, alignItems: "flex-start" },
   resumeSheet: {
+    position: "absolute", left: 16, right: 16, zIndex: 50,
     backgroundColor: "#16161c", borderRadius: 12, padding: 10,
-    borderWidth: 1, borderColor: "#2a2a34", maxHeight: 420,
+    borderWidth: 1, borderColor: "#3a3a46",
+    height: "62%",
+    shadowColor: "#000", shadowOpacity: 0.5, shadowRadius: 12,
+    elevation: 8,
   },
   sheetHeader: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginBottom: 4 },
   sheetClose: {
@@ -809,7 +813,7 @@ const s = StyleSheet.create({
   },
   searchInput: {
     backgroundColor: "#1a1b23", borderRadius: 8,
-    borderWidth: 1, borderColor: "#374151",
+    borderWidth: 1, borderColor: "#2a2a34",
     paddingHorizontal: 12, paddingVertical: 8, color: "#f3f4f6",
     fontSize: 14, marginBottom: 6,
   },
