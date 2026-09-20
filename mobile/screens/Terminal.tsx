@@ -13,6 +13,7 @@ import {
 } from "react-native";
 import * as Clipboard from "expo-clipboard";
 import * as DocumentPicker from "expo-document-picker";
+import { readAsStringAsync, EncodingType } from "expo-file-system/legacy";
 import { ChatMsg, Frame, Layout, ModelChoice, PaneSnap, b64, nextId } from "../lib/frames";
 import { Relay } from "../lib/relay";
 import { parseSgrRow, Span as SgrSpan } from "../lib/sgr";
@@ -376,27 +377,36 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
   // req_id of an in-flight device-file upload (FilePut -> FilePutOk)
   const putReqRef = useRef<string | null>(null);
   // upload a file picked from the phone to the daemon's uploads dir,
-  // then attach the returned path to the next chat message
+  // then attach the returned path to the next chat message.
+  // NOTE: document-picker's `base64` option is web-only — on Android the
+  // asset carries a content:// uri; we read the bytes ourselves.
   const pickFromDevice = useCallback(async () => {
     try {
-      const res = await DocumentPicker.getDocumentAsync({ base64: true });
+      const res = await DocumentPicker.getDocumentAsync({
+        copyToCacheDirectory: true,
+      });
       if (res.canceled || !res.assets?.length) return;
       const a = res.assets[0];
-      if (!a.base64) {
-        setConn("could not read that file");
-        return;
-      }
       if (a.size && a.size > 10 * 1024 * 1024) {
         Alert.alert("file too large", "uploads are capped at 10 MB");
+        return;
+      }
+      setConn("reading file…");
+      const b64 = await readAsStringAsync(a.uri, {
+        encoding: EncodingType.Base64,
+      });
+      if (!b64) {
+        Alert.alert("upload failed", "could not read the picked file");
         return;
       }
       setConn("uploading…");
       const rid = nextId();
       putReqRef.current = rid;
-      relay.send({ t: "FilePut", id: nextId(), client: "mobile", req_id: rid, name: a.name, b64: a.base64 } as Frame);
+      relay.send({ t: "FilePut", id: nextId(), client: "mobile", req_id: rid, name: a.name, b64 } as Frame);
     } catch (e) {
       putReqRef.current = null;
       setConn(`upload failed: ${e instanceof Error ? e.message : String(e)}`);
+      Alert.alert("upload failed", e instanceof Error ? e.message : String(e));
     }
   }, [relay, setConn]);
   // agent model picker (chat panes): catalog per pane + open/closed.

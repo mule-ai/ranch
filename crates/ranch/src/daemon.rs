@@ -3404,6 +3404,7 @@ impl Daemon {
             } => {
                 use base64::Engine as _;
                 let dec = base64::engine::general_purpose::STANDARD;
+                eprintln!("ranchd: FilePut from client {from}: name={name} b64_len={}", b64.len());
                 let mut reply_err = |msg: String| {
                     if let Some(c) = self.clients.get_mut(&from) {
                         send_frame(
@@ -3455,6 +3456,7 @@ impl Daemon {
                 let dest = uploads.join(format!("{ts}-{clean}"));
                 match std::fs::write(&dest, &bytes) {
                     Ok(()) => {
+                        eprintln!("ranchd: FilePut stored {} ({} bytes) at {}", name, bytes.len(), dest.display());
                         if let Some(c) = self.clients.get_mut(&from) {
                             send_frame(
                                 c,

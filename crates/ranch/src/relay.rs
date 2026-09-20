@@ -721,6 +721,11 @@ fn handle_ws_text(
             // remote client frame: payload = {event:"frame", payload:<frame>}
             if msg_topic == topic {
                 if let Some(frame) = payload.get("payload") {
+                    // TEMP DIAG: log every inbound frame type so uploads
+                    // from mobile can be traced (remove after debugging)
+                    if let Some(t) = frame.get("t").and_then(|v| v.as_str()) {
+                        clog(&format!("relay: <- {t}"));
+                    }
                     let mut line = serde_json::to_string(frame).unwrap_or_default();
                     line.push('\n');
                     to_daemon_w
