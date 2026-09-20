@@ -3394,6 +3394,82 @@ impl Daemon {
                     }
                 }
             }
+            // client -> daemon: upload a file from a remote client (mobile)
+            // into the daemon's uploads dir; reply with the absolute path.
+            Frame::FilePut {
+                req_id,
+                name,
+                b64,
+                ..
+            } => {
+                use base64::Engine as _;
+                let dec = base64::engine::general_purpose::STANDARD;
+                let mut reply_err = |msg: String| {
+                    if let Some(c) = self.clients.get_mut(&from) {
+                        send_frame(
+                            c,
+                            &Frame::Error {
+                                req_id: Some(req_id.clone()),
+                                message: msg,
+                            },
+                        );
+                    }
+                };
+                // base64-decode (cap decoded size to 50 MiB to avoid a
+                // memory-blow from a malicious/accidental huge upload)
+                let bytes = match dec.decode(b64.as_bytes()) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        reply_err(format!("invalid base64: {e}"));
+                        return;
+                    }
+                };
+                if bytes.len() > 10 * 1024 * 1024 {
+                    reply_err("file too large (max 10 MiB)".into());
+                    return;
+                }
+                // sanitize the suggested name: take the basename, strip
+                // path separators / traversal, fall back to a generated name
+                let clean: String = name
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(name.as_str())
+                    .trim()
+                    .chars()
+                    .filter(|c| c.is_alphanumeric() || matches!(c, '.' | '-' | '_'))
+                    .collect();
+                let clean = if clean.len() > 64 {
+                    clean.get(..64).unwrap_or(clean.as_str()).to_string()
+                } else if clean.is_empty() {
+                    "upload".to_string()
+                } else {
+                    clean
+                };
+                let uploads = home_dir()
+                    .join(".local/state/ranch/uploads");
+                if let Err(e) = std::fs::create_dir_all(&uploads) {
+                    reply_err(format!("cannot create uploads dir: {e}"));
+                    return;
+                }
+                let ts = chrono::Utc::now().timestamp();
+                let dest = uploads.join(format!("{ts}-{clean}"));
+                match std::fs::write(&dest, &bytes) {
+                    Ok(()) => {
+                        if let Some(c) = self.clients.get_mut(&from) {
+                            send_frame(
+                                c,
+                                &Frame::FilePutOk {
+                                    id: String::new(),
+                                    req_id: req_id.clone(),
+                                    path: dest.to_string_lossy().into_owned(),
+                                    size: bytes.len() as u64,
+                                },
+                            );
+                        }
+                    }
+                    Err(e) => reply_err(format!("could not write upload: {e}")),
+                }
+            }
             // client -> forge: list resumable sessions (blocking HTTP
             // on the worker thread)
             Frame::ForgeList { req_id, .. } => {

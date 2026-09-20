@@ -205,6 +205,15 @@ The daemon is the file server; clients (mobile/CLI) are thin editors.
   A changed on-disk mtime is pushed to *that* client only; clients with
   the file open surface a conflict (reload vs keep local) instead of
   discovering the clobber risk only at save time.
+- **`FilePut`** `{req_id, name, b64}` — client → daemon: upload a file
+  from a remote client (mobile) to the daemon's uploads dir
+  (`~/.local/state/ranch/uploads/<ts>-<name>`). `name` is sanitized
+  (basename, alnum/`.`/`-`/`_` only, 64-char cap); `b64` is
+  base64-encoded content (≤ 10 MiB decoded). May arrive chunked when
+  large — the daemon reassembles via the standard `Chunk` mechanism.
+- **`FilePutOk`** `{req_id, path, size}` — daemon → client: the upload
+  was stored; `path` is the absolute daemon path (usable as a
+  `ChatSend` attachment so the agent can read it).
 
 ### Sync
 

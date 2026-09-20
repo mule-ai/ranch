@@ -217,6 +217,8 @@ export type Frame =
   | { t: "FileReadOk"; id: string; req_id: string; path: string; content: string; mtime: number; size: number }
   | { t: "FileWrite"; id: string; client: string; req_id: string; path: string; content: string; mtime?: number | null }
   | { t: "FileWriteOk"; id: string; req_id: string; path: string; mtime: number }
+  | { t: "FilePut"; id: string; client: string; req_id: string; name: string; b64: string }
+  | { t: "FilePutOk"; id: string; req_id: string; path: string; size: number }
   | { t: "FileChanged"; path: string; mtime: number }
   | { t: "ForgeListOk"; id: string; req_id: string; sessions: ForgeSessionInfo[] }
   | { t: "PiListOk"; id: string; req_id: string; sessions: PiSessionInfo[] }

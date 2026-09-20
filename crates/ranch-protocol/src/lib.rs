@@ -229,6 +229,26 @@ pub enum Frame {
         path: String,
         mtime: i64,
     },
+    /// Client -> daemon: upload a file from a remote client (mobile)
+    /// to the daemon's uploads dir. `name` is the suggested file name
+    /// (sanitized by the daemon); `b64` is base64-encoded content.
+    /// Large payloads may arrive chunked (reassembled before decode).
+    FilePut {
+        id: String,
+        client: String,
+        /// echoed back in FilePutOk so clients match the reply
+        req_id: String,
+        name: String,
+        b64: String,
+    },
+    /// Daemon -> client: the uploaded file was stored; `path` is the
+    /// absolute path on the daemon machine (usable as a chat attachment).
+    FilePutOk {
+        id: String,
+        req_id: String,
+        path: String,
+        size: u64,
+    },
     /// Client -> daemon: list resumable forge sessions.
     ForgeList {
         id: String,
@@ -1430,6 +1450,25 @@ mod tests {
             path: "/home/j/notes.md".into(),
             mtime: 1757500002,
         };
+        let put = Frame::FilePut {
+            id: "i5".into(),
+            client: "mobile".into(),
+            req_id: "r3".into(),
+            name: "notes.txt".into(),
+            b64: "aGVsbG8=".into(),
+        };
+        let put_ok = Frame::FilePutOk {
+            id: "i6".into(),
+            req_id: "r3".into(),
+            path: "/home/j/.local/state/ranch/uploads/1757500002-notes.txt".into(),
+            size: 5,
+        };
+        for f in [put, put_ok.clone()] {
+            let line = encode_frame(&f, "c");
+            assert_eq!(line.len(), 1);
+            let back: Frame = serde_json::from_str(&line[0]).unwrap();
+            assert_eq!(back, f);
+        }
         // optional mtime must deserialize as None when absent (back-compat)
         let json =
             r#"{"t":"FileWrite","id":"i","client":"c","req_id":"r","path":"/x","content":""}"#;

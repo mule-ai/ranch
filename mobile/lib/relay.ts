@@ -95,11 +95,31 @@ export class Relay {
   }
 
   send(f: Frame) {
-    this.channel?.send({
-      type: "broadcast",
-      event: "frame",
-      payload: f,
-    });
+    const json = JSON.stringify(f);
+    // Supabase Realtime caps a single broadcast payload at ~28 KB; the
+    // daemon's FrameDecoder reassembles Chunk frames (same scheme the
+    // daemon uses for large outbound frames), so split anything over
+    // the protocol's MAX_FRAME here instead of sending one fat line.
+    const MAX = 16 * 1024;
+    if (json.length <= MAX) {
+      this.channel?.send({ type: "broadcast", event: "frame", payload: f });
+      return;
+    }
+    const n = Math.ceil(json.length / MAX);
+    const cid = "c" + Math.random().toString(36).slice(2) + Date.now().toString(36);
+    for (let i = 0; i < n; i++) {
+      this.channel?.send({
+        type: "broadcast",
+        event: "frame",
+        payload: {
+          t: "Chunk",
+          chunk_id: cid,
+          i,
+          n,
+          data: json.slice(i * MAX, (i + 1) * MAX),
+        },
+      });
+    }
   }
 
   leave() {

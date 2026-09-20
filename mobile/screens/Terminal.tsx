@@ -12,6 +12,7 @@ import {
   View,
 } from "react-native";
 import * as Clipboard from "expo-clipboard";
+import * as DocumentPicker from "expo-document-picker";
 import { ChatMsg, Frame, Layout, ModelChoice, PaneSnap, b64, nextId } from "../lib/frames";
 import { Relay } from "../lib/relay";
 import { parseSgrRow, Span as SgrSpan } from "../lib/sgr";
@@ -262,16 +263,27 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
           break;
         }
         case "Error":
-          // request-scoped errors (model switch etc.) only matter when the
-          // req_id is one we sent; daemon-side failures flash a banner
-          if (f.req_id && f.req_id !== modelSetReq.current) break;
+          // request-scoped errors (model switch, file upload, etc.) only
+          // matter when the req_id is one we sent
+          if (f.req_id && f.req_id !== modelSetReq.current && f.req_id !== putReqRef.current) break;
           modelSetReq.current = null;
+          putReqRef.current = null;
           setConn(`error: ${f.message}`);
           break;
         case "DirListOk": {
           if (f.req_id === attachDirReqRef.current) {
             attachDirReqRef.current = null;
             setAttachBrowse({ path: f.path, parent: f.parent ?? null, dirs: f.dirs, files: f.files ?? [] });
+          }
+          break;
+        }
+        case "FilePutOk": {
+          // device-file upload landed on the daemon; attach its path
+          if (f.req_id === putReqRef.current) {
+            putReqRef.current = null;
+            setChatAttachments((prev) =>
+              prev.includes(f.path) ? prev : [...prev, f.path]
+            );
           }
           break;
         }
@@ -361,6 +373,32 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
   // file browser state for the attachment picker
   const [attachBrowse, setAttachBrowse] = useState<{ path: string; parent: string | null; dirs: string[]; files: string[] } | null>(null);
   const attachDirReqRef = useRef<string | null>(null);
+  // req_id of an in-flight device-file upload (FilePut -> FilePutOk)
+  const putReqRef = useRef<string | null>(null);
+  // upload a file picked from the phone to the daemon's uploads dir,
+  // then attach the returned path to the next chat message
+  const pickFromDevice = useCallback(async () => {
+    try {
+      const res = await DocumentPicker.getDocumentAsync({ base64: true });
+      if (res.canceled || !res.assets?.length) return;
+      const a = res.assets[0];
+      if (!a.base64) {
+        setConn("could not read that file");
+        return;
+      }
+      if (a.size && a.size > 10 * 1024 * 1024) {
+        Alert.alert("file too large", "uploads are capped at 10 MB");
+        return;
+      }
+      setConn("uploading…");
+      const rid = nextId();
+      putReqRef.current = rid;
+      relay.send({ t: "FilePut", id: nextId(), client: "mobile", req_id: rid, name: a.name, b64: a.base64 } as Frame);
+    } catch (e) {
+      putReqRef.current = null;
+      setConn(`upload failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }, [relay, setConn]);
   // agent model picker (chat panes): catalog per pane + open/closed.
   // The pane's active model lives on the PaneSnap (`model`).
   const [modelOpts, setModelOpts] = useState<Record<string, ModelChoice[]>>({});
@@ -639,10 +677,22 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
               <Pressable
                 style={{ paddingHorizontal: 10, paddingVertical: 6, backgroundColor: '#1e1e26', borderRadius: 6 }}
                 onPress={() => {
-                  setAttachBrowse(null);
-                  const rid = nextId();
-                  attachDirReqRef.current = rid;
-                  relay.send({ t: "DirList", id: nextId(), client: "mobile", req_id: rid } as Frame);
+                  Alert.alert("attach a file", undefined, [
+                    {
+                      text: "📱 pick from device",
+                      onPress: pickFromDevice,
+                    },
+                    {
+                      text: "🖥️ browse daemon files",
+                      onPress: () => {
+                        setAttachBrowse(null);
+                        const rid = nextId();
+                        attachDirReqRef.current = rid;
+                        relay.send({ t: "DirList", id: nextId(), client: "mobile", req_id: rid } as Frame);
+                      },
+                    },
+                    { text: "cancel", style: "cancel" },
+                  ]);
                 }}
               >
                 <Text style={{ color: '#888', fontSize: 16 }}>📎</Text>
@@ -1334,9 +1384,8 @@ const styles = StyleSheet.create({
   pickerRowActive: { backgroundColor: "#1a2018" },
   pickerRowText: { color: "#d1d5db", fontSize: 13, fontFamily: "JetBrainsMono NF Mono" },
   chatInputRow: {
-    flexDirection: "row", borderTopWidth: 1, borderTopColor: "#23232c",
-    padding: 8, paddingTop: 10, paddingBottom: 30, gap: 8,
-    alignItems: "flex-end",
+    flexDirection: "column", borderTopWidth: 1, borderTopColor: "#23232c",
+    padding: 8, paddingTop: 10, paddingBottom: 30, gap: 6,
   },
   chatInput: {
     flex: 1, backgroundColor: "#16161c", borderRadius: 10, color: "#f3f4f6",
