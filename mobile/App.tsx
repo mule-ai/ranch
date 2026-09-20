@@ -582,8 +582,18 @@ export default function App() {
           // filter helpers: one folder per distinct working dir + free text
           const folderOf = (i: { kind: string; path?: string; working_dir?: string | null }) =>
             i.kind === "forge" ? i.working_dir ?? undefined : i.path ?? undefined;
-          const folders = Array.from(new Set(resumeList.map(folderOf).filter((f): f is string => !!f)))
-            .sort();
+          const folderCounts = new Map<string, number>();
+          for (const i of resumeList) {
+            const f = folderOf(i);
+            if (f) folderCounts.set(f, (folderCounts.get(f) ?? 0) + 1);
+          }
+          // show only the busiest folders as chips; the rest are reachable
+          // via the search box. Capped so a 200-session list doesn't render
+          // 200 chips.
+          const folders = Array.from(folderCounts.entries())
+            .sort((a, b) => b[1] - a[1])
+            .slice(0, 10)
+            .map((e) => e[0]);
           const q = resumeQuery.trim().toLowerCase();
           const filtered = resumeList.filter((i) => {
             const f = folderOf(i);
@@ -622,33 +632,35 @@ export default function App() {
               showing {filtered.length} of {resumeList.length} session{resumeList.length === 1 ? "" : "s"}
             </Text>
             {folders.length > 1 && (
-              <ScrollView
-                horizontal
-                showsHorizontalScrollIndicator={false}
-                style={{ paddingBottom: 4 }}
-              >
-                <View style={s.kindRow}>
-                  <Pressable
-                    style={[s.kindChip, resumeFolder === null && s.kindChipOn]}
-                    onPress={() => setResumeFolder(null)}
-                  >
-                    <Text style={resumeFolder === null ? s.kindTextOn : s.kindText}>
-                      all ({resumeList.length})
-                    </Text>
-                  </Pressable>
-                  {folders.map((f) => {
-                    const on = resumeFolder === f;
-                    const n = resumeList.filter((i) => folderOf(i) === f).length;
-                    return (
-                      <Pressable key={f} style={[s.kindChip, on && s.kindChipOn]} onPress={() => setResumeFolder(on ? null : f)}>
-                        <Text style={on ? s.kindTextOn : s.kindText} numberOfLines={1}>
-                          {shortPath(f)} · {n}
-                        </Text>
-                      </Pressable>
-                    );
-                  })}
-                </View>
-              </ScrollView>
+              <View style={{ height: 38, justifyContent: "center" }}>
+                <ScrollView
+                  horizontal
+                  showsHorizontalScrollIndicator={false}
+                  contentContainerStyle={{ justifyContent: "flex-start", alignItems: "center", paddingVertical: 2 }}
+                >
+                  <View style={s.kindRow}>
+                    <Pressable
+                      style={[s.kindChip, resumeFolder === null && s.kindChipOn]}
+                      onPress={() => setResumeFolder(null)}
+                    >
+                      <Text style={resumeFolder === null ? s.kindTextOn : s.kindText}>
+                        all ({resumeList.length})
+                      </Text>
+                    </Pressable>
+                    {folders.map((f) => {
+                      const on = resumeFolder === f;
+                      const n = resumeList.filter((i) => folderOf(i) === f).length;
+                      return (
+                        <Pressable key={f} style={[s.kindChip, on && s.kindChipOn]} onPress={() => setResumeFolder(on ? null : f)}>
+                          <Text style={on ? s.kindTextOn : s.kindText} numberOfLines={1}>
+                            {shortPath(f)} · {n}
+                          </Text>
+                        </Pressable>
+                      );
+                    })}
+                  </View>
+                </ScrollView>
+              </View>
             )}
             <FlatList
               data={filtered}
@@ -804,10 +816,10 @@ const s = StyleSheet.create({
     borderWidth: 1, borderColor: "#374151", backgroundColor: "#1f2430",
   },
   sheetCloseText: { color: "#f3f4f6", fontSize: 16, fontWeight: "700", lineHeight: 20 },
-  kindRow: { flexDirection: "row", gap: 8, paddingBottom: 4 },
+  kindRow: { flexDirection: "row", gap: 8, paddingBottom: 4, alignItems: "center" },
   kindChip: {
     borderWidth: 1, borderColor: "#374151", borderRadius: 999,
-    paddingHorizontal: 12, paddingVertical: 4,
+    paddingHorizontal: 12, paddingVertical: 4, alignSelf: "center",
   },
   kindChipOn: { borderColor: "#4ade80", backgroundColor: "rgba(74,222,128,0.12)" },
   kindText: { color: "#9ca3af", fontSize: 13 },
