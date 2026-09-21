@@ -32,6 +32,20 @@ export const CHANNEL = "ranch";
 let cache: NotifSettings = { ...DEFAULT_SETTINGS };
 let loaded = false;
 
+// Captured once from initNotifications: if the native module is missing
+// (e.g. the APK was built before expo-notifications was added) or a
+// scheduling call throws, we record the reason so Settings can surface it
+// instead of silently no-oping.
+let moduleError: string | null = null;
+export function getModuleError(): string | null {
+  return moduleError;
+}
+
+/** True when the native notifications module responded at init time. */
+export function moduleAvailable(): boolean {
+  return moduleError === null;
+}
+
 // merge over defaults; tolerate missing keys, corrupt JSON, wrong types
 function merge(partial: unknown): NotifSettings {
   const out: NotifSettings = { ...DEFAULT_SETTINGS };
@@ -84,13 +98,18 @@ export async function initNotifications(): Promise<void> {
         shouldSetBadge: false,
       }),
     });
-    await Notifications.requestPermissionsAsync();
+    // getPermissionsAsync proves the native module is present; a missing
+    // module (stale APK) rejects here and we record it for diagnostics.
+    const perm = await Notifications.getPermissionsAsync();
+    if (!perm.granted) await Notifications.requestPermissionsAsync();
     // upsert the "ranch" channel (creates it on first run; Android only)
     await Notifications.setNotificationChannelAsync(CHANNEL, {
       name: "ranch",
       importance: Notifications.AndroidImportance.HIGH,
     });
-  } catch {
+    moduleError = null;
+  } catch (e: any) {
+    moduleError = e?.message ?? String(e);
     // notifications are an optional nicety — never crash over them
   }
 }
@@ -113,20 +132,54 @@ export async function notify(
     // attention when they've put the phone down. While the app is the
     // active screen the user can already see the event in the UI.
     if (AppState.currentState === "active") return false;
-    const data: Record<string, unknown> = {};
-    if (threadIdentifier) data.threadIdentifier = threadIdentifier;
-    await Notifications.scheduleNotificationAsync({
-      content: {
-        title,
-        body,
-        data,
-      },
-      // immediate delivery, on the "ranch" channel (SDK 57: channelId
-      // lives on the trigger, not the content)
-      trigger: { channelId: CHANNEL },
-    });
+    await scheduleOne(title, body, threadIdentifier);
     return true;
   } catch {
     return false;
+  }
+}
+
+async function scheduleOne(
+  title: string,
+  body: string,
+  threadIdentifier?: string,
+): Promise<void> {
+  const data: Record<string, unknown> = {};
+  if (threadIdentifier) data.threadIdentifier = threadIdentifier;
+  await Notifications.scheduleNotificationAsync({
+    content: {
+      title,
+      body,
+      data,
+    },
+    // immediate delivery, on the "ranch" channel (SDK 57: channelId
+    // lives on the trigger, not the content)
+    trigger: { channelId: CHANNEL },
+  });
+}
+
+/**
+ * Fire a test notification regardless of app state or the per-event
+ * toggles — used by the Settings "test" button to verify the native
+ * pipeline (module present + permission granted + channel created).
+ * Returns a human-readable result so the UI can explain a failure.
+ */
+export async function testNotification(): Promise<{ ok: boolean; detail: string }> {
+  if (moduleError !== null) {
+    return { ok: false, detail: `module unavailable: ${moduleError}` };
+  }
+  try {
+    const perm = await Notifications.getPermissionsAsync();
+    if (!perm.granted) {
+      const req = await Notifications.requestPermissionsAsync();
+      if (!req.granted) {
+        return { ok: false, detail: "permission not granted — tap 'request' below" };
+      }
+    }
+    await scheduleOne("ranch", "test notification — if you see this, notifications work");
+    return { ok: true, detail: "sent — pull down the notification shade" };
+  } catch (e: any) {
+    moduleError = e?.message ?? String(e);
+    return { ok: false, detail: `failed: ${moduleError}` };
   }
 }

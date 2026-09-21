@@ -17,7 +17,8 @@ import * as Notifications from "expo-notifications";
 import {
   loadSettings,
   saveSettings,
-  notify,
+  testNotification,
+  getModuleError,
   type NotifSettings,
 } from "../lib/notifications";
 
@@ -72,10 +73,8 @@ export function SettingsScreen({ onExit }: Props) {
 
   const test = async () => {
     setTestNote("sending…");
-    const ok = await notify("questions", "ranch", "test notification");
-    setTestNote(ok
-      ? "scheduled — you'll see it when the app is in the background"
-      : "not sent (setting off, or app is in the foreground — background it and try again)");
+    const { ok, detail } = await testNotification();
+    setTestNote(ok ? detail : detail);
   };
 
   const reRequest = async () => {
@@ -103,6 +102,11 @@ export function SettingsScreen({ onExit }: Props) {
           Notifications appear when the app is in the background — they're for pulling
           you back in, not for the screen you're already reading.
         </Text>
+        {getModuleError() && (
+          <Text style={{ color: "#f87171", fontSize: 12, marginBottom: 6 }}>
+            ⚠ notifications module unavailable: {getModuleError()}
+          </Text>
+        )}
 
         {settings === null ? (
           <Text style={s.dim}>loading…</Text>
