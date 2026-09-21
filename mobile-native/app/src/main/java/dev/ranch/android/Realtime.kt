@@ -245,12 +245,13 @@ class Realtime(
             // Phoenix join/leave/heartbeat replies
             if (event == "phx_reply") {
                 val ref = msg.optString("ref")
-                val reply = msg.optJSONObject("reply")
+                val reply = msg.optJSONObject("payload")
                 if (ref == "join" && reply != null &&
                     reply.optString("status") == "ok"
                 ) {
                     joinOk = true
                     lastServerSeen = System.currentTimeMillis()
+                    onStatus("joined")
                 }
                 return
             }

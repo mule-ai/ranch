@@ -72,3 +72,28 @@ classes present in the DEX. APK at `releases/ranch-native-0.2.0.apk`.
 
 Follow-ons: terminal-screen rendering (Phase 2), Google-OAuth login path
 (email/password is the current path), FCM as an optional true-push channel.
+
+## 2026-09-21 — Agent `Meta` broadcast root-cause fix + native joinOk
+
+**Root cause (daemon):** the local-pi harness's `write_status()` emitted
+`Frame::Meta { kind:"agent", pane: None }` for every working/idle transition.
+The daemon's `Meta` handler resolves the owning session *from the pane UUID*;
+with `pane: None` the lookup fails and the frame is dropped **before** the
+machine-wide broadcast — so no client (TUI, relay, native) ever saw agent
+working/idle. The `all = kind=="agent"` recipient fix (`bf045b8`) was
+necessary but not sufficient: the frame never reached the broadcast step.
+`write_status()` now carries the pane UUID (`pilocal.rs`), matching
+`write_model_status`/`write_context_status`, which already worked. Forge
+agent Meta already carried the pane, so only the local-pi path was broken.
+
+**Root cause (native client):** `Realtime.kt` checked the join reply at
+`payload.reply.status`; Supabase returns it at `payload.status`, so `joinOk`
+never latched and the pump skipped all heartbeats/refresh. Now reads
+`payload.status`.
+
+Verified end-to-end against the live relay: spawned a scratch pi agent, and a
+standalone WS client on `realtime:machines:{id}` (machine JWT, matching the
+native client) received the `Meta agent working → idle` edge and the daemon
+logged `relay: broadcasting frame`. Test sessions cleaned up.
+
+APK rebuilt (`releases/ranch-native-0.2.0.apk`) with the joinOk fix.

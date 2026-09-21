@@ -741,7 +741,7 @@ pub fn read_session_messages(path: &str) -> Result<Vec<ChatMsg>, String> {
         // error row + clears the indicator instead)
         let att = if attachments.is_empty() { None } else { Some(attachments.to_vec()) };
         emit_chat_with(pipe, self.pane, "user", display_text, att, now_iso());
-        write_status(pipe, "working");
+        write_status(pipe, self.pane, "working");
         Ok(())
     }
 
@@ -901,7 +901,7 @@ fn run_pi_reader(
                                 message: format!("model switch failed: {msg}"),
                             },
                         );
-                        write_status(&pipe, "idle");
+                        write_status(&pipe, t_pane, "idle");
                     }
                 } else if v.get("command").and_then(|c| c.as_str()) == Some("compact") {
                     let success = v.get("success").and_then(|s| s.as_bool()).unwrap_or(false);
@@ -938,7 +938,7 @@ fn run_pi_reader(
                                 message: format!("compact failed: {msg}"),
                             },
                         );
-                        write_status(&pipe, "idle");
+                        write_status(&pipe, t_pane, "idle");
                     }
                 } else if v.get("command").and_then(|c| c.as_str()) == Some("get_session_stats") {
                     // context-window readout (footer-style numbers)
@@ -1179,7 +1179,7 @@ fn run_pi_reader(
                 }
             }
             "turn_end" | "agent_end" => {
-                write_status(&pipe, "idle");
+                write_status(&pipe, t_pane, "idle");
                 // the turn may have grown the context — refresh the
                 // readout (reader thread fires the RPC itself)
                 rpc(
@@ -1193,7 +1193,7 @@ fn run_pi_reader(
                     .and_then(|m| m.as_str())
                     .unwrap_or("pi error");
                 emit_chat(&pipe, t_pane, "assistant", &format!("⚠ {msg}"), now_iso());
-                write_status(&pipe, "idle");
+                write_status(&pipe, t_pane, "idle");
             }
             _ => {}
         }
@@ -1335,12 +1335,12 @@ fn format_k_tokens(n: i64) -> String {
     }
 }
 
-fn write_status(pipe: &PipeWriter, status: &str) {
+fn write_status(pipe: &PipeWriter, pane: Uuid, status: &str) {
     write_frame(
         pipe,
         &Frame::Meta {
             session: String::new(),
-            pane: None,
+            pane: Some(pane.to_string()),
             kind: "agent".to_string(),
             status: Some(status.to_string()),
         },
