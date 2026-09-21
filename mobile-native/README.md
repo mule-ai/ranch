@@ -15,7 +15,7 @@ already shows everything). A native foreground service sidesteps that: the
 process stays alive (exempt from Doze), the WS stays open, and notifications
 fire while the phone is in a drawer.
 
-## What it does today (v0.2.0)
+## What it does today (v0.3.0)
 
 - **Supabase auth** — email/password (GoTrue) with refresh; tokens persist in
   SharedPreferences. (`Auth.kt`)
@@ -24,7 +24,9 @@ fire while the phone is in a drawer.
   `realtime:machines:{machineId}` (JWT in the join payload). Ported from
   `crates/ranch/src/relay.rs`: 25 s app heartbeats, 75 s zombie-connection
   guard, JWT refresh ~2 min pre-expiry (`access_token` event + re-join),
-  chunk reassembly. (`Realtime.kt`)
+  chunk reassembly, **and outbound frames** (`Hello`/`Attach`/`Resize`/
+  `Input`/`ChatSend`/`Detach`) sent as Realtime `broadcast` messages and
+  queued until the channel is joined. (`Realtime.kt`)
 - **Notification engine** — port of `mobile/lib/notifyEvents.ts` +
   `mobile/lib/notifications.ts`. Fires local notifications for
   turn-end / every-message / agent-question **only when the app is in the
@@ -33,10 +35,26 @@ fire while the phone is in a drawer.
 - **Foreground service** — `MonitorService` keeps the WS alive and shows a
   persistent low-importance "monitoring …" notification. Restarts
   itself + restores the machine from Prefs on process kill (START_STICKY).
-- **UI** — `MainActivity` (programmatic views): sign in, pick a machine,
-  start/stop monitoring, the 4 notification toggles, permission + test
-  buttons, and a live diagnostics readout (frames seen, fired/skipped/error
-  counters).
+- **Main screen** — `MainActivity` (programmatic views): sign in, pick a
+  machine, start/stop monitoring, the 4 notification toggles, permission +
+  test buttons, a **live session list** (from `HelloOk` + `SessionsAck` +
+  `Meta exited`), a "+ New shell session" button, and a live diagnostics
+  readout.
+- **Session / terminal screen** — `SessionActivity`: attaches to one
+  session and renders its active pane.
+  - **PTY panes** → `TerminalView` (custom `View`) paints the SGR-tagged row
+    strings into a monospace cell grid with per-cell fg/bg, bold/underline,
+    and a blinking cursor block. (`TerminalView.kt`, `Sgr.kt`)
+  - **Agent panes** (pi/forge, `kind=forge-chat`) → a chat list (role labels,
+    collapsed tool calls, model line) with a send box that posts `ChatSend`.
+  - **Input capture** — PTY: a sentinel-space `EditText` (backspace→DEL,
+    newlines→CR) + a row of special keys (arrows, Enter, Esc, Tab, Ctrl-
+    C/D/L) that emit the same byte sequences as the RN client; chat: a plain
+    message box.
+  - **Geometry** — the view computes cols/rows from its pixel size and sends
+    `Resize` (canonical size follows this client, tmux-style). Multi-pane
+    sessions get a tab row; tapping a tab sends `PaneSelect`.
+  - **Resync** — per-pane `seq` gap → re-`Attach` so the daemon re-snapshots.
 
 ## Build
 
@@ -49,7 +67,7 @@ cd mobile-native
 export JAVA_HOME=$(mise where java) ANDROID_HOME=~/.local/android-sdk
 ./gradlew assembleRelease
 # -> app/build/outputs/apk/release/app-release.apk
-# copy to ../releases/ranch-native-0.2.0.apk
+# copy to ../releases/ranch-native-0.3.0.apk
 ```
 
 - AGP 8.12.0, Gradle 9.4.1, Kotlin 2.2.10.
@@ -65,11 +83,17 @@ private channel the RN app uses, with the same user JWT.
 
 ## Roadmap
 
-- **v0.2.x** — notification tuning, persistent-connection reliability,
-  proper app icon.
-- **Phase 2** — terminal screen: render the semantic grid (Snapshot/Update,
-  ANSI colors, cursor) and send encoded keys back (`Input` frames).
-- **Phase 3** — sessions / agents / chat / settings.
-- **Phase 4** — file editor, workflows, triggers, machines.
+- **v0.3.x** — terminal polish (predictive echo, scrollback paging,
+  CJK/wide-char metrics, multi-pane split layout instead of tabs),
+  Google-OAuth login, proper app icon.
+- **Phase 3** — file editor, model picker, chat scrollback paging.
+- **Phase 4** — workflows, triggers, machines management.
 - Optional: **FCM** as a belt-and-suspenders true-push channel (needs a
   Firebase project + a daemon/edge-function push path).
+
+## Verification (protocol round-trip)
+
+The exact frame flow the app uses was validated against a live daemon:
+local-socket `Hello→Attach→Snapshot→Resize→Input(echo)→Update` (PTY path)
+and Realtime `join→Hello→HelloOk→Attach→chunked Snapshot` (chat path),
+confirming both the outbound `broadcast` envelope and chunk reassembly.

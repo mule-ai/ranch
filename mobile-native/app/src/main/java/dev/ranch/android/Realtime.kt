@@ -8,8 +8,8 @@ import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.concurrent.Volatile
 
@@ -48,6 +48,13 @@ class Realtime(
     @Volatile private var tokenDeadline = 0L
     @Volatile private var refreshFailures = 0
     private var pumpThread: Thread? = null
+
+    // Frames sent before the channel is joined are queued and flushed in
+    // order on joinOk, so Hello->Attach->Resize->Input stay sequenced.
+    // Frames sent before the channel is joined are queued and flushed in
+    // order on joinOk. ConcurrentLinkedQueue: written by the UI thread
+    // (sendFrame) and drained by the WS thread (flushPending on joinOk).
+    private val pending = ConcurrentLinkedQueue<JSONObject>()
 
     private data class Chunk(
         val n: Int,
@@ -196,6 +203,41 @@ class Realtime(
 
     // ---- send helpers ----
 
+    /**
+     * Send a ranch frame to the daemon over the shared machine channel.
+     * Envelope mirrors the daemon's relay receive side (relay.rs):
+     *   {topic, event:"broadcast", payload:{event:"frame", payload:<frame>}}
+     * If the channel is not joined yet, the frame is queued and flushed on
+     * joinOk so ordering is preserved.
+     */
+    @Synchronized
+    fun sendFrame(frame: JSONObject) {
+        if (!joinOk) {
+            pending.add(frame)
+            if (pending.size > 64) pending.poll() // bound the queue
+            return
+        }
+        doSendFrame(frame)
+    }
+
+    private fun doSendFrame(frame: JSONObject) {
+        val msg = JSONObject()
+            .put("topic", topic)
+            .put("event", "broadcast")
+            .put("ref", "fr${refCounter.incrementAndGet()}")
+            .put("payload", JSONObject()
+                .put("event", "frame")
+                .put("payload", frame))
+        ws?.send(msg.toString())
+    }
+
+    private fun flushPending() {
+        while (true) {
+            val f = pending.poll() ?: break
+            doSendFrame(f)
+        }
+    }
+
     private fun sendJoin() {
         synchronized(auth) {
             val payload = JSONObject()
@@ -252,6 +294,9 @@ class Realtime(
                     joinOk = true
                     lastServerSeen = System.currentTimeMillis()
                     onStatus("joined")
+                    flushPending()
+                    // Establish this client + fetch the live session list.
+                    doSendFrame(Term.hello())
                 }
                 return
             }

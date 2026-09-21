@@ -38,6 +38,8 @@ class MainActivity : Activity() {
     private lateinit var diagText: TextView
     private lateinit var machinePicker: Spinner
     private var machines: List<Machine> = emptyList()
+    private lateinit var sessionsBox: LinearLayout
+    private lateinit var sessionsHeader: TextView
 
     private val diagRunnable = object : Runnable {
         override fun run() {
@@ -49,10 +51,33 @@ class MainActivity : Activity() {
                     appendLine("fired: turn=${d["firedTurn"]} msg=${d["firedMsg"]} q=${d["firedQ"]}")
                     appendLine("skipped: active=${d["skipActive"]} off=${d["skipOff"]}  errors=${d["errors"]}")
                 }
+                refreshSessions()
             } else {
                 diagText.text = "monitor not running"
+                refreshSessions()
             }
             handler.postDelayed(this, 2000)
+        }
+    }
+
+    private fun refreshSessions() {
+        if (!::sessionsBox.isInitialized) return
+        val sessions = Monitor.sessions
+        sessionsBox.removeAllViews()
+        sessionsHeader.text = if (sessions.isEmpty()) "no sessions yet" else "${sessions.size} session(s)"
+        if (sessions.isEmpty()) return
+        for (s in sessions) {
+            val b = Button(this).apply {
+                val badge = when (s.kind) { "forge" -> "agent"; "pi" -> "pi"; else -> "" }
+                text = "\u25B6 ${s.name.ifEmpty { s.id.take(8) }}" + (if (badge.isNotEmpty()) "  ($badge)" else "")
+                setPadding(0, dp(6), 0, dp(6))
+                setOnClickListener {
+                    startActivity(Intent(this@MainActivity, SessionActivity::class.java)
+                        .putExtra("sessionId", s.id)
+                        .putExtra("sessionName", s.name))
+                }
+            }
+            sessionsBox.addView(b)
         }
     }
 
@@ -133,6 +158,25 @@ class MainActivity : Activity() {
             setPadding(0, 0, 0, dp(16))
         }
         root.addView(monitorStatus)
+
+        // --- Sessions ---
+        root.addView(sectionHeader("Sessions"))
+        root.addView(Button(this).apply {
+            text = "+ New shell session"
+            setPadding(0, dp(6), 0, dp(6))
+            setOnClickListener {
+                if (Monitor.relay == null) { monitorStatus.text = "start monitoring first"; return@setOnClickListener }
+                Monitor.relay?.createSession("shell")
+                monitorStatus.text = "creating shell session…"
+            }
+        })
+        sessionsHeader = TextView(this).apply {
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            setPadding(0, 0, 0, dp(4))
+        }
+        root.addView(sessionsHeader)
+        sessionsBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        root.addView(sessionsBox)
 
         // --- Notification settings ---
         root.addView(sectionHeader("Notifications"))

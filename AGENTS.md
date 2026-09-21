@@ -45,10 +45,13 @@ dated entry) rather than the target-system spec.
   `mobile/AGENTS.md` (and the versioned Expo v57 docs) before touching
   it. `mobile/CLAUDE.md` just points at `mobile/AGENTS.md`.
 - `mobile-native/` — native Android (Kotlin) client, the replacement for
-  `mobile/`. Primary job today: a foreground service that holds the
-  Supabase Realtime socket so agent-event notifications fire in the
-  background. Speaks the same wire protocol / private channel as every
-  other client. See `mobile-native/README.md` + `BUILD-APK.md`.
+  `mobile/`. (1) A foreground service holds the Supabase Realtime socket so
+  agent-event notifications fire in the background. (2) A session/terminal
+  screen: session list → attach → PTY grid (SGR cell renderer + cursor,
+  sentinel-EditText key capture + special-key row) or agent chat pane
+  (`ChatSend`), plus `Resize`/`PaneSelect`/seq-gap resync. Speaks the same
+  wire protocol / private channel as every other client (outbound frames as
+  Realtime `broadcast`). See `mobile-native/README.md` + `BUILD-APK.md`.
   `applicationId` is `dev.ranch.android` (coexists with the RN app).
   Build: `cd mobile-native && ./gradlew assembleRelease` (AGP 8.12.0,
   Gradle 9.4.1, Kotlin 2.2.10, SDK 35, JDK 17).

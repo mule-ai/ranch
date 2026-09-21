@@ -97,3 +97,40 @@ native client) received the `Meta agent working → idle` edge and the daemon
 logged `relay: broadcasting frame`. Test sessions cleaned up.
 
 APK rebuilt (`releases/ranch-native-0.2.0.apk`) with the joinOk fix.
+
+## 2026-09-21 — Native Phase 2: session list + terminal/chat screen
+
+The native app is now actually *usable*, not just a notification daemon.
+
+- **Outbound frames** (`Realtime.kt`): client→daemon sends over the shared
+  machine channel as Realtime `broadcast {event:"frame", payload:<frame>}`,
+  mirroring the daemon's relay receive side. Frames sent before the channel
+  is joined are queued (bounded `ConcurrentLinkedQueue`) and flushed on
+  joinOk, so `Hello→Attach→Resize→Input` stay in order. A `Hello` is sent
+  automatically on (re)join.
+- **Frame bus** (`Monitor.kt`): `RelaySession` fans out every frame to
+  registered sinks; the Notify engine always runs, and the active
+  `SessionActivity` registers/unregisters itself. The live session list is
+  tracked from `HelloOk` + `SessionsAck` + `Meta exited`.
+- **Session list** (`MainActivity`): a live list of sessions (tapping opens
+  the session screen) and a "+ New shell session" button.
+- **Session/terminal screen** (`SessionActivity.kt` + `TerminalView.kt` +
+  `Sgr.kt`): attaches to a session and renders its active pane.
+  - PTY panes → `TerminalView` paints SGR-tagged rows into a monospace cell
+    grid (per-cell fg/bg, bold/underline, blinking cursor block).
+  - Agent panes (`kind=forge-chat`) → chat list (role labels, collapsed tool
+    calls, model line) + `ChatSend` box.
+  - PTY input: sentinel-space `EditText` (backspace→DEL, newlines→CR) + a
+    special-key row emitting the same byte sequences as the RN client.
+  - Geometry: the view computes cols/rows from pixel size and sends
+    `Resize`; multi-pane sessions get a tab row (`PaneSelect`).
+  - Resync: per-pane `seq` gap → re-`Attach`.
+
+Verified against the live daemon: local-socket `Hello→Attach→Snapshot→
+Resize→Input(echo)→Update` (PTY path) and Realtime `join→Hello→HelloOk→
+Attach→chunked Snapshot` (chat path, including chunk reassembly). Bumped to
+v0.3.0 / versionCode 2 → `releases/ranch-native-0.3.0.apk`.
+
+Phase 3 follow-ons: terminal polish (predictive echo, scrollback paging,
+CJK/wide-char metrics, true split layout), model picker, file editor,
+workflows/triggers/machines, Google-OAuth login.
