@@ -40,3 +40,35 @@ block on a human decision:
 Verified: `cargo test` green (protocol round-trips + ask registry),
 scratch-daemon e2e of the full ask→answer→status flow PASS,
 `mobile` + `web` `tsc --noEmit` clean.
+
+## 2026-09-21 — Agent status machine-wide + native Android client (`mobile-native/`)
+
+**Agent `Meta` broadcast fix** (`bf045b8`) — the daemon only routed
+`Meta`/`Chat` frames to clients *attached* to a session, so a phone on the
+sessions list (`attach=None`) received no agent frames and fired no
+notifications. Agent working/idle is now machine-level lifecycle info and is
+broadcast to **all** connected clients (like `AgentAskRequest`); model/
+context stay attach-scoped. This is what makes parallel-session background
+notifications possible on any client.
+
+**Native Android client** (`mobile-native/`, v0.2.0) — a Kotlin app that
+replaces the RN client's weak background-notification path. Its primary job
+is a foreground service that holds the Supabase Realtime socket (exempt from
+Doze) so agent-event notifications fire while the phone is in a drawer.
+- Hand-rolled Phoenix client over the private channel
+  `realtime:machines:{id}` (JWT in join payload) — port of `relay.rs`:
+  25 s heartbeats, 75 s zombie guard, JWT refresh ~2 min pre-expiry,
+  chunk reassembly. No daemon/protocol changes; reuses the existing
+  machine-wide broadcast.
+- Notification engine port of `notifyEvents.ts` (turn-end / every-message /
+  question, background-only, replay-safe dedup, 4 per-event toggles).
+- Foreground service restores the machine from Prefs on process kill
+  (START_STICKY). `applicationId` `dev.ranch.android` coexists with the RN
+  app (`dev.ranch.app`) during migration.
+
+Verified: `./gradlew assembleRelease` clean (AGP 8.12.0 / Gradle 9.4.1 /
+Kotlin 2.2.10, SDK 35), APK signed with the shared `ranch` keystore, all
+classes present in the DEX. APK at `releases/ranch-native-0.2.0.apk`.
+
+Follow-ons: terminal-screen rendering (Phase 2), Google-OAuth login path
+(email/password is the current path), FCM as an optional true-push channel.
