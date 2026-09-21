@@ -70,6 +70,31 @@ AgentDone  { spawn_id, pane, session, outcome: "completed"|"failed"|"closed",
   human's own panes are unaffected — agents can only close what they
   spawned).
 
+### A2b. `ranch_ask` — agent asks the user (shipped 2026-09-20)
+
+The agent can block on a human decision: multiple-choice options,
+optional suggested option, optional blank free-text option, and
+select-one vs select-many. The tool call stays blocked in the harness
+until the human answers (or the 30-min TTL expires → "no answer").
+
+- Frames: `AgentAsk` → `AgentAskOk {ask_id}`; daemon broadcasts
+  `AgentAskRequest` to every client; `AgentAskAnswer` (any client,
+  first answer wins) re-broadcasts to all clients; agent polls
+  `AgentAskStatus` → `AgentAskStatusOk {answered, state}`.
+- Transports: loopback control API routes `/agent/ask` +
+  `/agent/ask/status` (local pi). Forge bridge path (F3a) is a
+  follow-on; the tool is unavailable to forge agents until then.
+- Clients: TUI renders the question on the prompt line and answers
+  via `:answer <n[,n…]>` / `:answer <text>` (bare = suggested choice
+  or empty). Web + mobile show an inline question card (choice
+  buttons + free-text input) above the chat input; mobile additionally
+  pushes a local notification (settings toggle "Agent questions").
+- Mobile notifications + settings page (`mobile/screens/Settings.tsx`,
+  `mobile/lib/notifications.ts`, expo-notifications): toggles for
+  turn-end / every message / ignore tool calls / questions; settings
+  in AsyncStorage; notifications fire only while the app is
+  backgrounded.
+
 ### A3. Tool exposure to agents (topology matters)
 
 The agent runtime is pi *or* forge, and forge usually runs on a
@@ -81,8 +106,8 @@ listener, and a forge sandbox cannot reach ranchd's loopback.
   registered via `pi.registerToolProvider`, the same mechanism forge's
   own `forge-tools` extension uses (`extensions/forge-tools/`) —
   exposes `ranch_spawn`/`ranch_send`/`ranch_status`/`ranch_read`/
-  `ranch_close` and forwards them to a **loopback HTTP control API on
-  the daemon** (127.0.0.1 only, bearer token in env
+  `ranch_close`/`ranch_ask` and forwards them to a **loopback HTTP
+  control API on the daemon** (127.0.0.1 only, bearer token in env
   `RANCH_CONTROL_TOKEN` passed to the child; `pilocal` spawns with the
   extra env). The daemon endpoint is 5 routes that construct the
   corresponding `Frame` and enter the same `handle_frame` path clients

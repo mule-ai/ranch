@@ -278,6 +278,14 @@ can orchestrate visibly:
   the pi child / unbinds the forge watch; sessions spawned by the
   agent die with their last pane). Agents can only close panes they
   spawned (ownership recorded daemon-side).
+- `ranch_ask` — ask the user a question and block the agent's turn
+  until they answer. The agent supplies the question, 0..n multiple-
+  choice options, an optional suggested option, an optional blank
+  free-text option, and a select-one / select-many flag. The daemon
+  broadcasts the question to every attached client (TUI prompt line,
+  web/mobile inline card; mobile can push a local notification); the
+  first answer wins. The agent polls until answered or a 30-min TTL
+  (→ "no answer (expired)").
 - **Callbacks** — every `ranch_spawn` registers a completion callback:
   when the spawned agent's turn ends (`turn_ended` SSE event / pi
   `agent_end` RPC event), the daemon delivers a `tool_result`-
@@ -462,7 +470,7 @@ New frames (full reference lives in PROTOCOL.md as they land):
 | workflows (mule) | `WorkflowList/WorkflowListOk`, `WorkflowGet/WorkflowGetOk`, `WorkflowPut/WorkflowPutOk`, `WorkflowDelete/WorkflowDeleteOk`, `WorkflowRun/WorkflowRunOk` |
 | triggers | `TriggerList/TriggerListOk`, `TriggerPut/TriggerPutOk`, `TriggerDelete/TriggerDeleteOk`, `TriggerRun/TriggerRunOk` |
 | webhooks | `WebhookList/…`, `WebhookPut/…`, `WebhookDelete/…`, `WebhookEvent` (relay → daemon) |
-| agent tools | `AgentSpawn/AgentSpawnOk`, `AgentSend`, `AgentStatus/AgentStatusOk`, `AgentRead/AgentReadOk`, `AgentClose/AgentCloseOk`, `AgentDone` (daemon → caller pane, completion callback) |
+| agent tools | `AgentSpawn/AgentSpawnOk`, `AgentSend`, `AgentStatus/AgentStatusOk`, `AgentRead/AgentReadOk`, `AgentClose/AgentCloseOk`, `AgentDone` (daemon → caller pane, completion callback), `AgentAsk/AgentAskOk`, `AgentAskRequest` (broadcast), `AgentAskAnswer`, `AgentAskStatus/AgentAskStatusOk` |
 
 All follow the existing conventions: `req_id` correlation, broadcast +
 client-side match, `Error {req_id, message}` on failure, unknown

@@ -113,6 +113,25 @@ export type ProfileDraft = {
 
 export type ChatMsgDone = { pane: string; outcome: string; last?: string };
 
+// ----- agent ask (Phase A2): agent asks user questions -----
+
+export type AgentAskRequest = {
+  ask_id: string;
+  session: string;
+  pane: string;
+  question: string;
+  choices: string[];
+  suggested?: number | null;
+  multi: boolean;
+  free_text: boolean;
+};
+
+export type AgentAskAnswer = {
+  ask_id: string;
+  choices: number[];
+  text: string;
+};
+
 
 // ----- workflows (Phase C): mule proxy -----
 
@@ -238,6 +257,8 @@ export type Frame =
   | { t: "AgentSpawnOk"; req_id: string; spawn_id: string; session: string; pane: string }
   | { t: "AgentSpawnRequest"; spawn_id: string; caller_pane: string; kind: string; preview: string }
   | { t: "AgentSpawnApprove"; spawn_id: string; allow: boolean }
+  | { t: "AgentAskRequest"; ask_id: string; session: string; pane: string; question: string; choices: string[]; suggested?: number | null; multi: boolean; free_text: boolean }
+  | { t: "AgentAskAnswer"; ask_id: string; choices: number[]; text: string }
   | { t: "AgentSend"; req_id: string; caller_pane: string; session: string; pane: string; text: string; delivery?: string }
   | { t: "AgentStatus"; req_id: string; caller_pane: string; pane: string }
   | { t: "AgentStatusOk"; req_id: string; pane: string; state: string; model?: string | null }

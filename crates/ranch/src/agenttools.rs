@@ -282,6 +282,128 @@ pub fn registry_from_value(v: &serde_json::Value) -> SpawnRegistry {
     reg
 }
 
+/// The user's answer to an ask-question.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AskAnswer {
+    /// selected choice indices (empty when only free text)
+    pub choices: Vec<usize>,
+    /// free-text answer (may be empty when a choice was picked)
+    pub text: String,
+}
+
+/// One pending ask-user question. The agent's tool call stays blocked
+/// (in the harness) until a client answers or the TTL expires.
+#[derive(Debug, Clone)]
+pub struct AskRecord {
+    pub ask_id: String,
+    /// the pane that asked (nil = human-initiated)
+    pub caller_pane: Uuid,
+    pub session: Uuid,
+    /// None until answered or expired
+    pub answer: Option<AskAnswer>,
+    pub created_at: Instant,
+    /// when the answer landed (drives the post-answer prune window)
+    pub answered_at: Option<Instant>,
+}
+
+/// How long an answered/expired ask stays in the registry after
+/// resolution (the agent's status poll needs it for a bit).
+pub const ASK_DONE_GRACE: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+impl AskRecord {
+    pub fn state(&self) -> &'static str {
+        match &self.answer {
+            Some(_) => "answered",
+            None => {
+                if self.created_at.elapsed() > ASK_TTL {
+                    "expired"
+                } else {
+                    "pending"
+                }
+            }
+        }
+    }
+}
+
+/// How long an unanswered ask stays pending before agents see "expired".
+pub const ASK_TTL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// The daemon's pending-question registry.
+#[derive(Default)]
+pub struct AskRegistry {
+    pub pending: BTreeMap<String, AskRecord>,
+}
+
+impl AskRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn insert(&mut self, rec: AskRecord) {
+        self.pending.insert(rec.ask_id.clone(), rec);
+    }
+    pub fn get(&self, ask_id: &str) -> Option<&AskRecord> {
+        self.pending.get(ask_id)
+    }
+    pub fn get_mut(&mut self, ask_id: &str) -> Option<&mut AskRecord> {
+        self.pending.get_mut(ask_id)
+    }
+    /// Drop resolved asks older than the grace window (the agent's
+    /// status poll needs them briefly; pending asks are never pruned).
+    pub fn prune(&mut self) -> Vec<String> {
+        let stale: Vec<String> = self
+            .pending
+            .values()
+            .filter(|r| match r.answered_at {
+                Some(at) => at.elapsed() > ASK_DONE_GRACE,
+                None => r.state() == "expired" && r.created_at.elapsed() > ASK_TTL + ASK_DONE_GRACE,
+            })
+            .map(|r| r.ask_id.clone())
+            .collect();
+        for id in &stale {
+            self.pending.remove(id.as_str());
+        }
+        stale
+    }
+}
+
+#[cfg(test)]
+mod ask_tests {
+    use super::*;
+
+    fn rec(answered: bool) -> AskRecord {
+        AskRecord {
+            ask_id: "a1".into(),
+            caller_pane: Uuid::new_v4(),
+            session: Uuid::new_v4(),
+            answer: answered.then_some(AskAnswer {
+                choices: vec![0],
+                text: String::new(),
+            }),
+            created_at: Instant::now(),
+            answered_at: answered.then_some(Instant::now()),
+        }
+    }
+
+    #[test]
+    fn ask_states() {
+        let r = rec(false);
+        assert_eq!(r.state(), "pending");
+        let r2 = rec(true);
+        assert_eq!(r2.state(), "answered");
+        let mut reg = AskRegistry::new();
+        reg.insert(rec(false));
+        assert!(reg.prune().is_empty()); // pending is kept
+        let mut answered = rec(true);
+        // fresh answer: within the grace window, kept
+        reg.insert(answered.clone());
+        assert!(reg.prune().is_empty());
+        // stale answer: pruned
+        answered.answered_at = Some(Instant::now() - ASK_DONE_GRACE - std::time::Duration::from_secs(1));
+        *reg.get_mut("a1").unwrap() = answered;
+        assert_eq!(reg.prune().len(), 1);
+    }
+}
+
 /// The frame a completed/closed/denied spawn emits to clients.
 pub fn agent_done_frame(spawn: &SpawnRecord, session: Uuid, pane: Uuid, outcome: &str, last: Option<ChatMsg>) -> Frame {
     let _ = spawn; // spawn_id is carried in the row for correlation

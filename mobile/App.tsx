@@ -26,6 +26,8 @@ import { EditorScreen } from "./screens/Editor";
 import { AgentsScreen } from "./screens/Agents";
 import { WorkflowsScreen } from "./screens/Workflows";
 import { TriggersScreen } from "./screens/Triggers";
+import { SettingsScreen } from "./screens/Settings";
+import { initNotifications, loadSettings } from "./lib/notifications";
 import { clearSessionChat } from "./lib/chatCache";
 
 type Machine = { id: string; name: string };
@@ -59,7 +61,7 @@ export default function App() {
   // Bottom tabs while a machine is picked: sessions | files | agents |
   // automation (the old top-bar action pile — five text buttons
   // crammed next to the title — is unusable on a phone)
-  const [tab, setTab] = useState<"sessions" | "files" | "agents" | "automation">("sessions");
+  const [tab, setTab] = useState<"sessions" | "files" | "agents" | "automation" | "settings">("sessions");
   const [pendingProfile, setPendingProfile] = useState<ProfileSummary | null>(null);
   // hot daemon upgrade in flight (button shows progress, err shows result)
   const [upgrading, setUpgrading] = useState(false);
@@ -127,6 +129,12 @@ export default function App() {
     });
     return () => sub.remove();
   }, [attached, machine]);
+
+  // init local notifications once at app mount; also warm the settings cache
+  useEffect(() => {
+    initNotifications().catch(() => {});
+    loadSettings().catch(() => {});
+  }, []);
 
   // update banner: this APK vs the published release; and the daemon
   // binary vs this APK (HelloOk.version)
@@ -578,6 +586,7 @@ export default function App() {
         />
       )}
       {tab === "automation" && <AutomationScreen relay={relay} />}
+      {tab === "settings" && <SettingsScreen onExit={() => setTab("sessions")} />}
         {resumeList !== null && (() => {
           // filter helpers: one folder per distinct working dir + free text
           const folderOf = (i: { kind: string; path?: string; working_dir?: string | null }) =>
@@ -716,8 +725,8 @@ function TabBar({
   tab,
   onPick,
 }: {
-  tab: "sessions" | "files" | "agents" | "automation";
-  onPick: (t: "sessions" | "files" | "agents" | "automation") => void;
+  tab: "sessions" | "files" | "agents" | "automation" | "settings";
+  onPick: (t: "sessions" | "files" | "agents" | "automation" | "settings") => void;
 }) {
   // sit above the Android gesture-bar/home-pill area, not under it
   const insets = useSafeAreaInsets();
@@ -726,6 +735,7 @@ function TabBar({
     { id: "files" as const, label: "files", icon: "≡" },
     { id: "agents" as const, label: "agents", icon: "◆" },
     { id: "automation" as const, label: "automation", icon: "⏱" },
+    { id: "settings" as const, label: "settings", icon: "⚙" },
   ];
   return (
     <View style={[s.tabbar, { paddingBottom: 10 + insets.bottom }]}>

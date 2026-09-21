@@ -347,6 +347,24 @@ AgentClose { session, pane, req_id }
   → AgentCloseOk { req_id }
 AgentDone { spawn_id, pane, session, outcome: "completed"|"failed"|"closed"|"denied"|"timeout", last_row? }
   // daemon → broadcast; callers render as a system chat row
+
+// Agent asks the user a question (shipped — Phase A2). The agent's
+// tool call blocks in the harness; the daemon registers the ask and
+// broadcasts AgentAskRequest so every client can answer. The agent
+// polls AgentAskStatus until answered or TTL-expired (30 min → "expired").
+AgentAsk { req_id, caller_pane, question, choices: [string],
+           suggested?: index, multi: bool, free_text: bool }
+  → AgentAskOk { req_id, ask_id }
+AgentAskRequest { ask_id, session, pane, question, choices: [string],
+                  suggested?: index, multi: bool, free_text: bool }
+  // daemon → broadcast to all clients; clients render a prompt and may
+  // push a local notification (mobile)
+AgentAskAnswer { ask_id, choices: [index], text }
+  // any client → daemon; first answer wins, others are ignored. The
+  // daemon re-broadcasts this frame so all clients update/dismiss.
+AgentAskStatus { req_id, caller_pane, ask_id }
+  → AgentAskStatusOk { req_id, ask_id, answered, choices: [index],
+                       text, state: "pending"|"answered"|"expired"|"unknown" }
 ```
 
 PaneMeta gains `spawned_by: Option<String>` (pane badge). Completion

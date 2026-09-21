@@ -255,4 +255,68 @@ export default function (pi) {
 			return { content: [{ type: "text", text: `closed ${params.pane}` }] };
 		},
 	});
+
+	pi.registerTool({
+		name: "ranch_ask",
+		label: "Ranch Ask",
+		description:
+			"Ask the human user a question and block until they answer. " +
+			"The question is shown live on every attached ranch interface (TUI, web, phone) and can trigger a " +
+			"phone notification. Provide 2-5 short choices, mark one as suggested, and keep free_text=true so the " +
+			"user can type a custom answer. Use multi=true when more than one choice may apply. " +
+			"Returns the user's answer (selected choices and/or free text) or 'no answer (timed out)' after 30 minutes.",
+		promptGuidelines: [
+			"Use ranch_ask when you genuinely need a human decision (ambiguous requirements, destructive actions, preferences).",
+			"Choices must be short (a few words each); put nuance in the question text.",
+			"Prefer multi=false unless the question really allows several options at once.",
+		],
+		parameters: {
+			type: "object",
+			properties: {
+				question: { type: "string", description: "the question to ask" },
+				choices: { type: "array", items: { type: "string" }, description: "2-5 short answer options" },
+				suggested: { type: "number", description: "0-based index of the suggested choice" },
+				multi: { type: "boolean", description: "true = user may select multiple choices (default false)" },
+				free_text: { type: "boolean", description: "also allow a blank user-typed answer (default true)" },
+			},
+			required: ["question"],
+		},
+		async execute(_id, params) {
+			const reply = await ctl("ask", {
+				question: params.question,
+				choices: params.choices || [],
+				suggested: params.suggested,
+				multi: !!params.multi,
+				free_text: params.free_text !== false,
+			});
+			if (reply.error) {
+				return { content: [{ type: "text", text: `ranch_ask failed: ${reply.error}` }] };
+			}
+			const ok = reply.AgentAskOk;
+			if (!ok || !ok.ask_id) {
+				return { content: [{ type: "text", text: "ranch_ask: no ask_id in reply" }] };
+			}
+			// block (in the tool) until the user answers or 30 min elapse
+			const deadline = Date.now() + 30 * 60 * 1000;
+			for (;;) {
+				if (Date.now() > deadline) {
+					return { content: [{ type: "text", text: "no answer (timed out)" }] };
+				}
+				await sleep(3000);
+				const st = await ctl("ask-status", { ask_id: ok.ask_id });
+				if (st.error) continue;
+				const so = st.AgentAskStatusOk;
+				if (!so) continue;
+				if (so.state === "expired" || so.state === "unknown") {
+					return { content: [{ type: "text", text: `no answer (${so.state})` }] };
+				}
+				if (so.answered) {
+					const parts = [];
+					if (so.choices && so.choices.length) parts.push("selected: " + so.choices.join(", "));
+					if (so.text) parts.push("text: " + so.text);
+					return { content: [{ type: "text", text: parts.length ? parts.join(" | ") : "(empty answer)" }] };
+				}
+			}
+		},
+	});
 }

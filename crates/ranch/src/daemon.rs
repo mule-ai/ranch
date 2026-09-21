@@ -553,6 +553,8 @@ struct Daemon {
     forge_pipe_w: Option<std::sync::Arc<std::sync::Mutex<std::fs::File>>>,
     /// agent tool surface (Phase A): spawned-pane ownership + callbacks
     spawns: agenttools::SpawnRegistry,
+    /// agent ask-user questions (Phase A2): pending ask_id -> record
+    asks: agenttools::AskRegistry,
     /// `[agents] spawn_policy` from daemon.toml (default allow)
     spawn_policy: agenttools::SpawnPolicy,
     /// mule worker jobs (None when mule is not configured)
@@ -1849,6 +1851,138 @@ impl Daemon {
             }
         }
     }
+
+    // ---------- agent ask-user question (Phase A2) ----------
+
+    /// Agent (via control API) or client asks the human a question.
+    /// Registers a pending ask, broadcasts `AgentAskRequest` to every
+    /// client (they render a prompt + may push a notification), and
+    /// answers the requester with `AgentAskOk { ask_id }`. The agent's
+    /// tool call stays blocked in the harness; it polls
+    /// `AgentAskStatus` until a client answers (or the TTL expires).
+    #[allow(clippy::too_many_arguments)]
+    fn handle_agent_ask(
+        &mut self,
+        from: RawFd,
+        req_id: &str,
+        caller_pane: &str,
+        question: &str,
+        choices: Vec<String>,
+        suggested: Option<usize>,
+        multi: bool,
+        free_text: bool,
+    ) {
+        let caller = Uuid::parse_str(caller_pane).unwrap_or(Uuid::nil());
+        let session = self.find_chat(caller);
+        let ask_id = Uuid::new_v4().to_string();
+        let rec = agenttools::AskRecord {
+            ask_id: ask_id.clone(),
+            caller_pane: caller,
+            session: session.unwrap_or(Uuid::nil()),
+            answer: None,
+            created_at: Instant::now(),
+            answered_at: None,
+        };
+        self.asks.insert(rec.clone());
+
+        // Broadcast the question to every attached client.
+        let req = Frame::AgentAskRequest {
+            ask_id: ask_id.clone(),
+            session: rec.session.to_string(),
+            pane: caller.to_string(),
+            question: question.to_string(),
+            choices,
+            suggested,
+            multi,
+            free_text,
+        };
+        let fds: Vec<RawFd> = self.clients.keys().copied().collect();
+        for fd in fds {
+            if let Some(c) = self.clients.get_mut(&fd) {
+                send_frame(c, &req);
+            }
+        }
+
+        // Ack back to the requester (the control-API sink).
+        if let Some(c) = self.clients.get_mut(&from) {
+            send_frame(
+                c,
+                &Frame::AgentAskOk {
+                    req_id: req_id.to_string(),
+                    ask_id,
+                },
+            );
+        }
+    }
+
+    /// A client answered a pending question. First answer wins; the
+    /// answer is recorded and re-broadcast so every client can dismiss
+    /// its prompt and show the chosen value.
+    fn handle_agent_ask_answer(
+        &mut self,
+        ask_id: &str,
+        choices: Vec<usize>,
+        text: &str,
+    ) {
+        let Some(rec) = self.asks.get_mut(ask_id) else {
+            return; // unknown or already pruned
+        };
+        if rec.answered_at.is_some() {
+            return; // already answered (idempotent)
+        }
+        rec.answer = Some(agenttools::AskAnswer { choices: choices.clone(), text: text.to_string() });
+        rec.answered_at = Some(Instant::now());
+
+        // Re-broadcast the answer so all clients update/dismiss.
+        let ans = Frame::AgentAskAnswer {
+            ask_id: ask_id.to_string(),
+            choices: choices.clone(),
+            text: text.to_string(),
+        };
+        let fds: Vec<RawFd> = self.clients.keys().copied().collect();
+        for fd in fds {
+            if let Some(c) = self.clients.get_mut(&fd) {
+                send_frame(c, &ans);
+            }
+        }
+        eprintln!("ranchd: ask {ask_id} answered (choices={choices:?} text={text:?})");
+    }
+
+    /// Agent polls whether its question has been answered yet.
+    fn handle_agent_ask_status(&mut self, from: RawFd, req_id: &str, caller_pane: &str, ask_id: &str) {
+        let caller = Uuid::parse_str(caller_pane).unwrap_or(Uuid::nil());
+        let (state, choices, text) = match self.asks.get(ask_id) {
+            None => ("unknown".to_string(), Vec::new(), String::new()),
+            Some(rec) => {
+                // Ownership: only the asking pane (or a human, nil) may read.
+                if !caller.is_nil() && rec.caller_pane != caller {
+                    ("unknown".to_string(), Vec::new(), String::new())
+                } else {
+                    match &rec.answer {
+                        Some(a) => ("answered".to_string(), a.choices.clone(), a.text.clone()),
+                        None => {
+                            let st = rec.state();
+                            (st.to_string(), Vec::new(), String::new())
+                        }
+                    }
+                }
+            }
+        };
+        let answered = state == "answered";
+        if let Some(c) = self.clients.get_mut(&from) {
+            send_frame(
+                c,
+                &Frame::AgentAskStatusOk {
+                    req_id: req_id.to_string(),
+                    ask_id: ask_id.to_string(),
+                    answered,
+                    choices,
+                    text,
+                    state,
+                },
+            );
+        }
+    }
 }
 
 // ---------- daemon ----------
@@ -1909,6 +2043,7 @@ impl Daemon {
             pi_agents: BTreeMap::new(),
             forge_pipe_w: None,
             spawns: agenttools::SpawnRegistry::new(),
+            asks: agenttools::AskRegistry::new(),
             spawn_policy,
             mule_tx: None,
             triggers: triggers::Scheduler::new(None),
@@ -2876,6 +3011,41 @@ impl Daemon {
             }
             Frame::AgentSpawnApprove { spawn_id, allow } => {
                 self.handle_agent_approve(from, spawn_id.clone(), *allow);
+            }
+            Frame::AgentAsk {
+                req_id,
+                caller_pane,
+                question,
+                choices,
+                suggested,
+                multi,
+                free_text,
+            } => {
+                self.handle_agent_ask(
+                    from,
+                    req_id,
+                    caller_pane,
+                    question,
+                    choices.clone(),
+                    *suggested,
+                    *multi,
+                    *free_text,
+                );
+            }
+            Frame::AgentAskAnswer { ask_id, choices, text } => {
+                self.handle_agent_ask_answer(ask_id, choices.clone(), text);
+            }
+            Frame::AgentAskStatus {
+                req_id,
+                caller_pane,
+                ask_id,
+            } => {
+                self.handle_agent_ask_status(
+                    from,
+                    req_id,
+                    caller_pane,
+                    ask_id,
+                );
             }
             Frame::AgentSend {
                 req_id,
@@ -5722,6 +5892,10 @@ fn run(
                 callback_fired: false,
             };
             daemon.deliver_agent_done(caller, &rec, uuid::Uuid::nil(), uuid::Uuid::nil(), "denied", None);
+        }
+        // agent ask-user questions: prune resolved/expired entries
+        for id in daemon.asks.prune() {
+            eprintln!("ranchd: ask {id} pruned from registry");
         }
         fw_tick = fw_tick.wrapping_add(1);
         if fw_tick.wrapping_rem(66) == 0 {

@@ -213,6 +213,23 @@ fn build_frame(tool: &str, body: &[u8], caller: uuid::Uuid) -> Option<ranch_prot
             session: String::new(),
             pane: get("pane"),
         }),
+        "ask" => Some(ranch_protocol::Frame::AgentAsk {
+            req_id: uuid::Uuid::new_v4().to_string(),
+            caller_pane: caller.to_string(),
+            question: get("question"),
+            choices: v.get("choices")
+                .and_then(|c| c.as_array())
+                .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                .unwrap_or_default(),
+            suggested: v.get("suggested").and_then(|s| s.as_u64()).map(|n| n as usize),
+            multi: v.get("multi").and_then(|m| m.as_bool()).unwrap_or(false),
+            free_text: v.get("free_text").and_then(|f| f.as_bool()).unwrap_or(true),
+        }),
+        "ask-status" => Some(ranch_protocol::Frame::AgentAskStatus {
+            req_id: uuid::Uuid::new_v4().to_string(),
+            caller_pane: caller.to_string(),
+            ask_id: get("ask_id"),
+        }),
         _ => None,
     }
 }

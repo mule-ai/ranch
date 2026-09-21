@@ -1842,6 +1842,18 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
     // req_id of an in-flight :compact; matched against Error frames
     let compact_pending: std::rc::Rc<std::cell::RefCell<Option<String>>> =
         std::rc::Rc::new(std::cell::RefCell::new(None));
+    // agent's pending user question (AgentAskRequest); answered with
+    // `:answer <n[,n...]>` or `:answer <text>`
+    #[derive(Clone, Debug)]
+    struct PendingAsk {
+        ask_id: String,
+        question: String,
+        choices: Vec<String>,
+        suggested: Option<usize>,
+        multi: bool,
+    }
+    let pending_ask: std::rc::Rc<std::cell::RefCell<Option<PendingAsk>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(None));
     let _ = &model_sel;
     // :help — command/key reference overlay (static lines, scroll + esc)
     let help_open = std::cell::Cell::new(false);
@@ -2139,6 +2151,46 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                                     if let Some(st) = mstat {
                                         eprintln!("ranch: {st}");
                                     }
+                                }
+                            }
+                            // agent asked the user a question: hold it for the
+                            // `:answer` command and flash a hint in the status
+                            Frame::AgentAskRequest {
+                                ask_id,
+                                session: qsess,
+                                pane: _qpane,
+                                question,
+                                choices,
+                                suggested,
+                                multi,
+                                free_text: _free_text,
+                            } => {
+                                if qsess == session_id {
+                                    *pending_ask.borrow_mut() = Some(PendingAsk {
+                                        ask_id: ask_id.clone(),
+                                        question: question.clone(),
+                                        choices: choices.clone(),
+                                        suggested,
+                                        multi,
+                                    });
+                                    err_flash.set(Some((
+                                        std::time::Instant::now(),
+                                        "agent question — :answer <n|text>".into(),
+                                    )));
+                                }
+                            }
+                            // question resolved elsewhere: dismiss our prompt
+                            Frame::AgentAskAnswer { ask_id, .. } => {
+                                if pending_ask
+                                    .borrow()
+                                    .as_ref()
+                                    .is_some_and(|a| a.ask_id == ask_id)
+                                {
+                                    pending_ask.borrow_mut().take();
+                                    err_flash.set(Some((
+                                        std::time::Instant::now(),
+                                        "question answered".into(),
+                                    )));
                                 }
                             }
                             Frame::Update {
@@ -3518,6 +3570,40 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
 
             // prompt line (rename / command / profile form)
             if let Some(kind) = prompt_now {
+                // while typing :answer, keep the question visible above
+                // the prompt line so the user can pick an option number
+                if matches!(kind, Prompt::Command)
+                    && let Some(ask) = pending_ask.borrow().clone()
+                {
+                        let mut s = String::from(" ? ");
+                        s.push_str(&ask.question.chars().take(40).collect::<String>());
+                        if !ask.choices.is_empty() {
+                            s.push_str(&format!(
+                                " {}",
+                                ask.choices
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(i, c)| {
+                                        format!(
+                                            "[{}]{}{}",
+                                            i + 1,
+                                            c.chars().take(14).collect::<String>(),
+                                            if ask.suggested == Some(i) { " *" } else { "" }
+                                        )
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join(" ")
+                            ));
+                        }
+                        let ql = Line::from(Span::styled(
+                            s.chars().take(area.width as usize).collect::<String>(),
+                            Style::default().fg(ratatui::style::Color::DarkGray),
+                        ));
+                        f.render_widget(
+                            Paragraph::new(vec![ql]),
+                            Rect::new(0, area.height.saturating_sub(3), area.width, 1),
+                        );
+                }
                 let label = match kind {
                     Prompt::RenameWindow => "rename window: ".to_string(),
                     Prompt::Command => ": ".to_string(),
@@ -3537,6 +3623,41 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                 ));
                 f.render_widget(
                     Paragraph::new(vec![pl]),
+                    Rect::new(0, area.height.saturating_sub(2), area.width, 1),
+                );
+            } else if let Some(ask) = pending_ask.borrow().clone() {
+                // agent question prompt: question + numbered choices until
+                // answered; the user replies with `:answer`.
+                let mut s = String::from(" ? ");
+                s.push_str(&ask.question.chars().take(48).collect::<String>());
+                if !ask.choices.is_empty() {
+                    if ask.multi {
+                        s.push_str(" (multi)");
+                    }
+                    s.push_str(&format!(
+                        " {}",
+                        ask.choices
+                            .iter()
+                            .enumerate()
+                            .map(|(i, c)| {
+                                format!(
+                                    "[{}]{}{}",
+                                    i + 1,
+                                    c.chars().take(14).collect::<String>(),
+                                    if ask.suggested == Some(i) { " *" } else { "" }
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    ));
+                }
+                s.push_str(" — :answer <n|text>");
+                let ql = Line::from(Span::styled(
+                    s.chars().take(area.width as usize).collect::<String>(),
+                    Style::default().fg(ratatui::style::Color::Yellow),
+                ));
+                f.render_widget(
+                    Paragraph::new(vec![ql]),
                     Rect::new(0, area.height.saturating_sub(2), area.width, 1),
                 );
             }
@@ -4953,6 +5074,68 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                                                             std::time::Instant::now(),
                                                             "model: not an agent (chat) pane".into(),
                                                         )));
+                                                    }
+                                                    prompt_input.clear();
+                                                    continue;
+                                                }
+                                                // :answer — reply to a pending agent question.
+                                                // Bare `:answer` sends the suggested choice (or empty
+                                                // text); `:answer 1,3` sends choice indices; anything
+                                                // else is sent as free text.
+                                                if let Some(rest) =
+                                                    prompt_input.trim().strip_prefix("answer")
+                                                {
+                                                    let arg = rest.trim().to_string();
+                                                    match pending_ask.borrow().clone() {
+                                                        Some(ask) => {
+                                                            let (sel, text) =
+                                                                if ask.choices.is_empty()
+                                                                {
+                                                                    (Vec::new(), arg)
+                                                                } else {
+                                                                    let nums: Vec<usize> = arg
+                                                                        .split([',', ' '])
+                                                                        .filter(|s| !s.is_empty())
+                                                                        .filter_map(|s| s.parse::<usize>().ok())
+                                                                        .map(|v| v.saturating_sub(1))
+                                                                        .filter(|&v| v < ask.choices.len())
+                                                                        .collect();
+                                                                    if nums.is_empty() {
+                                                                        // bare :answer → suggested
+                                                                        // choice when given, else free text
+                                                                        match ask.suggested {
+                                                                            Some(i) => (vec![i], String::new()),
+                                                                            None => (Vec::new(), arg),
+                                                                        }
+                                                                    } else if ask.multi {
+                                                                        (nums, String::new())
+                                                                    } else {
+                                                                        (
+                                                                            nums.into_iter()
+                                                                                .take(1)
+                                                                                .collect(),
+                                                                            String::new(),
+                                                                        )
+                                                                    }
+                                                                };
+                                                            let f = Frame::AgentAskAnswer {
+                                                                ask_id: ask.ask_id,
+                                                                choices: sel,
+                                                                text,
+                                                            };
+                                                            send_frame(&mut stream, &f).ok();
+                                                            pending_ask.borrow_mut().take();
+                                                            err_flash.set(Some((
+                                                                std::time::Instant::now(),
+                                                                "answer sent".into(),
+                                                            )));
+                                                        }
+                                                        None => {
+                                                            err_flash.set(Some((
+                                                                std::time::Instant::now(),
+                                                                "no pending question".into(),
+                                                            )));
+                                                        }
                                                     }
                                                     prompt_input.clear();
                                                     continue;

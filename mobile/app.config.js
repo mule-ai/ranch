@@ -14,6 +14,10 @@ export default {
   android: {
     package: "dev.ranch.app",
     versionCode: 2,
+    // Android 13+ (API 33+) runtime permission for local notifications.
+    // Declared here (not just in the generated manifest) so `expo prebuild`
+    // always emits it into android/app/src/main/AndroidManifest.xml.
+    permissions: ["android.permission.POST_NOTIFICATIONS"],
     // resize (not pan) so the window shrinks when the keyboard shows;
     // combined with the in-app keyboard inset the bottom inputs and the
     // terminal's bottom line stay visible above the keyboard

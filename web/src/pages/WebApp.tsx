@@ -4,6 +4,7 @@
 import { useEffect, useMemo, useRef, useState, useCallback } from "react";
 import { Relay } from "../lib/relay";
 import {
+  AgentAskRequest,
   ChatMsg,
   Frame,
   Layout,
@@ -729,6 +730,46 @@ function Terminal({
   const [chatLoadingOlder, setChatLoadingOlder] = useState(false);
   const chatScrollAnchor = useRef<{ y: number; contentH: number } | null>(null);
   const [history, setHistory] = useState<string[] | null>(null);
+  // agent asks (Phase A2): the latest unresolved question for this
+  // session; the card shows when its pane is the active one
+  const [pendingAsk, setPendingAsk] = useState<AgentAskRequest | null>(null);
+  const pendingAskRef = useRef(pendingAsk);
+  pendingAskRef.current = pendingAsk;
+  const [askSel, setAskSel] = useState<number[]>([]);
+  const [askText, setAskText] = useState("");
+  // "answered: …" rows appended to the visible chat list
+  const [askNotes, setAskNotes] = useState<{ id: string; text: string }[]>([]);
+  // frame-handler bookkeeping (refs so the onFrame closure is stale-safe):
+  // choice labels per ask, asks we answered locally, notes already shown
+  const askChoicesRef = useRef(new Map<string, string[]>());
+  const answeredAskRef = useRef(new Set<string>());
+  const askNoteIdsRef = useRef(new Set<string>());
+
+  // an ask with choices may be sent with no selection (empty answer is
+  // valid); with no choices the user must type text to unlock Send
+  const askCanSend = !!(
+    pendingAsk &&
+    (askSel.length > 0 || askText.trim() !== "" || pendingAsk.choices.length > 0)
+  );
+  const askSend = () => {
+    if (!pendingAsk || !askCanSend) return;
+    relay.send({
+      t: "AgentAskAnswer", ask_id: pendingAsk.ask_id,
+      choices: askSel, text: askText.trim(),
+    } as Frame);
+    // mark locally so the broadcast AgentAskAnswer still appends the
+    // "answered:" row even though the card is already cleared
+    answeredAskRef.current.add(pendingAsk.ask_id);
+    setPendingAsk(null);
+  };
+  // switching panes resets the card's selection/typing for that pane's ask
+  useEffect(() => {
+    const ask = pendingAskRef.current;
+    setAskSel(
+      ask && ask.pane === activePane && ask.suggested != null ? [ask.suggested] : []
+    );
+    setAskText("");
+  }, [activePane]);
 
   useEffect(() => {
     const unlisten = relay.onFrame((f: Frame) => {
@@ -863,6 +904,34 @@ function Terminal({
             attachDirReqRef.current = null;
             setAttachBrowse({ path: f.path, parent: f.parent ?? null, dirs: f.dirs, files: f.files ?? [] });
           }
+          break;
+        }
+        case "AgentAskRequest": {
+          if (f.session !== sessionId) break;
+          // a new ask replaces any pending one (incl. for the same pane)
+          askChoicesRef.current.set(f.ask_id, f.choices);
+          setPendingAsk(f);
+          setAskSel(f.suggested != null ? [f.suggested] : []);
+          setAskText("");
+          break;
+        }
+        case "AgentAskAnswer": {
+          // ignore answers we have no context for (answered by another
+          // client/session, or an ask already superseded)
+          if (pendingAskRef.current?.ask_id !== f.ask_id &&
+              !answeredAskRef.current.has(f.ask_id)) break;
+          if (askNoteIdsRef.current.has(f.ask_id)) break;
+          askNoteIdsRef.current.add(f.ask_id);
+          answeredAskRef.current.delete(f.ask_id);
+          const labels = f.choices
+            .map((i) => askChoicesRef.current.get(f.ask_id)?.[i])
+            .filter((l): l is string => !!l)
+            .join(", ");
+          const text = f.text.trim();
+          const shown = labels && text ? `${labels}, ${text}`
+            : labels || text || "(empty)";
+          if (pendingAskRef.current?.ask_id === f.ask_id) setPendingAsk(null);
+          setAskNotes((prev) => [...prev, { id: f.ask_id, text: `answered: ${shown}` }]);
           break;
         }
       }
@@ -1132,7 +1201,70 @@ function Terminal({
               )}
             {chatMsgs.length === 0 && <p className="dim">say something to the agent…</p>}
             {activeSnap?.agentBusy && <div className="bubble bubble-agent">● ● ●</div>}
+            {askNotes.map((n) => (
+              <div key={n.id} className="ask-note">{n.text}</div>
+            ))}
           </div>
+          {pendingAsk && pendingAsk.pane === activePane && (
+            <div className="ask-card">
+              <p className="ask-question">{pendingAsk.question}</p>
+              {pendingAsk.choices.length > 0 && (
+                <div className="ask-choices">
+                  {pendingAsk.choices.map((c: string, i: number) => {
+                    const on = askSel.includes(i);
+                    return (
+                      <button
+                        key={i}
+                        className={
+                          "ask-choice" +
+                          (on ? " ask-choice-on" : "") +
+                          (pendingAsk.suggested === i ? " ask-choice-suggested" : "")
+                        }
+                        onClick={() =>
+                          setAskSel((prev) =>
+                            pendingAsk.multi
+                              ? on
+                                ? prev.filter((x) => x !== i)
+                                : [...prev, i]
+                              : [i]
+                          )
+                        }
+                      >
+                        <span className="ask-mark">
+                          {on
+                            ? pendingAsk.multi ? "☑" : "●"
+                            : pendingAsk.multi ? "☐" : "○"}
+                        </span>
+                        <span className="ask-choice-label">{c}</span>
+                        {pendingAsk.suggested === i && (
+                          <span className="ask-sug">(suggested)</span>
+                        )}
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+              {pendingAsk.free_text && (
+                <input
+                  className="ask-free-text"
+                  type="text"
+                  value={askText}
+                  onChange={(e) => setAskText(e.target.value)}
+                  placeholder="or type your own answer…"
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" && askCanSend) askSend();
+                  }}
+                />
+              )}
+              <button
+                className="btn btn-primary ask-send"
+                disabled={!askCanSend}
+                onClick={askSend}
+              >
+                Send
+              </button>
+            </div>
+          )}
           <div className="chat-inputrow">
             {chatAttachments.length > 0 && (
               <div className="attach-chips" style={{ marginBottom: 4 }}>

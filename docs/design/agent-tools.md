@@ -84,6 +84,7 @@ and POSTs the result back. Either way the tool executes in
 | `ranch_status` | `pane` | `{state, busy, model, spawned_at}` — cheap check without reading rows. |
 | `ranch_read` | `pane`, `since_seq?`, `limit` | Recent conversation rows (same `ChatMsg` shape clients render). |
 | `ranch_close` | `pane` | Closes the pane (kills pi child / unbinds forge watch). Spawn-scoped: only panes in the caller's spawn registry. |
+| `ranch_ask` | `question`, `choices[]`, `suggested?`, `multi?`, `free_text?` | Blocks the agent's turn until the human answers a multiple-choice question (with optional suggested option and/or a blank free-text option; `multi` = select-many). Broadcast to every attached client (`AgentAskRequest`); first answer wins (`AgentAskAnswer`); agent polls `AgentAskStatus` until answered or a 30-min TTL (→ "no answer"). Mobile: pushes a local notification (settings toggle). |
 
 Ownership rule: a tool call from pane A may only `ranch_send`,
 `ranch_status`, `ranch_read`, `ranch_close` panes in A's spawn

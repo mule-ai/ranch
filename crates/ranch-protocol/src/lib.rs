@@ -606,6 +606,84 @@ pub enum Frame {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         last_row: Option<ChatMsg>,
     },
+    // ----- agent ask-user question (Phase A2) -----
+    /// Agent (or client) -> daemon: ask the human a question and block
+    /// the agent's tool call until it is answered. `choices` are the
+    /// multiple-choice options (0..n); `suggested` is the agent's
+    /// preferred index into `choices`; `multi` = select-many; `free_text`
+    /// = also allow a blank user-typed answer.
+        AgentAsk {
+        req_id: String,
+        /// requesting pane (ownership anchor; nil = human)
+        #[serde(default)]
+        caller_pane: String,
+        #[serde(default)]
+        question: String,
+        #[serde(default)]
+        choices: Vec<String>,
+        /// suggested option (index into choices)
+        suggested: Option<usize>,
+        /// true = user may select many
+        #[serde(default)]
+        multi: bool,
+        /// true = blank user-fillable option is offered
+        #[serde(default = "default_true")]
+        free_text: bool,
+    },
+    /// Daemon -> agent (control API reply): the question is pending.
+        AgentAskOk {
+        req_id: String,
+        ask_id: String,
+    },
+    /// Daemon -> all clients (broadcast): a question awaits an answer.
+    /// Clients render a prompt (TUI status bar, web/mobile card) and
+    /// may push a local notification.
+        AgentAskRequest {
+        ask_id: String,
+        session: String,
+        pane: String,
+        #[serde(default)]
+        question: String,
+        #[serde(default)]
+        choices: Vec<String>,
+        suggested: Option<usize>,
+        #[serde(default)]
+        multi: bool,
+        #[serde(default = "default_true")]
+        free_text: bool,
+    },
+    /// Client -> daemon: answer a pending AgentAskRequest. First
+    /// answer wins; idempotent (later answers ignored).
+        AgentAskAnswer {
+        ask_id: String,
+        /// selected choice indices (empty when only free text)
+        #[serde(default)]
+        choices: Vec<usize>,
+        /// free-text answer (may be empty when a choice was picked)
+        #[serde(default)]
+        text: String,
+    },
+    /// Agent -> daemon (poll): has my question been answered yet?
+        AgentAskStatus {
+        req_id: String,
+        #[serde(default)]
+        caller_pane: String,
+        ask_id: String,
+    },
+    /// Daemon -> agent: status reply. `answered` false until a client
+    /// (or TTL expiry) resolves the ask.
+        AgentAskStatusOk {
+        req_id: String,
+        ask_id: String,
+        #[serde(default)]
+        answered: bool,
+        #[serde(default)]
+        choices: Vec<usize>,
+        #[serde(default)]
+        text: String,
+        /// "pending" | "answered" | "expired" | "unknown"
+        state: String,
+    },
     // ----- agent builder (Phase B): forge profile CRUD proxy -----
     /// Client -> daemon: the pi model catalog (for profile forms).
     /// Pane-less variant of `ModelList` (which needs a chat pane).
@@ -779,6 +857,9 @@ fn default_delivery() -> String {
 }
 fn default_read_limit() -> u32 {
     50
+}
+fn default_true() -> bool {
+    true
 }
 
 /// One row of a forge agent conversation (M8). Mirrors a forge
@@ -1592,6 +1673,47 @@ mod tests {
                 pane: "pane".into(),
                 outcome: "completed".into(),
                 last_row: None,
+            },
+            Frame::AgentAsk {
+                req_id: "r6".into(),
+                caller_pane: "pane-a".into(),
+                question: "Deploy to prod?".into(),
+                choices: vec!["yes".into(), "no".into()],
+                suggested: Some(0),
+                multi: false,
+                free_text: true,
+            },
+            Frame::AgentAskOk {
+                req_id: "r6".into(),
+                ask_id: "a1".into(),
+            },
+            Frame::AgentAskRequest {
+                ask_id: "a1".into(),
+                session: "sess".into(),
+                pane: "pane-a".into(),
+                question: "Deploy to prod?".into(),
+                choices: vec!["yes".into(), "no".into()],
+                suggested: Some(0),
+                multi: false,
+                free_text: true,
+            },
+            Frame::AgentAskAnswer {
+                ask_id: "a1".into(),
+                choices: vec![0],
+                text: String::new(),
+            },
+            Frame::AgentAskStatus {
+                req_id: "r7".into(),
+                caller_pane: "pane-a".into(),
+                ask_id: "a1".into(),
+            },
+            Frame::AgentAskStatusOk {
+                req_id: "r7".into(),
+                ask_id: "a1".into(),
+                answered: true,
+                choices: vec![0],
+                text: String::new(),
+                state: "answered".into(),
             },
         ];
         for f in frames {

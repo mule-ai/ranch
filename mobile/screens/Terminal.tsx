@@ -22,6 +22,12 @@ import {
   mergeChat,
   saveCachedChat,
 } from "../lib/chatCache";
+import {
+  initNotifications,
+  loadSettings,
+  notify,
+  toolCallAllowed,
+} from "../lib/notifications";
 
 // Compute screen rects from the split tree (mirrors the desktop client).
 export type Rect = { pane: string; x: number; y: number; w: number; h: number };
@@ -44,6 +50,17 @@ export function layoutRects(l: Layout, x: number, y: number, w: number, h: numbe
 
 type Props = { relay: Relay; sessionId: string; sessionName: string; onExit: () => void };
 
+// An agent is blocked on a question (ranch_ask) until we answer it.
+type PendingAsk = {
+  ask_id: string;
+  question: string;
+  choices: string[];
+  suggested: number | null;
+  multi: boolean;
+  free_text: boolean;
+  pane: string;
+};
+
 const FONT_SIZE = 10; // px; JetBrainsMono advance is 0.6em
 const LINE_HEIGHT = 13;
 // how many chat rows to load on attach; older rows page in on scrollback
@@ -64,6 +81,17 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
     return () => sub.remove();
   }, [onExit]);
   const [history, setHistory] = useState<string[] | null>(null);
+  // agent question card: pending ranch_ask for this session + its answer note
+  const [pendingAsk, setPendingAsk] = useState<PendingAsk | null>(null);
+  const pendingAskRef = useRef<PendingAsk | null>(null);
+  pendingAskRef.current = pendingAsk;
+  const [askAnswerNote, setAskAnswerNote] = useState<string | null>(null);
+  // notifications: local push notifications for agent events (background only)
+  useEffect(() => {
+    // already done at app mount; safe to call again (idempotent init)
+    void initNotifications().catch(() => {});
+    void loadSettings().catch(() => {});
+  }, []);
   const [blink, setBlink] = useState(true);
   const inputRef = useRef<TextInput | null>(null);
   const [capture, setCapture] = useState(" ");
@@ -179,15 +207,37 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
           const cur = panesRef.current.get(f.pane);
           if (!cur) break;
           const chat = f.reset ? [...(f.msgs ?? [])] : [...(cur.chat ?? [])];
-          if (!f.reset) {
+          // newMsgs = rows not already in the pane's chat state; only these
+          // can trigger "every message" notifications (replays/dupes don't)
+          const newMsgs: ChatMsg[] = [];
+          if (f.reset) newMsgs.push(...(f.msgs ?? []));
+          else {
             for (const m of f.msgs ?? []) {
               const last = chat[chat.length - 1];
-              if (!last || m.seq > last.seq) chat.push(m);
+              if (!last || m.seq > last.seq) {
+                chat.push(m);
+                newMsgs.push(m);
+              }
             }
           }
           const next = new Map(panesRef.current);
           next.set(f.pane, { ...cur, chat });
           setPanes(next);
+          // per-message notifications (no-op unless the app is
+          // backgrounded and the matching setting is on)
+          for (const m of newMsgs) {
+            if (m.role === "assistant" && (m.text ?? "").trim() !== "") {
+              void notify(
+                "every_message", sessionName,
+                m.text.replace(/\s+/g, " ").slice(0, 120), f.pane,
+              );
+            } else if (m.role === "tool" && toolCallAllowed()) {
+              void notify(
+                "every_message", sessionName,
+                `tool: ${m.tool_name ?? "tool"}`, f.pane,
+              );
+            }
+          }
           // keep the on-device cache in step: a reset (e.g. post-compact
           // history) wipes it, appends extend it
           const cached = getCachedChat(sessionId, f.pane) ?? { msgs: [], hasMore: false };
@@ -226,6 +276,9 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
           if (f.kind === "agent" && f.pane) {
             const cur = panesRef.current.get(f.pane);
             if (cur) {
+              // turn-end notification: agent went working → idle
+              if (f.status === "idle" && cur.agentBusy)
+                void notify("turn_end", sessionName, "agent finished its turn", f.pane);
               const next = new Map(panesRef.current);
               next.set(f.pane, { ...cur, agentBusy: f.status === "working" });
               setPanes(next);
@@ -260,6 +313,32 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
               next.set(f.pane, { ...cur, model: f.current.name });
               setPanes(next);
             }
+          }
+          break;
+        }
+        case "AgentAskRequest": {
+          // an agent in this session is blocked on a user question
+          if (f.session !== sessionId) break;
+          setPendingAsk({
+            ask_id: f.ask_id,
+            question: f.question,
+            choices: f.choices ?? [],
+            suggested: f.suggested ?? null,
+            multi: f.multi,
+            free_text: f.free_text,
+            pane: f.pane,
+          });
+          setAskAnswerNote(null);
+          void notify("questions", "agent question", f.question.slice(0, 120), f.pane);
+          break;
+        }
+        case "AgentAskAnswer": {
+          // answered — by us or another client; dismiss the card
+          const p = pendingAskRef.current;
+          if (p && p.ask_id === f.ask_id) {
+            const labels = f.choices.map((i) => p.choices[i]).filter((c) => c != null).join(", ");
+            setPendingAsk(null);
+            setAskAnswerNote([labels, f.text].filter(Boolean).join(" · ") || "(no selection)");
           }
           break;
         }
@@ -527,6 +606,23 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
     setModelPicker(false);
   };
 
+  // answer a pending agent question (ranch_ask). Sends the chosen
+  // 0-based choice indices + free text; the AgentAskAnswer broadcast
+  // (from any client) dismisses the card.
+  const answerAsk = (choices: number[], text: string) => {
+    const p = pendingAskRef.current;
+    if (!p) return;
+    relay.send({
+      t: "AgentAskAnswer", ask_id: p.ask_id, choices, text,
+    } as Frame);
+    const labels = p.choices
+      .map((c, i) => (choices.includes(i) ? c : null))
+      .filter((c): c is string => c != null)
+      .join(", ");
+    setAskAnswerNote([labels, text].filter(Boolean).join(" · ") || "(no selection)");
+    setPendingAsk(null);
+  };
+
   const COLS = geom.cols;
   const ROWS = geom.rows;
   const rects = layout ? layoutRects(layout, 0, 0, COLS, ROWS) : [];
@@ -553,6 +649,14 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
   useEffect(() => {
     chatAtBottomRef.current = true;
   }, [activePane, sessionId]);
+
+  // agent-question card (ranch_ask): pinned above the input/keys bar so it
+  // stays visible without scrolling; dismissed by AgentAskAnswer or local send
+  const askBlock = pendingAsk ? (
+    <AskCard key={pendingAsk.ask_id} ask={pendingAsk} onSend={answerAsk} />
+  ) : askAnswerNote ? (
+    <Text style={styles.askNote} numberOfLines={2}>answered: {askAnswerNote}</Text>
+  ) : null;
 
   return (
     <View style={[styles.flex, { paddingBottom: kbHeight }]}>
@@ -673,6 +777,7 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
               </View>
             )}
           </ScrollView>
+          {askBlock}
           <View style={styles.chatInputRow}>
             {chatAttachments.length > 0 && (
               <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 4, paddingHorizontal: 8, paddingVertical: 4 }}>
@@ -1017,6 +1122,7 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
         </View>
       ) : null}
 
+      {askBlock}
       {history !== null ? (
         <View style={styles.histWrap}>
           <View style={styles.histHeader}>
@@ -1317,6 +1423,99 @@ function ChatBubble({ msg }: { msg: ChatMsg }) {
   );
 }
 
+function AskCard({ ask, onSend }: { ask: PendingAsk; onSend: (choices: number[], text: string) => void }) {
+  const [selected, setSelected] = useState<number[]>(
+    ask.suggested != null ? [ask.suggested] : []
+  );
+  const [text, setText] = useState("");
+
+  const toggle = (i: number) => {
+    setSelected((prev) => {
+      if (ask.multi) return prev.includes(i) ? prev.filter((x) => x !== i) : [...prev, i].sort((a, b) => a - b);
+      return [i];
+    });
+  };
+
+  const noOptions = ask.choices.length === 0;
+  const canSend = !noOptions || ask.free_text;
+
+  return (
+    <View style={askStyles.card}>
+      <Text style={askStyles.label}>agent question</Text>
+      <Text style={askStyles.question}>{ask.question}</Text>
+      {noOptions ? (
+        !ask.free_text ? (
+          <Text style={askStyles.dim}>no answer options given</Text>
+        ) : null
+      ) : (
+        ask.choices.map((c, i) => (
+          <Pressable key={i} style={askStyles.choiceRow} onPress={() => toggle(i)}>
+            <Text style={[askStyles.choiceText, selected.includes(i) && askStyles.choiceOn]}>
+              {selected.includes(i) ? "◉" : "○"} {c}
+              {ask.suggested === i ? "  (suggested)" : ""}
+            </Text>
+          </Pressable>
+        ))
+      )}
+      {ask.free_text && (
+        <TextInput
+          style={askStyles.input}
+          value={text}
+          onChangeText={setText}
+          placeholder="or type your own answer…"
+          placeholderTextColor="#4b5563"
+        />
+      )}
+      <Pressable
+        style={[askStyles.send, !canSend && askStyles.sendOff]}
+        disabled={!canSend}
+        onPress={() => onSend(selected, text.trim())}
+      >
+        <Text style={askStyles.sendText}>Send</Text>
+      </Pressable>
+    </View>
+  );
+}
+
+const askStyles = StyleSheet.create({
+  card: {
+    marginHorizontal: 8,
+    marginBottom: 6,
+    padding: 10,
+    backgroundColor: "#16161c",
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: "#4ade80",
+    gap: 6,
+  },
+  label: { color: "#4ade80", fontSize: 11, fontWeight: "700", textTransform: "uppercase", letterSpacing: 1 },
+  question: { color: "#f3f4f6", fontSize: 14, fontWeight: "700" },
+  dim: { color: "#6b7280", fontSize: 12 },
+  choiceRow: {
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: "#374151",
+    backgroundColor: "#1a1b23",
+  },
+  choiceText: { color: "#9ca3af", fontSize: 13 },
+  choiceOn: { color: "#4ade80", fontWeight: "600" },
+  input: {
+    backgroundColor: "#1a1b23",
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: "#2a2a34",
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    color: "#f3f4f6",
+    fontSize: 13,
+  },
+  send: { alignSelf: "flex-end", backgroundColor: "#16a34a", borderRadius: 8, paddingHorizontal: 16, paddingVertical: 8 },
+  sendOff: { backgroundColor: "#374151", opacity: 0.6 },
+  sendText: { color: "#fff", fontWeight: "700", fontSize: 13 },
+});
+
 const styles = StyleSheet.create({
   flex: { flex: 1, backgroundColor: "#101014" },
   header: {
@@ -1429,4 +1628,5 @@ const styles = StyleSheet.create({
   histHeader: { flexDirection: "row", justifyContent: "space-between", marginBottom: 6 },
   histTitle: { color: "#9ca3af", fontSize: 12, fontWeight: "700" },
   histScroll: { flex: 1 },
+  askNote: { color: "#6b7280", fontSize: 11, paddingHorizontal: 12, paddingBottom: 4 },
 });

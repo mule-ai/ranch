@@ -363,3 +363,40 @@ footer { text-align: center; color: var(--dim); font-size: 0.85rem; padding: 24p
 .keybtn-on { border-color: var(--accent); color: var(--accent); }
 .keybtn-danger { color: var(--danger); }
 .keybtn-danger:hover { border-color: var(--danger); background: rgba(248,113,113,0.08); }
+
+/* agent ask card (Phase A2): inline, directly above the chat input bar */
+.ask-card {
+  display: flex; flex-direction: column; gap: 8px;
+  padding: 10px 8px; border-top: 1px solid var(--border);
+  background: var(--accent-dim);
+}
+.ask-question {
+  margin: 0; font-weight: 700; font-size: 0.95rem; white-space: pre-wrap;
+}
+.ask-choices { display: flex; flex-direction: column; gap: 6px; }
+.ask-choice {
+  display: flex; align-items: center; gap: 8px; text-align: left;
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: 8px; color: var(--text); padding: 9px 12px;
+  font-size: 0.9rem; cursor: pointer;
+}
+.ask-choice-on { border-color: var(--accent); background: var(--accent-dim); }
+.ask-mark { font-family: var(--mono); color: var(--dim); }
+.ask-choice-on .ask-mark { color: var(--accent); }
+.ask-choice-label { flex: 1; white-space: pre-wrap; }
+.ask-sug {
+  font-size: 0.68rem; color: var(--accent); border: 1px solid var(--accent);
+  border-radius: 999px; padding: 1px 7px; flex-shrink: 0;
+}
+.ask-choice-suggested { border-color: var(--accent); }
+.ask-free-text {
+  background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+  color: var(--text); padding: 9px 12px; font-size: 0.92rem;
+}
+.ask-free-text:focus { outline: none; border-color: var(--accent); }
+.ask-send { align-self: flex-end; padding: 8px 18px; font-size: 0.9rem; }
+.ask-send:disabled { opacity: 0.5; cursor: not-allowed; }
+.ask-note {
+  align-self: center; color: var(--dim); font-size: 0.75rem;
+  font-family: var(--mono); padding: 2px 0;
+}

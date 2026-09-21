@@ -250,6 +250,13 @@ export type Frame =
   | { t: "AgentReadOk"; req_id: string; pane: string; msgs: ChatMsg[] }
   | { t: "AgentClose"; req_id: string; caller_pane: string; session: string; pane: string }
   | { t: "AgentDone"; spawn_id: string; session: string; pane: string; outcome: string; last_row?: ChatMsg | null }
+  // agent asked the user a question (ranch_ask): multiple choice with
+  // optional suggested index; multi = select many; free_text = a blank
+  // user-typed answer is allowed
+  | { t: "AgentAskRequest"; ask_id: string; session: string; pane: string; question: string; choices: string[]; suggested?: number | null; multi: boolean; free_text: boolean }
+  // broadcast when the question is answered (any client): choices =
+  // selected 0-based indices, text = free-text answer
+  | { t: "AgentAskAnswer"; ask_id: string; choices: number[]; text: string }
   | { t: "ProfileList"; id: string; req_id: string }
   | { t: "ProfileListOk"; id: string; req_id: string; profiles: ProfileSummary[] }
   | { t: "ProfileGet"; id: string; req_id: string; profile: string }
