@@ -84,6 +84,47 @@ export function toolCallAllowed(): boolean {
   return !cache.ignore_tool_calls;
 }
 
+// ---------- diagnostics (in-memory, app-session scoped) ----------
+// The point: when a user says "it didn't notify", we need to see WHY —
+// did agent frames even reach the app? Was the app active (gated off by
+// design)? Did a setting block it? Did scheduling throw? This ring buffer
+// + counters surface all of that in the Settings screen.
+const DIAG_MAX = 40;
+const diagLog: string[] = [];
+export function logDiag(msg: string): void {
+  try {
+    const ts = new Date().toTimeString().slice(0, 8);
+    diagLog.push(`${ts} ${msg}`);
+    if (diagLog.length > DIAG_MAX) diagLog.shift();
+  } catch {
+    // diagnostics must never throw
+  }
+}
+export function getDiagLog(): string[] {
+  return diagLog.slice();
+}
+
+export type NotifStats = {
+  fired: Record<keyof NotifSettings, number>;
+  skippedActive: number; // gated off because the app was the active screen
+  skippedOff: number; // gated off because the matching setting is off
+  errors: number;
+};
+const stats: NotifStats = {
+  fired: { turn_end: 0, every_message: 0, ignore_tool_calls: 0, questions: 0 },
+  skippedActive: 0,
+  skippedOff: 0,
+  errors: 0,
+};
+export function getNotifStats(): NotifStats {
+  return {
+    fired: { ...stats.fired },
+    skippedActive: stats.skippedActive,
+    skippedOff: stats.skippedOff,
+    errors: stats.errors,
+  };
+}
+
 // safe to call repeatedly (App does it at mount; TerminalScreen too)
 export async function initNotifications(): Promise<void> {
   try {
@@ -127,14 +168,26 @@ export async function notify(
 ): Promise<boolean> {
   try {
     if (!loaded) await loadSettings();
-    if (!cache[kind]) return false;
+    if (!cache[kind]) {
+      stats.skippedOff++;
+      logDiag(`[${kind}] skipped: setting off`);
+      return false;
+    }
     // background-only: these notifications exist to get the user's
     // attention when they've put the phone down. While the app is the
     // active screen the user can already see the event in the UI.
-    if (AppState.currentState === "active") return false;
+    if (AppState.currentState === "active") {
+      stats.skippedActive++;
+      // don't log every active-skip (noisy); it's expected behavior
+      return false;
+    }
     await scheduleOne(title, body, threadIdentifier);
+    stats.fired[kind] = (stats.fired[kind] ?? 0) + 1;
+    logDiag(`[${kind}] FIRED -> "${title}"`);
     return true;
-  } catch {
+  } catch (e: any) {
+    stats.errors++;
+    logDiag(`[${kind}] ERROR: ${e?.message ?? String(e)}`);
     return false;
   }
 }

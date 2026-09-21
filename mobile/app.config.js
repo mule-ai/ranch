@@ -5,7 +5,7 @@ const DEFAULT_ANON = process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY || "";
 export default {
   name: "Ranch",
   slug: "ranch",
-  version: "0.1.5",
+  version: "0.1.6",
   orientation: "default",
   userInterfaceStyle: "dark",
   scheme: "ranch",
@@ -13,7 +13,7 @@ export default {
   icon: "./assets/icon/icon-1024.png",
   android: {
     package: "dev.ranch.app",
-    versionCode: 3,
+    versionCode: 4,
     // Android 13+ (API 33+) runtime permission for local notifications.
     // Declared here (not just in the generated manifest) so `expo prebuild`
     // always emits it into android/app/src/main/AndroidManifest.xml.

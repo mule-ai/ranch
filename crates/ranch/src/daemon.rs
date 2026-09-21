@@ -4432,10 +4432,16 @@ impl Daemon {
                         kind: kind.clone(),
                         status: status.clone(),
                     };
+                    // Agent working/idle is machine-level lifecycle info (like
+                    // AgentAskRequest): every connected client gets it, so a
+                    // phone sitting on the sessions list still sees turn-end
+                    // for all parallel agent sessions and can notify. Model/
+                    // context stay attach-scoped (per-pane UI detail).
+                    let all = kind == "agent";
                     let recipients: Vec<RawFd> = self
                         .clients
                         .iter()
-                        .filter(|(_, c)| c.attach == Some(sid))
+                        .filter(|(_, c)| all || c.attach == Some(sid))
                         .map(|(f, _)| *f)
                         .collect();
                     for rfd in recipients {

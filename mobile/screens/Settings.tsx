@@ -19,8 +19,11 @@ import {
   saveSettings,
   testNotification,
   getModuleError,
+  getDiagLog,
+  getNotifStats,
   type NotifSettings,
 } from "../lib/notifications";
+import { getAgentFrameStats } from "../lib/notifyEvents";
 
 // Android back gesture/button = the on-screen back control (same pattern
 // as Triggers/Workflows).
@@ -163,7 +166,39 @@ export function SettingsScreen({ onExit }: Props) {
             Ranch → Notifications.
           </Text>
         )}
+
+        <Text style={s.sectionTitle}>diagnostics</Text>
+        <DiagBlock />
       </ScrollView>
+    </View>
+  );
+}
+
+/** Re-renders every 2s so counters stay live while the screen is open. */
+function DiagBlock() {
+  const [, tick] = useState(0);
+  useEffect(() => {
+    const t = setInterval(() => tick((x) => x + 1), 2000);
+    return () => clearInterval(t);
+  }, []);
+  const fs = getAgentFrameStats();
+  const st = getNotifStats();
+  const log = getDiagLog();
+  return (
+    <View>
+      <Text style={s.dim}>
+        {`Agent frames received: ${fs.seen}${fs.lastAt ? ` (last ${fs.lastAt})` : " (none yet)"}`}
+      </Text>
+      <Text style={s.dim}>
+        {`fired: turn_end=${st.fired.turn_end} msg=${st.fired.every_message} q=${st.fired.questions}  |  skipped(open)=${st.skippedActive} off=${st.skippedOff} err=${st.errors}`}
+      </Text>
+      {log.length > 0 && (
+        <View style={s.diagBox}>
+          {log.slice(-12).map((l, i) => (
+            <Text key={i} style={s.diagLine}>{l}</Text>
+          ))}
+        </View>
+      )}
     </View>
   );
 }
@@ -195,4 +230,8 @@ const s = StyleSheet.create({
   testBtnOn: { borderColor: "#4ade80", backgroundColor: "rgba(74,222,128,0.12)" },
   testBtnText: { color: "#9ca3af", fontSize: 13, fontWeight: "600" },
   testNote: { color: "#f59e0b", fontSize: 12, marginTop: 6, marginBottom: 4 },
+  diagBox: {
+    backgroundColor: "#1a1b23", borderRadius: 8, padding: 8, marginTop: 8,
+  },
+  diagLine: { color: "#9ca3af", fontSize: 10, lineHeight: 14 },
 });

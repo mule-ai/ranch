@@ -21,6 +21,17 @@ const lastSeq = new Map<string, number>(); // pane -> last-seen msg seq
 const primed = new Set<string>(); // panes whose baseline is established
 const notifiedAsks = new Set<string>(); // ask_ids we already notified for
 
+// diagnostics: how many agent-relevant frames reached the app
+let agentFramesSeen = 0;
+let lastAgentFrameAt: string | null = null;
+function noteAgentFrame(): void {
+  agentFramesSeen++;
+  lastAgentFrameAt = new Date().toTimeString().slice(0, 8);
+}
+export function getAgentFrameStats(): { seen: number; lastAt: string | null } {
+  return { seen: agentFramesSeen, lastAt: lastAgentFrameAt };
+}
+
 /**
  * Call from the always-on relay handler for EVERY frame. No-op for
  * anything that doesn't map to a notification. Never throws.
@@ -33,12 +44,15 @@ export function onFrameForNotifications(
     const name = sessionName || "agent";
     switch (f.t) {
       case "Meta":
+        if (f.kind === "agent") noteAgentFrame();
         onMetaForNotifications(f, name);
         break;
       case "Chat":
+        noteAgentFrame();
         onChatForNotifications(f, name);
         break;
       case "AgentAskRequest":
+        noteAgentFrame();
         if (f.ask_id && !notifiedAsks.has(f.ask_id)) {
           notifiedAsks.add(f.ask_id);
           void notify(
