@@ -25,8 +25,6 @@ import {
 import {
   initNotifications,
   loadSettings,
-  notify,
-  toolCallAllowed,
 } from "../lib/notifications";
 
 // Compute screen rects from the split tree (mirrors the desktop client).
@@ -207,37 +205,18 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
           const cur = panesRef.current.get(f.pane);
           if (!cur) break;
           const chat = f.reset ? [...(f.msgs ?? [])] : [...(cur.chat ?? [])];
-          // newMsgs = rows not already in the pane's chat state; only these
-          // can trigger "every message" notifications (replays/dupes don't)
-          const newMsgs: ChatMsg[] = [];
-          if (f.reset) newMsgs.push(...(f.msgs ?? []));
-          else {
+          // append only unseen rows to the pane's chat state. Per-message
+          // notifications are handled at the App level (notifyEvents.ts)
+          // so they fire regardless of which screen is shown.
+          if (!f.reset) {
             for (const m of f.msgs ?? []) {
               const last = chat[chat.length - 1];
-              if (!last || m.seq > last.seq) {
-                chat.push(m);
-                newMsgs.push(m);
-              }
+              if (!last || m.seq > last.seq) chat.push(m);
             }
           }
           const next = new Map(panesRef.current);
           next.set(f.pane, { ...cur, chat });
           setPanes(next);
-          // per-message notifications (no-op unless the app is
-          // backgrounded and the matching setting is on)
-          for (const m of newMsgs) {
-            if (m.role === "assistant" && (m.text ?? "").trim() !== "") {
-              void notify(
-                "every_message", sessionName,
-                m.text.replace(/\s+/g, " ").slice(0, 120), f.pane,
-              );
-            } else if (m.role === "tool" && toolCallAllowed()) {
-              void notify(
-                "every_message", sessionName,
-                `tool: ${m.tool_name ?? "tool"}`, f.pane,
-              );
-            }
-          }
           // keep the on-device cache in step: a reset (e.g. post-compact
           // history) wipes it, appends extend it
           const cached = getCachedChat(sessionId, f.pane) ?? { msgs: [], hasMore: false };
@@ -276,9 +255,8 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
           if (f.kind === "agent" && f.pane) {
             const cur = panesRef.current.get(f.pane);
             if (cur) {
-              // turn-end notification: agent went working → idle
-              if (f.status === "idle" && cur.agentBusy)
-                void notify("turn_end", sessionName, "agent finished its turn", f.pane);
+              // agent busy-state drives the spinner; the turn-end
+              // notification itself fires at the App level
               const next = new Map(panesRef.current);
               next.set(f.pane, { ...cur, agentBusy: f.status === "working" });
               setPanes(next);
@@ -329,7 +307,6 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
             pane: f.pane,
           });
           setAskAnswerNote(null);
-          void notify("questions", "agent question", f.question.slice(0, 120), f.pane);
           break;
         }
         case "AgentAskAnswer": {

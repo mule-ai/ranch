@@ -28,6 +28,7 @@ import { WorkflowsScreen } from "./screens/Workflows";
 import { TriggersScreen } from "./screens/Triggers";
 import { SettingsScreen } from "./screens/Settings";
 import { initNotifications, loadSettings } from "./lib/notifications";
+import { onFrameForNotifications, resetNotificationState } from "./lib/notifyEvents";
 import { clearSessionChat } from "./lib/chatCache";
 
 type Machine = { id: string; name: string };
@@ -86,6 +87,8 @@ export default function App() {
   // re-runs (deps: machine id only) — stale closure otherwise
   const nameRef = useRef(newName);
   nameRef.current = newName;
+  const sessionsRef = useRef<SessionMeta[] | null>(null);
+  sessionsRef.current = sessions;
   const kindRef = useRef(newKind);
   kindRef.current = newKind;
   const resumeReqRef = useRef<string | null>(null);
@@ -186,6 +189,9 @@ export default function App() {
       r.onReady = () => {
         // initial join and every reconnect: (re)request the session list
         gotHello = false;
+        // reconnect: drop per-pane busy/baseline state so a stale "working"
+        // flag can't fire a spurious turn-end after the link recovers
+        resetNotificationState();
         hello();
         if (retryTimer) clearInterval(retryTimer);
         retryTimer = setInterval(() => {
@@ -193,6 +199,13 @@ export default function App() {
         }, 3000);
       };
       unlisten = r.onFrame((f: Frame) => {
+        // always-on notification triggers (fire regardless of which screen
+        // is shown — needed for managing multiple parallel agent sessions)
+        const sid = (f as { session?: string }).session;
+        onFrameForNotifications(
+          f,
+          (sessionsRef.current ?? []).find((s) => s.id === sid)?.name,
+        );
         switch (f.t) {
           case "HelloOk":
             gotHello = true;
