@@ -725,20 +725,35 @@ pub fn read_session_messages(path: &str) -> Result<Vec<ChatMsg>, String> {
     /// content); `display_text` is what the user sees in the chat row;
     /// `attachments` are file paths shown as badges on the user row.
     pub fn prompt(&self, pipe: &PipeWriter, agent_text: &str, display_text: &str, attachments: &[String]) -> Result<(), String> {
-        let mut g = self
-            .stdin
-            .lock()
-            .map_err(|_| "pi stdin poisoned".to_string())?;
-        let s = g
-            .as_mut()
-            .ok_or_else(|| "pi stdin already taken".to_string())?;
-        let line = serde_json::json!({"type": "prompt", "message": agent_text}).to_string();
-        s.write_all(line.as_bytes())
-            .and_then(|_| s.write_all(b"\n"))
-            .and_then(|_| s.flush())
-            .map_err(|e| format!("pi stdin: {e}"))?;
-        // rows AFTER the write succeeded (a failed write emits the
-        // error row + clears the indicator instead)
+        let send = || -> Result<(), String> {
+            let mut g = self
+                .stdin
+                .lock()
+                .map_err(|_| "pi stdin poisoned".to_string())?;
+            let s = g
+                .as_mut()
+                .ok_or_else(|| "pi stdin already taken".to_string())?;
+            let line = serde_json::json!({"type": "prompt", "message": agent_text}).to_string();
+            s.write_all(line.as_bytes())
+                .and_then(|_| s.write_all(b"\n"))
+                .and_then(|_| s.flush())
+                .map_err(|e| format!("pi stdin: {e}"))?;
+            Ok(())
+        };
+        if let Err(e) = send() {
+            // a failed write emits the error row + clears the indicator
+            // instead — otherwise the message vanishes silently on every
+            // client (the phone worst of all, where there is no daemon
+            // log to check)
+            emit_chat(
+                pipe,
+                self.pane,
+                "assistant",
+                &format!("⚠ message not sent: {e}"),
+                now_iso(),
+            );
+            return Err(e);
+        }
         let att = if attachments.is_empty() { None } else { Some(attachments.to_vec()) };
         emit_chat_with(pipe, self.pane, "user", display_text, att, now_iso());
         write_status(pipe, self.pane, "working");
@@ -1150,6 +1165,10 @@ fn run_pi_reader(
                             })
                             .unwrap_or_default();
                         let trimmed = text.trim();
+                        let stop = msg
+                            .get("stopReason")
+                            .and_then(|s| s.as_str())
+                            .unwrap_or("");
                         if !trimmed.is_empty() {
                             // stamp with the agent's own timestamp when
                             // it carried one, else the arrival moment
@@ -1159,9 +1178,74 @@ fn run_pi_reader(
                                 .map(iso_utc_ms)
                                 .unwrap_or_else(now_iso);
                             emit_chat(&pipe, t_pane, "assistant", trimmed, ts);
+                        } else if stop == "error" {
+                            // a failed provider call ends the message with
+                            // stopReason "error" and no text — without this
+                            // row the turn just goes quiet and every client
+                            // (TUI + both mobile apps) shows nothing
+                            emit_chat(
+                                &pipe,
+                                t_pane,
+                                "assistant",
+                                "⚠ the model returned an error (no message)",
+                                now_iso(),
+                            );
+                            write_status(&pipe, t_pane, "idle");
                         }
                     }
                 }
+            }
+            // pi never emits a `type:"error"` RPC event — turn failures
+            // surface through the retry events below (and stopReason
+            // "error" on message_end). These ⚠ rows are how agent errors
+            // reach every client, mobile included.
+            "auto_retry_start" => {
+                // transient provider failure: pi retries on its own, so
+                // the turn is still live — keep the working indicator up
+                let attempt = v.get("attempt").and_then(|a| a.as_i64()).unwrap_or(0);
+                let max = v.get("maxAttempts").and_then(|a| a.as_i64()).unwrap_or(0);
+                let msg = v
+                    .get("errorMessage")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("transient error");
+                let attempt_txt = if max > 0 {
+                    format!(" (attempt {attempt}/{max})")
+                } else {
+                    String::new()
+                };
+                emit_chat(
+                    &pipe,
+                    t_pane,
+                    "assistant",
+                    &format!("⚠ retrying{attempt_txt}: {msg}"),
+                    now_iso(),
+                );
+            }
+            "auto_retry_end" => {
+                // retries exhausted: success:false + finalError is THE
+                // failure signal — emit the row and flip to idle (if a
+                // turn_end follows, the duplicate idle is a no-op)
+                if v.get("success").and_then(|s| s.as_bool()) == Some(false) {
+                    let msg = v
+                        .get("finalError")
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("agent failed");
+                    emit_chat(&pipe, t_pane, "assistant", &format!("⚠ {msg}"), now_iso());
+                    write_status(&pipe, t_pane, "idle");
+                }
+            }
+            "extension_error" => {
+                let msg = v
+                    .get("error")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("extension error");
+                emit_chat(
+                    &pipe,
+                    t_pane,
+                    "assistant",
+                    &format!("⚠ extension error: {msg}"),
+                    now_iso(),
+                );
             }
             "tool_execution_start" => {
                 let name = v

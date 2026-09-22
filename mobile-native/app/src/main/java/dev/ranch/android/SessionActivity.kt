@@ -210,8 +210,13 @@ class SessionActivity : Activity() {
             "ChatHistoryOk" -> onChatHistoryOk(f)
             "Scrollback" -> onScrollback(f)
             "Error" -> {
-                val rid = f.optString("req_id")
-                if (rid.isNotEmpty()) statusView.text = "err: ${f.optString("message")}"
+                // request-scoped errors (req_id set) are only meaningful
+                // to the client that sent the request — but unsolicited
+                // errors (req_id absent: upgrade denied, hot-upgrade
+                // failure, …) must flash, same as the TUI status bar
+                if (f.optString("req_id").isEmpty()) {
+                    statusView.text = "err: ${f.optString("message")}"
+                }
             }
         }
     }

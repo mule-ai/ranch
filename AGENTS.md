@@ -131,6 +131,15 @@ Rust workspace: edition 2024, stable toolchain (rustc 1.98 era).
   conversation lives in forge's `messages` table, polled/streamed by the
   `forge.rs` worker and emitted as `chat` frames. Local `pi` panes spawn
   `pi --mode rpc` in the pane cwd and map RPC events to the same chat rows.
+  **pi errors surface as `⚠ …` assistant chat rows** — pi never emits a
+  `type:"error"` RPC event; failures arrive as `auto_retry_end
+  {success:false, finalError}`, `message_end` with `stopReason:"error"`,
+  or `extension_error`, and `pilocal.rs` maps all of them (plus retry
+  attempts via `auto_retry_start`) to error rows so every client — TUI,
+  web, and both mobile apps — shows them. Both mobile notification
+  engines treat `⚠`-prefixed assistant rows as a default-on `errors`
+  notification that suppresses that pane's `turn_end` notification (the
+  error IS the turn-end news).
   A failed attach (e.g. forge down) must flash an error in the status bar,
   **not** `die()` the whole TUI (M8.4).
 - **Planned workers follow the worker pattern** (PLAN.md): any new

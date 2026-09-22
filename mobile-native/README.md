@@ -29,14 +29,16 @@ fire while the phone is in a drawer.
   queued until the channel is joined. (`Realtime.kt`)
 - **Notification engine** — port of `mobile/lib/notifyEvents.ts` +
   `mobile/lib/notifications.ts`. Fires local notifications for
-  turn-end / every-message / agent-question **only when the app is in the
-  background**, with the same 4 per-event toggles and replay-safe dedup.
-  (`Notify.kt`)
+  turn-end / agent-error / every-message / agent-question **only when the
+  app is in the background**, with the same per-event toggles and
+  replay-safe dedup. Agent-error rows (assistant text starting with `⚠`,
+  emitted by the daemon when a pi turn fails) are default-on and suppress
+  that pane's turn-end notification. (`Notify.kt`)
 - **Foreground service** — `MonitorService` keeps the WS alive and shows a
   persistent low-importance "monitoring …" notification. Restarts
   itself + restores the machine from Prefs on process kill (START_STICKY).
 - **Main screen** — `MainActivity` (programmatic views): sign in, pick a
-  machine, start/stop monitoring, the 4 notification toggles, permission +
+  machine, start/stop monitoring, the notification toggles, permission +
   test buttons, a **live session list** (from `HelloOk` + `SessionsAck` +
   `Meta exited`), a "+ New shell session" button, and a live diagnostics
   readout.

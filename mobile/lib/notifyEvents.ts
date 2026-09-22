@@ -114,12 +114,27 @@ function onChatForNotifications(
   lastSeq.set(pane, maxSeq);
   for (const m of fresh) {
     if (m.role === "assistant" && (m.text ?? "").trim() !== "") {
-      void notify(
-        "every_message",
-        name,
-        m.text.replace(/\s+/g, " ").slice(0, 120),
-        pane,
-      );
+      const text = (m.text ?? "").trim();
+      if (text.startsWith("⚠")) {
+        // agent error rows (the daemon emits them for failed pi turns,
+        // exhausted retries, failed sends) get their own default-on
+        // notification — and suppress the follow-up "agent finished its
+        // turn" for this pane, because the error IS the turn-end news
+        busy.set(pane, false);
+        void notify(
+          "errors",
+          name,
+          `agent error: ${text.replace(/\s+/g, " ").slice(0, 120)}`,
+          pane,
+        );
+      } else {
+        void notify(
+          "every_message",
+          name,
+          text.replace(/\s+/g, " ").slice(0, 120),
+          pane,
+        );
+      }
     } else if (m.role === "tool" && toolCallAllowed()) {
       void notify("every_message", name, `tool: ${m.tool_name ?? "tool"}`, pane);
     }

@@ -38,6 +38,7 @@ type Props = { onExit: () => void };
 
 const TOGGLES: { key: keyof NotifSettings; label: string; desc: string }[] = [
   { key: "turn_end", label: "Agent turn finished", desc: "notify when an agent turn ends (working → idle)" },
+  { key: "errors", label: "Agent errors", desc: "notify when an agent run fails" },
   { key: "every_message", label: "Every agent message", desc: "notify on each new assistant message" },
   { key: "ignore_tool_calls", label: "Ignore tool calls", desc: "when on, tool calls never notify" },
   { key: "questions", label: "Agent questions", desc: "notify when an agent asks a question" },
@@ -190,7 +191,7 @@ function DiagBlock() {
         {`Agent frames received: ${fs.seen}${fs.lastAt ? ` (last ${fs.lastAt})` : " (none yet)"}`}
       </Text>
       <Text style={s.dim}>
-        {`fired: turn_end=${st.fired.turn_end} msg=${st.fired.every_message} q=${st.fired.questions}  |  skipped(open)=${st.skippedActive} off=${st.skippedOff} err=${st.errors}`}
+        {`fired: turn_end=${st.fired.turn_end} errors=${st.fired.errors} msg=${st.fired.every_message} q=${st.fired.questions}  |  skipped(open)=${st.skippedActive} off=${st.skippedOff} err=${st.errors}`}
       </Text>
       {log.length > 0 && (
         <View style={s.diagBox}>

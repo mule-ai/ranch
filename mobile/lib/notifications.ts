@@ -15,6 +15,7 @@ export type NotifSettings = {
   every_message: boolean;
   ignore_tool_calls: boolean;
   questions: boolean;
+  errors: boolean;
 };
 
 export const DEFAULT_SETTINGS: NotifSettings = {
@@ -22,6 +23,7 @@ export const DEFAULT_SETTINGS: NotifSettings = {
   every_message: false,
   ignore_tool_calls: true,
   questions: true,
+  errors: true,
 };
 
 const KEY = "ranch.settings.v1";
@@ -111,7 +113,7 @@ export type NotifStats = {
   errors: number;
 };
 const stats: NotifStats = {
-  fired: { turn_end: 0, every_message: 0, ignore_tool_calls: 0, questions: 0 },
+  fired: { turn_end: 0, every_message: 0, ignore_tool_calls: 0, questions: 0, errors: 0 },
   skippedActive: 0,
   skippedOff: 0,
   errors: 0,

@@ -48,7 +48,7 @@ class MainActivity : Activity() {
                 diagText.text = buildString {
                     appendLine("status: ${d["status"]}  machine: ${d["machine"]}")
                     appendLine("frames received: ${d["frames"]}")
-                    appendLine("fired: turn=${d["firedTurn"]} msg=${d["firedMsg"]} q=${d["firedQ"]}")
+                    appendLine("fired: turn=${d["firedTurn"]} errors=${d["firedError"]} msg=${d["firedMsg"]} q=${d["firedQ"]}")
                     appendLine("skipped: active=${d["skipActive"]} off=${d["skipOff"]}  errors=${d["errors"]}")
                 }
                 refreshSessions()
@@ -181,6 +181,7 @@ class MainActivity : Activity() {
         // --- Notification settings ---
         root.addView(sectionHeader("Notifications"))
         root.addView(buildSwitch("turn_end", "Agent finished turn", app.prefs.getBool("turn_end", true)))
+        root.addView(buildSwitch("errors", "Agent errors", app.prefs.getBool("errors", true)))
         root.addView(buildSwitch("every_message", "Every agent message", app.prefs.getBool("every_message", false)))
         root.addView(buildSwitch("ignore_tool_calls", "Ignore tool calls", app.prefs.getBool("ignore_tool_calls", true)))
         root.addView(buildSwitch("questions", "Agent questions", app.prefs.getBool("questions", true)))

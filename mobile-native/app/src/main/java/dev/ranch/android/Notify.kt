@@ -36,6 +36,9 @@ class Notify(private val app: App) {
     var questions: Boolean
         get() = app.prefs.getBool("questions", true)
         set(v) { app.prefs.setBool("questions", v) }
+    var notifyErrors: Boolean
+        get() = app.prefs.getBool("errors", true)
+        set(v) { app.prefs.setBool("errors", v) }
 
     // ---- dedup state (single relay thread, no locking needed) ----
     private val busy = HashMap<String, Boolean>()
@@ -49,6 +52,7 @@ class Notify(private val app: App) {
     @Volatile var firedTurn = 0; private set
     @Volatile var firedMessage = 0; private set
     @Volatile var firedQuestion = 0; private set
+    @Volatile var firedError = 0; private set
     @Volatile var skippedActive = 0; private set
     @Volatile var skippedOff = 0; private set
     @Volatile var errors = 0; private set
@@ -130,9 +134,18 @@ class Notify(private val app: App) {
         lastSeq[pane] = maxSeq
         for (m in fresh) {
             val role = m.optString("role")
+            val text = m.optString("text")
             when {
-                role == "assistant" && m.optString("text").trim().isNotEmpty() ->
-                    notify("every_message", name, m.optString("text").replace(Regex("\\s+"), " ").take(120), name)
+                role == "assistant" && text.trim().isNotEmpty() && text.trim().startsWith("⚠") -> {
+                    // agent error rows (failed pi turns, exhausted retries,
+                    // failed sends) get their own default-on notification —
+                    // and suppress the follow-up "agent finished its turn",
+                    // because the error IS the turn-end news
+                    busy[pane] = false
+                    notify("errors", name, "agent error: " + text.replace(Regex("\\s+"), " ").take(120), name)
+                }
+                role == "assistant" && text.trim().isNotEmpty() ->
+                    notify("every_message", name, text.replace(Regex("\\s+"), " ").take(120), name)
                 role == "tool" && !ignoreToolCalls ->
                     notify("every_message", name, "tool: " + m.optString("tool_name", "tool"), name)
             }
@@ -145,6 +158,7 @@ class Notify(private val app: App) {
             "turn_end" -> turnEnd
             "every_message" -> everyMessage
             "questions" -> questions
+            "errors" -> notifyErrors
             else -> false
         }
         if (!enabled) { skippedOff++; return false }
@@ -154,6 +168,7 @@ class Notify(private val app: App) {
             "turn_end" -> firedTurn++
             "every_message" -> firedMessage++
             "questions" -> firedQuestion++
+            "errors" -> firedError++
         }
         true
     } catch (e: Exception) {

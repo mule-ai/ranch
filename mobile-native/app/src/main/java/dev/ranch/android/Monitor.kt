@@ -62,6 +62,7 @@ object Monitor {
             "firedTurn" to (n?.firedTurn ?: 0),
             "firedMsg" to (n?.firedMessage ?: 0),
             "firedQ" to (n?.firedQuestion ?: 0),
+            "firedError" to (n?.firedError ?: 0),
             "skipActive" to (n?.skippedActive ?: 0),
             "skipOff" to (n?.skippedOff ?: 0),
             "errors" to (n?.errors ?: 0),
