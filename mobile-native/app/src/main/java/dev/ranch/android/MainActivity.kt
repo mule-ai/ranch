@@ -128,7 +128,20 @@ class MainActivity : Activity() {
             setPadding(0, 0, 0, dp(16))
         }
         root.addView(loginStatus)
+        root.addView(Button(this).apply {
+            text = "Sign in with Google"
+            setPadding(0, dp(6), 0, dp(6))
+            setOnClickListener {
+                try {
+                    startActivity(Intent(Intent.ACTION_VIEW, android.net.Uri.parse(auth.googleAuthorizeUrl())))
+                    loginStatus.text = "completing sign-in in browser…"
+                } catch (e: Exception) { loginStatus.text = "no browser: ${e.message}" }
+            }
+        })
         if (auth.isLoggedIn()) loginStatus.text = "signed in (restored)"
+
+        // OAuth deep-link return: ranch://auth-callback#access_token=…
+        handleAuthIntent(intent)
 
         // --- Machine picker ---
         root.addView(sectionHeader("Machine"))
@@ -237,6 +250,20 @@ class MainActivity : Activity() {
         // restore machine picker if we have a cached selection
         val cachedMachine = app.prefs.get("machine_id", "")
         if (cachedMachine.isNotEmpty()) loadMachines()
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        handleAuthIntent(intent)
+    }
+
+    private fun handleAuthIntent(i: Intent?) {
+        val data = i?.data ?: return
+        if (data.scheme != "ranch" || data.host != "auth-callback") return
+        val err = auth.applyOAuthFragment(data.fragment)
+        if (!::loginStatus.isInitialized) return
+        loginStatus.text = if (err == null) "signed in with Google ✓" else "google sign-in failed: $err"
+        if (err == null) loadMachines()
     }
 
     override fun onDestroy() {

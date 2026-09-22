@@ -222,3 +222,54 @@ delete (needs the full `WorkflowDraft` form), window-stack ops
 (`WindowNew`/`Select`/`Next`/`Kill`/`Rename`), pane ops (`PaneSplit`/
 `Resize`/`Kill`/`Swap` — blocked on the true split-pane layout), forge
 resume (`ForgeList`), FCM, Google-OAuth.
+
+---
+
+## Native app — Phase 5: polish (2026-09-21)
+
+`mobile-native/` v0.6.0 (versionCode 5) — `releases/ranch-native-0.6.0.apk`.
+
+- **Google OAuth login** (`Auth.kt` + `MainActivity` + manifest): a
+  "Sign in with Google" button opens Supabase's
+  `/auth/v1/authorize?provider=google&redirect_to=ranch://auth-callback`
+  in the system browser; the return deep link lands on `MainActivity`
+  (singleTask + BROWSABLE intent-filter on `ranch://auth-callback`),
+  which parses the token fragment via `Auth.applyOAuthFragment` and
+  persists access/refresh like the password path. **Requires the Google
+  provider enabled in the Supabase dashboard with `ranch://auth-callback`
+  allow-listed** — not verifiable from here.
+- **FCM: deliberately skipped** (as planned) — needs a Firebase project +
+  `google-services.json` + a daemon→FCM push path. The foreground service
+  owns the socket today; revisit only if it proves flaky under Doze.
+- App icon: the existing PNG mipmaps are kept (a redesign is cosmetic).
+
+## Native app — Phase 6 prep: parity matrix (2026-09-21)
+
+RN (`mobile/`) is **deprecated but not deleted** until the native app is
+confirmed working on the device. Parity after v0.6.0:
+
+| Feature | RN | Native |
+|---|---|---|
+| Background notifications + 4 toggles | ✅ | ✅ (foreground service) |
+| Session list / new shell session | ✅ | ✅ |
+| PTY terminal (SGR grid, cursor, keys) | ✅ | ✅ + predictive echo |
+| PTY scrollback | ✅ | ✅ |
+| Agent chat + markdown | ✅ | ✅ (basic markdown) |
+| Model picker + context readout | ✅ | ✅ |
+| Agent question card (`ranch_ask`) | ✅ | ✅ |
+| Agents/pi manager + adopt | ✅ | ✅ |
+| File browser/editor/upload | ✅ | ✅ |
+| Workflows list/run/delete | ✅ | ✅ (no edit form) |
+| Triggers list/run/delete/create | ✅ | ✅ |
+| Machines + upgrade | ✅ | ✅ |
+| True split-pane layout | ✅ | ❌ (tabs) |
+| Window stack ops | ✅ | ❌ |
+| Pane ops (split/resize/kill/swap) | ✅ | ❌ |
+| Forge resume | ✅ | ❌ |
+| Workflow/trigger full edit forms | ✅ | ❌ |
+| Google OAuth | ✅ | ✅ (needs dashboard config) |
+| FCM true-push | ❌ | ❌ (foreground service instead) |
+
+Retiring RN = delete `mobile/`, remove its docs, and note the RN-only
+features above as native follow-ups. Do it only after on-device parity
+sign-off.
