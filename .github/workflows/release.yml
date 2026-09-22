@@ -82,18 +82,15 @@ jobs:
         with:
           distribution: temurin
           java-version: "17"
-      # android-actions/setup-android@v3 is broken: it installs the legacy
-      # `tools` package, which Google removed from the SDK repo.
-      # Set up the preinstalled runner SDK explicitly instead.
+      # native Kotlin client (mobile-native/) — replaced the Expo/RN app
+      # (mobile/) during the RN->Kotlin migration. Plain Gradle build: no
+      # Node, no expo prebuild, no NDK.
       - name: Android SDK (licenses + components)
         run: |
           export ANDROID_HOME=/usr/local/lib/android/sdk
           yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
-            "platform-tools" "platforms;android-36" "build-tools;36.0.0" "ndk;27.1.12297006"
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
+            "platform-tools" "platforms;android-35" "build-tools;35.0.0"
       - name: Decode signing keystore
         if: env.RANCH_KEYSTORE_B64 != ''
         env:
@@ -102,18 +99,13 @@ jobs:
           mkdir -p ~/.local/android-keystore
           echo "$RANCH_KEYSTORE_B64" | base64 -d > ~/.local/android-keystore/ranch.keystore
       - name: Build APK
-        working-directory: mobile
-        env:
-          # update banner: compared with versions.json's version field
-          EXPO_PUBLIC_APP_VERSION: main-${{ github.sha }}
+        working-directory: mobile-native
         run: |
-          npm install
-          npx expo prebuild --platform android --no-install
-          python3 apply-signing.py
-          cd android && ./gradlew assembleRelease
+          export ANDROID_HOME=/usr/local/lib/android/sdk
+          ./gradlew assembleRelease --no-daemon
       - name: Stage
         run: |
-          cp mobile/android/app/build/outputs/apk/release/app-release.apk ranch.apk
+          cp mobile-native/app/build/outputs/apk/release/app-release.apk ranch.apk
           sha256sum ranch.apk | awk '{print $1}' > ranch.apk.sha256
       - uses: actions/upload-artifact@v4
         with:

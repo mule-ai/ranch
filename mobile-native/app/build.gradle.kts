@@ -17,10 +17,10 @@ android {
 
     signingConfigs {
         create("release") {
-            storeFile = file(
-                System.getenv("RANCH_KEYSTORE")
-                    ?: "${System.getProperty("user.home")}/.local/android-keystore/ranch.keystore"
-            )
+            val ksPath = System.getenv("RANCH_KEYSTORE")
+                ?: "${System.getProperty("user.home")}/.local/android-keystore/ranch.keystore"
+            val ksFile = File(ksPath)
+            storeFile = ksFile
             storePassword = "ranch-sign-2026"
             keyAlias = "ranch"
             keyPassword = "ranch-sign-2026"
@@ -29,8 +29,11 @@ android {
 
     buildTypes {
         release {
+            // CI without the RANCH_KEYSTORE secret builds an unsigned APK
+            // (matches the old RN apply-signing.py behavior)
+            signingConfig = if (signingConfigs["release"].storeFile?.exists() == true)
+                signingConfigs.getByName("release") else null
             isMinifyEnabled = false
-            signingConfig = signingConfigs.getByName("release")
         }
     }
 
