@@ -1,6 +1,7 @@
 package dev.ranch.android
 
 import android.util.Base64
+import org.json.JSONArray
 import org.json.JSONObject
 import java.util.UUID
 
@@ -59,6 +60,48 @@ object Term {
         return o
     }
 
+    fun agentAskAnswer(askId: String, choices: List<Int>, text: String): JSONObject =
+        JSONObject()
+            .put("t", "AgentAskAnswer")
+            .put("ask_id", askId)
+            .put("choices", JSONArray(choices))
+            .put("text", text)
+
+    fun modelList(pane: String): JSONObject =
+        JSONObject()
+            .put("t", "ModelList").put("id", newId()).put("client", CLIENT)
+            .put("pane", pane).put("req_id", "ml-" + newId())
+
+    fun modelSet(session: String, pane: String, provider: String, model: String): JSONObject =
+        JSONObject()
+            .put("t", "ModelSet").put("id", newId()).put("client", CLIENT)
+            .put("session", session).put("pane", pane)
+            .put("provider", provider).put("model", model)
+            .put("req_id", "ms-" + newId())
+
+    fun chatHistory(session: String, pane: String, limit: Int, before: Long? = null): JSONObject {
+        val o = JSONObject()
+            .put("t", "ChatHistory").put("id", newId()).put("client", CLIENT)
+            .put("session", session).put("pane", pane)
+            .put("req_id", "ch-" + newId()).put("limit", limit)
+        if (before != null) o.put("before", before)
+        return o
+    }
+
+    fun scrollbackReq(session: String, pane: String, offset: Long = 0, limit: Int = 2000): JSONObject =
+        JSONObject()
+            .put("t", "ScrollbackReq").put("id", newId()).put("client", CLIENT)
+            .put("session", session).put("pane", pane)
+            .put("offset", offset).put("limit", limit)
+
+    fun sessionsKill(session: String): JSONObject =
+        JSONObject().put("t", "SessionsKill").put("session", session)
+
+    fun sessionsRename(session: String, name: String): JSONObject =
+        JSONObject().put("t", "SessionsRename").put("session", session).put("name", name)
+
+    fun upgrade(): JSONObject = JSONObject().put("t", "Upgrade")
+
     // ---- special-key sequences (mirror mobile/screens/Terminal.tsx) ----
     // Escapes use \u00XX so the source stays plain ASCII.
 
@@ -97,6 +140,42 @@ object Term {
         val durationMs: Long?,
         val createdAt: String?,
     )
+
+    data class ModelChoice(
+        val provider: String,
+        val id: String,
+        val name: String,
+    )
+
+    data class AgentAsk(
+        val askId: String,
+        val session: String,
+        val pane: String,
+        val question: String,
+        val choices: List<String>,
+        val suggested: Int?,
+        val multi: Boolean,
+        val freeText: Boolean,
+    )
+
+    fun parseModelChoice(o: JSONObject): ModelChoice =
+        ModelChoice(
+            provider = o.optString("provider"),
+            id = o.optString("id"),
+            name = o.optString("name"),
+        )
+
+    fun parseAgentAsk(f: JSONObject): AgentAsk =
+        AgentAsk(
+            askId = f.optString("ask_id"),
+            session = f.optString("session"),
+            pane = f.optString("pane"),
+            question = f.optString("question"),
+            choices = f.optJSONArray("choices")?.let { a -> (0 until a.length()).map { a.optString(it) } } ?: emptyList(),
+            suggested = if (f.has("suggested") && !f.isNull("suggested")) f.optInt("suggested") else null,
+            multi = f.optBoolean("multi", false),
+            freeText = f.optBoolean("free_text", true),
+        )
 
     fun parseSessionMeta(o: JSONObject): SessionMeta =
         SessionMeta(

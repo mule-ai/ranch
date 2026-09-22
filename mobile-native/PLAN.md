@@ -57,6 +57,12 @@ polish (predictive echo, markdown, scrollback, split layout).
 
 ## Phase 3 — make the terminal + chat feel right (the long pole)
 
+> **Status (0.4.0):** 3b done — markdown chat, chat scrollback paging,
+> model picker + context readout, agent-question card (all frames validated
+> against the live daemon). 3a done — predictive echo + PTY scrollback
+> (`hist` key). Deferred: true split-pane layout (still active-pane tabs),
+> CJK/wide-char metrics (ASCII-only for now), on-device IME tuning.
+
 This is the phase that turns "it works" into "I actually use the phone."
 Ordered by user value.
 

@@ -40,6 +40,23 @@ class TerminalView(context: Context) : View(context) {
             invalidate()
         }
 
+    // ---- predictive echo (client-side) ----
+    @Volatile private var predText = ""
+    @Volatile private var predX = 0
+    @Volatile private var predY = 0
+
+    /**
+     * Paint [text] faintly at cell (x,y) until the next real [applyUpdate]
+     * replaces that row (which clears the prediction). Reduces perceived
+     * latency for local keystrokes.
+     */
+    fun setPrediction(x: Int, y: Int, text: String) {
+        predText = text
+        predX = x
+        predY = y
+        invalidate()
+    }
+
     /** Reports the cell geometry the view can display (cols, rows). */
     var onGeometry: ((Int, Int) -> Unit)? = null
 
@@ -112,6 +129,8 @@ class TerminalView(context: Context) : View(context) {
     /** Apply incremental row changes (from an Update). */
     fun applyUpdate(rowsUpd: List<Pair<Int, String>>, cursor: Triple<Int, Int, Boolean>?) {
         val spans = rowSpans
+        // the real frame arrived — clear any predictive echo it supersedes
+        predText = ""
         for ((y, text) in rowsUpd) {
             if (y in 0 until spans.size) {
                 spans[y] = Sgr.parseRow(text).toTypedArray()
@@ -195,6 +214,19 @@ class TerminalView(context: Context) : View(context) {
                 paint.isFakeBoldText = false
                 paint.color = Color.WHITE
                 canvas.drawText(cellChar.toString(), cx.toFloat(), (y * ch + baseline).toFloat(), paint)
+            }
+
+            // predictive echo: dim chars the user typed but the daemon hasn't
+            // echoed back yet
+            if (predText.isNotEmpty() && y == predY) {
+                paint.typeface = tfNormal
+                paint.isFakeBoldText = false
+                paint.color = Color.parseColor("#5a6268")
+                for ((ix, chx) in predText.withIndex()) {
+                    val px = (predX + ix) * cw
+                    if (px >= cols * cw) break
+                    canvas.drawText(chx.toString(), px.toFloat(), (y * ch + baseline).toFloat(), paint)
+                }
             }
         }
     }

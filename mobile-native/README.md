@@ -15,7 +15,7 @@ already shows everything). A native foreground service sidesteps that: the
 process stays alive (exempt from Doze), the WS stays open, and notifications
 fire while the phone is in a drawer.
 
-## What it does today (v0.3.0)
+## What it does today (v0.4.0)
 
 - **Supabase auth** — email/password (GoTrue) with refresh; tokens persist in
   SharedPreferences. (`Auth.kt`)
@@ -55,6 +55,19 @@ fire while the phone is in a drawer.
     `Resize` (canonical size follows this client, tmux-style). Multi-pane
     sessions get a tab row; tapping a tab sends `PaneSelect`.
   - **Resync** — per-pane `seq` gap → re-`Attach` so the daemon re-snapshots.
+  - **Predictive echo** — typed chars paint dimmed at the cursor and clear
+    when the authoritative `Update` for that row lands.
+  - **PTY scrollback** — `hist` key sends `ScrollbackReq` → `Scrollback`
+    rendered in a popup.
+  - **Markdown** — chat messages render `**bold**`/`*italic*`/inline code/
+    headers/lists via `SpannableStringBuilder`.
+  - **Chat scrollback paging** — scrolling to the top fires `ChatHistory` →
+    `ChatHistoryOk`; older rows prepend.
+  - **Model picker** — a chip shows the pane's model + context; tapping sends
+    `ModelList` → `ModelListOk` and a popup lets you `ModelSet`.
+  - **Agent question card** — `AgentAskRequest` renders an interactive card
+    (choices + suggested + free-text + multi) pinned above the input; Send
+    posts `AgentAskAnswer`. The phone UI for the `ranch_ask` agent tool.
 
 ## Build
 
@@ -67,7 +80,7 @@ cd mobile-native
 export JAVA_HOME=$(mise where java) ANDROID_HOME=~/.local/android-sdk
 ./gradlew assembleRelease
 # -> app/build/outputs/apk/release/app-release.apk
-# copy to ../releases/ranch-native-0.3.0.apk
+# copy to ../releases/ranch-native-0.4.0.apk
 ```
 
 - AGP 8.12.0, Gradle 9.4.1, Kotlin 2.2.10.
@@ -83,11 +96,9 @@ private channel the RN app uses, with the same user JWT.
 
 ## Roadmap
 
-- **v0.3.x** — terminal polish (predictive echo, scrollback paging,
-  CJK/wide-char metrics, multi-pane split layout instead of tabs),
-  Google-OAuth login, proper app icon.
-- **Phase 3** — file editor, model picker, chat scrollback paging.
-- **Phase 4** — workflows, triggers, machines management.
+- **v0.4.x** — CJK/wide-char metrics, multi-pane split layout instead of tabs,
+  on-device IME tuning, Google-OAuth login, proper app icon.
+- **Phase 4** — agents/pi manager, file editor, workflows, triggers, machines.
 - Optional: **FCM** as a belt-and-suspenders true-push channel (needs a
   Firebase project + a daemon/edge-function push path).
 
@@ -95,5 +106,7 @@ private channel the RN app uses, with the same user JWT.
 
 The exact frame flow the app uses was validated against a live daemon:
 local-socket `Hello→Attach→Snapshot→Resize→Input(echo)→Update` (PTY path)
-and Realtime `join→Hello→HelloOk→Attach→chunked Snapshot` (chat path),
-confirming both the outbound `broadcast` envelope and chunk reassembly.
+and Realtime `join→Hello→HelloOk→Attach→chunked Snapshot` (chat path).
+Phase-3 frames also validated live: `ModelList→ModelListOk`,
+`ChatHistory→ChatHistoryOk`, `AgentAskStatus→AgentAskStatusOk`,
+`ScrollbackReq→Scrollback`.

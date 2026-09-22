@@ -134,3 +134,50 @@ v0.3.0 / versionCode 2 → `releases/ranch-native-0.3.0.apk`.
 Phase 3 follow-ons: terminal polish (predictive echo, scrollback paging,
 CJK/wide-char metrics, true split layout), model picker, file editor,
 workflows/triggers/machines, Google-OAuth login.
+
+---
+
+## Native app — Phase 3: terminal + chat feel (2026-09-21)
+
+`mobile-native/` v0.4.0 (versionCode 3) — `releases/ranch-native-0.4.0.apk`.
+
+Turns "it works" into "I actually use it." All of 3a+3b landed except
+split-pane layout / CJK metrics / on-device IME tuning (deferred):
+
+**3a — terminal feel (PTY panes):**
+- **Predictive echo**: on each keystroke the typed chars paint dimmed at
+  the last-known cursor in `TerminalView` (`setPrediction`) and clear when
+  the authoritative `Update` for that row lands (`applyUpdate` resets the
+  prediction). Makes typing over the relay feel instant.
+- **PTY scrollback**: a `hist` key sends `ScrollbackReq{offset:0,limit:2000}`
+  → `Scrollback{lines}` rendered in a popup of monospace text.
+
+**3b — agent chat (forge-chat panes):**
+- **Markdown**: `markdownToSpannable` renders `**bold**`/`*italic*`/
+  `` `code` ``/headers/lists into a `SpannableStringBuilder` (no WebView).
+- **Chat scrollback paging**: scrolling the chat to the top fires
+  `ChatHistory{before,limit}` → `ChatHistoryOk`; older rows prepend,
+  `has_more` re-arms. `chat_has_more` is inferred from the initial tail
+  length (`>= CHAT_TAIL`).
+- **Model picker + context readout**: a model chip above the chat shows the
+  pane's `model` + `context` (`Meta model`/`context`). Tapping it sends
+  `ModelList` → `ModelListOk` (catalog) and renders a `PopupWindow` list;
+  a tap sends `ModelSet` and updates the chip.
+- **Agent question card**: `AgentAskRequest` renders an interactive card
+  (choice rows w/ suggested marker, multi-select ◉/○, free-text box, Send)
+  pinned above the input. It mutates buttons in place on toggle (so the
+  typed free-text is not wiped on re-render). Send posts
+  `AgentAskAnswer{choices,text}`; a broadcast `AgentAskAnswer` (from any
+  client) dismisses the card and shows an "answered:" note. This is the
+  phone UI for the `ranch_ask` agent tool.
+
+**New frame builders** in `Term.kt`: `agentAskAnswer`, `modelList`,
+`modelSet`, `chatHistory`, `scrollbackReq`, `sessionsKill`, `sessionsRename`,
+`upgrade` + `parseAgentAsk`/`parseModelChoice` + `AgentAsk`/`ModelChoice`.
+
+**Verification** (live daemon, local socket + chunk reassembly):
+`ModelList→ModelListOk` (61 models, current correct),
+`ChatHistory→ChatHistoryOk` (msgs, has_more=true),
+`AgentAskStatus→AgentAskStatusOk` (state=unknown for a bogus id),
+`ScrollbackReq→Scrollback` on a fresh shell pane. PTY echo + chat
+attach/update unchanged from Phase 2. All symbols present in the release DEX.
