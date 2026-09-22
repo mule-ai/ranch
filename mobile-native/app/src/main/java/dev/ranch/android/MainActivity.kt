@@ -26,7 +26,10 @@ import java.util.concurrent.Executors
 class MainActivity : Activity() {
 
     private val app get() = application as App
-    private val auth = Auth(app.prefs)
+
+    // lazy: field initializers run at construction, before Activity.attach(),
+    // where getApplication() is still null (NPE = crash on launch)
+    private val auth by lazy { Auth(app.prefs) }
     private val handler = Handler(Looper.getMainLooper())
     private val exec = Executors.newSingleThreadExecutor()
 

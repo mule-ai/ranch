@@ -21,6 +21,18 @@ class App : Application() {
     override fun onCreate() {
         super.onCreate()
         prefs = Prefs(this)
+        // crash log: last uncaught exception lands in filesDir/crash.txt so
+        // on-device crashes are debuggable without adb
+        Thread.setDefaultUncaughtExceptionHandler { t, e ->
+            try {
+                java.io.File(filesDir, "crash.txt").writeText(
+                    java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.US)
+                        .format(java.util.Date()) + " thread=" + t.name + "\n" +
+                    e.stackTraceToString()
+                )
+            } catch (_: Exception) {}
+            android.os.Process.killProcess(android.os.Process.myPid())
+        }
         val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
         nm.createNotificationChannel(
             NotificationChannel("ranch", "ranch", NotificationManager.IMPORTANCE_HIGH)
