@@ -181,3 +181,44 @@ split-pane layout / CJK metrics / on-device IME tuning (deferred):
 `AgentAskStatus→AgentAskStatusOk` (state=unknown for a bogus id),
 `ScrollbackReq→Scrollback` on a fresh shell pane. PTY echo + chat
 attach/update unchanged from Phase 2. All symbols present in the release DEX.
+
+---
+
+## Native app — Phase 4: full feature parity (2026-09-21)
+
+`mobile-native/` v0.5.0 (versionCode 4) — `releases/ranch-native-0.5.0.apk`.
+
+Five new screens, all request/response over the existing `RelaySession`
+frame bus (no daemon changes):
+
+- **Agents** (`AgentsActivity.kt`): `PiList`→`PiListOk` list (title, cwd,
+  active ●/○, [ext] badge); `PiMonitor` toggle; adopt a pi conversation
+  into ranch via `SessionsCreate{kind:pi, pi_session_file}`; "+ New agent
+  session".
+- **Files** (`EditorActivity.kt`): `DirList`/`DirListOk` browser (⌂ parent,
+  📁 dirs, 📄 files), `FileRead`→monospace editor, `FileWrite` with the
+  read `mtime` for conflict detection, `FilePut` uploads a phone file
+  (base64) to the host, `FileChanged` auto-reloads an open file.
+- **Workflows** (`WorkflowsActivity.kt`): `WorkflowList`→`WorkflowListOk`,
+  per-row Details (`WorkflowGet`→`WorkflowGetOk` step list), Run
+  (`WorkflowRun`), Delete (`WorkflowDelete`→Ok).
+- **Triggers** (`TriggersActivity.kt`): `TriggerList`→`TriggerListOk`
+  (●/○ enabled, kind · cron · workflow), Run / Delete per row, a minimal
+  create-cron form via `TriggerPut`, live `TriggerFired` line.
+- **Machines** (`MachinesActivity.kt`): machine list with online status
+  (REST `machines_info`, 90 s freshness) + **Upgrade** button sending the
+  `Upgrade` frame (hot daemon upgrade, sessions survive).
+
+Session extras in `SessionActivity`: ✎ rename (`SessionsRename` via
+dialog) and ✕ kill (`SessionsKill`) in the top bar. `Term.kt` gains
+builders: `piList`, `piMonitor`, `adoptPiSession`, `dirList`, `fileRead`,
+`fileWrite`, `filePut`, `workflowList/Get/Run/Delete`, `muleAgents`,
+`triggerList/Run/Delete`, `sessionsKill`, `sessionsRename` (+ `PiSession`
+parse). Home screen gets a Tools nav row (Agents · Files · Workflows ·
+Triggers · Machines). All activities registered in the manifest.
+
+Not yet ported (follow-ons): workflow/trigger *editing* beyond create/run/
+delete (needs the full `WorkflowDraft` form), window-stack ops
+(`WindowNew`/`Select`/`Next`/`Kill`/`Rename`), pane ops (`PaneSplit`/
+`Resize`/`Kill`/`Swap` — blocked on the true split-pane layout), forge
+resume (`ForgeList`), FCM, Google-OAuth.

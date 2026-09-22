@@ -102,6 +102,70 @@ object Term {
 
     fun upgrade(): JSONObject = JSONObject().put("t", "Upgrade")
 
+    // ---- Phase 4: agents / pi manager ----
+    fun piList(): JSONObject =
+        JSONObject().put("t", "PiList").put("id", newId()).put("client", CLIENT)
+            .put("req_id", "pil-" + newId())
+
+    fun piMonitor(enabled: Boolean): JSONObject =
+        JSONObject().put("t", "PiMonitor").put("enabled", enabled).put("req_id", "pim-" + newId())
+
+    fun adoptPiSession(sessionFile: String): JSONObject {
+        val o = JSONObject().put("t", "SessionsCreate").put("req_id", newId())
+            .put("client", CLIENT).put("kind", "pi")
+        o.put("pi_session_file", sessionFile)
+        return o
+    }
+
+    // ---- Phase 4: file editor ----
+    fun dirList(path: String? = null): JSONObject {
+        val o = JSONObject().put("t", "DirList").put("id", newId()).put("client", CLIENT)
+            .put("req_id", "dl-" + newId())
+        if (path != null) o.put("path", path)
+        return o
+    }
+
+    fun fileRead(path: String): JSONObject =
+        JSONObject().put("t", "FileRead").put("id", newId()).put("client", CLIENT)
+            .put("req_id", "fr-" + newId()).put("path", path)
+
+    fun fileWrite(path: String, content: String, mtime: Long? = null): JSONObject {
+        val o = JSONObject().put("t", "FileWrite").put("id", newId()).put("client", CLIENT)
+            .put("req_id", "fw-" + newId()).put("path", path).put("content", content)
+        if (mtime != null) o.put("mtime", mtime)
+        return o
+    }
+
+    fun filePut(name: String, b64: String): JSONObject =
+        JSONObject().put("t", "FilePut").put("id", newId()).put("client", CLIENT)
+            .put("req_id", "fp-" + newId()).put("name", name).put("b64", b64)
+
+    // ---- Phase 4: workflows / mule ----
+    fun workflowList(): JSONObject =
+        JSONObject().put("t", "WorkflowList").put("req_id", "wl-" + newId())
+
+    fun workflowGet(id: String): JSONObject =
+        JSONObject().put("t", "WorkflowGet").put("req_id", "wg-" + newId()).put("workflow", id)
+
+    fun workflowRun(id: String): JSONObject =
+        JSONObject().put("t", "WorkflowRun").put("req_id", "wr-" + newId()).put("workflow", id)
+
+    fun workflowDelete(id: String): JSONObject =
+        JSONObject().put("t", "WorkflowDelete").put("req_id", "wd-" + newId()).put("workflow", id)
+
+    fun muleAgents(): JSONObject =
+        JSONObject().put("t", "MuleAgents").put("req_id", "ma-" + newId())
+
+    // ---- Phase 4: triggers ----
+    fun triggerList(): JSONObject =
+        JSONObject().put("t", "TriggerList").put("req_id", "tl-" + newId())
+
+    fun triggerRun(id: String): JSONObject =
+        JSONObject().put("t", "TriggerRun").put("req_id", "tr-" + newId()).put("trigger", id)
+
+    fun triggerDelete(id: String): JSONObject =
+        JSONObject().put("t", "TriggerDelete").put("req_id", "td-" + newId()).put("trigger", id)
+
     // ---- special-key sequences (mirror mobile/screens/Terminal.tsx) ----
     // Escapes use \u00XX so the source stays plain ASCII.
 
@@ -157,6 +221,27 @@ object Term {
         val multi: Boolean,
         val freeText: Boolean,
     )
+
+    data class PiSession(
+        val id: String,
+        val title: String,
+        val sessionFile: String,
+        val path: String,
+        val active: Boolean,
+        val external: Boolean,
+        val updated: String,
+    )
+
+    fun parsePiSession(o: JSONObject): PiSession =
+        PiSession(
+            id = o.optString("id"),
+            title = o.optString("title"),
+            sessionFile = o.optString("session_file"),
+            path = o.optString("path"),
+            active = o.optBoolean("active", false),
+            external = o.optBoolean("external", false),
+            updated = o.optString("updated"),
+        )
 
     fun parseModelChoice(o: JSONObject): ModelChoice =
         ModelChoice(

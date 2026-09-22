@@ -178,6 +178,23 @@ class MainActivity : Activity() {
         sessionsBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         root.addView(sessionsBox)
 
+        // --- Tools (Phase 4 screens) ---
+        root.addView(sectionHeader("Tools"))
+        val tools = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        fun toolBtn(label: String, cls: Class<*>) = Button(this).apply {
+            text = label; setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            setOnClickListener { startActivity(Intent(this@MainActivity, cls)) }
+        }
+        tools.addView(toolBtn("Agents", AgentsActivity::class.java))
+        tools.addView(toolBtn("Files", EditorActivity::class.java))
+        root.addView(tools)
+        val tools2 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        tools2.addView(toolBtn("Workflows", WorkflowsActivity::class.java))
+        tools2.addView(toolBtn("Triggers", TriggersActivity::class.java))
+        tools2.addView(toolBtn("Machines", MachinesActivity::class.java))
+        root.addView(tools2)
+
         // --- Notification settings ---
         root.addView(sectionHeader("Notifications"))
         root.addView(buildSwitch("turn_end", "Agent finished turn", app.prefs.getBool("turn_end", true)))

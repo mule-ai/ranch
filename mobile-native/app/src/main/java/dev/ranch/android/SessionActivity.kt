@@ -126,6 +126,21 @@ class SessionActivity : Activity() {
         }
         top.addView(back)
         top.addView(titleView, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f))
+        top.addView(Button(this).apply {
+            text = "✎"; setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            setPadding(dp(6), 0, dp(6), 0)
+            setOnClickListener { renameSession() }
+        })
+        top.addView(Button(this).apply {
+            text = "✕"; setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            setPadding(dp(6), 0, dp(6), 0)
+            setTextColor(0xFFef4444.toInt())
+            setOnClickListener {
+                relay?.send(Term.sessionsKill(sessionId))
+                statusView.text = "killing…"
+                handler.postDelayed({ finish() }, 800)
+            }
+        })
         top.addView(statusView)
         root.addView(top)
 
@@ -840,6 +855,23 @@ class SessionActivity : Activity() {
     private fun sendPaneSelect(pane: String) {
         relay?.send(JSONObject().put("t", "PaneSelect").put("id", Term.newId())
             .put("client", Term.CLIENT).put("session", sessionId).put("pane", pane))
+    }
+
+    private fun renameSession() {
+        val input = EditText(this).apply { setText(sessionName.ifEmpty { sessionId.take(8) }) }
+        android.app.AlertDialog.Builder(this)
+            .setTitle("rename session")
+            .setView(input)
+            .setPositiveButton("rename") { _, _ ->
+                val n = input.text.toString().trim()
+                if (n.isNotEmpty()) {
+                    relay?.send(Term.sessionsRename(sessionId, n))
+                    titleView.text = n
+                    sessionName = n
+                }
+            }
+            .setNegativeButton("cancel", null)
+            .show()
     }
 
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
