@@ -932,6 +932,8 @@ fn run_pi_reader(
                             format!("compacted → {after} est. tokens")
                         };
                         write_context_status(&pipe, t_pane, &note);
+                        // close the "compacting" lifecycle machine-wide
+                        write_status(&pipe, t_pane, "idle");
                         // refresh the live readout (pi re-reported after
                         // the window shrank)
                         rpc(

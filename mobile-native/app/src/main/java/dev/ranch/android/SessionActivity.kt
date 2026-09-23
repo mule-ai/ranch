@@ -369,8 +369,30 @@ class SessionActivity : Activity() {
     private fun onMeta(f: JSONObject) {
         when (f.optString("kind")) {
             "agent" -> {
-                agentStatus = f.optString("status", "")
-                statusView.text = when (agentStatus) {
+                val st = f.optString("status", "")
+                val pane = f.optString("pane")
+                // compaction is a machine-wide lifecycle state: the daemon
+                // broadcasts "compacting" when a ChatCompact lands (from any
+                // client) and "idle" when it completes
+                if (st == "compacting" && pane.isNotEmpty()) {
+                    compacting = true
+                    compactingPane = pane
+                    handler.removeCallbacks(compactTimeoutRun)
+                    handler.postDelayed(compactTimeoutRun, 600_000)
+                    renderQueue()
+                    if (pane == activePane) {
+                        statusView.text = "🗜 compacting…"
+                        updateModelBar()
+                    }
+                    return
+                }
+                if (compacting && st == "idle" && pane == compactingPane) {
+                    // completion signal — the context readout / Error frame
+                    // usually lands first; this catches any straggler
+                    finishCompact()
+                }
+                agentStatus = st
+                statusView.text = when (st) {
                     "working" -> "● working"
                     "idle" -> "● idle"
                     else -> ""
@@ -558,7 +580,7 @@ class SessionActivity : Activity() {
         compacting = true
         compactingPane = activePane
         handler.removeCallbacks(compactTimeoutRun)
-        handler.postDelayed(compactTimeoutRun, 120_000)
+        handler.postDelayed(compactTimeoutRun, 600_000)
         renderQueue()
         updateModelBar()
     }
@@ -587,7 +609,8 @@ class SessionActivity : Activity() {
     private fun renderQueue() {
         if (!::queueContainer.isInitialized) return
         queueContainer.removeAllViews()
-        val show = compacting || queued.isNotEmpty() || queuedNote != null
+        val show = (compacting && compactingPane == activePane)
+            || queued.isNotEmpty() || queuedNote != null
         queueContainer.visibility = if (show) View.VISIBLE else View.GONE
         if (!show) return
         if (compacting) {

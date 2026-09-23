@@ -3309,6 +3309,22 @@ impl Daemon {
                     .map(|cp| cp.forge_sid);
                 match backing {
                     Some(fs) => {
+                        // machine-wide lifecycle: every client sees compaction
+                        // start (the phone keys its in-progress UI off this;
+                        // completion clears it via the context "compacted"
+                        // readout and the agent-idle that follows)
+                        let compacting = Frame::Meta {
+                            session: sid.to_string(),
+                            pane: Some(pid.to_string()),
+                            kind: "agent".into(),
+                            status: Some("compacting".into()),
+                        };
+                        let fds: Vec<RawFd> = self.clients.keys().copied().collect();
+                        for fd in fds {
+                            if let Some(c) = self.clients.get_mut(&fd) {
+                                send_frame(c, &compacting);
+                            }
+                        }
                         if fs.is_nil() {
                             match self.pi_agents.get(&pid) {
                                 Some(lp) => {

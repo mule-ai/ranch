@@ -629,6 +629,16 @@ pub fn spawn_worker(cfg: ForgeConfig, pipe_w: std::fs::File, rx: mpsc::Receiver<
                                         status: Some(note),
                                     },
                                 );
+                                // close the "compacting" lifecycle machine-wide
+                                write_frame(
+                                    &pipe,
+                                    &Frame::Meta {
+                                        session: String::new(),
+                                        pane: Some(pane.to_string()),
+                                        kind: "agent".into(),
+                                        status: Some("idle".into()),
+                                    },
+                                );
                                 // the compaction changed the window — refresh
                                 let t_pipe = pipe.clone();
                                 let t_cfg = cfg.clone();
