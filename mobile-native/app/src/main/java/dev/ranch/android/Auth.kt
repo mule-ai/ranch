@@ -31,6 +31,15 @@ class Auth(private val prefs: Prefs) {
 
     fun isLoggedIn(): Boolean = accessToken.isNotEmpty()
 
+    fun logout() {
+        accessToken = ""
+        refreshToken = ""
+        expiresAt = 0
+        prefs.set("access_token", "")
+        prefs.set("refresh_token", "")
+        prefs.set("expires_at", "0")
+    }
+
     /** @return null on success, error string otherwise. */
     fun login(email: String, password: String): String? {
         val body = JSONObject()
