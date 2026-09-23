@@ -299,3 +299,11 @@ the queue on re-attach. Restored state older than 10 min is treated as
 timed out (queued messages flush with a note). Meta exited clears the
 persisted state (nothing to flush into a dead session). v0.7.0 /
 versionCode 14.
+
+## Native app — copy message contents (2026-09-23)
+
+Port of the RN copy UX: long-press a chat bubble → the raw markdown text
+(not the rendered spans) goes to the clipboard, with the meta line
+flipping to "copied ✓" for 1.5 s (before it: "hold to copy"). Tool rows:
+tap toggles the full output (▼/▲), long-press copies the tool output —
+RN parity restored. v0.7.1 / versionCode 15.

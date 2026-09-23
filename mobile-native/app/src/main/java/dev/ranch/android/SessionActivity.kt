@@ -904,34 +904,64 @@ class SessionActivity : Activity() {
         if (nearBottom) chatScroll.fullScroll(View.FOCUS_DOWN)
     }
 
+    private fun copyToClipboard(text: String): Boolean {
+        if (text.isBlank()) return false
+        val cm = getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+        cm.setPrimaryClip(android.content.ClipData.newPlainText("ranch", text))
+        return true
+    }
+
     private fun renderChatMsg(m: Term.ChatMsg): LinearLayout {
         val wrap = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(0, dp(4), 0, dp(4))
         }
         if (m.toolName != null) {
-            // tool call: compact one-liner + truncated output
+            // tool row: tap toggles the full output, long-press copies it
+            // (same UX as the RN app)
             val dur = m.durationMs?.let {
                 if (it >= 1000) " · " + String.format(java.util.Locale.US, "%.1fs", it / 1000.0)
                 else " · ${it}ms"
             } ?: ""
-            wrap.addView(TextView(this).apply {
-                text = "⚙ ${m.toolName}$dur"
+            val detail = (m.toolOutput ?: m.text).takeIf { it.isNotEmpty() }
+            var open = false
+            var expanded: TextView? = null
+            val baseTitle = "⚙ ${m.toolName}$dur"
+            val title = TextView(this).apply {
+                text = if (detail != null) "$baseTitle ▼" else baseTitle
                 setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
                 setTextColor(0xFF8bd08b.toInt())
                 setPadding(dp(10), dp(6), dp(10), dp(6))
-            })
-            val detail = (m.toolOutput ?: m.text).takeIf { it.isNotEmpty() }
+                if (detail != null) {
+                    setOnClickListener {
+                        open = !open
+                        text = "$baseTitle ${if (open) "▲" else "▼"}"
+                        expanded?.maxLines = if (open) 500 else 6
+                    }
+                    setOnLongClickListener {
+                        if (copyToClipboard(detail)) {
+                            text = "$baseTitle · copied ✓"
+                            handler.postDelayed({
+                                text = "$baseTitle ${if (open) "▲" else "▼"}"
+                            }, 1500)
+                        }
+                        true
+                    }
+                }
+            }
+            wrap.addView(title)
             if (detail != null) {
-                wrap.addView(TextView(this).apply {
-                    text = detail.take(2000)
+                val out = TextView(this).apply {
+                    text = detail
                     maxLines = 6
                     ellipsize = android.text.TextUtils.TruncateAt.END
                     setTypeface(Typeface.MONOSPACE)
                     setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
                     setTextColor(0xFF9aa0a6.toInt())
                     setPadding(dp(10), 0, dp(10), 0)
-                })
+                }
+                expanded = out
+                wrap.addView(out)
             }
             return wrap
         }
@@ -960,13 +990,25 @@ class SessionActivity : Activity() {
         wrap.addView(row)
         val meta = listOf(if (isUser) "you" else "agent", fmtTime(m.createdAt))
             .filter { it.isNotEmpty() }.joinToString(" · ")
-        if (meta.isNotEmpty()) wrap.addView(TextView(this).apply {
-            text = meta
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 10f)
-            setTextColor(0xFF5C636B.toInt())
-            setPadding(dp(6), dp(2), dp(6), 0)
-            gravity = if (isUser) Gravity.END else Gravity.START
-        })
+        if (meta.isNotEmpty()) {
+            val metaBase = "$meta · hold to copy"
+            val metaView = TextView(this).apply {
+                text = metaBase
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 10f)
+                setTextColor(0xFF5C636B.toInt())
+                setPadding(dp(6), dp(2), dp(6), 0)
+                gravity = if (isUser) Gravity.END else Gravity.START
+            }
+            wrap.addView(metaView)
+            // long-press copies the raw markdown text (not the rendered spans)
+            bubble.setOnLongClickListener {
+                if (copyToClipboard(m.text)) {
+                    metaView.text = "copied ✓"
+                    handler.postDelayed({ metaView.text = metaBase }, 1500)
+                }
+                true
+            }
+        }
         return wrap
     }
 
