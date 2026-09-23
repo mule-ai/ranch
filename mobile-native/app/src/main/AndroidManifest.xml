@@ -17,6 +17,7 @@
         <activity
             android:name=".MainActivity"
             android:exported="true"
+            android:windowSoftInputMode="adjustResize"
             android:launchMode="singleTask"
             android:configChanges="orientation|screenSize">
             <intent-filter>
@@ -35,15 +36,16 @@
         <activity
             android:name=".SessionActivity"
             android:exported="false"
+            android:windowSoftInputMode="adjustResize"
             android:configChanges="orientation|screenSize">
         </activity>
 
         <activity android:name=".AgentsActivity" android:exported="false" android:configChanges="orientation|screenSize" />
-        <activity android:name=".EditorActivity" android:exported="false" android:configChanges="orientation|screenSize" />
+        <activity android:name=".EditorActivity" android:exported="false" android:windowSoftInputMode="adjustResize" android:configChanges="orientation|screenSize" />
         <activity android:name=".WorkflowsActivity" android:exported="false" android:configChanges="orientation|screenSize" />
         <activity android:name=".TriggersActivity" android:exported="false" android:configChanges="orientation|screenSize" />
         <activity android:name=".MachinesActivity" android:exported="false" android:configChanges="orientation|screenSize" />
-        <activity android:name=".SettingsActivity" android:exported="false" android:configChanges="orientation|screenSize" />
+        <activity android:name=".SettingsActivity" android:exported="false" android:windowSoftInputMode="adjustResize" android:configChanges="orientation|screenSize" />
 
         <service
             android:name=".MonitorService"

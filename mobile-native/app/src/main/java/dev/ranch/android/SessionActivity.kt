@@ -195,6 +195,14 @@ class SessionActivity : Activity() {
 
         setContentView(root)
 
+        // keyboard open/close resizes the window — keep the newest chat
+        // message visible, but only if the user was already at the bottom
+        content.addOnLayoutChangeListener { _, _, top, _, bottom, _, oldTop, _, oldBottom ->
+            if ((top != oldTop || bottom != oldBottom) && uiKind == "forge-chat") {
+                chatScroll.post { chatStickBottom() }
+            }
+        }
+
         // subscribe + attach
         sink = { frame -> onFrame(frame) }
         r.addSink(sink)
@@ -660,6 +668,11 @@ class SessionActivity : Activity() {
         chatScroll.post { chatScroll.fullScroll(View.FOCUS_DOWN) }
     }
 
+    private fun chatStickBottom() {
+        val nearBottom = chatScroll.scrollY + chatScroll.height >= chatBox.height - dp(48)
+        if (nearBottom) chatScroll.fullScroll(View.FOCUS_DOWN)
+    }
+
     private fun renderChatMsg(m: Term.ChatMsg): LinearLayout {
         val wrap = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -839,7 +852,8 @@ class SessionActivity : Activity() {
             })
         }
         keys.addView(keyRow)
-        inputArea.addView(keys)
+        inputArea.addView(keys, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
     }
 
     private fun keyButton(label: String, onClick: () -> Unit): Button =
@@ -883,7 +897,10 @@ class SessionActivity : Activity() {
         send.setOnClickListener { sendChat() }
         row.addView(chatEdit, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
         row.addView(send)
-        inputArea.addView(row)
+        // explicit params: bare addView on a horizontal LinearLayout defaults
+        // to WRAP_CONTENT, which squeezed the composer to its content width
+        inputArea.addView(row, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
     }
 
     private fun focusHidden() {
