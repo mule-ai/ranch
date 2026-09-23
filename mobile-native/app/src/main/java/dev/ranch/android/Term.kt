@@ -79,6 +79,12 @@ object Term {
             .put("provider", provider).put("model", model)
             .put("req_id", "ms-" + newId())
 
+    fun chatCompact(session: String, pane: String): JSONObject =
+        JSONObject()
+            .put("t", "ChatCompact").put("id", newId()).put("client", CLIENT)
+            .put("session", session).put("pane", pane)
+            .put("req_id", "compact-" + newId())
+
     fun chatHistory(session: String, pane: String, limit: Int, before: Long? = null): JSONObject {
         val o = JSONObject()
             .put("t", "ChatHistory").put("id", newId()).put("client", CLIENT)

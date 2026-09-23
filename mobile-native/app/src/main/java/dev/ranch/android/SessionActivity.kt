@@ -77,6 +77,23 @@ class SessionActivity : Activity() {
     private var chatScrollAnchor: Pair<Int, Int>? = null
     private var renderedSeq = 0L   // highest chat seq currently on screen
 
+    // compaction + queued messages: the daemon confirms a finished
+    // compaction with a context Meta ("compacted → N est. tokens") or an
+    // Error{req_id} on failure — there is no "compacting" broadcast, so
+    // progress is tracked client-side
+    private var compacting = false
+    private var compactingPane = ""
+    private var compactReqId: String? = null
+    private val queued = mutableListOf<Queued>()
+    private var queuedNote: String? = null
+    private lateinit var queueContainer: LinearLayout
+
+    private data class Queued(val pane: String, val text: String)
+
+    private val compactTimeoutRun = Runnable {
+        if (compacting) finishCompact("compaction timed out — sending queued messages")
+    }
+
     // views
     private lateinit var titleView: TextView
     private lateinit var statusView: TextView
@@ -188,6 +205,14 @@ class SessionActivity : Activity() {
         }
         root.addView(askContainer)
 
+        // compaction banner + queued-message rows (above input)
+        queueContainer = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility = View.GONE
+            setPadding(dp(8), dp(2), dp(8), dp(2))
+        }
+        root.addView(queueContainer)
+
         // input area
         inputArea = LinearLayout(this)
         root.addView(inputArea, LinearLayout.LayoutParams(
@@ -240,8 +265,13 @@ class SessionActivity : Activity() {
                 // to the client that sent the request — but unsolicited
                 // errors (req_id absent: upgrade denied, hot-upgrade
                 // failure, …) must flash, same as the TUI status bar
-                if (f.optString("req_id").isEmpty()) {
-                    statusView.text = "err: ${f.optString("message")}"
+                val rid = f.optString("req_id")
+                when {
+                    rid == compactReqId -> {
+                        statusView.text = "compaction failed: ${f.optString("message")}"
+                        finishCompact()
+                    }
+                    rid.isEmpty() -> statusView.text = "err: ${f.optString("message")}"
                 }
             }
         }
@@ -360,6 +390,12 @@ class SessionActivity : Activity() {
                 panes[p]?.let { pane ->
                     pane.context = f.optString("status")
                     if (p == activePane && uiKind == "forge-chat") updateModelBar()
+                    // the daemon confirms a finished compaction with a
+                    // context readout ("compacted → N est. tokens")
+                    if (compacting && p == compactingPane &&
+                        pane.context.startsWith("compacted")) {
+                        finishCompact()
+                    }
                 }
             }
             "exited" -> {
@@ -494,8 +530,103 @@ class SessionActivity : Activity() {
         if (p.kind != "forge-chat") { modelBar.visibility = View.GONE; return }
         modelBar.visibility = View.VISIBLE
         modelChip.text = "◈ ${p.model.ifEmpty { "pick a model…" }}"
-        contextLabel.text = p.context
+        contextLabel.text = when {
+            compacting && compactingPane == activePane -> "compacting…"
+            p.context.isEmpty() -> "tap to compact"
+            else -> "${p.context} · tap to compact"
+        }
         modelChip.setOnClickListener { openModelPicker() }
+        contextLabel.setOnClickListener {
+            if (compacting && compactingPane == activePane) return@setOnClickListener
+            android.app.AlertDialog.Builder(this)
+                .setTitle("Compact context?")
+                .setMessage(
+                    "Compaction summarizes the conversation so far and drops older turns.\n\n" +
+                    "You can keep typing: messages sent while compacting are queued " +
+                    "and sent automatically when it finishes."
+                )
+                .setPositiveButton("Compact") { _, _ -> startCompact() }
+                .setNegativeButton("Cancel", null)
+                .show()
+        }
+    }
+
+    private fun startCompact() {
+        if (compacting || activePane.isEmpty()) return
+        val frame = Term.chatCompact(sessionId, activePane)
+        compactReqId = frame.optString("req_id")
+        compacting = true
+        compactingPane = activePane
+        handler.removeCallbacks(compactTimeoutRun)
+        handler.postDelayed(compactTimeoutRun, 120_000)
+        renderQueue()
+        updateModelBar()
+    }
+
+    /** Compaction finished (success, failure, or timeout) — flush the queue. */
+    private fun finishCompact(note: String? = null) {
+        if (!compacting) return
+        compacting = false
+        compactingPane = ""
+        compactReqId = null
+        handler.removeCallbacks(compactTimeoutRun)
+        if (queued.isNotEmpty()) {
+            for (q in queued) relay?.chatSend(sessionId, q.pane, q.text)
+            queued.clear()
+            queuedNote = note ?: "✓ queued messages sent"
+            handler.postDelayed({ queuedNote = null; renderQueue() }, 4000)
+        } else if (note != null) {
+            queuedNote = note
+            handler.postDelayed({ queuedNote = null; renderQueue() }, 4000)
+        }
+        renderQueue()
+        updateModelBar()
+    }
+
+    /** Compaction banner + queued-message rows, pinned above the composer. */
+    private fun renderQueue() {
+        if (!::queueContainer.isInitialized) return
+        queueContainer.removeAllViews()
+        val show = compacting || queued.isNotEmpty() || queuedNote != null
+        queueContainer.visibility = if (show) View.VISIBLE else View.GONE
+        if (!show) return
+        if (compacting) {
+            queueContainer.addView(TextView(this).apply {
+                text = "🗜 compacting context — new messages will be queued"
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+                setTextColor(0xFFFBBF24.toInt())
+                setPadding(dp(4), dp(2), dp(4), dp(2))
+            })
+        }
+        for ((i, q) in queued.withIndex()) {
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(4), dp(2), dp(4), dp(2))
+            }
+            row.addView(TextView(this).apply {
+                text = "⏳ queued: ${q.text.take(80)}"
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+                setTextColor(0xFF9AA0A6.toInt())
+            }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            row.addView(Button(this).apply {
+                text = "✕"
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+                minWidth = 0
+                setPadding(dp(10), 0, dp(10), 0)
+                setOnClickListener { queued.removeAt(i); renderQueue() }
+            })
+            queueContainer.addView(row, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+        }
+        queuedNote?.let {
+            queueContainer.addView(TextView(this).apply {
+                text = it
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+                setTextColor(0xFF4ADE80.toInt())
+                setPadding(dp(4), dp(2), dp(4), dp(2))
+            })
+        }
     }
 
     private fun openModelPicker() {
@@ -624,6 +755,7 @@ class SessionActivity : Activity() {
         }
         buildInputArea()
         updateModelBar()
+        renderQueue()
         if (uiKind == "pty") handler.post { focusHidden() }
     }
 
@@ -919,6 +1051,13 @@ class SessionActivity : Activity() {
     private fun sendChat() {
         val t = chatEdit.text.toString().trim()
         if (t.isEmpty()) return
+        // mid-compaction: hold the message and send it when the queue flushes
+        if (compacting && activePane == compactingPane) {
+            queued.add(Queued(activePane, t))
+            chatEdit.setText("")
+            renderQueue()
+            return
+        }
         relay?.chatSend(sessionId, activePane, t)
         chatEdit.setText("")
     }
