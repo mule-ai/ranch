@@ -19,6 +19,7 @@ import android.graphics.Typeface
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
+import android.widget.HorizontalScrollView
 import android.widget.PopupWindow
 import android.widget.ScrollView
 import android.widget.TextView
@@ -74,6 +75,7 @@ class SessionActivity : Activity() {
     // chat scrollback
     private var chatHistReqId: String? = null
     private var chatScrollAnchor: Pair<Int, Int>? = null
+    private var renderedSeq = 0L   // highest chat seq currently on screen
 
     // views
     private lateinit var titleView: TextView
@@ -322,7 +324,7 @@ class SessionActivity : Activity() {
             val last = pane.chat.lastOrNull()?.seq ?: 0L
             for (m in msgs) if (m.seq > last) pane.chat.add(m)
         }
-        if (paneId == activePane && uiKind == "forge-chat") renderChat(pane)
+        if (paneId == activePane && uiKind == "forge-chat") renderChat(pane, false)
     }
 
     private fun onMeta(f: JSONObject) {
@@ -545,7 +547,7 @@ class SessionActivity : Activity() {
         val add = msgs.filter { it.seq !in existing }
         pane.chat = (add + pane.chat).toMutableList()
         pane.chatHasMore = f.optBoolean("has_more", false)
-        if (paneId == activePane && uiKind == "forge-chat") renderChat(pane)
+        if (paneId == activePane && uiKind == "forge-chat") renderChat(pane, true)   // prepended → rebuild
     }
 
     private fun loadOlderChat() {
@@ -607,7 +609,7 @@ class SessionActivity : Activity() {
         content.removeAllViews()
         if (p.kind == "forge-chat") {
             buildChatViews()
-            renderChat(p)
+            renderChat(p, true)
         } else {
             buildTerminalView()
         }
@@ -648,17 +650,12 @@ class SessionActivity : Activity() {
         })
     }
 
-    private fun renderChat(p: Pane) {
-        chatBox.removeAllViews()
+    private fun renderChat(p: Pane, full: Boolean) {
+        if (full) { chatBox.removeAllViews(); renderedSeq = 0 }
         for (m in p.chat) {
+            if (m.seq <= renderedSeq) continue   // already on screen
             chatBox.addView(renderChatMsg(m))
-        }
-        if (p.chatHasMore) {
-            chatBox.addView(TextView(this).apply {
-                text = "… loading older …"
-                setTextColor(0xFF6b7280.toInt())
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
-            })
+            renderedSeq = m.seq
         }
         chatScroll.post { chatScroll.fullScroll(View.FOCUS_DOWN) }
     }
@@ -666,47 +663,82 @@ class SessionActivity : Activity() {
     private fun renderChatMsg(m: Term.ChatMsg): LinearLayout {
         val wrap = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(0, dp(6), 0, dp(6))
+            setPadding(0, dp(4), 0, dp(4))
         }
-        val label = TextView(this).apply {
-            text = when (m.role) { "user" -> "you"; "assistant" -> "agent"; else -> m.role }
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
-            setTextColor(if (m.role == "user") 0xFF7fd4ff.toInt() else 0xFF9aa0a6.toInt())
-        }
-        wrap.addView(label)
         if (m.toolName != null) {
-            // tool call: collapsed
-            val dur = m.durationMs?.let { " · ${it}ms" } ?: ""
-            val title = TextView(this).apply {
+            // tool call: compact one-liner + truncated output
+            val dur = m.durationMs?.let {
+                if (it >= 1000) " · " + String.format(java.util.Locale.US, "%.1fs", it / 1000.0)
+                else " · ${it}ms"
+            } ?: ""
+            wrap.addView(TextView(this).apply {
                 text = "⚙ ${m.toolName}$dur"
                 setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
                 setTextColor(0xFF8bd08b.toInt())
-                setPadding(dp(6), dp(4), dp(6), dp(4))
-                setBackgroundColor(0xFF1b2126.toInt())
-            }
-            wrap.addView(title)
+                setPadding(dp(10), dp(6), dp(10), dp(6))
+            })
             val detail = (m.toolOutput ?: m.text).takeIf { it.isNotEmpty() }
             if (detail != null) {
                 wrap.addView(TextView(this).apply {
-                    text = detail.take(500)
+                    text = detail.take(2000)
+                    maxLines = 6
+                    ellipsize = android.text.TextUtils.TruncateAt.END
                     setTypeface(Typeface.MONOSPACE)
                     setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
                     setTextColor(0xFF9aa0a6.toInt())
+                    setPadding(dp(10), 0, dp(10), 0)
                 })
             }
-        } else {
-            // regular message with basic markdown
-            val md = markdownToSpannable(m.text)
-            wrap.addView(TextView(this).apply {
-                text = md
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
-                setTextColor(0xFFE5E5E5.toInt())
-            })
+            return wrap
         }
+        // chat bubble: user right (blue), agent left (dark) — like every
+        // other messaging app, so scanning the conversation is effortless
+        val isUser = m.role == "user"
+        val body = if (m.text.length > 8000) m.text.substring(0, 8000) + " …" else m.text
+        val bubble = TextView(this).apply {
+            text = markdownToSpannable(body)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+            setTextColor(if (isUser) 0xFFEAF2FF.toInt() else 0xFFE5E5E5.toInt())
+            setPadding(dp(12), dp(8), dp(12), dp(8))
+            background = android.graphics.drawable.GradientDrawable().apply {
+                cornerRadius = dp(14).toFloat()
+                setColor(if (isUser) 0xFF24557E.toInt() else 0xFF1C2127.toInt())
+            }
+        }
+        val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        if (isUser) {
+            row.addView(View(this), LinearLayout.LayoutParams(0, 1, 0.22f))
+            row.addView(bubble, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 0.78f))
+        } else {
+            row.addView(bubble, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 0.92f))
+            row.addView(View(this), LinearLayout.LayoutParams(0, 1, 0.08f))
+        }
+        wrap.addView(row)
+        val meta = listOf(if (isUser) "you" else "agent", fmtTime(m.createdAt))
+            .filter { it.isNotEmpty() }.joinToString(" · ")
+        if (meta.isNotEmpty()) wrap.addView(TextView(this).apply {
+            text = meta
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 10f)
+            setTextColor(0xFF5C636B.toInt())
+            setPadding(dp(6), dp(2), dp(6), 0)
+            gravity = if (isUser) Gravity.END else Gravity.START
+        })
         return wrap
     }
 
-    // basic markdown: **bold**, `code`, # headers, - list
+    private fun fmtTime(iso: String?): String {
+        if (iso.isNullOrEmpty()) return ""
+        return try {
+            java.time.format.DateTimeFormatter.ofPattern("HH:mm")
+                .withZone(java.time.ZoneId.systemDefault())
+                .format(java.time.Instant.parse(iso))
+        } catch (_: Exception) { "" }
+    }
+
+    // basic markdown: **bold**, *italic*, `code`, # headers, - lists.
+    // Hand-rolled inline scanner — the old nested-quantifier regex
+    // (`(.+?)*`) hit catastrophic backtracking on long agent messages and
+    // ANR'd the chat. This is O(n), no backtracking possible.
     private fun markdownToSpannable(raw: String): SpannableStringBuilder {
         val sb = SpannableStringBuilder()
         val lines = raw.replace("\r\n", "\n").split("\n")
@@ -718,32 +750,40 @@ class SessionActivity : Activity() {
             var content = trimmed
             if (isHeader) content = content.replace(Regex("^#+\\s*"), "")
             if (isList) content = "• " + content.replace(Regex("^[-*]\\s*"), "")
-            var pos = sb.length
-            // process inline **bold** and `code`
-            val remaining = content
-            val boldRe = Regex("\\*\\*(.+?)*\\*|\\*(.+?)*\\*|`(.+?)`")
-            var last = 0
-            for (m in boldRe.findAll(remaining)) {
-                sb.append(remaining.substring(last, m.range.first))
-                val s = sb.length
-                if (m.groupValues[0].startsWith("**")) {
-                    sb.append(m.groupValues[0].removePrefix("**").removeSuffix("**"))
-                    sb.setSpan(StyleSpan(android.graphics.Typeface.BOLD), s, sb.length, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
-                } else if (m.groupValues[0].startsWith("*")) {
-                    sb.append(m.groupValues[0].removePrefix("*").removeSuffix("*"))
-                    sb.setSpan(StyleSpan(android.graphics.Typeface.ITALIC), s, sb.length, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
-                } else {
-                    sb.append(m.groupValues[0].removePrefix("`").removeSuffix("`"))
-                    sb.setSpan(ForegroundColorSpan(0xFF4ade80.toInt()), s, sb.length, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
-                }
-                last = m.range.last + 1
-            }
-            sb.append(remaining.substring(last))
-            if (isHeader) {
+            val pos = sb.length
+            mdInline(sb, content)
+            if (isHeader && sb.length > pos) {
+                sb.setSpan(StyleSpan(Typeface.BOLD), pos, sb.length, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
                 sb.setSpan(ForegroundColorSpan(0xFF7fd4ff.toInt()), pos, sb.length, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
             }
         }
         return sb
+    }
+
+    /** Inline **bold** / *italic* / `code` — linear scan, no regex. */
+    private fun mdInline(sb: SpannableStringBuilder, text: String) {
+        var i = 0
+        val n = text.length
+        while (i < n) {
+            val c = text[i]
+            val markLen = when {
+                c == '*' && i + 1 < n && text[i + 1] == '*' -> 2
+                c == '*' || c == '`' -> 1
+                else -> 0
+            }
+            if (markLen == 0) { sb.append(c); i++; continue }
+            val closeSeq = if (c == '`') "`" else if (markLen == 2) "**" else "*"
+            val close = text.indexOf(closeSeq, i + markLen)
+            if (close < 0) { sb.append(c); i++; continue }
+            val s = sb.length
+            sb.append(text.substring(i + markLen, close))
+            when {
+                c == '`' -> sb.setSpan(ForegroundColorSpan(0xFF4ade80.toInt()), s, sb.length, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
+                markLen == 2 -> sb.setSpan(StyleSpan(Typeface.BOLD), s, sb.length, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
+                else -> sb.setSpan(StyleSpan(Typeface.ITALIC), s, sb.length, Spannable.SPAN_EXCLUSIVE_EXCLUSIVE)
+            }
+            i = close + markLen
+        }
     }
 
     // ---- input area ----
@@ -785,9 +825,10 @@ class SessionActivity : Activity() {
         inputArea.addView(hiddenEdit, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, 1))
 
-        val keys = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val keys = HorizontalScrollView(this).apply { isHorizontalScrollBarEnabled = false }
+        val keyRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         for (k in listOf("←", "↑", "↓", "→", "Enter", "Esc", "Tab", "Ctrl-C", "Ctrl-D", "Ctrl-L", "hist")) {
-            keys.addView(keyButton(k) {
+            keyRow.addView(keyButton(k) {
                 if (k == "hist") {
                     relay?.send(Term.scrollbackReq(sessionId, activePane))
                 } else {
@@ -797,33 +838,48 @@ class SessionActivity : Activity() {
                 focusHidden()
             })
         }
+        keys.addView(keyRow)
         inputArea.addView(keys)
     }
 
     private fun keyButton(label: String, onClick: () -> Unit): Button =
         Button(this).apply {
             text = label
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
             setTextColor(0xFFE5E5E5.toInt())
-            setPadding(dp(6), dp(6), dp(6), dp(6))
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            setPadding(dp(14), dp(8), dp(14), dp(8))
+            minWidth = dp(56)
             setOnClickListener { onClick() }
         }
 
     private fun buildChatInput() {
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            setPadding(dp(8), dp(4), dp(8), dp(4))
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(10), dp(6), dp(10), dp(8))
         }
         chatEdit = EditText(this).apply {
             hint = "message the agent…"
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
-            imeOptions = EditorInfo.IME_ACTION_SEND
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+            maxLines = 4
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
             setTextColor(0xFFE5E5E5.toInt())
+            setHintTextColor(0xFF5C636B.toInt())
+            val pad = dp(14)
+            setPadding(pad, dp(10), pad, dp(10))
+            background = android.graphics.drawable.GradientDrawable().apply {
+                cornerRadius = dp(24).toFloat()
+                setColor(0xFF1C2127.toInt())
+            }
+            imeOptions = EditorInfo.IME_FLAG_NO_EXTRACT_UI
             setOnEditorActionListener { _, _, _ -> sendChat(); true }
         }
-        val send = Button(this).apply { text = "Send" }
+        val send = Button(this).apply {
+            text = "➤"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 18f)
+            minWidth = dp(60)
+            setPadding(0, dp(6), 0, dp(6))
+        }
         send.setOnClickListener { sendChat() }
         row.addView(chatEdit, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
         row.addView(send)

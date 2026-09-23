@@ -71,9 +71,14 @@ class MainActivity : Activity() {
         if (sessions.isEmpty()) return
         for (s in sessions) {
             val b = Button(this).apply {
-                val badge = when (s.kind) { "forge" -> "agent"; "pi" -> "pi"; else -> "" }
-                text = "\u25B6 ${s.name.ifEmpty { s.id.take(8) }}" + (if (badge.isNotEmpty()) "  ($badge)" else "")
-                setPadding(0, dp(6), 0, dp(6))
+                val badge = when (s.kind) {
+                    "forge" -> "🤖 agent"
+                    "pi" -> "π pi"
+                    else -> "💻 shell"
+                }
+                text = "${s.name.ifEmpty { s.id.take(8) }}\n$badge"
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+                setPadding(dp(14), dp(12), dp(14), dp(12))
                 setOnClickListener {
                     startActivity(Intent(this@MainActivity, SessionActivity::class.java)
                         .putExtra("sessionId", s.id)
@@ -102,6 +107,24 @@ class MainActivity : Activity() {
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 24f)
             setPadding(0, 0, 0, dp(16))
         })
+
+        // last-crash viewer: uncaught exceptions land in filesDir/crash.txt
+        // (survives app updates) so on-device crashes are debuggable
+        val crashFile = java.io.File(filesDir, "crash.txt")
+        if (crashFile.exists()) {
+            root.addView(Button(this).apply {
+                text = "⚠ view last crash log"
+                setTextColor(0xFFEF4444.toInt())
+                setOnClickListener {
+                    android.app.AlertDialog.Builder(this@MainActivity)
+                        .setTitle("last crash")
+                        .setMessage(crashFile.readText().take(4000))
+                        .setPositiveButton("clear") { _, _ -> crashFile.delete() }
+                        .setNegativeButton("close", null)
+                        .show()
+                }
+            })
+        }
 
         // --- Login section ---
         root.addView(sectionHeader("Sign in"))
@@ -177,15 +200,28 @@ class MainActivity : Activity() {
 
         // --- Sessions ---
         root.addView(sectionHeader("Sessions"))
-        root.addView(Button(this).apply {
-            text = "+ New shell session"
-            setPadding(0, dp(6), 0, dp(6))
+        val newSessionRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        newSessionRow.addView(Button(this).apply {
+            text = "+ shell"
+            setPadding(dp(8), dp(8), dp(8), dp(8))
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
             setOnClickListener {
                 if (Monitor.relay == null) { monitorStatus.text = "start monitoring first"; return@setOnClickListener }
                 Monitor.relay?.createSession("shell")
                 monitorStatus.text = "creating shell session…"
             }
         })
+        newSessionRow.addView(Button(this).apply {
+            text = "+ agent"
+            setPadding(dp(8), dp(8), dp(8), dp(8))
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            setOnClickListener {
+                if (Monitor.relay == null) { monitorStatus.text = "start monitoring first"; return@setOnClickListener }
+                Monitor.relay?.createSession("pi")
+                monitorStatus.text = "creating agent session…"
+            }
+        })
+        root.addView(newSessionRow)
         sessionsHeader = TextView(this).apply {
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
             setPadding(0, 0, 0, dp(4))
