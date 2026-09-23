@@ -954,6 +954,7 @@ class SessionActivity : Activity() {
                 val out = TextView(this).apply {
                     text = detail
                     maxLines = 6
+                    setTextIsSelectable(true)
                     ellipsize = android.text.TextUtils.TruncateAt.END
                     setTypeface(Typeface.MONOSPACE)
                     setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
@@ -966,11 +967,14 @@ class SessionActivity : Activity() {
             return wrap
         }
         // chat bubble: user right (blue), agent left (dark) — like every
-        // other messaging app, so scanning the conversation is effortless
+        // other messaging app, so scanning the conversation is effortless.
+        // Text is selectable: long-press → selection handles → copy part
+        // or all (system toolbar incl. Select All)
         val isUser = m.role == "user"
         val body = if (m.text.length > 8000) m.text.substring(0, 8000) + " …" else m.text
         val bubble = TextView(this).apply {
             text = markdownToSpannable(body)
+            setTextIsSelectable(true)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
             setTextColor(if (isUser) 0xFFEAF2FF.toInt() else 0xFFE5E5E5.toInt())
             setPadding(dp(12), dp(8), dp(12), dp(8))
@@ -991,23 +995,13 @@ class SessionActivity : Activity() {
         val meta = listOf(if (isUser) "you" else "agent", fmtTime(m.createdAt))
             .filter { it.isNotEmpty() }.joinToString(" · ")
         if (meta.isNotEmpty()) {
-            val metaBase = "$meta · hold to copy"
-            val metaView = TextView(this).apply {
-                text = metaBase
+            wrap.addView(TextView(this).apply {
+                text = "$meta · long-press to select"
                 setTextSize(TypedValue.COMPLEX_UNIT_SP, 10f)
                 setTextColor(0xFF5C636B.toInt())
                 setPadding(dp(6), dp(2), dp(6), 0)
                 gravity = if (isUser) Gravity.END else Gravity.START
-            }
-            wrap.addView(metaView)
-            // long-press copies the raw markdown text (not the rendered spans)
-            bubble.setOnLongClickListener {
-                if (copyToClipboard(m.text)) {
-                    metaView.text = "copied ✓"
-                    handler.postDelayed({ metaView.text = metaBase }, 1500)
-                }
-                true
-            }
+            })
         }
         return wrap
     }

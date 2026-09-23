@@ -11,8 +11,8 @@ android {
         applicationId = "dev.ranch.android"
         minSdk = 26
         targetSdk = 35
-        versionCode = 15
-        versionName = "0.7.1"
+        versionCode = 16
+        versionName = "0.7.2"
         // baked by release.yml (same string as versions.json, e.g.
         // "main-82c0643"); "dev" locally → the update banner skips
         buildConfigField("String", "RANCH_VERSION", "\"${System.getenv("RANCH_VERSION") ?: "dev"}\"")

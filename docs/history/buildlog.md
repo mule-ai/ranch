@@ -307,3 +307,12 @@ Port of the RN copy UX: long-press a chat bubble → the raw markdown text
 flipping to "copied ✓" for 1.5 s (before it: "hold to copy"). Tool rows:
 tap toggles the full output (▼/▲), long-press copies the tool output —
 RN parity restored. v0.7.1 / versionCode 15.
+
+## Native app — selectable chat text (2026-09-23)
+
+Chat bubbles and tool output now use Android's native text-selection
+flow (setTextIsSelectable): long-press → selection handles → copy part
+of a message, or Select All from the toolbar. Replaces the
+long-press-copies-everything behavior; the meta hint says "long-press to
+select". Tool titles keep tap-to-expand + long-press-copies-full-output.
+v0.7.2 / versionCode 16.
