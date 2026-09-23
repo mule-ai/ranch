@@ -39,10 +39,12 @@ class MainActivity : Activity() {
     private val exec = Executors.newSingleThreadExecutor()
 
     private lateinit var stateBox: LinearLayout
+    private lateinit var bannerBox: LinearLayout
     private var sessionsBox: LinearLayout? = null
     private var homeStatus: TextView? = null
     private var monitorWanted = false
     private val machines = mutableListOf<Machine>()
+    private var update: Version.Update? = null
 
     private val refreshRunnable = object : Runnable {
         override fun run() {
@@ -62,6 +64,8 @@ class MainActivity : Activity() {
         setContentView(ScrollView(this).apply { addView(root) })
         applyEdgeToEdgeInsets(findViewById(android.R.id.content))
         addCrashRow(root)
+        bannerBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        root.addView(bannerBox)
         stateBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         root.addView(stateBox)
         handleAuthIntent(intent)
@@ -77,6 +81,16 @@ class MainActivity : Activity() {
     override fun onResume() {
         super.onResume()
         renderState()
+        renderBanner()
+        // update check (silent on failure / dev builds)
+        exec.execute {
+            val u = Version.checkUpdate()
+            handler.post {
+                val changed = u?.latest != update?.latest
+                update = u
+                if (changed) renderBanner()
+            }
+        }
         handler.postDelayed(refreshRunnable, 1000)
     }
 
@@ -343,6 +357,39 @@ class MainActivity : Activity() {
     }
 
     // ---- shared ----
+    /** Out-of-date banner + daemon-version note (port of the RN banner). */
+    private fun renderBanner() {
+        if (!::bannerBox.isInitialized) return
+        bannerBox.removeAllViews()
+        update?.let { u ->
+            bannerBox.addView(Button(this).apply {
+                text = "⬆ update available — download ${u.latest}"
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+                setPadding(dp(10), dp(10), dp(10), dp(10))
+                layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                ).apply { setMargins(0, dp(4), 0, dp(4)) }
+                setOnClickListener {
+                    try {
+                        startActivity(Intent(Intent.ACTION_VIEW, android.net.Uri.parse(u.apkUrl)))
+                    } catch (e: Exception) {
+                        Toast.makeText(this@MainActivity, "no browser: ${e.message}", Toast.LENGTH_LONG).show()
+                    }
+                }
+            })
+        }
+        val dv = Monitor.daemonVersion
+        if (update != null && dv.isNotEmpty() && dv != "dev" && dv != update?.latest) {
+            bannerBox.addView(TextView(this).apply {
+                text = "daemon runs $dv — latest is ${update?.latest}; update the daemon (\"ranch upgrade\" or reinstall)"
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+                setTextColor(0xFFF59E0B.toInt())
+                setPadding(dp(4), dp(2), dp(4), dp(6))
+            })
+        }
+    }
+
     private fun addCrashRow(root: LinearLayout) {
         val crashFile = java.io.File(filesDir, "crash.txt")
         if (!crashFile.exists()) return

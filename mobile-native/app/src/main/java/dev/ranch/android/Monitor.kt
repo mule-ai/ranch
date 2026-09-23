@@ -29,6 +29,10 @@ object Monitor {
     var sessions: List<Term.SessionMeta> = emptyList()
         private set
 
+    /** Version string the daemon reported in HelloOk ("" = unknown). */
+    @Volatile
+    var daemonVersion: String = ""
+
     fun publishSessions(s: List<Term.SessionMeta>) { sessions = s }
 
     fun start(app: App, machineId: String, machineName: String) {
@@ -36,6 +40,7 @@ object Monitor {
         this.machineId = machineId
         this.machineName = machineName
         sessions = emptyList()
+        daemonVersion = ""
         val s = RelaySession(app, machineId)
         session = s
         running = true
@@ -48,6 +53,7 @@ object Monitor {
         running = false
         status = "stopped"
         sessions = emptyList()
+        daemonVersion = ""
     }
 
     val relay: RelaySession? get() = session
@@ -120,7 +126,10 @@ class RelaySession(
 
     private fun refreshSessions(frame: JSONObject) {
         when (val t = frame.optString("t")) {
-            "HelloOk" -> Monitor.publishSessions(Term.parseSessionList(frame))
+            "HelloOk" -> {
+                Monitor.daemonVersion = frame.optString("version", "")
+                Monitor.publishSessions(Term.parseSessionList(frame))
+            }
             "SessionsAck" -> {
                 val sid = frame.optString("session")
                 val pane = frame.optString("pane")

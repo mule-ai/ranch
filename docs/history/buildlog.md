@@ -273,3 +273,15 @@ confirmed working on the device. Parity after v0.6.0:
 Retiring RN = delete `mobile/`, remove its docs, and note the RN-only
 features above as native follow-ups. Do it only after on-device parity
 sign-off.
+
+## Native app — out-of-date banner (2026-09-23)
+
+Port of the RN update banner (`mobile/lib/version.ts`): CI bakes
+`RANCH_VERSION=main-<sha>` into BuildConfig (same string versions.json
+publishes); the app fetches `ranch-dist/main/versions.json` on resume and
+compares. Banner = a full-width "⬆ update available — download <latest>"
+button opening the ranch.apk URL in the browser. Also ported the
+daemon-version note: `HelloOk.version` is now captured into
+`Monitor.daemonVersion`; when the daemon's version differs from latest,
+an amber note points at `ranch upgrade`. Dev builds ("dev") skip the
+banner. v0.6.9 / versionCode 13.

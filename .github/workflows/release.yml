@@ -100,6 +100,10 @@ jobs:
           echo "$RANCH_KEYSTORE_B64" | base64 -d > ~/.local/android-keystore/ranch.keystore
       - name: Build APK
         working-directory: mobile-native
+        env:
+          # baked into BuildConfig; the app compares it with versions.json
+          # (same string) to show the out-of-date banner
+          RANCH_VERSION: main-${{ github.sha }}
         run: |
           export ANDROID_HOME=/usr/local/lib/android/sdk
           ./gradlew assembleRelease --no-daemon
