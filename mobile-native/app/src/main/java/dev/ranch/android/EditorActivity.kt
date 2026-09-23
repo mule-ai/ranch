@@ -87,6 +87,7 @@ class EditorActivity : Activity() {
             LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
 
         setContentView(root)
+        applyEdgeToEdgeInsets(findViewById(android.R.id.content))
         sink = { f -> handler.post { onFrame(f) } }
         r.addSink(sink)
         browse(null)

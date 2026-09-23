@@ -50,6 +50,7 @@ class SettingsActivity : Activity() {
             setPadding(dp(16), dp(16), dp(16), dp(16))
         }
         setContentView(ScrollView(this).apply { addView(root) })
+        applyEdgeToEdgeInsets(findViewById(android.R.id.content))
 
         val bar = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         bar.addView(Button(this).apply { text = "←"; setOnClickListener { finish() } })

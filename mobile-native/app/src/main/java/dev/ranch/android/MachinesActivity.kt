@@ -77,6 +77,7 @@ class MachinesActivity : Activity() {
             LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
 
         setContentView(root)
+        applyEdgeToEdgeInsets(findViewById(android.R.id.content))
         // monitor status frames (Meta / Upgrade ack) — light: just status text
         if (r != null) {
             sink = { f -> handler.post {

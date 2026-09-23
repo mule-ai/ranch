@@ -194,6 +194,7 @@ class SessionActivity : Activity() {
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
 
         setContentView(root)
+        applyEdgeToEdgeInsets(findViewById(android.R.id.content))
 
         // keyboard open/close resizes the window — keep the newest chat
         // message visible, but only if the user was already at the bottom

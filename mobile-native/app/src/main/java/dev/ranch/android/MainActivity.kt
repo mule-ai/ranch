@@ -60,6 +60,7 @@ class MainActivity : Activity() {
             setPadding(dp(16), dp(16), dp(16), dp(16))
         }
         setContentView(ScrollView(this).apply { addView(root) })
+        applyEdgeToEdgeInsets(findViewById(android.R.id.content))
         addCrashRow(root)
         stateBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         root.addView(stateBox)
