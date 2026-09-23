@@ -285,3 +285,17 @@ daemon-version note: `HelloOk.version` is now captured into
 `Monitor.daemonVersion`; when the daemon's version differs from latest,
 an amber note points at `ranch upgrade`. Dev builds ("dev") skip the
 banner. v0.6.9 / versionCode 13.
+
+## Native app — compaction state survives back-swipe / process kill (2026-09-23)
+
+The compacting banner + queued messages lived only in the Activity's
+memory: a back-swipe finished the activity and the state was gone, even
+though the daemon kept compacting server-side. Now the compaction state
+(pane, since, queued messages) persists to Prefs keyed per session,
+restores on screen create, and reconciles on the first Snapshot: the
+daemon caches the last context readout on the pane, so compaction that
+finished while the app was away shows up as "compacted → …" and flushes
+the queue on re-attach. Restored state older than 10 min is treated as
+timed out (queued messages flush with a note). Meta exited clears the
+persisted state (nothing to flush into a dead session). v0.7.0 /
+versionCode 14.

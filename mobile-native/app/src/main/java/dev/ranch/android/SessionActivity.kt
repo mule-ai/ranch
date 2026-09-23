@@ -83,6 +83,7 @@ class SessionActivity : Activity() {
     // progress is tracked client-side
     private var compacting = false
     private var compactingPane = ""
+    private var compactingSince = 0L
     private var compactReqId: String? = null
     private val queued = mutableListOf<Queued>()
     private var queuedNote: String? = null
@@ -92,6 +93,60 @@ class SessionActivity : Activity() {
 
     private val compactTimeoutRun = Runnable {
         if (compacting) finishCompact("compaction timed out — sending queued messages")
+    }
+
+    // ---- compaction persistence (survives back-swipe + process kill) ----
+    // Keyed per session: {pane, since, queued:[{pane,text}]}. Restored on
+    // create; reconciled against the daemon's cached context readout when
+    // the Snapshot lands (compaction that finished while the app was away
+    // shows up as "compacted → …" and flushes the queue).
+    private fun compactKey(): String = "compact.$sessionId"
+
+    private fun prefs() = (application as App).prefs
+
+    private fun persistCompaction() {
+        val o = JSONObject()
+            .put("pane", compactingPane)
+            .put("since", compactingSince)
+        val arr = org.json.JSONArray()
+        for (q in queued) arr.put(JSONObject().put("pane", q.pane).put("text", q.text))
+        o.put("queued", arr)
+        prefs().set(compactKey(), o.toString())
+    }
+
+    private fun clearPersistedCompaction() {
+        prefs().set(compactKey(), "")
+    }
+
+    private fun restoreCompaction() {
+        val raw = prefs().get(compactKey(), "")
+        if (raw.isEmpty()) return
+        try {
+            val o = JSONObject(raw)
+            val pane = o.optString("pane")
+            compactingSince = o.optLong("since", 0)
+            val arr = o.optJSONArray("queued")
+            if (arr != null) {
+                for (i in 0 until arr.length()) {
+                    val q = arr.getJSONObject(i)
+                    queued.add(Queued(q.optString("pane"), q.optString("text")))
+                }
+            }
+            if (pane.isEmpty() && queued.isEmpty()) {
+                clearPersistedCompaction(); return
+            }
+            compactingPane = pane
+            compacting = pane.isNotEmpty()
+            // compaction that outlived the app for >10 min is stale
+            if (compacting &&
+                (compactingSince <= 0 ||
+                 System.currentTimeMillis() - compactingSince > 600_000)
+            ) {
+                finishCompact("compaction timed out — sending queued messages")
+            }
+        } catch (_: Exception) {
+            clearPersistedCompaction()
+        }
     }
 
     // views
@@ -219,6 +274,10 @@ class SessionActivity : Activity() {
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
 
         setContentView(root)
+
+        // restore compaction state + queued messages that outlived the
+        // screen (back-swipe, backgrounding, process kill)
+        restoreCompaction()
         applyEdgeToEdgeInsets(findViewById(android.R.id.content))
 
         // keyboard open/close resizes the window — keep the newest chat
@@ -309,6 +368,11 @@ class SessionActivity : Activity() {
         rebuildTabs()
         renderActive()
         updateModelBar()
+        // compaction completed while the app was away? the daemon caches the
+        // last context readout on the pane, so the Snapshot tells us
+        if (compacting && panes[compactingPane]?.context?.startsWith("compacted") == true) {
+            finishCompact()
+        }
         if (uiKind == "pty") sendResize()
     }
 
@@ -375,8 +439,10 @@ class SessionActivity : Activity() {
                 // broadcasts "compacting" when a ChatCompact lands (from any
                 // client) and "idle" when it completes
                 if (st == "compacting" && pane.isNotEmpty()) {
+                    if (!compacting) compactingSince = System.currentTimeMillis()
                     compacting = true
                     compactingPane = pane
+                    persistCompaction()
                     handler.removeCallbacks(compactTimeoutRun)
                     handler.postDelayed(compactTimeoutRun, 600_000)
                     renderQueue()
@@ -421,6 +487,11 @@ class SessionActivity : Activity() {
                 }
             }
             "exited" -> {
+                // nothing to flush into a dead session
+                compacting = false
+                compactingPane = ""
+                queued.clear()
+                clearPersistedCompaction()
                 statusView.text = "session ended"
                 handler.postDelayed({ finish() }, 1500)
             }
@@ -579,6 +650,8 @@ class SessionActivity : Activity() {
         compactReqId = frame.optString("req_id")
         compacting = true
         compactingPane = activePane
+        compactingSince = System.currentTimeMillis()
+        persistCompaction()
         handler.removeCallbacks(compactTimeoutRun)
         handler.postDelayed(compactTimeoutRun, 600_000)
         renderQueue()
@@ -587,11 +660,13 @@ class SessionActivity : Activity() {
 
     /** Compaction finished (success, failure, or timeout) — flush the queue. */
     private fun finishCompact(note: String? = null) {
-        if (!compacting) return
+        if (!compacting && queued.isEmpty()) return
         compacting = false
         compactingPane = ""
+        compactingSince = 0
         compactReqId = null
         handler.removeCallbacks(compactTimeoutRun)
+        clearPersistedCompaction()
         if (queued.isNotEmpty()) {
             for (q in queued) relay?.chatSend(sessionId, q.pane, q.text)
             queued.clear()
@@ -637,7 +712,7 @@ class SessionActivity : Activity() {
                 setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
                 minWidth = 0
                 setPadding(dp(10), 0, dp(10), 0)
-                setOnClickListener { queued.removeAt(i); renderQueue() }
+                setOnClickListener { queued.removeAt(i); persistCompaction(); renderQueue() }
             })
             queueContainer.addView(row, LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
@@ -1078,6 +1153,7 @@ class SessionActivity : Activity() {
         if (compacting && activePane == compactingPane) {
             queued.add(Queued(activePane, t))
             chatEdit.setText("")
+            persistCompaction()
             renderQueue()
             return
         }
