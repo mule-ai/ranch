@@ -366,3 +366,22 @@ down, so fresh test sessions' turns hung and nothing accumulated;
 1%-context session correctly refuses ("Nothing to compact (session too
 small)"). Verified live: compaction works on switched model; tool_args
 round-trips. v0.7.3 / versionCode 17.
+
+## Notification timing + composer focus fixes (2026-09-24)
+
+Root cause of "notifications fire on the first agent message, not the
+last": pi emits `turn_end` after EVERY tool round (per LLM segment), and
+pilocal wrote agent "idle" on it — so the working→idle edge fired
+mid-turn, after the first tool result. Fix: idle only on `agent_end`
+(pi's true end-of-run), reinforce "working" on turn_start/agent_start.
+Also fixes the TUI busy indicator flickering mid-turn. Phone-side:
+turn-end notification now carries the last assistant message's text
+(batched per turn; every_message/tool pings fold into it when turn-end
+is on — verified live: one notification, at the end, body = last
+message).
+
+Composer focus steal: ScrollView.fullScroll(FOCUS_DOWN) runs a focus
+search that hands focus to newly-added selectable bubbles, yanking it
+from the composer mid-typing. Replaced with a pure scrollTo
+(chatScrollBottom), used by renderChat + chatStickBottom.
+v0.7.4 / versionCode 18.

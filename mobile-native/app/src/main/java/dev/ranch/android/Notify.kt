@@ -45,6 +45,10 @@ class Notify(private val app: App) {
     private val lastSeq = HashMap<String, Long>()
     private val primed = HashSet<String>()
     private val notifiedAsks = HashSet<String>()
+    // last assistant message of the current turn, per pane — the
+    // turn-end notification carries it so the ping lands on the LAST
+    // message (with the actual reply), not the first
+    private val turnLast = HashMap<String, String>()
 
     // ---- diagnostics (in-memory, session scoped) ----
     @Volatile var framesSeen = 0; private set
@@ -62,6 +66,7 @@ class Notify(private val app: App) {
         busy.clear()
         lastSeq.clear()
         primed.clear()
+        turnLast.clear()
     }
 
     /** Call for EVERY frame received. Never throws. */
@@ -96,10 +101,17 @@ class Notify(private val app: App) {
         lastFrameAt = System.currentTimeMillis()
         val status = f.optString("status")
         when {
-            status == "working" -> busy[pane] = true
+            status == "working" -> {
+                busy[pane] = true
+                turnLast.remove(pane)
+            }
             status == "idle" && busy[pane] == true -> {
                 busy[pane] = false
-                notify("turn_end", name, "agent finished its turn", name)
+                val body = turnLast.remove(pane)
+                    ?.replace(Regex("\\s+"), " ")
+                    ?.take(160)
+                    ?: "agent finished its turn"
+                notify("turn_end", name, body, name)
             }
         }
     }
@@ -142,11 +154,20 @@ class Notify(private val app: App) {
                     // and suppress the follow-up "agent finished its turn",
                     // because the error IS the turn-end news
                     busy[pane] = false
+                    turnLast.remove(pane)
                     notify("errors", name, "agent error: " + text.replace(Regex("\\s+"), " ").take(120), name)
                 }
-                role == "assistant" && text.trim().isNotEmpty() ->
-                    notify("every_message", name, text.replace(Regex("\\s+"), " ").take(120), name)
-                role == "tool" && !ignoreToolCalls ->
+                role == "assistant" && text.trim().isNotEmpty() -> {
+                    if (turnEnd) {
+                        // batch into the turn-end notification: pinging per
+                        // row means the FIRST message wakes the user, they
+                        // open the app, and the final reply never notifies
+                        turnLast[pane] = text
+                    } else {
+                        notify("every_message", name, text.replace(Regex("\\s+"), " ").take(120), name)
+                    }
+                }
+                role == "tool" && !ignoreToolCalls && !turnEnd ->
                     notify("every_message", name, "tool: " + m.optString("tool_name", "tool"), name)
             }
         }

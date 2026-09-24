@@ -82,8 +82,8 @@ class SettingsActivity : Activity() {
 
         // ---- notifications ----
         root.addView(sectionHeader("Notifications"))
-        root.addView(buildSwitch("turn_end", "Agent finished turn", app.prefs.getBool("turn_end", true)))
-        root.addView(buildSwitch("every_message", "Every agent message", app.prefs.getBool("every_message", false)))
+        root.addView(buildSwitch("turn_end", "Agent finished turn (includes last message)", app.prefs.getBool("turn_end", true)))
+        root.addView(buildSwitch("every_message", "Every agent message (only when turn-end is off)", app.prefs.getBool("every_message", false)))
         root.addView(buildSwitch("ignore_tool_calls", "Ignore tool calls", app.prefs.getBool("ignore_tool_calls", true)))
         root.addView(buildSwitch("questions", "Agent questions", app.prefs.getBool("questions", true)))
         root.addView(Button(this).apply {

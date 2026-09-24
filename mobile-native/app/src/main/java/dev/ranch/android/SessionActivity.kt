@@ -896,12 +896,23 @@ class SessionActivity : Activity() {
             chatBox.addView(renderChatMsg(m))
             renderedSeq = m.seq
         }
-        chatScroll.post { chatScroll.fullScroll(View.FOCUS_DOWN) }
+        chatScrollBottom()
+    }
+
+    /// Scroll to the newest message WITHOUT touching focus —
+    /// ScrollView.fullScroll() runs a focus search that hands focus to
+    /// the selectable bubbles, yanking it from the composer mid-typing
+    /// (and collapsing the keyboard).
+    private fun chatScrollBottom() {
+        chatScroll.post {
+            val content = chatScroll.getChildAt(0) ?: return@post
+            chatScroll.scrollTo(0, (content.height - chatScroll.height).coerceAtLeast(0))
+        }
     }
 
     private fun chatStickBottom() {
         val nearBottom = chatScroll.scrollY + chatScroll.height >= chatBox.height - dp(48)
-        if (nearBottom) chatScroll.fullScroll(View.FOCUS_DOWN)
+        if (nearBottom) chatScrollBottom()
     }
 
     private fun copyToClipboard(text: String): Boolean {

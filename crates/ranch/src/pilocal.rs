@@ -1270,7 +1270,17 @@ fn run_pi_reader(
                     emit_tool(&pipe, t_pane, &name, args.as_deref(), dur, &out, now_iso());
                 }
             }
-            "turn_end" | "agent_end" => {
+            "turn_start" | "agent_start" => {
+                // cover turns that start without a prompt send (steering /
+                // follow-up) — prompt-send already wrote "working"
+                write_status(&pipe, t_pane, "working");
+            }
+            // NOTE: `turn_end` fires after EVERY tool round (each LLM call
+            // segment), not at the end of the agent's work — writing idle
+            // here made the busy indicator flicker mid-turn and fired
+            // turn-end notifications on the first tool result. The true
+            // end of the run is `agent_end`.
+            "agent_end" => {
                 write_status(&pipe, t_pane, "idle");
                 // the turn may have grown the context — refresh the
                 // readout (reader thread fires the RPC itself)
