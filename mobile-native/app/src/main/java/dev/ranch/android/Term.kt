@@ -207,6 +207,7 @@ object Term {
         val toolName: String?,
         val toolCallId: String?,
         val toolOutput: String?,
+        val toolArgs: String?,
         val durationMs: Long?,
         val createdAt: String?,
     )
@@ -292,6 +293,7 @@ object Term {
             toolName = o.optString("tool_name").takeIf { it.isNotEmpty() },
             toolCallId = o.optString("tool_call_id").takeIf { it.isNotEmpty() },
             toolOutput = o.optString("tool_output").takeIf { it.isNotEmpty() },
+            toolArgs = o.optString("tool_args").takeIf { it.isNotEmpty() },
             durationMs = o.optLong("duration_ms").takeIf { o.has("duration_ms") },
             createdAt = o.optString("created_at").takeIf { it.isNotEmpty() },
         )

@@ -316,3 +316,53 @@ of a message, or Select All from the toolbar. Replaces the
 long-press-copies-everything behavior; the meta hint says "long-press to
 select". Tool titles keep tap-to-expand + long-press-copies-full-output.
 v0.7.2 / versionCode 16.
+
+## Daemon — relay wedge can no longer freeze the daemon (2026-09-23)
+
+Live incident: the daemon deadlocked for ~2h. The relay thread hit
+`WebSocket protocol error: Connection reset without closing handshake`,
+reconnected to a silently-wedged TCP connection (receives appeared to
+work, broadcasts never flushed), and got stranded in `ws_send`'s
+unbounded `flush()` retry loop — outside the poll loop, so the 75s
+zombie-connection guard could not fire. Nothing drained the
+daemon→relay pipe; once its 64 KiB buffer filled, the main loop's
+BLOCKING `write_all` parked in `anon_pipe_write` and every client,
+local ones included, hung (`ranch ls` never returned). SIGTERM was
+unusable (shutdown handler stuck in the same deadlock); recovery
+required SIGKILL + restart, losing all pane children.
+
+Two fixes, defense in depth:
+
+- `relay.rs` `ws_send`: the flush retry is now bounded (30s). A
+  connection that is not writable within 30s errors the session and
+  takes the normal reconnect/backoff path. Wedged-connection detection
+  is no longer dependent on TCP eventually erroring.
+- `daemon.rs` `send_frame`: the relay pipe's write end is now
+  `O_NONBLOCK` (set in `relay::make_pipes`). The main loop writes to it
+  without blocking; frames that hit a full pipe spill into a bounded
+  (192 KiB) per-client `backlog` drained by the poll loop each tick,
+  oldest frames dropped on overflow. A wedged or slow relay thread can
+  now at worst delay/drop remote frames — it can never again stall the
+  main loop or hang local clients. Clients resync via Snapshot frames
+  and the seq-gap logic on attach.
+
+## Tool call display rework (2026-09-24)
+
+Wire protocol: ChatMsg gains `tool_args` (pi `args` / forge
+`tool_input`, compact JSON) — the command was never reaching clients,
+only the result blob. pilocal captures args at tool_execution_start;
+forge maps tool_input; all other ChatMsg sites None.
+
+Native app tool rows redesigned: collapsed = `⚙ bash · <command> · 1.2s
+▼` (key argument per tool: command/path/pattern); tap expands labelled
+"command" + "output" mono blocks (selectable, dark boxes); output
+unwraps pi's `{content:[{text}]}` envelope to plain text, red "error"
+label when isError; long-press copies command+output.
+
+Also diagnosed today's "context reporting or compaction broken" report:
+neither broken — (1) default model spark/qwen3.8-sglang endpoint was
+down, so fresh test sessions' turns hung and nothing accumulated;
+(2) pi only compacts history older than keepRecentTokens=20000, so a
+1%-context session correctly refuses ("Nothing to compact (session too
+small)"). Verified live: compaction works on switched model; tool_args
+round-trips. v0.7.3 / versionCode 17.

@@ -188,6 +188,7 @@ pub fn agent_done_row(spawn: &SpawnRecord, pane: Uuid, outcome: &str, last: Opti
         // spawn id rides in tool_call_id so clients can correlate
         tool_call_id: Some(spawn.spawn_id.clone()),
         tool_output: None,
+        tool_args: None,
         duration_ms: None,
         created_at: Some(now_iso()),
         attachments: None,

@@ -11,7 +11,10 @@ Conventions inherited from the build so far (AGENTS.md):
 - One frame schema (`crates/ranch-protocol`) for unix socket + relay.
 - Daemon workers get their **own pipe pair** (`relay::make_pipes`);
   worker → clients is broadcast like any client frame
-  (`daemon.rs:handle_frame` match arms).
+  (`daemon.rs:handle_frame` match arms). Main-loop writes to worker
+  pipes are **non-blocking + bounded backlog, never `write_all`**: a
+  wedged worker must not stall the poll loop (2026-09-23 relay freeze,
+  see build log).
 - Errors are `Frame::Error {req_id, message}`; requests correlate by
   `req_id`; failed agent splits must flash in the status bar, never
   `die()` the TUI (M8.4 pattern).

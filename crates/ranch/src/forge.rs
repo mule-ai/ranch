@@ -178,6 +178,16 @@ fn to_chat_msg(r: &serde_json::Value) -> Option<ChatMsg> {
             })
         }
     });
+    let tool_args = r.get("tool_input").and_then(|t| {
+        if t.is_null() {
+            None
+        } else {
+            Some(match t.as_str() {
+                Some(s) => s.to_string(),
+                None => t.to_string(),
+            })
+        }
+    });
     let duration_ms = r.get("duration_ms").and_then(|d| d.as_i64());
     let created_at = r
         .get("created_at")
@@ -194,6 +204,7 @@ fn to_chat_msg(r: &serde_json::Value) -> Option<ChatMsg> {
         tool_name,
         tool_call_id,
         tool_output,
+        tool_args,
         duration_ms,
         created_at,
         attachments: None,

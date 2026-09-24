@@ -911,35 +911,148 @@ class SessionActivity : Activity() {
         return true
     }
 
+    private fun prettyJson(s: String): String = try {
+        val t = s.trimStart()
+        when {
+            t.startsWith("{") -> org.json.JSONObject(s).toString(2)
+            t.startsWith("[") -> org.json.JSONArray(s).toString(2)
+            else -> s
+        }
+    } catch (e: Exception) {
+        s
+    }
+
+    /// The one argument that explains the call: the command for shell
+    /// tools, the path for file tools, the pattern for search tools.
+    private fun toolKeyArg(name: String?, argsJson: String?): String? {
+        val a = argsJson?.let {
+            try { org.json.JSONObject(it) } catch (e: Exception) { null }
+        } ?: return null
+        val keys = when (name?.lowercase()) {
+            "bash", "sh", "exec", "shell", "run" ->
+                listOf("command", "cmd", "script")
+            "read", "write", "edit" ->
+                listOf("path", "file_path", "file")
+            "grep", "search", "find", "rg" ->
+                listOf("pattern", "query")
+            else ->
+                listOf("command", "cmd", "path", "file_path", "pattern", "query", "url")
+        }
+        for (k in keys) {
+            val v = a.opt(k)
+            if (v is String && v.isNotBlank()) return v.replace("\n", " ⏎ ")
+        }
+        return null
+    }
+
+    /// A labelled dark mono box (command / output) inside an expanded
+    /// tool row.
+    private fun toolBlock(label: String, body: String, labelColor: Int = 0xFF5C636B.toInt()): android.view.View {
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = android.graphics.drawable.GradientDrawable().apply {
+                cornerRadius = dp(8).toFloat()
+                setColor(0xFF14181D.toInt())
+            }
+            setPadding(dp(8), dp(6), dp(8), dp(6))
+        }
+        box.addView(TextView(this).apply {
+            text = label
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 9f)
+            setTextColor(labelColor)
+        })
+        box.addView(TextView(this).apply {
+            text = body
+            setTextIsSelectable(true)
+            setTypeface(Typeface.MONOSPACE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            setTextColor(0xFFC9D1D9.toInt())
+        })
+        return box
+    }
+
+    /// Tool results arrive as pi's envelope
+    /// `{content:[{type:"text",text:…}], isError:…}` — unwrap the text
+    /// for display; fall back to the pretty-printed raw JSON.
+    private fun toolOutputDisplay(raw: String): Pair<String, String> {
+        try {
+            val o = org.json.JSONObject(raw)
+            val content = o.opt("content")
+            if (content is org.json.JSONArray) {
+                val sb = StringBuilder()
+                for (i in 0 until content.length()) {
+                    val item = content.optJSONObject(i) ?: continue
+                    val t = item.optString("text")
+                    if (t.isNotEmpty()) {
+                        if (sb.isNotEmpty()) sb.append('\n')
+                        sb.append(t)
+                    }
+                }
+                if (sb.isNotEmpty()) {
+                    val label = if (o.optBoolean("isError", false)) "error" else "output"
+                    return label to sb.toString()
+                }
+            }
+        } catch (e: Exception) {
+        }
+        return "output" to raw
+    }
+
     private fun renderChatMsg(m: Term.ChatMsg): LinearLayout {
         val wrap = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(0, dp(4), 0, dp(4))
         }
         if (m.toolName != null) {
-            // tool row: tap toggles the full output, long-press copies it
-            // (same UX as the RN app)
+            // tool row: collapsed = one line with the command so the call
+            // is readable at a glance; tap expands labelled command +
+            // output blocks; long-press copies both
             val dur = m.durationMs?.let {
                 if (it >= 1000) " · " + String.format(java.util.Locale.US, "%.1fs", it / 1000.0)
                 else " · ${it}ms"
             } ?: ""
-            val detail = (m.toolOutput ?: m.text).takeIf { it.isNotEmpty() }
+            val outRaw = (m.toolOutput ?: m.text).takeIf { it.isNotEmpty() }
+            val outDisp = outRaw?.let { toolOutputDisplay(prettyJson(it)) }
+            val cmdBody = m.toolArgs?.let { prettyJson(it) }
+            val summary = toolKeyArg(m.toolName, m.toolArgs)
+                ?.let { if (it.length > 70) it.substring(0, 70) + " …" else it }
+            val baseTitle = buildString {
+                append("⚙ "); append(m.toolName)
+                if (summary != null) { append(" · "); append(summary) }
+                append(dur)
+            }
             var open = false
-            var expanded: TextView? = null
-            val baseTitle = "⚙ ${m.toolName}$dur"
+            val details = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(dp(10), dp(2), dp(10), dp(4))
+                visibility = android.view.View.GONE
+            }
+            if (cmdBody != null) details.addView(toolBlock("command", cmdBody))
+            if (outDisp != null) {
+                details.addView(View(this), LinearLayout.LayoutParams(1, dp(4)))
+                details.addView(
+                    toolBlock(
+                        outDisp.first,
+                        if (outDisp.second.length > 8000) outDisp.second.substring(0, 8000) + " …" else outDisp.second,
+                        if (outDisp.first == "error") 0xFFE06C75.toInt() else 0xFF5C636B.toInt()
+                    )
+                )
+            }
+            val expandable = cmdBody != null || outDisp != null
             val title = TextView(this).apply {
-                text = if (detail != null) "$baseTitle ▼" else baseTitle
+                text = if (expandable) "$baseTitle ▼" else baseTitle
                 setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
                 setTextColor(0xFF8bd08b.toInt())
-                setPadding(dp(10), dp(6), dp(10), dp(6))
-                if (detail != null) {
+                setPadding(dp(10), dp(6), dp(10), if (expandable) dp(2) else dp(6))
+                if (expandable) {
                     setOnClickListener {
                         open = !open
                         text = "$baseTitle ${if (open) "▲" else "▼"}"
-                        expanded?.maxLines = if (open) 500 else 6
+                        details.visibility = if (open) android.view.View.VISIBLE else android.view.View.GONE
                     }
                     setOnLongClickListener {
-                        if (copyToClipboard(detail)) {
+                        val all = listOfNotNull(cmdBody, outDisp?.second).joinToString("\n\n")
+                        if (copyToClipboard(all)) {
                             text = "$baseTitle · copied ✓"
                             handler.postDelayed({
                                 text = "$baseTitle ${if (open) "▲" else "▼"}"
@@ -950,20 +1063,7 @@ class SessionActivity : Activity() {
                 }
             }
             wrap.addView(title)
-            if (detail != null) {
-                val out = TextView(this).apply {
-                    text = detail
-                    maxLines = 6
-                    setTextIsSelectable(true)
-                    ellipsize = android.text.TextUtils.TruncateAt.END
-                    setTypeface(Typeface.MONOSPACE)
-                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
-                    setTextColor(0xFF9aa0a6.toInt())
-                    setPadding(dp(10), 0, dp(10), 0)
-                }
-                expanded = out
-                wrap.addView(out)
-            }
+            wrap.addView(details)
             return wrap
         }
         // chat bubble: user right (blue), agent left (dark) — like every

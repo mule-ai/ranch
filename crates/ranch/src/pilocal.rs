@@ -602,6 +602,7 @@ pub fn read_session_messages(path: &str) -> Result<Vec<ChatMsg>, String> {
                 tool_name,
                 tool_call_id: None,
                 tool_output,
+                tool_args: None,
                 duration_ms: None,
                 created_at,
                 attachments: None,
@@ -814,7 +815,7 @@ fn run_pi_reader(
         }
     }
     let reader = BufReader::new(stdout);
-    let mut pending_tool: Option<(String, std::time::Instant)> = None;
+    let mut pending_tool: Option<(String, Option<String>, std::time::Instant)> = None;
     for line in reader.lines() {
         if stop.load(Ordering::Relaxed) {
             break;
@@ -1007,6 +1008,7 @@ fn run_pi_reader(
                                     tool_name,
                                     tool_call_id: None,
                                     tool_output,
+                                    tool_args: None,
                                     duration_ms: None,
                                     created_at: ts.clone(),
                                     attachments: None,
@@ -1255,13 +1257,17 @@ fn run_pi_reader(
                     .and_then(|t| t.as_str())
                     .unwrap_or("tool")
                     .to_string();
-                pending_tool = Some((name, std::time::Instant::now()));
+                // arguments (command / path / pattern…) — shown on the
+                // phone so the tool call is understandable without
+                // expanding the raw result
+                let args = v.get("args").map(|a| a.to_string());
+                pending_tool = Some((name, args, std::time::Instant::now()));
             }
             "tool_execution_end" => {
-                if let Some((name, started)) = pending_tool.take() {
+                if let Some((name, args, started)) = pending_tool.take() {
                     let dur = started.elapsed().as_millis() as i64;
                     let out = v.get("result").map(|r| r.to_string()).unwrap_or_default();
-                    emit_tool(&pipe, t_pane, &name, dur, &out, now_iso());
+                    emit_tool(&pipe, t_pane, &name, args.as_deref(), dur, &out, now_iso());
                 }
             }
             "turn_end" | "agent_end" => {
@@ -1302,6 +1308,7 @@ fn emit_chat(pipe: &PipeWriter, pane: Uuid, role: &str, text: &str, created_at: 
                 tool_name: None,
                 tool_call_id: None,
                 tool_output: None,
+                tool_args: None,
                 duration_ms: None,
                 created_at: Some(created_at),
                 attachments: None,
@@ -1333,6 +1340,7 @@ fn emit_chat_with(
                 tool_name: None,
                 tool_call_id: None,
                 tool_output: None,
+                tool_args: None,
                 duration_ms: None,
                 created_at: Some(created_at),
                 attachments,
@@ -1342,7 +1350,15 @@ fn emit_chat_with(
     );
 }
 
-fn emit_tool(pipe: &PipeWriter, pane: Uuid, name: &str, dur_ms: i64, out: &str, created_at: String) {
+fn emit_tool(
+    pipe: &PipeWriter,
+    pane: Uuid,
+    name: &str,
+    args: Option<&str>,
+    dur_ms: i64,
+    out: &str,
+    created_at: String,
+) {
     write_frame(
         pipe,
         &Frame::Chat {
@@ -1356,6 +1372,7 @@ fn emit_tool(pipe: &PipeWriter, pane: Uuid, name: &str, dur_ms: i64, out: &str, 
                 tool_name: Some(name.to_string()),
                 tool_call_id: None,
                 tool_output: Some(out.to_string()),
+                tool_args: args.map(String::from),
                 duration_ms: Some(dur_ms),
                 created_at: Some(created_at),
                 attachments: None,

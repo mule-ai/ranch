@@ -876,6 +876,10 @@ pub struct ChatMsg {
     pub tool_call_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_output: Option<String>,
+    /// Tool call arguments as compact JSON (pi `args` / forge
+    /// `tool_input`) — lets clients show the command, not just the result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_args: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1656,6 +1660,7 @@ mod tests {
                     tool_name: None,
                     tool_call_id: None,
                     tool_output: None,
+                    tool_args: None,
                     duration_ms: None,
                     created_at: None,
                     attachments: None,

@@ -19,7 +19,7 @@
 //! both authenticated with the machine user's JWT.
 
 use std::io::Write;
-use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd, RawFd};
 use std::sync::mpsc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -185,6 +185,15 @@ pub fn make_pipes() -> Result<((RawFd, std::fs::File), (RawFd, std::fs::File)), 
     // with a blocking read hangs the thread forever (seen live: relay
     // died silently, machine showed offline).
     set_nonblocking(relay_r)?;
+    // The main loop writes daemon->relay frames with a NON-BLOCKING
+    // write (see daemon.rs send_frame): if the relay thread is wedged
+    // (e.g. stuck retrying a flush on a dead TCP connection), a blocking
+    // write here freezes the whole daemon once the 64 KiB pipe buffer
+    // fills — every client, local ones included (seen live 2026-09-23:
+    // main thread parked in anon_pipe_write for 2h, ranch ls hung).
+    // Non-blocking + bounded local queue keeps the daemon alive; stale
+    // frames are dropped until the relay recovers.
+    set_nonblocking(relay_w.as_raw_fd())?;
     Ok(((daemon_r, daemon_w), (relay_r, relay_w)))
 }
 
@@ -749,9 +758,20 @@ fn ws_send(
     // on write/flush. That is NOT fatal — previously it tore down the whole
     // session and backed off up to 60s, which stalled every remote client
     // (the daemon->relay pipe filled and blocked the main loop). Instead,
-    // wait briefly for writability and retry until the buffer accepts.
+    // wait briefly for writability and retry.
+    //
+    // But bound the retry: retrying forever strands this thread OUTSIDE the
+    // poll loop when the connection wedges silently (peer gone without
+    // RST — laptop sleep, NAT timeout). Writes then never fail AND never
+    // succeed, so the zombie-connection guard never fires either (it is
+    // checked in the poll loop), the daemon->relay pipe fills, and the
+    // daemon's main loop blocks behind it (seen live 2026-09-23). If the
+    // socket is not writable within 30s, tear the session down: the poll
+    // loop's reconnect/backoff path knows how to recover, and local
+    // clients keep working while the daemon->relay frames queue up.
     ws.write(Message::Text(text.into()))
         .map_err(|e| format!("ws send: {e}"))?;
+    let flush_deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
         match ws.flush() {
             Ok(()) => return Ok(()),
@@ -759,6 +779,11 @@ fn ws_send(
                 if e.kind() == std::io::ErrorKind::WouldBlock
                     || e.kind() == std::io::ErrorKind::Interrupted =>
             {
+                if std::time::Instant::now() >= flush_deadline {
+                    return Err(
+                        "ws flush: not writable for 30s — wedged connection, reconnecting".into(),
+                    );
+                }
                 std::thread::sleep(Duration::from_millis(20));
             }
             Err(e) => return Err(format!("ws flush: {e}")),

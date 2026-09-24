@@ -507,8 +507,17 @@ struct Client {
     /// frames arrive via the relay pipe, read separately in the loop).
     stream: Option<UnixStream>,
     /// Frames written here are broadcast to remote clients over the relay.
-    /// Set only for the relay client.
+    /// Set only for the relay client. The fd is NON-BLOCKING (see
+    /// relay::make_pipes); writes that WouldBlock spill into `backlog`
+    /// instead of blocking the main loop, and are retried when the
+    /// poll loop sees the pipe writable again.
     relay_out: Option<std::fs::File>,
+    /// Spill queue for relay frames that hit a full pipe (relay thread
+    /// wedged/slow). Bounded: when full, oldest frames are dropped — a
+    /// stale delta/snapshot is worse than a lost one, and wedging the
+    /// daemon is never acceptable. Clients resync via Snapshot frames
+    /// and the seq-gap logic on attach.
+    backlog: std::collections::VecDeque<Vec<u8>>,
     /// Remote frames land on this pipe (read end); set only for the relay
     /// client. The write end lives in the relay thread.
     relay_in: Option<std::fs::File>,
@@ -1126,7 +1135,14 @@ fn send_frame(c: &mut Client, frame: &Frame) {
         bytes.push(b'\n');
         let res = match (&mut c.stream, &mut c.relay_out) {
             (Some(s), _) => s.write_all(&bytes),
-            (None, Some(w)) => w.write_all(&bytes),
+            (None, Some(w)) => {
+                // Relay pipe: NON-BLOCKING. A blocking write_all here is
+                // how a wedged relay thread froze the entire daemon
+                // (2026-09-23): pipe full -> main loop parked in
+                // anon_pipe_write -> every client hung, local included.
+                // Instead: queue what does not fit and keep serving.
+                write_relay_frame(w, &mut c.backlog, &bytes)
+            }
             // control pseudo-client: collect (the request thread returns
             // them in the HTTP response)
             (None, None) if c.sink.is_some() => {
@@ -1144,6 +1160,90 @@ fn send_frame(c: &mut Client, frame: &Frame) {
             break;
         }
     }
+}
+
+/// Relay-pipe capacity bound for the backlog queue (bytes across all
+/// queued frames). Roughly 3x the 64 KiB kernel pipe buffer: enough to
+/// ride out a normal reconnect backoff without dropping anything, small
+/// enough that a wedged relay cannot balloon memory.
+const RELAY_BACKLOG_MAX: usize = 192 * 1024;
+
+/// Write one newline-terminated frame line to the NON-BLOCKING relay
+/// pipe, spilling into `backlog` (and dropping oldest backlog bytes)
+/// when the pipe is full. Never blocks. The backlog is drained by
+/// `flush_relay_backlog` from the poll loop once the pipe is writable
+/// again.
+fn write_relay_frame(
+    w: &mut std::fs::File,
+    backlog: &mut VecDeque<Vec<u8>>,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    // previous backlog first: preserve ordering
+    if !backlog.is_empty() {
+        backlog.push_back(bytes.to_vec());
+        trim_relay_backlog(backlog);
+        return Ok(());
+    }
+    match w.write(bytes) {
+        Ok(0) => {
+            // cannot happen for a pipe with room; treat as WouldBlock
+            backlog.push_back(bytes.to_vec());
+            trim_relay_backlog(backlog);
+            Ok(())
+        }
+        Ok(n) if n == bytes.len() => Ok(()),
+        Ok(n) => {
+            // partial write: queue the remainder
+            backlog.push_back(bytes[n..].to_vec());
+            trim_relay_backlog(backlog);
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            backlog.push_back(bytes.to_vec());
+            trim_relay_backlog(backlog);
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+            backlog.push_back(bytes.to_vec());
+            trim_relay_backlog(backlog);
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn trim_relay_backlog(backlog: &mut VecDeque<Vec<u8>>) {
+    let mut total: usize = backlog.iter().map(|b| b.len()).sum();
+    while total > RELAY_BACKLOG_MAX && backlog.len() > 1 {
+        if let Some(dropped) = backlog.pop_front() {
+            total -= dropped.len();
+        }
+    }
+}
+
+/// Try to drain the relay backlog into the pipe (called from the poll
+/// loop when the relay fd is writable / on the periodic tick). Returns
+/// true when fully drained.
+fn flush_relay_backlog(c: &mut Client) -> bool {
+    let Some(w) = c.relay_out.as_mut() else {
+        return true;
+    };
+    while let Some(front) = c.backlog.front() {
+        match w.write(front) {
+            Ok(n) if n == front.len() => {
+                c.backlog.pop_front();
+            }
+            Ok(_) => return false, // partial: pipe full again
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::Interrupted =>
+            {
+                return false;
+            }
+            Err(_) => return true, // real error: drop backlog, send_frame will report
+        }
+    }
+    true
 }
 
 // ---------- agent tools (Phase A) ----------
@@ -2012,6 +2112,7 @@ impl Daemon {
                     relay_client = Some(Client {
                         stream: None,
                         relay_out: Some(relay_w),
+                        backlog: std::collections::VecDeque::new(),
                         relay_in: Some(fd_file(daemon_r)),
                         sink: None,
                         decoder: Decoder::new(),
@@ -2074,6 +2175,7 @@ impl Daemon {
                 let fclient = Client {
                     stream: None,
                     relay_out: None,
+                    backlog: std::collections::VecDeque::new(),
                     relay_in: Some(fd_file(f_daemon_r)),
                     sink: None,
                     decoder: Decoder::new(),
@@ -5750,6 +5852,21 @@ fn run(
         if pilocal::STATE_DIRTY.swap(false, Ordering::Relaxed) {
             daemon.write_state();
         }
+        // drain any relay backlog that accumulated while the pipe was
+        // full (wedged/slow relay thread); no-op when empty
+        {
+            let relay_fds: Vec<RawFd> = daemon
+                .clients
+                .iter()
+                .filter(|(_, c)| c.relay_out.is_some() && !c.backlog.is_empty())
+                .map(|(fd, _)| *fd)
+                .collect();
+            for rfd in relay_fds {
+                if let Some(rc) = daemon.clients.get_mut(&rfd) {
+                    flush_relay_backlog(rc);
+                }
+            }
+        }
         let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as u64, timeout) };
         if n < 0 {
             eprintln!("ranchd: poll: {:?}", std::io::Error::last_os_error());
@@ -5769,6 +5886,7 @@ fn run(
                     Client {
                         stream: Some(stream),
                         relay_out: None,
+                        backlog: std::collections::VecDeque::new(),
                         relay_in: None,
                         sink: None,
                         decoder: Decoder::new(),
@@ -5860,6 +5978,7 @@ fn run(
                             Client {
                                 stream: None,
                                 relay_out: None,
+                                backlog: std::collections::VecDeque::new(),
                                 relay_in: None,
                                 sink: Some(sink.clone()),
                                 decoder: Decoder::new(),
