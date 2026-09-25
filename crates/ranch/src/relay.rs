@@ -602,6 +602,17 @@ fn ws_session(
                 while let Some(nl) = pending.iter().position(|&b| b == b'\n') {
                     let line: Vec<u8> = pending.drain(..=nl).collect();
                     let body = &line[..line.len() - 1];
+                    // TEMP diagnostics: record every line as received
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open("/tmp/ranch-relay-received.log")
+                    {
+                        use std::io::Write;
+                        let _ = f.write_all(body);
+                        let _ = f.write_all(b"\n");
+                        let _ = f.flush();
+                    }
                     let line = match std::str::from_utf8(body) {
                         Ok(l) => l,
                         Err(_) => {

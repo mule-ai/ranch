@@ -94,14 +94,15 @@ class MainActivity : Activity() {
     }
 
     // ---- notification deep link ----
-    // Notifications carry open_session/open_session_name; once the
-    // monitor is up we drop the user straight into that conversation.
-    private var pendingOpen: Pair<String, String>? = null
+    // Notifications carry open_session/open_session_name/open_pane; once
+    // the monitor is up we drop the user straight into that conversation
+    // (and that exact pane, for sessions with several chat panes).
+    private var pendingOpen: Triple<String, String, String>? = null
 
-    private fun pendingFromIntent(i: Intent?): Pair<String, String>? {
+    private fun pendingFromIntent(i: Intent?): Triple<String, String, String>? {
         val sid = i?.getStringExtra("open_session") ?: return null
         if (sid.isEmpty()) return null
-        return sid to (i.getStringExtra("open_session_name") ?: "")
+        return Triple(sid, i.getStringExtra("open_session_name") ?: "", i.getStringExtra("open_pane") ?: "")
     }
 
     private fun maybeAutoOpen() {
@@ -110,7 +111,8 @@ class MainActivity : Activity() {
         pendingOpen = null
         startActivity(Intent(this, SessionActivity::class.java)
             .putExtra("sessionId", p.first)
-            .putExtra("sessionName", p.second))
+            .putExtra("sessionName", p.second)
+            .putExtra("openPane", p.third))
     }
 
     override fun onResume() {

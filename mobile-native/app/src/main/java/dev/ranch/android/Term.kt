@@ -86,6 +86,13 @@ object Term {
             .put("session", session).put("pane", pane)
             .put("req_id", "compact-" + newId())
 
+    /// Interrupt the in-flight agent turn (immediate, non-destructive).
+    /// The agent keeps its session + conversation; the running work stops.
+    fun interrupt(session: String, pane: String): JSONObject =
+        JSONObject()
+            .put("t", "Interrupt").put("id", newId()).put("client", CLIENT)
+            .put("session", session).put("pane", pane)
+
     fun chatHistory(session: String, pane: String, limit: Int, before: Long? = null): JSONObject {
         val o = JSONObject()
             .put("t", "ChatHistory").put("id", newId()).put("client", CLIENT)

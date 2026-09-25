@@ -404,3 +404,14 @@ Commit 57bc252 swept in the uncommitted non-blocking relay-write work
 `Ok(n) if n > 0` + `Ok(0)` as non-exhaustive (guarded arms don't count
 toward coverage) — reordered to an unguarded `Ok(n)` arm and made the
 fn take &mut File. Daemon hot-upgraded.
+
+## Deep-link pane precision + per-session notifications (2026-09-25)
+
+Wrong-conversation report: the deep link opened the right session but
+the daemon's ACTIVE pane — wrong conversation when a session has
+several chat panes. Notifications now carry open_pane and
+SessionActivity honors it on the first snapshot (preferredPane, then
+follows the daemon again). Also: notification title is now the session
+name (was the machine name) and the shade tag is the session id —
+notifications from different agents stack instead of clobbering.
+v0.7.6 / versionCode 20.

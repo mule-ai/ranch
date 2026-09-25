@@ -229,21 +229,27 @@ class Notify(private val app: App) {
         // MainActivity consumes the extras once the monitor is up
         val intent = Intent(app, MainActivity::class.java)
         val sid = pane?.let { paneSession[it] }
+        // the session name beats the machine name as title, and each
+        // session gets its own shade entry (no clobbering between agents)
+        val sname = sid?.let { s ->
+            Monitor.sessions.firstOrNull { it.id == s }?.name
+                .takeUnless { it.isNullOrEmpty() }
+        } ?: title
+        var notifTag = tag
         if (!sid.isNullOrEmpty()) {
-            // prefer the real session display name over the machine name
-            val sname = Monitor.sessions.firstOrNull { it.id == sid }?.name
-                .takeUnless { it.isNullOrEmpty() } ?: title
             intent.putExtra("open_session", sid)
             intent.putExtra("open_session_name", sname)
+            if (!pane.isNullOrEmpty()) intent.putExtra("open_pane", pane)
+            notifTag = sid
         }
         intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         val openIntent = PendingIntent.getActivity(
-            app, tag.hashCode(), intent,
+            app, notifTag.hashCode(), intent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
         val builder = Notification.Builder(app, "ranch")
             .setSmallIcon(R.drawable.ic_stat_ranch)
-            .setContentTitle(title)
+            .setContentTitle(sname)
             .setContentText(body)
             .setAutoCancel(true)
             .setCategory(Notification.CATEGORY_REMINDER)
@@ -253,6 +259,6 @@ class Notify(private val app: App) {
         if (Build.VERSION.SDK_INT >= 26) {
             builder.setGroup("ranch")
         }
-        nm.notify(tag.hashCode(), builder.build())
+        nm.notify(notifTag.hashCode(), builder.build())
     }
 }

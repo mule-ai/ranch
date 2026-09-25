@@ -272,6 +272,18 @@ The daemon is the file server; clients (mobile/CLI) are thin editors.
     `compact` RPC on the child. Success is confirmed out-of-band as
     `meta {kind:"context"}` (status begins with `"compacted"`) plus a
     refreshed readout; failure returns `Error {req_id}`.
+  - `Interrupt {session, pane}` — stop the in-flight agent turn
+    immediately, without killing the agent or the session. Pi panes:
+    the `abort` RPC on the child (pi flushes the interrupted turn's
+    terminal events and answers the RPC; the pane's `agent_end` flips
+    the status back to `idle`). Forge panes: `POST /sessions/{id}/interrupt`
+    (forge writes the `abort` RPC to the shared pi stdin pipe — the
+    turn driver holds the per-session agent lock for the whole turn —
+    and records a `system` row when a turn was in flight; the row +
+    `turn_ended` ride back on the SSE watch). Both backends leave a
+    `⏹ interrupted` system chat row visible on every client. A no-op
+    (still idempotent) when the agent is idle. No reply frame; the
+    out-of-band row + `meta {kind:"agent", status:"idle"}` confirm it.
 
 ## 4. Coalescing & sequencing
 

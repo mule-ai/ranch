@@ -52,9 +52,14 @@ class SessionActivity : Activity() {
         var model: String = "",
         var context: String = "",
         var seq: Long = 0,
+        /// true while the pane's agent has an in-flight turn (drives the
+        /// ⏹ stop button); flipped by `meta { kind: "agent" }` frames.
+        var agentWorking: Boolean = false,
     )
     private val panes = LinkedHashMap<String, Pane>()
     private var activePane = ""
+    /// pane requested by a notification deep link (open_pane extra)
+    private var preferredPane = ""
     private val lastSeq = LinkedHashMap<String, Long>()
     private var uiKind = ""
     private var agentStatus = ""
@@ -160,6 +165,7 @@ class SessionActivity : Activity() {
     private lateinit var inputArea: LinearLayout
     private lateinit var hiddenEdit: EditText
     private lateinit var chatEdit: EditText
+    private var stopBtn: Button? = null
     private lateinit var modelBar: LinearLayout
     private lateinit var modelChip: TextView
     private lateinit var contextLabel: TextView
@@ -364,6 +370,13 @@ class SessionActivity : Activity() {
             )
             if (p.optLong("seq", 0) > 0) lastSeq[id] = p.optLong("seq")
         }
+        // notification deep link: prefer the pane that fired it over the
+        // session's daemon-side active pane (honored once, on the first
+        // snapshot — later snapshots follow the daemon again)
+        if (preferredPane.isNotEmpty() && next.containsKey(preferredPane)) {
+            activePane = preferredPane
+            preferredPane = ""
+        }
         panes.clear(); panes.putAll(next)
         rebuildTabs()
         renderActive()
@@ -427,7 +440,13 @@ class SessionActivity : Activity() {
             val last = pane.chat.lastOrNull()?.seq ?: 0L
             for (m in msgs) if (m.seq > last) pane.chat.add(m)
         }
-        if (paneId == activePane && uiKind == "forge-chat") renderChat(pane, false)
+        // a user row landing means the agent took the message — show the
+        // stop button even before the `meta working` frame arrives
+        if (pane.chat.lastOrNull()?.role == "user") pane.agentWorking = true
+        if (paneId == activePane && uiKind == "forge-chat") {
+            renderChat(pane, false)
+            updateStopButton()
+        }
     }
 
     private fun onMeta(f: JSONObject) {
@@ -458,11 +477,13 @@ class SessionActivity : Activity() {
                     finishCompact()
                 }
                 agentStatus = st
+                panes[pane]?.agentWorking = (st == "working")
                 statusView.text = when (st) {
                     "working" -> "● working"
                     "idle" -> "● idle"
                     else -> ""
                 }
+                if (pane == activePane && uiKind == "forge-chat") updateStopButton()
             }
             "model" -> {
                 val p = f.optString("pane")
@@ -1266,6 +1287,18 @@ class SessionActivity : Activity() {
             imeOptions = EditorInfo.IME_FLAG_NO_EXTRACT_UI
             setOnEditorActionListener { _, _, _ -> sendChat(); true }
         }
+        // stop button: only visible while this pane's agent has a turn in
+        // flight. Interrupts the running work immediately but keeps the
+        // session + conversation (pi `abort` RPC / forge /interrupt).
+        stopBtn = Button(this).apply {
+            text = "⏹ stop"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            setTextColor(0xFFE06C75.toInt())
+            setPadding(dp(10), dp(4), dp(10), dp(4))
+            minWidth = dp(56)
+            visibility = View.GONE
+            setOnClickListener { sendInterrupt() }
+        }
         val send = Button(this).apply {
             text = "➤"
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 18f)
@@ -1274,11 +1307,31 @@ class SessionActivity : Activity() {
         }
         send.setOnClickListener { sendChat() }
         row.addView(chatEdit, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        row.addView(stopBtn)
         row.addView(send)
         // explicit params: bare addView on a horizontal LinearLayout defaults
         // to WRAP_CONTENT, which squeezed the composer to its content width
         inputArea.addView(row, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+        updateStopButton()
+    }
+
+    /// Show the ⏹ stop button iff the active pane is an agent pane with a
+    /// turn in flight. Called from input-area builds, pane switches, chat
+    /// frames (user row landing), and `meta { kind: "agent" }` updates.
+    private fun updateStopButton() {
+        val b = stopBtn ?: return
+        val working = panes[activePane]?.agentWorking == true && uiKind == "forge-chat"
+        b.visibility = if (working) View.VISIBLE else View.GONE
+    }
+
+    private fun sendInterrupt() {
+        if (activePane.isEmpty()) return
+        relay?.send(Term.interrupt(sessionId, activePane))
+        // the idle meta + the "⏹ interrupted" system row follow; hide the
+        // button optimistically so a double-tap can't re-fire the RPC
+        panes[activePane]?.agentWorking = false
+        updateStopButton()
     }
 
     private fun focusHidden() {
