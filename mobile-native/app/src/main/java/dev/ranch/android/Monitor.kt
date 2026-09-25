@@ -139,6 +139,11 @@ class RelaySession(
                         activePane = pane, panes = listOf(pane)
                     )
                     Monitor.publishSessions(Monitor.sessions.filterNot { it.id == created.id } + created)
+                    // The ack carries no kind, so the new row briefly shows as a
+                    // shell. The daemon inserts the session before acking, so a
+                    // Hello now returns the authoritative list with the real
+                    // kind (pi/forge) — fixes the badge immediately.
+                    send(Term.hello())
                 }
             }
             "Meta" -> {

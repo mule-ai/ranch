@@ -385,3 +385,14 @@ search that hands focus to newly-added selectable bubbles, yanking it
 from the composer mid-typing. Replaced with a pure scrollTo
 (chatScrollBottom), used by renderChat + chatStickBottom.
 v0.7.4 / versionCode 18.
+
+## Notification deep link (2026-09-24)
+
+Tapping a notification now opens the conversation that fired it.
+Notify tracks pane→session from frames (all triggers carry both) and
+stamps open_session/open_session_name extras on the PendingIntent
+(requestCode = tag hash so stacked notifications keep their own
+targets). MainActivity consumes the extras in onCreate/onNewIntent and
+auto-opens the session once the monitor is up (retry on the 2s refresh
+tick; cold start = login → machine pick → auto-open). Session title
+resolved from Monitor.sessions. v0.7.5 / versionCode 19.

@@ -761,6 +761,18 @@ pub fn read_session_messages(path: &str) -> Result<Vec<ChatMsg>, String> {
         Ok(())
     }
 
+    /// Interrupt the in-flight agent turn (pi RPC `abort`). Immediate
+    /// and non-destructive: the child, session file, and conversation
+    /// all survive — pi flushes the interrupted turn's terminal events
+    /// (the reader flips the pane to idle) and answers the RPC. Also
+    /// leaves a system chat row so every client sees the stop was on
+    /// purpose. No-op (still emits the row) when idle.
+    pub fn interrupt(&self, pipe: &PipeWriter) -> Result<(), String> {
+        self.send_rpc(&serde_json::json!({"type": "abort"}))?;
+        emit_chat(pipe, self.pane, "system", "⏹ interrupted", now_iso());
+        Ok(())
+    }
+
     /// Kill the child (pane close). Best-effort. On the inherit path the
     /// pid is signaled directly (no Child handle).
     /// Kill the rpc child. Returns its pid so the caller can reap it

@@ -1168,6 +1168,38 @@ fn send_frame(c: &mut Client, frame: &Frame) {
 /// enough that a wedged relay cannot balloon memory.
 const RELAY_BACKLOG_MAX: usize = 192 * 1024;
 
+/// Outcome of a non-blocking pipe write.
+enum PipeWrite {
+    /// Every byte is in the pipe.
+    Complete,
+    /// Exactly `off` bytes made it into the pipe; `bytes[off..]` still
+    /// needs writing.
+    Partial(usize),
+}
+
+/// Write to the NON-BLOCKING relay pipe, retrying EINTR from the CURRENT
+/// OFFSET. A write can be interrupted by a signal (SIGCHLD from a pi
+/// child, etc.) AFTER the kernel already wrote some bytes; re-queueing
+/// the whole buffer in that case duplicates the in-flight prefix and the
+/// relay sees a corrupted line ("dropping unparseable daemon frame").
+fn write_pipe_nb(w: &std::fs::File, bytes: &[u8]) -> Result<PipeWrite, std::io::Error> {
+    let mut off = 0;
+    loop {
+        if off == bytes.len() {
+            return Ok(PipeWrite::Complete);
+        }
+        match w.write(&bytes[off..]) {
+            Ok(n) if n > 0 => off += n,
+            Ok(0) => return Ok(PipeWrite::Partial(off)),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                return Ok(PipeWrite::Partial(off));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// Write one newline-terminated frame line to the NON-BLOCKING relay
 /// pipe, spilling into `backlog` (and dropping oldest backlog bytes)
 /// when the pipe is full. Never blocks. The backlog is drained by
@@ -1184,31 +1216,15 @@ fn write_relay_frame(
         trim_relay_backlog(backlog);
         return Ok(());
     }
-    match w.write(bytes) {
-        Ok(0) => {
-            // cannot happen for a pipe with room; treat as WouldBlock
-            backlog.push_back(bytes.to_vec());
+    match write_pipe_nb(w, bytes)? {
+        PipeWrite::Complete => Ok(()),
+        PipeWrite::Partial(off) => {
+            // Queue only the UNWRITTEN remainder: the first `off` bytes
+            // are already in the pipe.
+            backlog.push_back(bytes[off..].to_vec());
             trim_relay_backlog(backlog);
             Ok(())
         }
-        Ok(n) if n == bytes.len() => Ok(()),
-        Ok(n) => {
-            // partial write: queue the remainder
-            backlog.push_back(bytes[n..].to_vec());
-            trim_relay_backlog(backlog);
-            Ok(())
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-            backlog.push_back(bytes.to_vec());
-            trim_relay_backlog(backlog);
-            Ok(())
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
-            backlog.push_back(bytes.to_vec());
-            trim_relay_backlog(backlog);
-            Ok(())
-        }
-        Err(e) => Err(e),
     }
 }
 
@@ -1229,16 +1245,16 @@ fn flush_relay_backlog(c: &mut Client) -> bool {
         return true;
     };
     while let Some(front) = c.backlog.front() {
-        match w.write(front) {
-            Ok(n) if n == front.len() => {
+        match write_pipe_nb(w, front) {
+            Ok(PipeWrite::Complete) => {
                 c.backlog.pop_front();
             }
-            Ok(_) => return false, // partial: pipe full again
-            Err(e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::Interrupted =>
-            {
-                return false;
+            Ok(PipeWrite::Partial(off)) => {
+                // Keep only the unwritten remainder, else the next flush
+                // re-sends the first `off` bytes already in the pipe.
+                let entry = c.backlog.pop_front().expect("front taken above");
+                c.backlog.push_front(entry[off..].to_vec());
+                return false; // pipe full again
             }
             Err(_) => return true, // real error: drop backlog, send_frame will report
         }
@@ -3080,6 +3096,37 @@ impl Daemon {
                                 pane: pid,
                                 forge_sid: cp.forge_sid,
                                 text: augmented,
+                            });
+                        }
+                    }
+                }
+            }
+            // client -> agent: interrupt the in-flight turn (immediate,
+            // non-destructive). Local-pi: the `abort` RPC + a system row;
+            // forge-backed: forge's interrupt endpoint (its system row +
+            // idle status ride back on the SSE watch).
+            Frame::Interrupt { session, pane, .. } => {
+                let sid = match self.resolve_session(session).map(|s| s.id) {
+                    Some(s) => s,
+                    None => return,
+                };
+                let Ok(pid) = Uuid::parse_str(pane) else {
+                    return;
+                };
+                if let Some(s) = self.sessions.get(&sid) {
+                    if let Some(cp) = s.chats.get(&pid) {
+                        if cp.forge_sid.is_nil() {
+                            if let Some(lp) = self.pi_agents.get(&pid) {
+                                if let Some(pipe_w) = &self.forge_pipe_w {
+                                    if let Err(e) = lp.interrupt(pipe_w) {
+                                        eprintln!("ranchd: pi interrupt failed: {e}");
+                                    }
+                                }
+                            }
+                        } else if let Some(tx) = &self.forge_tx {
+                            let _ = tx.send(forge::ForgeJob::Interrupt {
+                                pane: pid,
+                                forge_sid: cp.forge_sid,
                             });
                         }
                     }

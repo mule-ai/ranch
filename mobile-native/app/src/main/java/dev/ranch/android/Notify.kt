@@ -45,6 +45,9 @@ class Notify(private val app: App) {
     private val lastSeq = HashMap<String, Long>()
     private val primed = HashSet<String>()
     private val notifiedAsks = HashSet<String>()
+    // pane -> ranch session id, captured from any frame carrying both —
+    // notification taps deep-link into the conversation that fired them
+    private val paneSession = HashMap<String, String>()
     // last assistant message of the current turn, per pane — the
     // turn-end notification carries it so the ping lands on the LAST
     // message (with the actual reply), not the first
@@ -67,6 +70,7 @@ class Notify(private val app: App) {
         lastSeq.clear()
         primed.clear()
         turnLast.clear()
+        paneSession.clear()
     }
 
     /** Call for EVERY frame received. Never throws. */
@@ -79,10 +83,11 @@ class Notify(private val app: App) {
                 "AgentAskRequest" -> {
                     framesSeen++
                     lastFrameAt = System.currentTimeMillis()
+                    rememberSession(f)
                     val askId = f.optString("ask_id")
                     if (askId.isNotEmpty() && notifiedAsks.add(askId)) {
                         val q = f.optString("question").take(110)
-                        notify("questions", sessionName, "agent question: $q", sessionName)
+                        notify("questions", sessionName, "agent question: $q", sessionName, f.optString("pane"))
                     }
                 }
                 "AgentAskAnswer" -> f.optString("ask_id").takeIf { it.isNotEmpty() }?.let(notifiedAsks::remove)
@@ -93,12 +98,20 @@ class Notify(private val app: App) {
         }
     }
 
+    /** Remember pane -> session from any frame that carries both. */
+    private fun rememberSession(f: JSONObject) {
+        val pane = f.optString("pane")
+        val sid = f.optString("session")
+        if (pane.isNotEmpty() && sid.isNotEmpty()) paneSession[pane] = sid
+    }
+
     private fun onMeta(f: JSONObject, name: String) {
         if (f.optString("kind") != "agent") return
         val pane = f.optString("pane")
         if (pane.isEmpty()) return
         framesSeen++
         lastFrameAt = System.currentTimeMillis()
+        rememberSession(f)
         val status = f.optString("status")
         when {
             status == "working" -> {
@@ -111,7 +124,7 @@ class Notify(private val app: App) {
                     ?.replace(Regex("\\s+"), " ")
                     ?.take(160)
                     ?: "agent finished its turn"
-                notify("turn_end", name, body, name)
+                notify("turn_end", name, body, name, pane)
             }
         }
     }
@@ -119,6 +132,7 @@ class Notify(private val app: App) {
     private fun onChat(f: JSONObject, name: String) {
         framesSeen++
         lastFrameAt = System.currentTimeMillis()
+        rememberSession(f)
         val pane = f.optString("pane")
         val msgs = f.optJSONArray("msgs") ?: return
         if (msgs.length() == 0) return
@@ -155,7 +169,7 @@ class Notify(private val app: App) {
                     // because the error IS the turn-end news
                     busy[pane] = false
                     turnLast.remove(pane)
-                    notify("errors", name, "agent error: " + text.replace(Regex("\\s+"), " ").take(120), name)
+                    notify("errors", name, "agent error: " + text.replace(Regex("\\s+"), " ").take(120), name, pane)
                 }
                 role == "assistant" && text.trim().isNotEmpty() -> {
                     if (turnEnd) {
@@ -164,16 +178,16 @@ class Notify(private val app: App) {
                         // open the app, and the final reply never notifies
                         turnLast[pane] = text
                     } else {
-                        notify("every_message", name, text.replace(Regex("\\s+"), " ").take(120), name)
+                        notify("every_message", name, text.replace(Regex("\\s+"), " ").take(120), name, pane)
                     }
                 }
                 role == "tool" && !ignoreToolCalls && !turnEnd ->
-                    notify("every_message", name, "tool: " + m.optString("tool_name", "tool"), name)
+                    notify("every_message", name, "tool: " + m.optString("tool_name", "tool"), name, pane)
             }
         }
     }
 
-    private fun notify(kind: String, title: String, body: String, tag: String): Boolean {
+    private fun notify(kind: String, title: String, body: String, tag: String, pane: String? = null): Boolean {
         return try {
         val enabled = when (kind) {
             "turn_end" -> turnEnd
@@ -184,7 +198,7 @@ class Notify(private val app: App) {
         }
         if (!enabled) { skippedOff++; return false }
         if (app.isForeground) { skippedActive++; return false }
-        postLocal(title, body, tag)
+        postLocal(title, body, tag, pane)
         when (kind) {
             "turn_end" -> firedTurn++
             "every_message" -> firedMessage++
@@ -202,7 +216,7 @@ class Notify(private val app: App) {
     fun testNotification(): Pair<Boolean, String> {
         return try {
         if (!nm.areNotificationsEnabled()) return Pair(false, "notifications disabled on device")
-        postLocal("ranch", "test notification — if you see this, notifications work", "test")
+        postLocal("ranch", "test notification — if you see this, notifications work", "test", null)
         Pair(true, "sent — pull down the notification shade")
     } catch (e: Exception) {
         errors++
@@ -210,9 +224,21 @@ class Notify(private val app: App) {
     }
     }
 
-    private fun postLocal(title: String, body: String, tag: String) {
+    private fun postLocal(title: String, body: String, tag: String, pane: String?) {
+        // deep link: tapping opens the conversation that fired this —
+        // MainActivity consumes the extras once the monitor is up
+        val intent = Intent(app, MainActivity::class.java)
+        val sid = pane?.let { paneSession[it] }
+        if (!sid.isNullOrEmpty()) {
+            // prefer the real session display name over the machine name
+            val sname = Monitor.sessions.firstOrNull { it.id == sid }?.name
+                .takeUnless { it.isNullOrEmpty() } ?: title
+            intent.putExtra("open_session", sid)
+            intent.putExtra("open_session_name", sname)
+        }
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         val openIntent = PendingIntent.getActivity(
-            app, 0, Intent(app, MainActivity::class.java),
+            app, tag.hashCode(), intent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
         val builder = Notification.Builder(app, "ranch")

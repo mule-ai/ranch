@@ -601,7 +601,19 @@ fn ws_session(
                 pending.extend_from_slice(&buf[..r as usize]);
                 while let Some(nl) = pending.iter().position(|&b| b == b'\n') {
                     let line: Vec<u8> = pending.drain(..=nl).collect();
-                    let line = std::str::from_utf8(&line[..line.len() - 1]).unwrap_or("");
+                    let body = &line[..line.len() - 1];
+                    let line = match std::str::from_utf8(body) {
+                        Ok(l) => l,
+                        Err(_) => {
+                            clog(&format!(
+                                "relay: DROPPED non-utf8 line ({} bytes) head={:?} tail={:?}",
+                                body.len(),
+                                &body[..body.len().min(64)],
+                                &body[body.len().saturating_sub(64)..],
+                            ));
+                            continue;
+                        }
+                    };
                     if line.is_empty() {
                         continue;
                     }
@@ -617,7 +629,21 @@ fn ws_session(
                             });
                             ws_send(&mut ws, &msg.to_string())?;
                         }
-                        Err(_) => clog("relay: dropping unparseable daemon frame"),
+                        Err(e) => {
+                            let head: &str = line.get(..96).unwrap_or(line);
+                            let tail_from = line.len().saturating_sub(96);
+                            let tail: &str = line.get(tail_from..).unwrap_or("");
+                            clog(&format!(
+                                "relay: dropping unparseable daemon frame: head={head:?} tail={tail:?} err={e}"
+                            ));
+                            // TEMP diagnostics: dump the full corrupt line
+                            // (without its trailing newline) for inspection.
+                            let _ = std::fs::OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open("/tmp/ranch-corrupt-lines.log")
+                                .and_then(|mut f| std::io::Write::write_all(&mut f, body));
+                        }
                     }
                 }
             }

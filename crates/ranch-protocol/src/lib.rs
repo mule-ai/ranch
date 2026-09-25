@@ -388,6 +388,19 @@ pub enum Frame {
         #[serde(default)]
         attachments: Vec<String>,
     },
+    /// Client -> daemon: interrupt the in-flight agent turn of a chat
+    /// pane. Immediate and non-destructive: the session, conversation
+    /// history, and (local-pi) agent process all survive. Local-pi
+    /// panes get pi's `abort` RPC; forge-backed panes hit forge's
+    /// `POST /sessions/{id}/interrupt`. A no-op when the agent is
+    /// idle. Confirmation is out-of-band: a system chat row ("⏹ …")
+    /// plus the usual `meta { kind: "agent", status: "idle" }`.
+    Interrupt {
+        id: String,
+        client: String,
+        session: String,
+        pane: String,
+    },
     /// Daemon -> client: conversation rows for a forge-chat pane.
     /// `reset` replaces whatever the client has (snapshot semantics);
     /// otherwise `msgs` are appends in sequence order.

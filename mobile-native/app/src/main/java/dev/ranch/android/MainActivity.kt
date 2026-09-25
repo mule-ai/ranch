@@ -16,6 +16,7 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import org.json.JSONObject
 import java.util.concurrent.Executors
 
 /**
@@ -46,6 +47,18 @@ class MainActivity : Activity() {
     private val machines = mutableListOf<Machine>()
     private var update: Version.Update? = null
 
+    // New-agent dialog + working-directory picker (RN parity)
+    private var agentKind = "pi"
+    private var agentDir = ""          // "" = $HOME (daemon default)
+    private var pickerDialog: android.app.AlertDialog? = null
+    private var pickerPath = ""
+    private var pickerParent: String? = null
+    private var pickerPathText: TextView? = null
+    private var pickerList: LinearLayout? = null
+    private var pickerUp: Button? = null
+    private var dirReqId: String? = null
+    private var frameSink: ((JSONObject) -> Unit)? = null
+
     private val refreshRunnable = object : Runnable {
         override fun run() {
             refreshSessions()
@@ -56,6 +69,7 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         monitorWanted = Monitor.running
+        pendingOpen = pendingFromIntent(intent)
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(0xFF101418.toInt())
@@ -74,8 +88,29 @@ class MainActivity : Activity() {
 
     override fun onNewIntent(i: Intent) {
         super.onNewIntent(i)
+        pendingFromIntent(i)?.let { pendingOpen = it }
         handleAuthIntent(i)
         renderState()
+    }
+
+    // ---- notification deep link ----
+    // Notifications carry open_session/open_session_name; once the
+    // monitor is up we drop the user straight into that conversation.
+    private var pendingOpen: Pair<String, String>? = null
+
+    private fun pendingFromIntent(i: Intent?): Pair<String, String>? {
+        val sid = i?.getStringExtra("open_session") ?: return null
+        if (sid.isEmpty()) return null
+        return sid to (i.getStringExtra("open_session_name") ?: "")
+    }
+
+    private fun maybeAutoOpen() {
+        val p = pendingOpen ?: return
+        if (!Monitor.running) return   // retry on the refresh tick once connected
+        pendingOpen = null
+        startActivity(Intent(this, SessionActivity::class.java)
+            .putExtra("sessionId", p.first)
+            .putExtra("sessionName", p.second))
     }
 
     override fun onResume() {
@@ -102,6 +137,9 @@ class MainActivity : Activity() {
     override fun onDestroy() {
         handler.removeCallbacksAndMessages(null)
         exec.shutdownNow()
+        frameSink?.let { Monitor.relay?.removeSink(it) }
+        frameSink = null
+        pickerDialog = null
         super.onDestroy()
     }
 
@@ -270,6 +308,7 @@ class MainActivity : Activity() {
 
     // ---- 3. monitor home ----
     private fun renderMonitorHome() {
+        ensureFrameSink()
         val head = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
         head.addView(TextView(this).apply {
             text = "🤠 ${Monitor.machineName.ifEmpty { "monitor" }}"
@@ -302,18 +341,23 @@ class MainActivity : Activity() {
             setPadding(0, dp(12), 0, dp(4))
         })
         val newSessionRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        for ((label, kind) in listOf("+ shell" to "shell", "+ agent" to "pi")) {
-            newSessionRow.addView(Button(this).apply {
-                text = label
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
-                setPadding(dp(8), dp(8), dp(8), dp(8))
-                layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-                setOnClickListener {
-                    Monitor.relay?.createSession(kind)
-                    homeStatus?.text = "creating $kind session…"
-                }
-            })
-        }
+        newSessionRow.addView(Button(this).apply {
+            text = "+ shell"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            setPadding(dp(8), dp(8), dp(8), dp(8))
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            setOnClickListener {
+                Monitor.relay?.createSession("shell")
+                homeStatus?.text = "creating shell session…"
+            }
+        })
+        newSessionRow.addView(Button(this).apply {
+            text = "+ agent"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            setPadding(dp(8), dp(8), dp(8), dp(8))
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            setOnClickListener { showNewAgentDialog() }
+        })
         stateBox.addView(newSessionRow)
         val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         sessionsBox = box
@@ -326,6 +370,8 @@ class MainActivity : Activity() {
             setPadding(0, dp(16), 0, dp(8))
             setOnClickListener { startActivity(Intent(this@MainActivity, SettingsActivity::class.java)) }
         })
+
+        maybeAutoOpen()
     }
 
     private fun refreshSessions() {
@@ -352,6 +398,176 @@ class MainActivity : Activity() {
                         .putExtra("sessionId", s.id)
                         .putExtra("sessionName", s.name))
                 }
+            })
+        }
+        maybeAutoOpen()
+    }
+
+    // ---- new agent dialog: kind + name + working-dir picker (RN parity) ----
+
+    private fun ensureFrameSink() {
+        val relay = Monitor.relay ?: return
+        if (frameSink != null) return
+        val sink: (JSONObject) -> Unit = { f ->
+            if (f.optString("t") == "DirListOk") handler.post { onDirListOk(f) }
+        }
+        frameSink = sink
+        relay.addSink(sink)
+    }
+
+    private fun showNewAgentDialog() {
+        val relay = Monitor.relay ?: return
+        ensureFrameSink()
+        agentDir = ""
+        agentKind = "pi"
+
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(12), dp(16), dp(8))
+        }
+        val kindRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        var piChip: Button? = null
+        var forgeChip: Button? = null
+        var dirRow: LinearLayout? = null
+        piChip = agentChip("π local pi") {
+            agentKind = "pi"; styleAgentChips(piChip!!, forgeChip!!, dirRow!!)
+        }
+        forgeChip = agentChip("🤖 forge") {
+            agentKind = "forge"; styleAgentChips(piChip!!, forgeChip!!, dirRow!!)
+        }
+        kindRow.addView(piChip)
+        kindRow.addView(forgeChip)
+        root.addView(kindRow)
+
+        val nameEdit = EditText(this).apply {
+            hint = "name (optional)"
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+        }
+        root.addView(nameEdit, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        ).apply { setMargins(0, dp(8), 0, 0) })
+
+        dirRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(0, dp(8), 0, 0)
+        }
+        var dirChip: Button? = null
+        dirChip = agentChip("dir: \$HOME") { showDirPicker(dirChip!!) }
+        dirRow!!.addView(dirChip!!)
+        root.addView(dirRow)
+
+        styleAgentChips(piChip!!, forgeChip!!, dirRow!!)
+
+        android.app.AlertDialog.Builder(this)
+            .setTitle("New agent session")
+            .setView(root)
+            .setPositiveButton("create") { _, _ ->
+                val name = nameEdit.text.toString().trim().ifEmpty { null }
+                val cwd = if (agentKind == "pi") agentDir.ifEmpty { null } else null
+                relay.send(Term.sessionsCreate(agentKind, name, cwd))
+                homeStatus?.text = "creating $agentKind session…"
+            }
+            .setNegativeButton("cancel", null)
+            .show()
+    }
+
+    private fun styleAgentChips(piChip: Button, forgeChip: Button, dirRow: LinearLayout) {
+        val isPi = agentKind == "pi"
+        styleChip(piChip, isPi)
+        styleChip(forgeChip, !isPi)
+        dirRow.visibility = if (isPi) View.VISIBLE else View.GONE
+    }
+
+    private fun styleChip(b: Button, on: Boolean) {
+        b.setTextColor(if (on) 0xFFFFFFFF.toInt() else 0xFF7FD4FF.toInt())
+        b.setBackgroundColor(if (on) 0xFF1B6FD4.toInt() else 0xFF1B2126.toInt())
+    }
+
+    private fun agentChip(label: String, click: () -> Unit): Button = Button(this).apply {
+        text = label
+        setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+        setPadding(dp(10), dp(6), dp(10), dp(6))
+        minWidth = 0
+        setOnClickListener { click() }
+    }
+
+    private fun showDirPicker(dirChip: Button) {
+        val relay = Monitor.relay ?: return
+        ensureFrameSink()
+        pickerPath = ""
+        pickerParent = null
+
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(8), dp(16), dp(8))
+        }
+        pickerPathText = TextView(this).apply {
+            text = "\$HOME"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            setTextColor(0xFFE5E5E5.toInt())
+            setPadding(0, 0, 0, dp(6))
+        }
+        root.addView(pickerPathText!!)
+
+        pickerList = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        root.addView(ScrollView(this).apply { addView(pickerList!!) },
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(220)
+            ).apply { setMargins(0, 0, 0, dp(8)) })
+
+        val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val up = agentChip("up…") { pickerParent?.let { browseDir(it) } }
+        row.addView(up)
+        row.addView(agentChip("use this dir") {
+            agentDir = pickerPath
+            dirChip.text = "dir: " + (agentDir.ifEmpty { "\$HOME" })
+            pickerDialog?.dismiss()
+        })
+        row.addView(agentChip("cancel") { pickerDialog?.dismiss() })
+        root.addView(row)
+        this@MainActivity.pickerUp = up
+
+        pickerDialog = android.app.AlertDialog.Builder(this)
+            .setTitle("choose working directory")
+            .setView(root)
+            .create()
+        pickerDialog?.show()
+        browseDir(null)
+    }
+
+    private fun browseDir(path: String?) {
+        val relay = Monitor.relay ?: return
+        val frame = Term.dirList(path)
+        dirReqId = frame.optString("req_id")
+        relay.send(frame)
+    }
+
+    private fun onDirListOk(f: JSONObject) {
+        if (f.optString("req_id") != dirReqId) return
+        dirReqId = null
+        pickerPath = f.optString("path")
+        pickerParent = f.optString("parent").takeIf { it.isNotEmpty() }
+        val dirs = f.optJSONArray("dirs")
+            ?.let { a -> (0 until a.length()).map { a.optString(it) } } ?: emptyList()
+        pickerPathText?.text = pickerPath
+        pickerUp?.visibility = if (pickerParent != null) View.VISIBLE else View.GONE
+        val list = pickerList ?: return
+        list.removeAllViews()
+        if (dirs.isEmpty()) {
+            list.addView(TextView(this).apply {
+                text = "no subdirectories"
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+                setTextColor(0xFF6B7280.toInt())
+            })
+        }
+        for (d in dirs) {
+            list.addView(Button(this).apply {
+                text = "$d/"
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+                setTextColor(0xFFE5E5E5.toInt())
+                setPadding(dp(8), dp(8), dp(8), dp(8))
+                setOnClickListener { browseDir("$pickerPath/$d") }
             })
         }
     }

@@ -52,11 +52,12 @@ object Term {
             .put("t", "ChatSend").put("id", newId()).put("client", CLIENT)
             .put("session", session).put("pane", pane).put("text", text)
 
-    fun sessionsCreate(kind: String = "shell", name: String? = null): JSONObject {
+    fun sessionsCreate(kind: String = "shell", name: String? = null, cwd: String? = null): JSONObject {
         val o = JSONObject()
             .put("t", "SessionsCreate").put("req_id", newId()).put("client", CLIENT)
             .put("kind", kind)
         if (name != null) o.put("name", name)
+        if (cwd != null && cwd.isNotEmpty()) o.put("cwd", cwd)
         return o
     }
 
