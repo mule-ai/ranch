@@ -396,3 +396,11 @@ targets). MainActivity consumes the extras in onCreate/onNewIntent and
 auto-opens the session once the monitor is up (retry on the 2s refresh
 tick; cold start = login → machine pick → auto-open). Session title
 resolved from Monitor.sessions. v0.7.5 / versionCode 19.
+
+## CI fix (2026-09-25)
+
+Commit 57bc252 swept in the uncommitted non-blocking relay-write work
+(write_pipe_nb/PipeWrite/backlog). CI's rustc rejected
+`Ok(n) if n > 0` + `Ok(0)` as non-exhaustive (guarded arms don't count
+toward coverage) — reordered to an unguarded `Ok(n)` arm and made the
+fn take &mut File. Daemon hot-upgraded.

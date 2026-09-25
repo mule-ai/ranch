@@ -1182,15 +1182,18 @@ enum PipeWrite {
 /// child, etc.) AFTER the kernel already wrote some bytes; re-queueing
 /// the whole buffer in that case duplicates the in-flight prefix and the
 /// relay sees a corrupted line ("dropping unparseable daemon frame").
-fn write_pipe_nb(w: &std::fs::File, bytes: &[u8]) -> Result<PipeWrite, std::io::Error> {
+fn write_pipe_nb(w: &mut std::fs::File, bytes: &[u8]) -> Result<PipeWrite, std::io::Error> {
     let mut off = 0;
     loop {
         if off == bytes.len() {
             return Ok(PipeWrite::Complete);
         }
         match w.write(&bytes[off..]) {
-            Ok(n) if n > 0 => off += n,
+            // unguarded Ok arm — guarded arms don't count toward
+            // exhaustiveness and CI's rustc rejects `Ok(n) if n > 0` +
+            // `Ok(0)` as non-exhaustive
             Ok(0) => return Ok(PipeWrite::Partial(off)),
+            Ok(n) => off += n,
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 return Ok(PipeWrite::Partial(off));
             }
