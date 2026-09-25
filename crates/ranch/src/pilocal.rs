@@ -734,7 +734,17 @@ pub fn read_session_messages(path: &str) -> Result<Vec<ChatMsg>, String> {
             let s = g
                 .as_mut()
                 .ok_or_else(|| "pi stdin already taken".to_string())?;
-            let line = serde_json::json!({"type": "prompt", "message": agent_text}).to_string();
+            // `streamingBehavior: "steer"` queues a mid-turn prompt as a
+            // steering message (delivered at the next turn boundary, run
+            // continues) instead of being rejected with "Agent is already
+            // processing". When the agent is idle it is ignored — a plain
+            // prompt. Optional field since pi 0.32.2.
+            let line = serde_json::json!({
+                "type": "prompt",
+                "message": agent_text,
+                "streamingBehavior": "steer",
+            })
+            .to_string();
             s.write_all(line.as_bytes())
                 .and_then(|_| s.write_all(b"\n"))
                 .and_then(|_| s.flush())
@@ -1154,6 +1164,29 @@ fn run_pi_reader(
                                 msgs,
                                 reset: true,
                             },
+                        );
+                    }
+                } else if v.get("command").and_then(|c| c.as_str()) == Some("prompt") {
+                    // A REJECTED prompt must not vanish: `prompt()` has
+                    // already emitted the optimistic user row + "working"
+                    // status, so without this row every client (TUI + both
+                    // mobile apps) would show a message the agent never
+                    // received. With streamingBehavior this is now rare
+                    // (extension/hook commands, malformed input).
+                    let success = v.get("success").and_then(|s| s.as_bool()).unwrap_or(false);
+                    if !success {
+                        let msg = v
+                            .get("error")
+                            .and_then(|e| e.as_str())
+                            .unwrap_or("message rejected")
+                            .to_string();
+                        eprintln!("ranchd: local pi {t_pane} prompt rejected: {msg}");
+                        emit_chat(
+                            &pipe,
+                            t_pane,
+                            "assistant",
+                            &format!("⚠ message not delivered: {msg}"),
+                            now_iso(),
                         );
                     }
                 }
