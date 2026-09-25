@@ -106,7 +106,7 @@ pub enum ForgeJob {
     /// Interrupt the in-flight turn (POST /sessions/:id/interrupt).
     /// Immediate and non-destructive; the forge system row + idle status
     /// ride back on the SSE watch, so no reply frame is needed.
-    Interrupt { pane: Uuid, forge_sid: Uuid },
+    Interrupt { forge_sid: Uuid },
     // ----- agent builder (Phase B): profile CRUD proxy -----
     /// The pi model catalog (GET /v1/models/catalog) for profile forms.
     ModelCatalog { req_id: String },
@@ -673,7 +673,7 @@ pub fn spawn_worker(cfg: ForgeConfig, pipe_w: std::fs::File, rx: mpsc::Receiver<
                             }
                         }
                     }
-                    ForgeJob::Interrupt { pane, forge_sid } => {
+                    ForgeJob::Interrupt { forge_sid } => {
                         let path = format!("/sessions/{forge_sid}/interrupt");
                         match http_json(&cfg, "POST", &path, Some(&serde_json::json!({}))) {
                             Ok(_) => {

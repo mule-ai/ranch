@@ -1307,6 +1307,20 @@ function Terminal({
                   }
                 }}
               />
+              {panes.get(activePane)?.agentBusy && (
+                <button
+                  title="Stop the agent's current turn"
+                  onClick={() =>
+                    relay.send({
+                      t: "Interrupt", id: nextId(), client: "web",
+                      session: sessionId, pane: activePane,
+                    } as Frame)
+                  }
+                  style={{ background: '#3a1a1a', border: '1px solid #f66', borderRadius: 4, color: '#f88', cursor: 'pointer', fontSize: '0.85rem', padding: '2px 10px', whiteSpace: 'nowrap' }}
+                >
+                  ⏹ stop
+                </button>
+              )}
             </div>
           </div>
           {attachBrowse !== undefined && attachBrowse !== null && chatMode && (

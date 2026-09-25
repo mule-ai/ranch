@@ -415,3 +415,26 @@ follows the daemon again). Also: notification title is now the session
 name (was the machine name) and the shade tag is the session id —
 notifications from different agents stack instead of clobbering.
 v0.7.6 / versionCode 20.
+
+## Stop agent: immediate, non-destructive turn interrupt (2026-09-25)
+
+New `Interrupt` frame (client → daemon) halts the in-flight turn of a
+chat pane without killing anything: local-pi panes get pi's `abort`
+RPC ("abort current operation, wait for idle") and the daemon emits a
+`⏹ interrupted` system row; forge-backed panes POST to forge's new
+`POST /sessions/{id}/interrupt`. The forge side writes the abort RPC
+to pi's SHARED stdin (`SharedPiAgent::stdin`) — it deliberately bypasses
+the per-session agent `Mutex`, which `drive_turn` holds for the whole
+turn, so the interrupt never blocks on the turn it is trying to stop.
+Idle interrupts are no-ops (no row); the stop is immediate and the
+session, history, and pi process all survive.
+
+Clients: native mobile `⏹ stop` button in the composer (visible while
+the pane's `meta {kind:"agent", status:"working"}` says busy; hides
+optimistically on tap), web `⏹ stop` button beside the composer input
+(same agentBusy state), TUI `:stop` command and chat `/stop`.
+Confirmation is out-of-band: the system row + the usual
+`meta status:"idle"`.
+
+Also swept the two TEMP relay diagnostics out of `send_frame`/
+`write_pipe_nb` (the /tmp frame log and the EINTR eprintln).

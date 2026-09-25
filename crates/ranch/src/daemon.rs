@@ -20,7 +20,7 @@
 
 
 use std::collections::{BTreeMap, VecDeque};
-use std::io::{BufRead, Read, Write};
+use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -1136,16 +1136,6 @@ fn send_frame(c: &mut Client, frame: &Frame) {
         let res = match (&mut c.stream, &mut c.relay_out) {
             (Some(s), _) => s.write_all(&bytes),
             (None, Some(w)) => {
-                // TEMP diagnostics: record exactly what goes onto the pipe
-                if let Ok(mut f) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open("/tmp/ranch-daemon-sent.log")
-                {
-                    use std::io::Write;
-                    let _ = f.write_all(&bytes);
-                    let _ = f.flush();
-                }
                 // Relay pipe: NON-BLOCKING. A blocking write_all here is
                 // how a wedged relay thread froze the entire daemon
                 // (2026-09-23): pipe full -> main loop parked in
@@ -1207,16 +1197,7 @@ fn write_pipe_nb(w: &mut std::fs::File, bytes: &[u8]) -> Result<PipeWrite, std::
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 return Ok(PipeWrite::Partial(off));
             }
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
-                // TEMP: confirm EINTR-with-progress is what we're hitting
-                if off > 0 {
-                    eprintln!(
-                        "ranchd: relay-pipe EINTR after {off}/{} bytes — retrying from offset",
-                        bytes.len()
-                    );
-                }
-                continue
-            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e),
         }
     }
@@ -3147,7 +3128,6 @@ impl Daemon {
                             }
                         } else if let Some(tx) = &self.forge_tx {
                             let _ = tx.send(forge::ForgeJob::Interrupt {
-                                pane: pid,
                                 forge_sid: cp.forge_sid,
                             });
                         }

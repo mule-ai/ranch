@@ -3446,6 +3446,7 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                     "  :model         switch the agent's model",
                     "  :compact       compact the agent's context now",
                     "  (in chat, /compact works too)",
+                    "  :stop          stop the agent's current turn (chat: /stop)",
                     "  :rename <name> rename this session",
                     "  :kill-pane     close the focused pane (also Ctrl-B x)",
                     "  :scrollback    pane history ring (also Ctrl-B [)",
@@ -5171,6 +5172,33 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                                                     prompt_input.clear();
                                                     continue;
                                                 }
+                                                // :stop — immediately interrupt the focused
+                                                // agent (chat) pane's in-flight turn
+                                                if prompt_input.trim() == "stop" {
+                                                    let is_chat = pane_views
+                                                        .get(&active_pane)
+                                                        .is_some_and(|pv| pv.is_chat());
+                                                    if is_chat {
+                                                        let f = Frame::Interrupt {
+                                                            id: Uuid::new_v4().to_string(),
+                                                            client: "attach".into(),
+                                                            session: session_id.clone(),
+                                                            pane: active_pane.clone(),
+                                                        };
+                                                        send_frame(&mut stream, &f).ok();
+                                                        err_flash.set(Some((
+                                                            std::time::Instant::now(),
+                                                            "interrupting…".into(),
+                                                        )));
+                                                    } else {
+                                                        err_flash.set(Some((
+                                                            std::time::Instant::now(),
+                                                            "stop: not an agent (chat) pane".into(),
+                                                        )));
+                                                    }
+                                                    prompt_input.clear();
+                                                    continue;
+                                                }
                                                 if let Some(rest) =
                                                     prompt_input.trim().strip_prefix("agent")
                                                 {
@@ -5466,6 +5494,20 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                                         err_flash.set(Some((
                                             std::time::Instant::now(),
                                             "compacting…".into(),
+                                        )));
+                                    } else if raw == "/stop" {
+                                        // same as the :stop command /
+                                        // web's stop button
+                                        let f = Frame::Interrupt {
+                                            id: Uuid::new_v4().to_string(),
+                                            client: "attach".into(),
+                                            session: session_id.clone(),
+                                            pane: active_pane.clone(),
+                                        };
+                                        send_frame(&mut stream, &f).ok();
+                                        err_flash.set(Some((
+                                            std::time::Instant::now(),
+                                            "interrupting…".into(),
                                         )));
                                     } else if !raw.is_empty() {
                                         // Extract @/path/to/file references as

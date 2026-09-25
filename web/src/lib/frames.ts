@@ -241,6 +241,7 @@ export type Frame =
   | { t: "PiMonitorOk"; req_id: string; enabled: boolean }
   | { t: "ChatSend"; id: string; client: string; session: string; pane: string; text: string; attachments?: string[] }
   | { t: "ChatCompact"; id: string; client: string; session: string; pane: string; req_id: string }
+  | { t: "Interrupt"; id: string; client: string; session: string; pane: string }
   | { t: "Chat"; id: string; session: string; pane: string; msgs: ChatMsg[]; reset?: boolean }
   | { t: "ChatHistory"; id: string; client: string; session: string; pane: string; req_id: string; limit: number; before?: number | null }
   | { t: "ChatHistoryOk"; req_id: string; pane: string; msgs: ChatMsg[]; has_more: boolean }
