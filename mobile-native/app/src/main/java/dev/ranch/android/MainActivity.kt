@@ -58,6 +58,10 @@ class MainActivity : Activity() {
     private var pickerUp: Button? = null
     private var dirReqId: String? = null
     private var frameSink: ((JSONObject) -> Unit)? = null
+    // the RelaySession the sink is registered on — Monitor.start() replaces
+    // the session (stop + re-pick, service restart), and a stale reference
+    // would silently stop receiving DirListOk (empty directory picker)
+    private var frameSinkRelay: RelaySession? = null
 
     private val refreshRunnable = object : Runnable {
         override fun run() {
@@ -139,8 +143,9 @@ class MainActivity : Activity() {
     override fun onDestroy() {
         handler.removeCallbacksAndMessages(null)
         exec.shutdownNow()
-        frameSink?.let { Monitor.relay?.removeSink(it) }
+        frameSink?.let { frameSinkRelay?.removeSink(it) }
         frameSink = null
+        frameSinkRelay = null
         pickerDialog = null
         super.onDestroy()
     }
@@ -409,11 +414,14 @@ class MainActivity : Activity() {
 
     private fun ensureFrameSink() {
         val relay = Monitor.relay ?: return
-        if (frameSink != null) return
+        if (frameSink != null && frameSinkRelay === relay) return
+        // re-register on the new session (drop the stale one first)
+        frameSink?.let { old -> frameSinkRelay?.removeSink(old) }
         val sink: (JSONObject) -> Unit = { f ->
             if (f.optString("t") == "DirListOk") handler.post { onDirListOk(f) }
         }
         frameSink = sink
+        frameSinkRelay = relay
         relay.addSink(sink)
     }
 
