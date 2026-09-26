@@ -38,6 +38,8 @@ pub(crate) mod agenttools;
 pub mod control_api;
 #[path = "mule.rs"]
 mod mule;
+#[path = "media.rs"]
+pub(crate) mod media;
 #[path = "triggers.rs"]
 mod triggers;
 
@@ -791,22 +793,39 @@ pub fn build_version() -> String {
         .unwrap_or_else(|| "dev".into())
 }
 
-/// Read each attached file (capped at 50 KiB per file) and build an
-/// augmented prompt: the file contents are prepended so the agent can
-/// see them immediately without a tool call.
-fn build_attached_prompt(text: &str, attachments: &[String]) -> String {
+/// Plan a `ChatSend`'s attachments:
+///
+/// - *text* files are inlined into the prompt (capped at 50 KiB each)
+///   so the agent can act on them without an extra read round-trip;
+/// - *image* files are loaded as base64 payloads for pi's vision
+///   inlining and registered in the media registry so clients can
+///   render them from `ChatMsg.image_refs`;
+/// - oversized/unreadable images degrade to a note in the prompt (the
+///   path is still registered, so the row stays viewable via FileGet).
+fn plan_attachments(text: &str, attachments: &[String]) -> (String, Vec<media::PiImage>) {
     if attachments.is_empty() {
-        return text.to_string();
+        return (text.to_string(), Vec::new());
     }
     let mut out = String::new();
+    let mut images = Vec::new();
     for path in attachments {
+        if media::is_image_path(path) {
+            media::register(path);
+            match media::load_image(path) {
+                Ok(img) => images.push(img),
+                Err(e) => out.push_str(&format!(
+                    "[Attached image: {} \u{2014} {}]\n", path, e
+                )),
+            }
+            continue;
+        }
         let p = std::path::Path::new(path);
         match std::fs::read(p) {
             Ok(bytes) => {
                 let cap = 50 * 1024; // 50 KiB
                 let content = if bytes.len() > cap {
                     let mut truncated = String::from_utf8_lossy(&bytes[..cap]).into_owned();
-                    truncated.push_str("\n… [truncated at 50 KiB]");
+                    truncated.push_str("\n\u{2026} [truncated at 50 KiB]");
                     truncated
                 } else {
                     String::from_utf8_lossy(&bytes).into_owned()
@@ -818,13 +837,12 @@ fn build_attached_prompt(text: &str, attachments: &[String]) -> String {
 \n", name, bytes.len(), content));
             }
             Err(e) => {
-                out.push_str(&format!("[Attached file: {} — read error: {}]
-\n", path, e));
+                out.push_str(&format!("[Attached file: {} \u{2014} read error: {}]\n", path, e));
             }
         }
     }
     out.push_str(text);
-    out
+    (out, images)
 }
 
 fn home_dir_string() -> String {
@@ -1728,7 +1746,7 @@ impl Daemon {
             Some(fsid) if fsid.is_nil() => {
                 if let Some(lp) = self.pi_agents.get(&pid) {
                     if let Some(pipe_w) = &self.forge_pipe_w {
-                        if let Err(e) = lp.prompt(pipe_w, text, text, &[]) {
+                        if let Err(e) = lp.prompt(pipe_w, text, text, &[], &[]) {
                             eprintln!("ranchd: pi prompt failed: {e}");
                         }
                     }
@@ -3080,25 +3098,40 @@ impl Daemon {
                 let Ok(pid) = Uuid::parse_str(pane) else {
                     return;
                 };
-                // Inline attached file content into the agent's prompt so
-                // the agent can act on it without an extra read round-trip.
-                let augmented = build_attached_prompt(&text, &attachments);
+                // Inline attached text-file content into the prompt; image
+                // attachments become vision payloads (pi) or path notes
+                // (forge) — see plan_attachments.
+                let (augmented, images) = plan_attachments(&text, &attachments);
                 if let Some(s) = self.sessions.get(&sid) {
                     if let Some(cp) = s.chats.get(&pid) {
                         if cp.forge_sid.is_nil() {
                             // local pi backing: prompt the child directly
+                            // (images inline via the RPC `images` field)
                             if let Some(lp) = self.pi_agents.get(&pid) {
                                 if let Some(pipe_w) = &self.forge_pipe_w {
-                                    if let Err(e) = lp.prompt(pipe_w, &augmented, &text, &attachments) {
+                                    if let Err(e) = lp.prompt(pipe_w, &augmented, &text, &attachments, &images) {
                                         eprintln!("ranchd: pi prompt failed: {e}");
                                     }
                                 }
                             }
                         } else if let Some(tx) = &self.forge_tx {
+                            // forge's POST /messages is text-only: the
+                            // agent sees the image via its Read tool, so
+                            // hand it the paths
+                            let text = if images.is_empty() {
+                                augmented
+                            } else {
+                                let mut t = String::with_capacity(augmented.len() + 128 * images.len());
+                                for img in &images {
+                                    t.push_str(&format!("[Attached image: {} ({} — view it with your Read tool)]\n", img.path, img.mime));
+                                }
+                                t.push_str(&augmented);
+                                t
+                            };
                             let _ = tx.send(forge::ForgeJob::Send {
                                 pane: pid,
                                 forge_sid: cp.forge_sid,
-                                text: augmented,
+                                text,
                             });
                         }
                     }
@@ -3794,6 +3827,8 @@ impl Daemon {
                 match std::fs::write(&dest, &bytes) {
                     Ok(()) => {
                         eprintln!("ranchd: FilePut stored {} ({} bytes) at {}", name, bytes.len(), dest.display());
+                        // uploads are viewable media (images among them)
+                        media::register(dest.to_string_lossy().as_ref());
                         if let Some(c) = self.clients.get_mut(&from) {
                             send_frame(
                                 c,
@@ -3808,6 +3843,53 @@ impl Daemon {
                     }
                     Err(e) => reply_err(format!("could not write upload: {e}")),
                 }
+            }
+            // client -> agent surface: fetch image bytes for rendering.
+            // Only registered media paths (uploads / chat attachments /
+            // agent-read images) and actual images — this is the ONLY
+            // byte-level read remote clients get from the daemon.
+            Frame::FileGet { req_id, path, .. } => {
+                let mut get_reply = |f: Frame| {
+                    if let Some(c) = self.clients.get_mut(&from) {
+                        send_frame(c, &f);
+                    }
+                };
+                let mut err_reply = |msg: String| {
+                    get_reply(Frame::Error { req_id: Some(req_id.clone()), message: msg })
+                };
+                if !media::is_registered(path) {
+                    err_reply(format!("{path}: not a registered media path"));
+                    return;
+                }
+                let mime = match media::sniff_mime(path) {
+                    Some(m) => m,
+                    None => {
+                        err_reply(format!("{path}: not a readable image"));
+                        return;
+                    }
+                };
+                const CAP: u64 = 16 * 1024 * 1024; // 16 MiB
+                let bytes = match std::fs::read(path) {
+                    Ok(b) if (b.len() as u64) <= CAP => b,
+                    Ok(_) => {
+                        err_reply(format!("{path}: exceeds the 16 MiB FileGet cap"));
+                        return;
+                    }
+                    Err(e) => {
+                        err_reply(format!("{path}: {e}"));
+                        return;
+                    }
+                };
+                use base64::Engine as _;
+                let enc = base64::engine::general_purpose::STANDARD;
+                get_reply(Frame::FileGetOk {
+                    id: String::new(),
+                    req_id: req_id.clone(),
+                    path: path.clone(),
+                    mime,
+                    size: bytes.len() as u64,
+                    b64: enc.encode(bytes),
+                });
             }
             // client -> forge: list resumable sessions (blocking HTTP
             // on the worker thread)

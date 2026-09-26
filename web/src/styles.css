@@ -231,6 +231,13 @@ footer { text-align: center; color: var(--dim); font-size: 0.85rem; padding: 24p
   display: inline-block; background: rgba(0,0,0,0.2); border: 1px solid rgba(255,255,255,0.15);
   border-radius: 12px; padding: 2px 8px; font-size: 0.72rem; white-space: nowrap;
 }
+.attach-thumb { display: block; max-height: 64px; max-width: 120px; border-radius: 6px; vertical-align: middle; }
+.img-chip { padding: 2px 4px; }
+.lightbox {
+  position: fixed; inset: 0; z-index: 200; background: rgba(0,0,0,0.85);
+  display: flex; align-items: center; justify-content: center; cursor: pointer;
+}
+.lightbox img { max-width: 92vw; max-height: 84vh; border-radius: 6px; box-shadow: 0 4px 40px rgba(0,0,0,0.7); }
 .toolrow {
   align-self: flex-start; background: #14141a; border: 1px solid var(--border);
   border-radius: 8px; padding: 6px 10px; font-size: 0.8rem; color: var(--dim);

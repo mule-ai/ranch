@@ -627,6 +627,7 @@ pub fn read_session_messages(path: &str) -> Result<Vec<ChatMsg>, String> {
                     text: String,
                     tool_name: Option<String>,
                     tool_output: Option<String>,
+                    tool_args: Option<String>,
                     created_at: Option<String>,
                     next_seq: &AtomicU64| {
             msgs.push(ChatMsg {
@@ -636,7 +637,7 @@ pub fn read_session_messages(path: &str) -> Result<Vec<ChatMsg>, String> {
                 tool_name,
                 tool_call_id: None,
                 tool_output,
-                tool_args: None,
+                tool_args,
                 duration_ms: None,
                 created_at,
                 attachments: None,
@@ -662,7 +663,7 @@ pub fn read_session_messages(path: &str) -> Result<Vec<ChatMsg>, String> {
                 let t = t.trim().to_string();
                 if !t.is_empty() {
                     push(
-                        &mut msgs, "user", t, None, None, ts.clone(), &SEQ,
+                        &mut msgs, "user", t, None, None, None, ts.clone(), &SEQ,
                     );
                 }
             }
@@ -678,7 +679,7 @@ pub fn read_session_messages(path: &str) -> Result<Vec<ChatMsg>, String> {
                                     if !t.is_empty() {
                                         push(
                                             &mut msgs, "assistant",
-                                            t.to_string(), None, None,
+                                            t.to_string(), None, None, None,
                                             ts.clone(), &SEQ,
                                         );
                                     }
@@ -694,10 +695,16 @@ pub fn read_session_messages(path: &str) -> Result<Vec<ChatMsg>, String> {
                                     .get("id")
                                     .and_then(|i| i.as_str())
                                     .map(String::from);
+                                // the call's arguments (path / command / …)
+                                // — clients show them, and image paths in
+                                // them become viewable image refs
+                                let args = blk
+                                    .get("arguments")
+                                    .map(|a| a.to_string());
                                 let idx = msgs.len();
                                 push(
                                     &mut msgs, "tool", String::new(),
-                                    Some(name), None, ts.clone(), &SEQ,
+                                    Some(name), None, args, ts.clone(), &SEQ,
                                 );
                                 if let Some(id) = call_id {
                                     tool_rows.insert(id, idx);
@@ -742,13 +749,17 @@ pub fn read_session_messages(path: &str) -> Result<Vec<ChatMsg>, String> {
                         .to_string();
                     push(
                         &mut msgs, "tool", String::new(),
-                        Some(name), Some(out), ts.clone(), &SEQ,
+                        Some(name), Some(out), None, ts.clone(), &SEQ,
                     );
                 }
             }
             _ => {}
         }
     }
+
+    // tool rows whose args reference an image get image_refs set (and the
+    // paths registered so clients can FileGet them after restarts)
+    crate::daemon::media::flag_image_refs(&mut msgs);
 
     Ok(msgs)
 }
@@ -759,8 +770,17 @@ pub fn read_session_messages(path: &str) -> Result<Vec<ChatMsg>, String> {
     ///
     /// `agent_text` is what pi receives (may include inlined attachment
     /// content); `display_text` is what the user sees in the chat row;
-    /// `attachments` are file paths shown as badges on the user row.
-    pub fn prompt(&self, pipe: &PipeWriter, agent_text: &str, display_text: &str, attachments: &[String]) -> Result<(), String> {
+    /// `attachments` are file paths shown as badges on the user row;
+    /// `images` are attached image files inlined into pi's prompt so a
+    /// vision model can see them directly.
+    pub fn prompt(
+        &self,
+        pipe: &PipeWriter,
+        agent_text: &str,
+        display_text: &str,
+        attachments: &[String],
+        images: &[crate::daemon::media::PiImage],
+    ) -> Result<(), String> {
         // every fresh user prompt resets the auto compact+retry budget
         // (the reader retries a context-killed turn at most once per
         // prompt — see compact_retries)
@@ -770,7 +790,7 @@ pub fn read_session_messages(path: &str) -> Result<Vec<ChatMsg>, String> {
             *g = Some(agent_text.to_string());
         }
         let send = || -> Result<(), String> {
-            write_prompt_line(&self.stdin, agent_text)
+            write_prompt_line(&self.stdin, agent_text, images)
         };
         if let Err(e) = send() {
             // a failed write emits the error row + clears the indicator
@@ -787,7 +807,20 @@ pub fn read_session_messages(path: &str) -> Result<Vec<ChatMsg>, String> {
             return Err(e);
         }
         let att = if attachments.is_empty() { None } else { Some(attachments.to_vec()) };
-        emit_chat_with(pipe, self.pane, "user", display_text, att, now_iso());
+        // attached images get image_refs on the user row so every client
+        // can render them (and the paths are registered for FileGet)
+        let mut image_refs: Vec<String> = attachments
+            .iter()
+            .filter(|p| crate::daemon::media::is_image_path(p))
+            .cloned()
+            .collect();
+        for i in images {
+            if !image_refs.iter().any(|p| p == &i.path) {
+                image_refs.push(i.path.clone());
+            }
+        }
+        let refs = if image_refs.is_empty() { None } else { Some(image_refs) };
+        emit_user_row(pipe, self.pane, display_text, att, refs, now_iso());
         write_status(pipe, self.pane, "working");
         Ok(())
     }
@@ -838,6 +871,7 @@ pub fn read_session_messages(path: &str) -> Result<Vec<ChatMsg>, String> {
 fn write_prompt_line(
     stdin: &Arc<Mutex<Option<Box<dyn std::io::Write + Send>>>>,
     agent_text: &str,
+    images: &[crate::daemon::media::PiImage],
 ) -> Result<(), String> {
     let mut g = stdin
         .lock()
@@ -850,12 +884,28 @@ fn write_prompt_line(
     // continues) instead of being rejected with "Agent is already
     // processing". When the agent is idle it is ignored — a plain
     // prompt. Optional field since pi 0.32.2.
-    let line = serde_json::json!({
+    let mut line = serde_json::json!({
         "type": "prompt",
         "message": agent_text,
         "streamingBehavior": "steer",
-    })
-    .to_string();
+    });
+    // attached images (base64) — pi inlines them into the user message so
+    // a vision model sees them without a tool round-trip
+    if !images.is_empty() {
+        line["images"] = serde_json::json!(
+            images
+                .iter()
+                .map(|i| {
+                    serde_json::json!({
+                        "type": "image",
+                        "data": i.b64,
+                        "mimeType": i.mime,
+                    })
+                })
+                .collect::<Vec<_>>()
+        );
+    }
+    let line = line.to_string();
     s.write_all(line.as_bytes())
         .and_then(|_| s.write_all(b"\n"))
         .and_then(|_| s.flush())
@@ -1053,7 +1103,7 @@ fn run_pi_reader(
                             if seq == prompt_seq.load(Ordering::Relaxed)
                                 && !stop.load(Ordering::Relaxed)
                             {
-                                match write_prompt_line(&stdin, &text) {
+                                match write_prompt_line(&stdin, &text, &[]) {
                                     Ok(()) => {
                                         write_status(&pipe, t_pane, "working");
                                     }
@@ -1156,7 +1206,8 @@ fn run_pi_reader(
                                             role: &str,
                                             text: String,
                                             tool_name: Option<String>,
-                                            tool_output: Option<String>|
+                                            tool_output: Option<String>,
+                                            tool_args: Option<String>|
                             {
                                 msgs.push(ChatMsg {
                                     seq: next_seq(),
@@ -1165,7 +1216,7 @@ fn run_pi_reader(
                                     tool_name,
                                     tool_call_id: None,
                                     tool_output,
-                                    tool_args: None,
+                                    tool_args,
                                     duration_ms: None,
                                     created_at: ts.clone(),
                                     attachments: None,
@@ -1189,7 +1240,7 @@ fn run_pi_reader(
                                     };
                                     let t = t.trim().to_string();
                                     if !t.is_empty() {
-                                        push(&mut msgs, "user", t, None, None);
+                                        push(&mut msgs, "user", t, None, None, None);
                                     }
                                 }
                                 "assistant" => {
@@ -1208,6 +1259,7 @@ fn run_pi_reader(
                                                                 t.to_string(),
                                                                 None,
                                                                 None,
+                                                                None,
                                                             );
                                                         }
                                                     }
@@ -1222,6 +1274,9 @@ fn run_pi_reader(
                                                         .get("id")
                                                         .and_then(|i| i.as_str())
                                                         .map(String::from);
+                                                    let args = blk
+                                                        .get("arguments")
+                                                        .map(|a| a.to_string());
                                                     let idx = msgs.len();
                                                     push(
                                                         &mut msgs,
@@ -1229,6 +1284,7 @@ fn run_pi_reader(
                                                         String::new(),
                                                         Some(name),
                                                         None,
+                                                        args,
                                                     );
                                                     if let Some(id) = call_id {
                                                         tool_rows.push((id, idx));
@@ -1279,7 +1335,7 @@ fn run_pi_reader(
                                             .and_then(|n| n.as_str())
                                             .unwrap_or("tool")
                                             .to_string();
-                                        push(&mut msgs, "tool", String::new(), Some(name), Some(out));
+                                        push(&mut msgs, "tool", String::new(), Some(name), Some(out), None);
                                     }
                                 }
                                 _ => {}
@@ -1287,6 +1343,7 @@ fn run_pi_reader(
                         }
                     }
                     if !msgs.is_empty() {
+                        crate::daemon::media::flag_image_refs(&mut msgs);
                         eprintln!(
                             "ranchd: local pi {t_pane} resync: {} rows from get_messages",
                             msgs.len()
@@ -1558,15 +1615,22 @@ fn emit_chat(pipe: &PipeWriter, pane: Uuid, role: &str, text: &str, created_at: 
     );
 }
 
-/// Like `emit_chat` but carries attachment file paths on the row.
-fn emit_chat_with(
+/// Like `emit_chat` but carries attachment file paths + image refs on
+/// the row (user prompt rows). The image paths are registered so every
+/// client can `FileGet` them.
+fn emit_user_row(
     pipe: &PipeWriter,
     pane: Uuid,
-    role: &str,
     text: &str,
     attachments: Option<Vec<String>>,
+    image_refs: Option<Vec<String>>,
     created_at: String,
 ) {
+    if let Some(refs) = &image_refs {
+        for r in refs {
+            crate::daemon::media::register(r);
+        }
+    }
     write_frame(
         pipe,
         &Frame::Chat {
@@ -1575,7 +1639,7 @@ fn emit_chat_with(
             pane: pane.to_string(),
             msgs: vec![ChatMsg {
                 seq: next_seq(),
-                role: role.to_string(),
+                role: "user".to_string(),
                 text: text.to_string(),
                 tool_name: None,
                 tool_call_id: None,
@@ -1584,7 +1648,7 @@ fn emit_chat_with(
                 duration_ms: None,
                 created_at: Some(created_at),
                 attachments,
-                image_refs: None,
+                image_refs,
             }],
             reset: false,
         },
@@ -1600,6 +1664,18 @@ fn emit_tool(
     out: &str,
     created_at: String,
 ) {
+    // tool rows whose args point at an image become viewable: set
+    // image_refs + register the path so clients can FileGet it
+    let image_refs = args
+        .and_then(|a| {
+            let refs = crate::daemon::media::image_refs_from_tool_args(a);
+            (!refs.is_empty()).then_some(refs)
+        });
+    if let Some(refs) = &image_refs {
+        for r in refs {
+            crate::daemon::media::register(r);
+        }
+    }
     write_frame(
         pipe,
         &Frame::Chat {
@@ -1617,7 +1693,7 @@ fn emit_tool(
                 duration_ms: Some(dur_ms),
                 created_at: Some(created_at),
                 attachments: None,
-                image_refs: None,
+                image_refs,
             }],
             reset: false,
         },

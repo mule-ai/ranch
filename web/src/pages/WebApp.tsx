@@ -718,6 +718,14 @@ function Terminal({
   const [chatAttachments, setChatAttachments] = useState<string[]>([]);
   const [attachBrowse, setAttachBrowse] = useState<{ path: string; parent: string | null; dirs: string[]; files: string[] } | null>(null);
   const attachDirReqRef = useRef<string | null>(null);
+  // image viewer: daemon-path -> dataURL (filled by FileGetOk), plus the
+  // lightbox + in-flight upload bookkeeping
+  const imgCacheRef = useRef<Map<string, string>>(new Map());
+  const [imgTick, setImgTick] = useState(0);
+  const [lightbox, setLightbox] = useState<{ path: string } | null>(null);
+  const [uploading, setUploading] = useState(0);
+  const uploadReqsRef = useRef<Map<string, string>>(new Map());
+  const pendingImgsRef = useRef<Set<string>>(new Set());
   const chatScrollRef = useRef<HTMLDivElement | null>(null);
   // sticky-bottom chat: auto-follow new messages only while the user is
   // at the bottom; if they've scrolled up, leave the view alone until
@@ -896,9 +904,32 @@ function Terminal({
             }
           }
           break;
-        case "Error":
+        case "Error": {
+          // image-fetch failures degrade to a placeholder, not a banner
+          if (typeof f.req_id === "string" && f.req_id.startsWith("fg-")) {
+            for (const p of [...pendingImgsRef.current]) {
+              pendingImgsRef.current.delete(p);
+            }
+            setImgTick(t => t + 1);
+            break;
+          }
           setConn(`error: ${f.message}`);
           break;
+        }
+        case "FileGetOk": {
+          imgCacheRef.current.set(f.path, `data:${f.mime};base64,${f.b64}`);
+          pendingImgsRef.current.delete(f.path);
+          setImgTick(t => t + 1);
+          break;
+        }
+        case "FilePutOk": {
+          if (uploadReqsRef.current.has(f.req_id)) {
+            uploadReqsRef.current.delete(f.req_id);
+            setChatAttachments(prev => prev.includes(f.path) ? prev : [...prev, f.path]);
+            setUploading(u => Math.max(0, u - 1));
+          }
+          break;
+        }
         case "DirListOk": {
           if (f.req_id === attachDirReqRef.current) {
             attachDirReqRef.current = null;
@@ -1023,6 +1054,50 @@ function Terminal({
     attachBrowseDir(undefined); // default $HOME
   };
 
+  // ---- image support: fetch daemon-side images for rendering (M-images) ----
+
+  /// Fetch a daemon image's bytes (cached; re-renders on arrival).
+  const fetchImage = (path: string) => {
+    if (!relay || imgCacheRef.current.has(path) || pendingImgsRef.current.has(path)) return;
+    pendingImgsRef.current.add(path);
+    relay.send({ t: "FileGet", id: nextId(), client: "web", req_id: `fg-${nextId()}`, path } as Frame);
+  };
+
+  const imgSrc = (path: string) => imgCacheRef.current.get(path);
+
+  /// Upload local image files to the daemon's uploads dir and add the
+  /// returned paths as composer attachments (FilePut -> FilePutOk).
+  const uploadImages = (files: File[] | FileList) => {
+    if (!relay) return;
+    const imgs = Array.from(files).filter(f => f.type.startsWith("image/"));
+    for (const f of imgs) {
+      setUploading(u => u + 1);
+      const fr = new FileReader();
+      fr.onload = () => {
+        const b64 = String(fr.result).split(",")[1] ?? "";
+        const rid = `fp-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+        uploadReqsRef.current.set(rid, f.name);
+        relay.send({ t: "FilePut", id: nextId(), client: "web", req_id: rid, name: f.name, b64 } as Frame);
+      };
+      fr.onerror = () => setUploading(u => Math.max(0, u - 1));
+      fr.readAsDataURL(f);
+    }
+  };
+
+  /// A thumbnail chip for an image path; click opens the lightbox.
+  const imgChip = (path: string, key?: React.Key) => {
+    const url = imgSrc(path);
+    return (
+      <span key={key ?? path} className="attach-chip img-chip" title={path} onClick={() => { fetchImage(path); setLightbox({ path }); }} style={{ cursor: "pointer" }}>
+        {url
+          ? <img src={url} className="attach-thumb" alt={path.split('/').pop() ?? "image"} />
+          : <span>🖼 {path.split('/').pop()}</span>}
+      </span>
+    );
+  };
+
+  const isImg = (path: string) => /\.(png|jpe?g|gif|webp|bmp|avif|heic|heif|svg)$/i.test(path);
+
   const removeAttachment = (path: string) => {
     setChatAttachments(prev => prev.filter(p => p !== path));
   };
@@ -1065,6 +1140,24 @@ function Terminal({
   const activeSnap = activePane ? panes.get(activePane) : undefined;
   const chatMode = activeSnap?.kind === "forge-chat";
   const chatMsgs = activeSnap?.chat ?? [];
+
+  // fetch the bytes of every image the conversation references so the
+  // thumbnails + lightbox render without a per-tap round-trip
+  useEffect(() => {
+    for (const m of chatMsgs) {
+      m.image_refs?.forEach(fetchImage);
+      m.attachments?.forEach((a) => { if (isImg(a)) fetchImage(a); });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [chatMsgs]);
+
+  // lightbox: full-size view of an image from the conversation
+  useEffect(() => {
+    if (!lightbox) return;
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setLightbox(null); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [lightbox]);
   // sticky-bottom chat: auto-follow new messages only while the user is
   // at the bottom; if they've scrolled up, leave the view alone until
   // they scroll back to the bottom
@@ -1149,7 +1242,15 @@ function Terminal({
       </div>
 
       {chatMode ? (
-        <div className="chat-wrap">
+        <div
+          className="chat-wrap"
+          onDragOver={(e) => { e.preventDefault(); }}
+          onDrop={(e) => {
+            e.preventDefault();
+            const files = Array.from(e.dataTransfer?.files ?? []);
+            if (files.some((f) => f.type.startsWith("image/"))) uploadImages(files);
+          }}
+        >
           <div className="dim" style={{ padding: "6px 10px 0", fontSize: "0.85rem", fontFamily: "var(--mono)" }}>
             {activeSnap?.context ?? ""}
             {activeSnap?.context ? <span> · /compact to compress</span> : null}
@@ -1157,6 +1258,7 @@ function Terminal({
           <div
             className="chat-list"
             ref={chatScrollRef}
+            data-imgtick={imgTick}
             onScroll={(e) => {
               const el = e.currentTarget;
               const atBottom =
@@ -1181,15 +1283,25 @@ function Terminal({
                 m.role === "tool" ? (
                   <details key={i} className="toolrow">
                     <summary>⚙ {m.tool_name || "tool"}{m.duration_ms != null ? ` · ${m.duration_ms}ms` : ""}{tsOf(m.created_at) ? ` · ${tsOf(m.created_at)}` : ""}</summary>
+                    {m.image_refs && m.image_refs.length > 0 && (
+                      <div className="attach-chips">
+                        {m.image_refs.map((p, j) => imgChip(p, j))}
+                      </div>
+                    )}
                     {m.tool_output && <pre className="toolout">{m.tool_output}</pre>}
                   </details>
                 ) : (
                   <div key={i} className={"bubble " + (m.role === "user" ? "bubble-user" : "bubble-agent")}>
                     {m.attachments && m.attachments.length > 0 && (
                       <div className="attach-chips">
-                        {m.attachments.map((a, j) => (
-                          <span key={j} className="attach-chip">📎 {a.split('/').pop()}</span>
-                        ))}
+                        {m.attachments.map((a, j) =>
+                          isImg(a) ? imgChip(a, j) : <span key={j} className="attach-chip">📎 {a.split('/').pop()}</span>
+                        )}
+                      </div>
+                    )}
+                    {m.image_refs && m.image_refs.length > 0 && !m.attachments?.length && (
+                      <div className="attach-chips">
+                        {m.image_refs.map((p, j) => imgChip(p, j))}
                       </div>
                     )}
                     {m.text}
@@ -1270,22 +1382,40 @@ function Terminal({
               <div className="attach-chips" style={{ marginBottom: 4 }}>
                 {chatAttachments.map((a) => (
                   <span key={a} className="attach-chip" onClick={() => removeAttachment(a)} style={{ cursor: 'pointer' }}>
-                    📎 {a.split('/').pop()} ✕
+                    {isImg(a) ? <img src={imgSrc(a) ?? undefined} className="attach-thumb" alt={a} /> : "📎 "}{a.split('/').pop()} ✕
                   </span>
                 ))}
+                {uploading > 0 && <span className="attach-chip dim">⏫ uploading {uploading}…</span>}
               </div>
             )}
             <div style={{ display: 'flex', gap: 6 }}>
               <button
                 onClick={openAttachPicker}
-                title="Attach file"
+                title="Attach a file from the machine"
                 style={{ background: 'transparent', border: '1px solid #444', borderRadius: 4, color: '#aaa', cursor: 'pointer', fontSize: '1rem', padding: '2px 8px' }}
               >📎</button>
+              <label
+                title="Upload an image from this device"
+                style={{ background: 'transparent', border: '1px solid #444', borderRadius: 4, color: '#aaa', cursor: 'pointer', fontSize: '1rem', padding: '2px 8px', lineHeight: '1.2rem' }}
+              >
+                ⬆
+                <input
+                  type="file" accept="image/*" multiple style={{ display: 'none' }}
+                  onChange={(e) => { uploadImages(e.target.files ?? []); e.target.value = ""; }}
+                />
+              </label>
               <input
                 value={chatDraft}
                 onChange={(e) => setChatDraft(e.target.value)}
-                placeholder="message the agent"
+                placeholder="message the agent (paste/drop an image to attach)"
                 style={{ flex: 1 }}
+                onPaste={(e) => {
+                  const files = Array.from(e.clipboardData?.files ?? []);
+                  if (files.some(f => f.type.startsWith("image/"))) {
+                    e.preventDefault();
+                    uploadImages(files);
+                  }
+                }}
                 onKeyDown={(e) => {
                   if (e.key === "Enter" && (chatDraft.trim() || chatAttachments.length > 0)) {
                     const text = chatDraft.trim() || "(see attached files)";
@@ -1344,6 +1474,23 @@ function Terminal({
                   📄 {f}
                 </div>
               ))}
+            </div>
+          )}
+          {lightbox && (
+            <div
+              className="lightbox"
+              onClick={() => setLightbox(null)}
+              role="dialog"
+              aria-label="image viewer"
+            >
+              <div style={{ textAlign: 'center' }}>
+                {imgSrc(lightbox.path)
+                  ? <img src={imgSrc(lightbox.path)!} alt={lightbox.path.split('/').pop() ?? "image"} />
+                  : <span className="dim" style={{ padding: 40, display: 'inline-block' }}>loading…</span>}
+                <div className="dim" style={{ fontFamily: 'var(--mono)', fontSize: '0.75rem', marginTop: 8, wordBreak: 'break-all' }}>
+                  {lightbox.path} · click anywhere to close
+                </div>
+              </div>
             </div>
           )}
         </div>

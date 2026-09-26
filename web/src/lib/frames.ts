@@ -57,6 +57,7 @@ export type ChatMsg = {
   duration_ms?: number;
   created_at?: string;
   attachments?: string[];
+  image_refs?: string[]; // image paths this row references (attach/view via FileGet)
 };
 
 
@@ -240,6 +241,10 @@ export type Frame =
   | { t: "PiMonitor"; enabled: boolean; req_id: string }
   | { t: "PiMonitorOk"; req_id: string; enabled: boolean }
   | { t: "ChatSend"; id: string; client: string; session: string; pane: string; text: string; attachments?: string[] }
+  | { t: "FileGet"; id: string; client: string; req_id: string; path: string }
+  | { t: "FileGetOk"; id: string; req_id: string; path: string; mime: string; size: number; b64: string }
+  | { t: "FilePut"; id: string; client: string; req_id: string; name: string; b64: string }
+  | { t: "FilePutOk"; id: string; req_id: string; path: string; size: number }
   | { t: "ChatCompact"; id: string; client: string; session: string; pane: string; req_id: string }
   | { t: "Interrupt"; id: string; client: string; session: string; pane: string }
   | { t: "Chat"; id: string; session: string; pane: string; msgs: ChatMsg[]; reset?: boolean }

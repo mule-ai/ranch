@@ -214,6 +214,42 @@ The daemon is the file server; clients (mobile/CLI) are thin editors.
 - **`FilePutOk`** `{req_id, path, size}` — daemon → client: the upload
   was stored; `path` is the absolute daemon path (usable as a
   `ChatSend` attachment so the agent can read it).
+- **`FileGet`** `{req_id, path}` → **`FileGetOk`** `{req_id, path, mime,
+  size, b64}` — image bytes for rendering. `path` must be a
+  *registered media path*: the daemon keeps a small persisted media
+  registry (`~/.local/state/ranch/media.json`) seeded with (a)
+  `FilePut` uploads, (b) image `ChatSend` attachments, and (c) image
+  paths the agent read during chat (tool rows whose args reference an
+  image). Unregistered paths, non-images (magic-byte sniffed:
+  png/jpeg/gif/webp/bmp/avif/heif/svg), and files over 16 MiB →
+  `error`. May arrive chunked (large images).
+
+### Images in chat (M-images)
+
+Images are first-class in every chat pane, on every surface:
+
+- `ChatSend.attachments` — absolute daemon paths. **Text** files are
+  inlined into the agent's prompt (50 KiB/file cap, as before).
+  **Image** files are instead (pi-backed panes) sent in the RPC
+  `prompt`'s `images` field (`{type:"image", data: b64, mimeType}`,
+  10 MiB/file cap) so a vision model sees them without a tool call, or
+  (forge-backed panes, whose `POST /messages` is text-only) inlined as
+  `[Attached image: <path> (mime — view it with your Read tool)]`
+  notes so the agent reads it with its Read tool.
+- `ChatMsg.image_refs` (`string[]`, optional) — image paths a row
+  references: user rows that attached an image, and tool rows whose
+  call args point at an image file (daemon-derived, so it survives
+  replay/resync the same way the rest of the row does). All values are
+  media-registry paths.
+- Every client can therefore **view** any image in a conversation:
+  web + mobile fetch bytes with `FileGet` and render thumbnails
+  (tap → full-size lightbox); the TUI shows `🖼 name` badges and opens
+  the system image viewer via `/open [path]` in the chat input.
+- **Selection** is both client-side and daemon-side: mobile picks
+  gallery/camera images (`FilePut` upload), web uploads local files
+  (file picker / paste / drag-drop → `FilePut`) *or* browses the daemon
+  filesystem (`DirList`), and the TUI attaches daemon paths with
+  `@/path/to/file` in the composer.
 
 ### Sync
 

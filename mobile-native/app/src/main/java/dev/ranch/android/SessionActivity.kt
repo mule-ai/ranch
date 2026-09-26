@@ -2,6 +2,10 @@ package dev.ranch.android
 
 import android.app.Activity
 import android.content.Context
+import android.content.Intent
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -18,6 +22,7 @@ import android.view.inputmethod.InputMethodManager
 import android.graphics.Typeface
 import android.widget.Button
 import android.widget.EditText
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.HorizontalScrollView
 import android.widget.PopupWindow
@@ -166,6 +171,15 @@ class SessionActivity : Activity() {
     private lateinit var hiddenEdit: EditText
     private lateinit var chatEdit: EditText
     private var stopBtn: Button? = null
+    // image attachments (M-images): composer state + rendered thumbnails
+    private var attachBtn: Button? = null
+    private var chipRow: LinearLayout? = null
+    private val pendingAtt = mutableListOf<String>()          // composer attachment paths
+    private val attUploadReqs = mutableMapOf<String, String>() // FilePut req_id -> name
+    private val imgCache = mutableMapOf<String, Bitmap>()     // path -> decoded bitmap
+    private val imgViews = mutableMapOf<String, MutableList<ImageView>>() // path -> live thumbs
+    private val imgRequesting = mutableSetOf<String>()
+    private val PICK_IMAGE_REQ = 42
     private lateinit var modelBar: LinearLayout
     private lateinit var modelChip: TextView
     private lateinit var contextLabel: TextView
@@ -325,6 +339,44 @@ class SessionActivity : Activity() {
             "ModelListOk" -> onModelListOk(f)
             "ChatHistoryOk" -> onChatHistoryOk(f)
             "Scrollback" -> onScrollback(f)
+            "FileGetOk" -> {
+                val path = f.optString("path")
+                val b64 = f.optString("b64")
+                if (path.isNotEmpty() && b64.isNotEmpty()) {
+                    try {
+                        val raw = android.util.Base64.decode(b64, android.util.Base64.DEFAULT)
+                        var bmp = BitmapFactory.decodeByteArray(raw, 0, raw.size)
+                        // keep the cache bounded: downscale huge rasters
+                        if (bmp != null && bmp.width * bmp.height > 4096 * 4096) {
+                            val scale = (4096.0 / maxOf(bmp.width, bmp.height)).toFloat()
+                            val small = Bitmap.createScaledBitmap(
+                                bmp,
+                                (bmp.width * scale).toInt().coerceAtLeast(1),
+                                (bmp.height * scale).toInt().coerceAtLeast(1),
+                                true,
+                            )
+                            if (small !== bmp) bmp.recycle()
+                            bmp = small
+                        }
+                        if (bmp != null) {
+                            imgCache[path] = bmp
+                            imgViews[path]?.forEach { it.setImageBitmap(bmp) }
+                            renderChips()
+                        }
+                    } catch (e: Exception) {
+                        // unrenderable image: leave the placeholder in place
+                    }
+                }
+            }
+            "FilePutOk" -> {
+                val rid = f.optString("req_id")
+                if (attUploadReqs.remove(rid) != null) {
+                    val p = f.optString("path")
+                    if (p.isNotEmpty() && p !in pendingAtt) pendingAtt.add(p)
+                    requestImage(p)
+                    renderChips()
+                }
+            }
             "Error" -> {
                 // request-scoped errors (req_id set) are only meaningful
                 // to the client that sent the request — but unsolicited
@@ -1095,6 +1147,9 @@ class SessionActivity : Activity() {
                 }
             }
             wrap.addView(title)
+            // images this tool call read: tappable thumbnail strip
+            val refs = m.imageRefs ?: emptyList()
+            if (refs.isNotEmpty()) wrap.addView(imageStrip(refs))
             wrap.addView(details)
             return wrap
         }
@@ -1104,6 +1159,10 @@ class SessionActivity : Activity() {
         // or all (system toolbar incl. Select All)
         val isUser = m.role == "user"
         val body = if (m.text.length > 8000) m.text.substring(0, 8000) + " …" else m.text
+        // user rows: attached images render as a tappable thumbnail strip
+        // above the bubble (files stay text chips in the bubble prefix)
+        val imgPaths = (m.imageRefs ?: emptyList()) +
+            (m.attachments ?: emptyList()).filter { isImagePath(it) }.distinct()
         val bubble = TextView(this).apply {
             text = markdownToSpannable(body)
             setTextIsSelectable(true)
@@ -1122,6 +1181,15 @@ class SessionActivity : Activity() {
         } else {
             row.addView(bubble, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 0.92f))
             row.addView(View(this), LinearLayout.LayoutParams(0, 1, 0.08f))
+        }
+        // attached images: a right-aligned thumbnail strip above the bubble
+        if (imgPaths.isNotEmpty()) {
+            val carrier = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+            }
+            carrier.addView(View(this), LinearLayout.LayoutParams(0, 1, 0.22f))
+            carrier.addView(imageStrip(imgPaths), LinearLayout.LayoutParams(0, 1, 0.78f))
+            wrap.addView(carrier)
         }
         wrap.addView(row)
         val meta = listOf(if (isUser) "you" else "agent", fmtTime(m.createdAt))
@@ -1287,6 +1355,14 @@ class SessionActivity : Activity() {
             imeOptions = EditorInfo.IME_FLAG_NO_EXTRACT_UI
             setOnEditorActionListener { _, _, _ -> sendChat(); true }
         }
+        // attach an image from the phone (gallery/camera): picked file is
+        // pushed to the daemon via FilePut and lands as a composer chip
+        attachBtn = Button(this).apply {
+            text = "🖼"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+            minWidth = dp(44)
+            setOnClickListener { pickImage() }
+        }
         // stop button: only visible while this pane's agent has a turn in
         // flight. Interrupts the running work immediately but keeps the
         // session + conversation (pi `abort` RPC / forge /interrupt).
@@ -1306,6 +1382,7 @@ class SessionActivity : Activity() {
             setPadding(0, dp(6), 0, dp(6))
         }
         send.setOnClickListener { sendChat() }
+        row.addView(attachBtn)
         row.addView(chatEdit, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
         row.addView(stopBtn)
         row.addView(send)
@@ -1313,6 +1390,14 @@ class SessionActivity : Activity() {
         // to WRAP_CONTENT, which squeezed the composer to its content width
         inputArea.addView(row, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+        // attachment chips: a dedicated row above the input so wrapping
+        // images can't squeeze the text field
+        chipRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(dp(10), 0, dp(10), 0)
+        }
+        inputArea.addView(chipRow, 1)
+        renderChips()
         updateStopButton()
     }
 
@@ -1341,6 +1426,134 @@ class SessionActivity : Activity() {
         imm.showSoftInput(hiddenEdit, InputMethodManager.SHOW_IMPLICIT)
     }
 
+    // ---- image attachments (M-images) ----
+
+    private fun isImagePath(p: String) =
+        ".*(\\.(png|jpe?g|gif|webp|bmp|avif|heic|heif|svg))$".toRegex(RegexOption.IGNORE_CASE).matches(p)
+
+    /// Ask the daemon for an image's bytes (FileGet); the reply fills
+    /// imgCache + every live thumbnail for that path.
+    private fun requestImage(path: String) {
+        if (imgCache.containsKey(path) || imgRequesting.contains(path)) return
+        imgRequesting.add(path)
+        relay?.send(Term.fileGet(path))
+    }
+
+    private fun pickImage() {
+        val i = Intent(Intent.ACTION_GET_CONTENT).apply {
+            type = "image/*"
+            addCategory(Intent.CATEGORY_OPENABLE)
+        }
+        startActivityForResult(Intent.createChooser(i, "Pick an image"), PICK_IMAGE_REQ)
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        if (requestCode == PICK_IMAGE_REQ && resultCode == RESULT_OK) {
+            data?.data?.let { uploadLocalImage(it) }
+        }
+        super.onActivityResult(requestCode, resultCode, data)
+    }
+
+    /// Read a picked/captured image off the phone and push it to the
+    /// daemon's uploads dir (FilePut -> FilePutOk -> composer chip).
+    private fun uploadLocalImage(uri: Uri) {
+        try {
+            val bytes = contentResolver.openInputStream(uri)?.use { it.readBytes() } ?: return
+            if (bytes.size > 10 * 1024 * 1024) {
+                statusView.text = "image too large (max 10 MiB)"
+                return
+            }
+            val name = uri.lastPathSegment?.substringAfterLast('/') ?: "image.jpg"
+            val rid = "fp-" + Term.newId()
+            attUploadReqs[rid] = name
+            statusView.text = "uploading $name …"
+            relay?.send(Term.filePut(name, android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP)))
+        } catch (e: Exception) {
+            statusView.text = "upload failed: ${e.message}"
+        }
+    }
+
+    /// The composer's attachment chip row (image paths with ✕ to drop).
+    private fun renderChips() {
+        val row = chipRow ?: return
+        row.removeAllViews()
+        for (p in pendingAtt) {
+            row.addView(TextView(this).apply {
+                val bmp = imgCache[p]
+                if (bmp != null) {
+                    // chip with a tiny preview
+                    setCompoundDrawablesWithIntrinsicBounds(null, null, null, null)
+                    text = " ✕"
+                } else {
+                    text = "📎 " + p.substringAfterLast('/') + " ✕"
+                }
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+                setTextColor(0xFFEAF2FF.toInt())
+                setPadding(dp(8), dp(4), dp(8), dp(4))
+                background = android.graphics.drawable.GradientDrawable().apply {
+                    cornerRadius = dp(12).toFloat()
+                    setColor(0xFF24557E.toInt())
+                }
+                setOnClickListener {
+                    pendingAtt.remove(p)
+                    renderChips()
+                }
+            })
+        }
+    }
+
+    /// One thumbnail (placeholder until FileGetOk lands); tap = full view.
+    private fun imageThumb(path: String): ImageView {
+        val iv = ImageView(this).apply {
+            val lp = LinearLayout.LayoutParams(dp(96), dp(72))
+            lp.rightMargin = dp(6)
+            layoutParams = lp
+            background = android.graphics.drawable.GradientDrawable().apply {
+                cornerRadius = dp(6).toFloat()
+                setColor(0xFF24292F.toInt())
+            }
+            scaleType = ImageView.ScaleType.CENTER_CROP
+            contentDescription = path
+            setOnClickListener { showImageFull(path) }
+        }
+        imgCache[path]?.let { iv.setImageBitmap(it) }
+        if (imgCache[path] == null) requestImage(path)
+        imgViews.getOrPut(path) { mutableListOf() }.add(iv)
+        return iv
+    }
+
+    /// A horizontal strip of thumbnails for the image paths on a row.
+    private fun imageStrip(paths: List<String>): LinearLayout {
+        val strip = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(0, dp(2), 0, dp(2))
+        }
+        for (p in paths) strip.addView(imageThumb(p))
+        return strip
+    }
+
+    private fun showImageFull(path: String) {
+        val bmp = imgCache[path] ?: run {
+            requestImage(path)
+            statusView.text = "loading image…"
+            return
+        }
+        val iv = ImageView(this).apply {
+            setImageBitmap(bmp)
+            scaleType = ImageView.ScaleType.FIT_CENTER
+            setPadding(dp(8), dp(8), dp(8), dp(8))
+            background = android.graphics.drawable.GradientDrawable().apply {
+                cornerRadius = dp(8).toFloat()
+                setColor(0xFF14181D.toInt())
+            }
+        }
+        android.app.AlertDialog.Builder(this)
+            .setTitle(path.substringAfterLast('/'))
+            .setView(iv)
+            .setNegativeButton("close", null)
+            .show()
+    }
+
     // ---- send helpers ----
     private fun sendPty(text: String) {
         if (text.isEmpty() || activePane.isEmpty()) return
@@ -1348,7 +1561,8 @@ class SessionActivity : Activity() {
     }
     private fun sendChat() {
         val t = chatEdit.text.toString().trim()
-        if (t.isEmpty()) return
+        val atts = pendingAtt.toList()
+        if (t.isEmpty() && atts.isEmpty()) return
         // mid-compaction: hold the message and send it when the queue flushes
         if (compacting && activePane == compactingPane) {
             queued.add(Queued(activePane, t))
@@ -1357,7 +1571,10 @@ class SessionActivity : Activity() {
             renderQueue()
             return
         }
-        relay?.chatSend(sessionId, activePane, t)
+        val text = if (t.isEmpty()) "(see attached images)" else t
+        relay?.chatSend(sessionId, activePane, text, atts)
+        pendingAtt.clear()
+        renderChips()
         chatEdit.setText("")
     }
     private fun sendResize() {

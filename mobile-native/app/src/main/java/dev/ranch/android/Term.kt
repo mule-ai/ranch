@@ -47,10 +47,21 @@ object Term {
             .put("t", "Resize").put("id", newId()).put("client", CLIENT)
             .put("session", session).put("cols", cols).put("rows", rows)
 
-    fun chatSend(session: String, pane: String, text: String): JSONObject =
-        JSONObject()
+    fun chatSend(session: String, pane: String, text: String, attachments: List<String> = emptyList()): JSONObject {
+        val o = JSONObject()
             .put("t", "ChatSend").put("id", newId()).put("client", CLIENT)
             .put("session", session).put("pane", pane).put("text", text)
+        if (attachments.isNotEmpty()) {
+            val a = JSONArray()
+            attachments.forEach { a.put(it) }
+            o.put("attachments", a)
+        }
+        return o
+    }
+
+    fun fileGet(path: String): JSONObject =
+        JSONObject().put("t", "FileGet").put("id", newId()).put("client", CLIENT)
+            .put("req_id", "fg-" + newId()).put("path", path)
 
     fun sessionsCreate(kind: String = "shell", name: String? = null, cwd: String? = null): JSONObject {
         val o = JSONObject()
@@ -218,6 +229,8 @@ object Term {
         val toolArgs: String?,
         val durationMs: Long?,
         val createdAt: String?,
+        val attachments: List<String>?,
+        val imageRefs: List<String>?,
     )
 
     data class ModelChoice(
@@ -293,6 +306,13 @@ object Term {
         return (0 until arr.length()).map { parseSessionMeta(arr.getJSONObject(it)) }
     }
 
+    private fun strList(o: JSONObject, key: String): List<String>? {
+        val a = o.opt(key) ?: return null
+        if (a !is JSONArray) return null
+        val out = (0 until a.length()).mapNotNull { a.optString(it).takeIf { s -> s.isNotEmpty() } }
+        return out.takeIf { it.isNotEmpty() }
+    }
+
     fun parseChatMsg(o: JSONObject): ChatMsg =
         ChatMsg(
             seq = o.optLong("seq"),
@@ -304,5 +324,7 @@ object Term {
             toolArgs = o.optString("tool_args").takeIf { it.isNotEmpty() },
             durationMs = o.optLong("duration_ms").takeIf { o.has("duration_ms") },
             createdAt = o.optString("created_at").takeIf { it.isNotEmpty() },
+            attachments = strList(o, "attachments"),
+            imageRefs = strList(o, "image_refs"),
         )
 }

@@ -201,6 +201,17 @@ fn to_chat_msg(r: &serde_json::Value) -> Option<ChatMsg> {
     if text.is_empty() && tool_name.is_none() {
         return None;
     }
+    // tool rows whose input references an image become viewable: set
+    // image_refs + register the path so clients can FileGet it
+    let image_refs = tool_args.as_ref().and_then(|a| {
+        let refs = crate::daemon::media::image_refs_from_tool_args(a);
+        if refs.is_empty() {
+            None
+        } else {
+            refs.iter().for_each(|r| crate::daemon::media::register(r));
+            Some(refs)
+        }
+    });
     Some(ChatMsg {
         seq,
         role,
@@ -212,7 +223,7 @@ fn to_chat_msg(r: &serde_json::Value) -> Option<ChatMsg> {
         duration_ms,
         created_at,
         attachments: None,
-        image_refs: None,
+        image_refs,
     })
 }
 

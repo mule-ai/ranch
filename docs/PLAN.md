@@ -417,6 +417,32 @@ wraps the payload one extra time on the wire.
 editor modal + `prefix-E` split; PaneSnap now carries the pane cwd
 (back-compat field) so the browser starts where the focused pane is.
 
+## Phase G — Images as first-class citizens (all surfaces)
+
+Images in agent chat: attach (client-side or daemon-side), view the
+attachment, and see images the agent reads during chat.
+
+- **Protocol** — `FileGet`/`FileGetOk` (client fetches image bytes
+  from the daemon; registered-media-only, 16 MiB cap) +
+  `ChatMsg.image_refs` (image paths a row references). See
+  PROTOCOL.md “Images in chat (M-images)”.
+- **Daemon** — `media.rs`: persisted media registry
+  (`~/.local/state/ranch/media.json`), magic-byte mime sniffing,
+  tool-args → image-path extraction, `PiImage` loader. `ChatSend`
+  attachments split: text inlines as before; images go to pi's RPC
+  `prompt.images` field (vision inlining) or — forge panes — to
+  “view it with your Read tool” notes. Live + replay tool rows get
+  `tool_args` captured and `image_refs` flagged.
+- **TUI** — `🖼 name` badges on user/tool rows, `/open [path]` opens
+  the system viewer.
+- **Web** — thumbnails in bubbles + tool rows, tap → lightbox;
+  composer: daemon dir picker (existing) + local image upload
+  (picker / paste / drag-drop → `FilePut`).
+- **Mobile-native** — gallery pick (`GET_CONTENT image/*`) → `FilePut`
+  → composer chip; thumbnails on user + tool rows, tap → full view.
+
+**Status**: implemented (2026-09-26).
+
 ---
 
 ## Sequencing & dependencies

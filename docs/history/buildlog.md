@@ -450,3 +450,40 @@ indefinitely (deadline removed); a daemon restart surfaces as
 Also completed a concurrent session's in-flight image_refs work that
 left the tree broken (8 ChatMsg initializers missing the field —
 mechanical image_refs: None; 20 tests green).
+
+## Images as first-class citizens (2026-09-26)
+
+All three surfaces can now attach images to prompts, view attached
+images, and see images the agent reads during chat. Selection is
+both client-side and daemon-side.
+
+- **Protocol** (`ranch-protocol`): new `FileGet`/`FileGetOk` frames
+  (client fetches image bytes from the daemon) and
+  `ChatMsg.image_refs` (image paths a row references). See
+  PROTOCOL.md § “Images in chat (M-images)” + the `Files` section.
+- **Daemon** (`crates/ranch/src/media.rs` + `daemon.rs` + `pilocal.rs`
+  + `forge.rs`): persisted media registry
+  (`~/.local/state/ranch/media.json`) — the set of paths a client may
+  `FileGet` (uploads, image attachments, agent-read image paths). Magic-byte
+  mime sniffing (png/jpeg/gif/webp/bmp/avif/heif/svg). `ChatSend`
+  attachments now split: text files inline into the prompt as before;
+  **image** files load into `PiImage` payloads and ride pi's RPC
+  `prompt` `images` field (true vision inlining, no tool round-trip),
+  or — for forge-backed panes (whose `POST /messages` is text-only) —
+  become `[Attached image: <path>]` notes so the agent's Read tool
+  surfaces them. Live + replay tool rows capture `tool_args` and flag
+  `image_refs` when a call reads an image.
+- **TUI** (`client.rs`): `🖼 name` badges on user + tool rows; `/open
+  [path]` opens the system image viewer (no path = most recent image
+  in the conversation).
+- **Web** (`WebApp.tsx` + `frames.ts` + `styles.css`): image
+  thumbnails in user bubbles and tool rows, tap → full-size lightbox
+  (Esc/click to close). Composer keeps the daemon dir picker and gains
+  local image upload (file picker / paste / drag-drop → `FilePut`).
+- **Mobile-native** (`Term.kt` + `SessionActivity.kt` + `Monitor.kt`):
+  gallery pick (`GET_CONTENT image/*`) → `FilePut` → composer chip;
+  thumbnails on user + tool rows, tap → full-size view.
+
+Tests: media module (sniff, tool-args refs, registry eviction, row
+flagging), FileGet/FileGetOk round-trip. `cargo test` + clippy green;
+web `tsc` + `vite build` green; native `assembleRelease` green.

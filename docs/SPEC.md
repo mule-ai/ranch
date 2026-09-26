@@ -164,6 +164,7 @@ parity for every user-facing capability:
 | mule workflow CRUD + run | ✅ | ✅ | ✅ |
 | workflow run panes | ✅ | ✅ | ✅ |
 | triggers (cron/event) management | ✅ | ✅ | ✅ |
+| image attachments + in-chat image viewing | ✅ `@path` + `/open` | ✅ pick/paste/drop + lightbox | ✅ gallery + thumbnails + full view |
 | agent spawn/steer/close tools | daemon-side | daemon-side | daemon-side |
 | webhook receiver config | ✅ | ✅ | ✅ |
 

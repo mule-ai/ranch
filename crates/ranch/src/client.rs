@@ -2675,6 +2675,38 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                             }).unwrap_or_default();
                             match m.role.as_str() {
                                 "user" => {
+                                    // attached files / images: a badge row
+                                    // above the bubble (🖼 = image, 📎 = file)
+                                    let mut atts: Vec<&String> =
+                                        m.attachments.iter().flatten().collect();
+                                    if let Some(refs) = &m.image_refs {
+                                        for r in refs {
+                                            if !atts.iter().any(|a| **a == *r) {
+                                                atts.push(r);
+                                            }
+                                        }
+                                    }
+                                    if !atts.is_empty() {
+                                        let names: Vec<String> = atts
+                                            .iter()
+                                            .map(|p| {
+                                                let icon = if crate::daemon::media::is_image_path(p) {
+                                                    "🖼"
+                                                } else {
+                                                    "📎"
+                                                };
+                                                format!(
+                                                    "{} {}",
+                                                    icon,
+                                                    p.rsplit('/').next().unwrap_or(p)
+                                                )
+                                            })
+                                            .collect();
+                                        li.push(Line::from(Span::styled(
+                                            format!(" {} /open views this", names.join("  ")).trim_start().to_string(),
+                                            dim,
+                                        )));
+                                    }
                                     // right-aligned green bubble
                                     let inner = user_w.saturating_sub(2);
                                     for chunk in wrap(&m.text, inner) {
@@ -2699,6 +2731,20 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                                         _ => "tool".into(),
                                     };
                                     li.push(Line::from(Span::styled(format!("   ⚙ {label}"), dim)));
+                                    // images the tool read: tappable badge
+                                    // (/open [path] views them)
+                                    if let Some(refs) = &m.image_refs {
+                                        let names: Vec<String> = refs
+                                            .iter()
+                                            .map(|p| {
+                                                format!("🖼 {}", p.rsplit('/').next().unwrap_or(p))
+                                            })
+                                            .collect();
+                                        li.push(Line::from(Span::styled(
+                                            format!("    {}", names.join("  ")),
+                                            dim,
+                                        )));
+                                    }
                                 }
                                 _ => {
                                     // left-aligned dark bubble
@@ -3447,6 +3493,7 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                     "  :compact       compact the agent's context now",
                     "  (in chat, /compact works too)",
                     "  :stop          stop the agent's current turn (chat: /stop)",
+                    "  (in chat, /open [path] views an image from the conversation)",
                     "  :rename <name> rename this session",
                     "  :kill-pane     close the focused pane (also Ctrl-B x)",
                     "  :scrollback    pane history ring (also Ctrl-B [)",
@@ -5509,6 +5556,69 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                                             std::time::Instant::now(),
                                             "interrupting…".into(),
                                         )));
+                                    } else if raw.starts_with("/open") {
+                                        // /open [path] — open an image from
+                                        // this conversation in the system
+                                        // viewer (no path = the most recent
+                                        // image reference in the chat)
+                                        let arg = raw["/open".len()..].trim();
+                                        let path = if arg.is_empty() {
+                                            pane_views.get(&active_pane).and_then(|pv| {
+                                                pv.chat.iter().rev().filter_map(|m| {
+                                                    m.image_refs
+                                                        .as_ref()
+                                                        .and_then(|v| v.last())
+                                                        .cloned()
+                                                        .or_else(||
+                                                            m.attachments
+                                                                .as_ref()
+                                                                .and_then(|v| v.last())
+                                                                .cloned(),
+                                                        )
+                                                })
+                                                .find(|p| {
+                                                    crate::daemon::media::is_image_path(p)
+                                                })
+                                            })
+                                        } else {
+                                            Some(arg.to_string())
+                                        };
+                                        match path {
+                                            Some(p)
+                                                if cloud_machine.is_none() =>
+                                            {
+                                                match std::process::Command::new(
+                                                        "xdg-open",
+                                                    )
+                                                    .arg(&p)
+                                                    .stdin(std::process::Stdio::null())
+                                                    .stdout(std::process::Stdio::null())
+                                                    .stderr(std::process::Stdio::null())
+                                                    .spawn()
+                                                {
+                                                    Ok(_) => err_flash.set(Some((
+                                                        std::time::Instant::now(),
+                                                        format!(
+                                                            "opening {p} in the system viewer"
+                                                        ),
+                                                    ))),
+                                                    Err(e) => err_flash.set(Some((
+                                                        std::time::Instant::now(),
+                                                        format!(
+                                                            "no system viewer available (xdg-open: {e})"
+                                                        ),
+                                                    ))),
+                                                }
+                                            }
+                                            Some(_) => err_flash.set(Some((
+                                                std::time::Instant::now(),
+                                                "that image lives on the remote machine — view it in the web app or on your phone".into(),
+                                            ))),
+                                            None => err_flash.set(Some((
+                                                std::time::Instant::now(),
+                                                "no image in this conversation yet".into(),
+                                            ))),
+                                        }
                                     } else if !raw.is_empty() {
                                         // Extract @/path/to/file references as
                                         // attachments; the remaining text is

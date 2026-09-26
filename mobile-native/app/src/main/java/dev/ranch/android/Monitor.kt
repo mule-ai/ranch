@@ -119,8 +119,8 @@ class RelaySession(
         send(Term.input(sessionId, pane, text))
     fun resize(sessionId: String, cols: Int, rows: Int) =
         send(Term.resize(sessionId, cols, rows))
-    fun chatSend(sessionId: String, pane: String, text: String) =
-        send(Term.chatSend(sessionId, pane, text))
+    fun chatSend(sessionId: String, pane: String, text: String, attachments: List<String> = emptyList()) =
+        send(Term.chatSend(sessionId, pane, text, attachments))
     fun createSession(kind: String = "shell") =
         send(Term.sessionsCreate(kind))
 
