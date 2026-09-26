@@ -192,6 +192,7 @@ pub fn agent_done_row(spawn: &SpawnRecord, pane: Uuid, outcome: &str, last: Opti
         duration_ms: None,
         created_at: Some(now_iso()),
         attachments: None,
+        image_refs: None,
     }
 }
 
@@ -293,41 +294,34 @@ pub struct AskAnswer {
 }
 
 /// One pending ask-user question. The agent's tool call stays blocked
-/// (in the harness) until a client answers or the TTL expires.
+/// (in the harness) until a client answers — there is NO timeout: the
+/// user may take arbitrarily long. If the daemon restarts, the ask is
+/// lost and the blocked poll sees "unknown" (the agent's escape hatch).
 #[derive(Debug, Clone)]
 pub struct AskRecord {
     pub ask_id: String,
     /// the pane that asked (nil = human-initiated)
     pub caller_pane: Uuid,
     pub session: Uuid,
-    /// None until answered or expired
+    /// None until answered
     pub answer: Option<AskAnswer>,
     pub created_at: Instant,
     /// when the answer landed (drives the post-answer prune window)
     pub answered_at: Option<Instant>,
 }
 
-/// How long an answered/expired ask stays in the registry after
-/// resolution (the agent's status poll needs it for a bit).
+/// How long an answered ask stays in the registry after resolution
+/// (the agent's status poll needs it for a bit).
 pub const ASK_DONE_GRACE: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
 impl AskRecord {
     pub fn state(&self) -> &'static str {
         match &self.answer {
             Some(_) => "answered",
-            None => {
-                if self.created_at.elapsed() > ASK_TTL {
-                    "expired"
-                } else {
-                    "pending"
-                }
-            }
+            None => "pending",
         }
     }
 }
-
-/// How long an unanswered ask stays pending before agents see "expired".
-pub const ASK_TTL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
 /// The daemon's pending-question registry.
 #[derive(Default)]
@@ -349,14 +343,15 @@ impl AskRegistry {
         self.pending.get_mut(ask_id)
     }
     /// Drop resolved asks older than the grace window (the agent's
-    /// status poll needs them briefly; pending asks are never pruned).
+    /// status poll needs them briefly; pending asks are never pruned —
+    /// asks have no expiry, the user may answer hours later).
     pub fn prune(&mut self) -> Vec<String> {
         let stale: Vec<String> = self
             .pending
             .values()
             .filter(|r| match r.answered_at {
                 Some(at) => at.elapsed() > ASK_DONE_GRACE,
-                None => r.state() == "expired" && r.created_at.elapsed() > ASK_TTL + ASK_DONE_GRACE,
+                None => false,
             })
             .map(|r| r.ask_id.clone())
             .collect();

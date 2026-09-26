@@ -22,7 +22,7 @@ use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use ranch_protocol::{ChatMsg, Frame, ModelChoice};
@@ -121,6 +121,24 @@ pub struct LocalPi {
     /// get_state racing the switch) and is ignored instead of clobbering
     /// the pin. Cleared once pi reports the pinned path.
     pin_unconfirmed: Arc<AtomicBool>,
+    /// The last user prompt sent to this child (agent text). The reader
+    /// uses it for the auto compact+retry path: when a context
+    /// exhaustion kills a turn, the failed prompt is what gets re-sent.
+    last_prompt: Arc<Mutex<Option<String>>>,
+    /// Monotonic user-prompt counter. The auto compact+retry path
+    /// captures the seq at trigger time and only re-sends when unchanged
+    /// (a newer user prompt is already in flight; the compact still
+    /// helps it, but nothing needs re-sending).
+    prompt_seq: Arc<AtomicU64>,
+    /// Auto compact+retry attempts for the CURRENT prompt. Capped at one
+    /// (like pi's own overflow recovery): if the re-sent prompt errors
+    /// again, show the plain error row instead of looping.
+    compact_retries: Arc<AtomicU32>,
+    /// Set when the reader auto-triggers a compact after a context
+    /// failure: (failed prompt text, prompt seq at trigger). Consumed
+    /// by the compact RPC response — success re-sends the prompt, failure
+    /// emits the too-large row.
+    compact_retry: Arc<Mutex<Option<(String, u64)>>>,
 }
 
 /// `pi_no_tools = "true"` in ~/.config/ranch/daemon.toml disables all
@@ -308,6 +326,10 @@ impl LocalPi {
             model_set_req: Arc::new(Mutex::new(None)),
             compact_req: Arc::new(Mutex::new(None)),
             pin_unconfirmed: Arc::new(AtomicBool::new(false)),
+            last_prompt: Arc::new(Mutex::new(None)),
+            prompt_seq: Arc::new(AtomicU64::new(0)),
+            compact_retries: Arc::new(AtomicU32::new(0)),
+            compact_retry: Arc::new(Mutex::new(None)),
         });
         panes.insert(pane, lp.clone());
         lp.start_reader(pipe);
@@ -388,6 +410,10 @@ impl LocalPi {
             model_set_req: Arc::new(Mutex::new(None)),
             compact_req: Arc::new(Mutex::new(None)),
             pin_unconfirmed: Arc::new(AtomicBool::new(false)),
+            last_prompt: Arc::new(Mutex::new(None)),
+            prompt_seq: Arc::new(AtomicU64::new(0)),
+            compact_retries: Arc::new(AtomicU32::new(0)),
+            compact_retry: Arc::new(Mutex::new(None)),
         });
         panes.insert(pane, lp.clone());
         lp.start_reader(pipe);
@@ -416,6 +442,10 @@ impl LocalPi {
         let model_set_req = self.model_set_req.clone();
         let compact_req = self.compact_req.clone();
         let pin_unconfirmed = self.pin_unconfirmed.clone();
+        let last_prompt = self.last_prompt.clone();
+        let prompt_seq = self.prompt_seq.clone();
+        let compact_retries = self.compact_retries.clone();
+        let compact_retry = self.compact_retry.clone();
         let stdin = self.stdin.clone();
         std::thread::spawn(move || {
             run_pi_reader(
@@ -428,6 +458,10 @@ impl LocalPi {
                 model_set_req,
                 compact_req,
                 pin_unconfirmed,
+                last_prompt,
+                prompt_seq,
+                compact_retries,
+                compact_retry,
                 stdin,
                 pipe,
             );
@@ -606,6 +640,7 @@ pub fn read_session_messages(path: &str) -> Result<Vec<ChatMsg>, String> {
                 duration_ms: None,
                 created_at,
                 attachments: None,
+                image_refs: None,
             });
         };
 
@@ -726,30 +761,16 @@ pub fn read_session_messages(path: &str) -> Result<Vec<ChatMsg>, String> {
     /// content); `display_text` is what the user sees in the chat row;
     /// `attachments` are file paths shown as badges on the user row.
     pub fn prompt(&self, pipe: &PipeWriter, agent_text: &str, display_text: &str, attachments: &[String]) -> Result<(), String> {
+        // every fresh user prompt resets the auto compact+retry budget
+        // (the reader retries a context-killed turn at most once per
+        // prompt — see compact_retries)
+        self.prompt_seq.fetch_add(1, Ordering::Relaxed);
+        self.compact_retries.store(0, Ordering::Relaxed);
+        if let Ok(mut g) = self.last_prompt.lock() {
+            *g = Some(agent_text.to_string());
+        }
         let send = || -> Result<(), String> {
-            let mut g = self
-                .stdin
-                .lock()
-                .map_err(|_| "pi stdin poisoned".to_string())?;
-            let s = g
-                .as_mut()
-                .ok_or_else(|| "pi stdin already taken".to_string())?;
-            // `streamingBehavior: "steer"` queues a mid-turn prompt as a
-            // steering message (delivered at the next turn boundary, run
-            // continues) instead of being rejected with "Agent is already
-            // processing". When the agent is idle it is ignored — a plain
-            // prompt. Optional field since pi 0.32.2.
-            let line = serde_json::json!({
-                "type": "prompt",
-                "message": agent_text,
-                "streamingBehavior": "steer",
-            })
-            .to_string();
-            s.write_all(line.as_bytes())
-                .and_then(|_| s.write_all(b"\n"))
-                .and_then(|_| s.flush())
-                .map_err(|e| format!("pi stdin: {e}"))?;
-            Ok(())
+            write_prompt_line(&self.stdin, agent_text)
         };
         if let Err(e) = send() {
             // a failed write emits the error row + clears the indicator
@@ -812,6 +833,57 @@ pub fn read_session_messages(path: &str) -> Result<Vec<ChatMsg>, String> {
 /// rows / agent status emitted into `pipe`. Runs on a dedicated thread
 /// (restartable — killed by exec on hot upgrade, restarted by the
 /// inheriting daemon).
+/// Write a `prompt` RPC line to pi's stdin. Shared by the user-prompt
+/// path and the reader's auto compact+retry.
+fn write_prompt_line(
+    stdin: &Arc<Mutex<Option<Box<dyn std::io::Write + Send>>>>,
+    agent_text: &str,
+) -> Result<(), String> {
+    let mut g = stdin
+        .lock()
+        .map_err(|_| "pi stdin poisoned".to_string())?;
+    let s = g
+        .as_mut()
+        .ok_or_else(|| "pi stdin already taken".to_string())?;
+    // `streamingBehavior: "steer"` queues a mid-turn prompt as a
+    // steering message (delivered at the next turn boundary, run
+    // continues) instead of being rejected with "Agent is already
+    // processing". When the agent is idle it is ignored — a plain
+    // prompt. Optional field since pi 0.32.2.
+    let line = serde_json::json!({
+        "type": "prompt",
+        "message": agent_text,
+        "streamingBehavior": "steer",
+    })
+    .to_string();
+    s.write_all(line.as_bytes())
+        .and_then(|_| s.write_all(b"\n"))
+        .and_then(|_| s.flush())
+        .map_err(|e| format!("pi stdin: {e}"))?;
+    Ok(())
+}
+
+/// Heuristic for pi context-exhaustion errors. pi is supposed to
+/// auto-compact + retry these, but its overflow detection regex-matches
+/// the provider's error TEXT — and its openai-completions path drops
+/// non-OpenAI error bodies (sglang's `{"object":"error",...}` shape), so
+/// the tell often arrives bare ("400 status code (no body)").
+fn looks_like_context_error(err: &str) -> bool {
+    const P: &[&str] = &[
+        "context length",
+        "context window",
+        "too long",
+        "too many tokens",
+        "token limit exceeded",
+        "request_too_large",
+        "context_length_exceeded",
+    ];
+    let lower = err.to_ascii_lowercase();
+    P.iter().any(|p| lower.contains(p))
+        || lower == "400 status code (no body)"
+        || lower == "413 status code (no body)"
+}
+
 fn run_pi_reader(
     stdout: Box<dyn std::io::Read + Send>,
     t_pane: Uuid,
@@ -822,6 +894,10 @@ fn run_pi_reader(
     model_set_req: Arc<Mutex<Option<String>>>,
     compact_req: Arc<Mutex<Option<String>>>,
     pin_unconfirmed: Arc<AtomicBool>,
+    last_prompt: Arc<Mutex<Option<String>>>,
+    prompt_seq: Arc<AtomicU64>,
+    compact_retries: Arc<AtomicU32>,
+    compact_retry: Arc<Mutex<Option<(String, u64)>>>,
     stdin: Arc<Mutex<Option<Box<dyn std::io::Write + Send>>>>,
     pipe: PipeWriter,
 ) {
@@ -963,6 +1039,38 @@ fn run_pi_reader(
                             &stdin,
                             r#"{"type": "get_session_stats"}"#,
                         );
+                        // auto compact+retry: if THIS compact was
+                        // triggered by a context failure, re-send the
+                        // failed prompt now that the window has room
+                        // again — unless a newer user prompt is already
+                        // in flight (the compact still helps it, but
+                        // nothing needs re-sending).
+                        if let Some((text, seq)) = compact_retry
+                            .lock()
+                            .ok()
+                            .and_then(|mut g| g.take())
+                        {
+                            if seq == prompt_seq.load(Ordering::Relaxed)
+                                && !stop.load(Ordering::Relaxed)
+                            {
+                                match write_prompt_line(&stdin, &text) {
+                                    Ok(()) => {
+                                        write_status(&pipe, t_pane, "working");
+                                    }
+                                    Err(e) => {
+                                        eprintln!("ranchd: local pi {t_pane} auto compact+retry re-send failed: {e}");
+                                        emit_chat(
+                                            &pipe,
+                                            t_pane,
+                                            "assistant",
+                                            &format!("⚠ compact retry failed: {e}"),
+                                            now_iso(),
+                                        );
+                                        write_status(&pipe, t_pane, "idle");
+                                    }
+                                }
+                            }
+                        }
                     } else {
                         let msg = v
                             .get("error")
@@ -970,14 +1078,41 @@ fn run_pi_reader(
                             .unwrap_or("compaction failed")
                             .to_string();
                         eprintln!("ranchd: local pi {t_pane} compact failed: {msg}");
-                        let req_id = compact_req.lock().ok().and_then(|mut g| g.take());
-                        write_frame(
-                            &pipe,
-                            &Frame::Error {
-                                req_id,
-                                message: format!("compact failed: {msg}"),
-                            },
-                        );
+                        if compact_retry.lock().ok().and_then(|mut g| g.take()).is_some() {
+                            // auto compact+retry died: the context is too
+                            // big for the compact request itself to fit the
+                            // window — nothing ranch can do; say so instead
+                            // of re-entering the 400 loop.
+                            emit_chat(
+                                &pipe,
+                                t_pane,
+                                "assistant",
+                                &format!(
+                                    "⚠ compact failed ({msg}) — context is too large to compact; start a new session or switch to a larger-context model"
+                                ),
+                                now_iso(),
+                            );
+                        } else {
+                            // user-initiated compact: keep the error frame
+                            // for the client that clicked, AND a ⚠ row so
+                            // every other client (phone, TUI) sees the
+                            // failure instead of a silent no-op.
+                            let req_id = compact_req.lock().ok().and_then(|mut g| g.take());
+                            write_frame(
+                                &pipe,
+                                &Frame::Error {
+                                    req_id,
+                                    message: format!("compact failed: {msg}"),
+                                },
+                            );
+                            emit_chat(
+                                &pipe,
+                                t_pane,
+                                "assistant",
+                                &format!("⚠ compact failed: {msg}"),
+                                now_iso(),
+                            );
+                        }
                         write_status(&pipe, t_pane, "idle");
                     }
                 } else if v.get("command").and_then(|c| c.as_str()) == Some("get_session_stats") {
@@ -1034,6 +1169,7 @@ fn run_pi_reader(
                                     duration_ms: None,
                                     created_at: ts.clone(),
                                     attachments: None,
+                                    image_refs: None,
                                 });
                             };
                             match role {
@@ -1214,7 +1350,7 @@ fn run_pi_reader(
                             })
                             .unwrap_or_default();
                         let trimmed = text.trim();
-                        let stop = msg
+                        let stop_reason = msg
                             .get("stopReason")
                             .and_then(|s| s.as_str())
                             .unwrap_or("");
@@ -1227,19 +1363,67 @@ fn run_pi_reader(
                                 .map(iso_utc_ms)
                                 .unwrap_or_else(now_iso);
                             emit_chat(&pipe, t_pane, "assistant", trimmed, ts);
-                        } else if stop == "error" {
+                        } else if stop_reason == "error" {
                             // a failed provider call ends the message with
                             // stopReason "error" and no text — without this
                             // row the turn just goes quiet and every client
-                            // (TUI + both mobile apps) shows nothing
-                            emit_chat(
-                                &pipe,
-                                t_pane,
-                                "assistant",
-                                "⚠ the model returned an error (no message)",
-                                now_iso(),
-                            );
-                            write_status(&pipe, t_pane, "idle");
+                            // (TUI + both mobile apps) shows nothing. pi
+                            // carries the provider's error in
+                            // `errorMessage` when it has one (e.g. "400
+                            // status code (no body)" from a gateway) —
+                            // surface it instead of a generic line.
+                            let err = msg
+                                .get("errorMessage")
+                                .and_then(|e| e.as_str())
+                                .filter(|e| !e.trim().is_empty())
+                                .unwrap_or("(no message)")
+                                .to_string();
+                            // context-exhaustion safety net: pi should
+                            // auto-compact + retry this, but its overflow
+                            // detection misses bodyless 400s, so the turn
+                            // just dies and the session wedges (too big to
+                            // prompt, and every re-send keeps failing). Mirror
+                            // the recovery: compact once, re-send the failed
+                            // prompt. At most one attempt per prompt.
+                            let last = last_prompt.lock().ok().and_then(|g| g.clone());
+                            let pending = compact_retry
+                                .lock()
+                                .ok()
+                                .map(|g| g.is_some())
+                                .unwrap_or(true);
+                            let attempts = compact_retries.load(Ordering::Relaxed);
+                            if last.is_some()
+                                && !pending
+                                && attempts < 1
+                                && looks_like_context_error(&err)
+                                && !stop.load(Ordering::Relaxed)
+                            {
+                                let text = last.unwrap();
+                                let seq = prompt_seq.load(Ordering::Relaxed);
+                                if let Ok(mut g) = compact_retry.lock() {
+                                    *g = Some((text.clone(), seq));
+                                }
+                                compact_retries.fetch_add(1, Ordering::Relaxed);
+                                eprintln!("ranchd: local pi {t_pane} context error ({err}) — auto-compacting + retrying");
+                                emit_chat(
+                                    &pipe,
+                                    t_pane,
+                                    "system",
+                                    "⚠ context appears full — compacting, then retrying your message…",
+                                    now_iso(),
+                                );
+                                write_status(&pipe, t_pane, "working");
+                                rpc(&stdin, r#"{"type": "compact"}"#);
+                            } else {
+                                emit_chat(
+                                    &pipe,
+                                    t_pane,
+                                    "assistant",
+                                    &format!("⚠ the model returned an error: {err}"),
+                                    now_iso(),
+                                );
+                                write_status(&pipe, t_pane, "idle");
+                            }
                         }
                     }
                 }
@@ -1367,6 +1551,7 @@ fn emit_chat(pipe: &PipeWriter, pane: Uuid, role: &str, text: &str, created_at: 
                 duration_ms: None,
                 created_at: Some(created_at),
                 attachments: None,
+                image_refs: None,
             }],
             reset: false,
         },
@@ -1399,6 +1584,7 @@ fn emit_chat_with(
                 duration_ms: None,
                 created_at: Some(created_at),
                 attachments,
+                image_refs: None,
             }],
             reset: false,
         },
@@ -1431,6 +1617,7 @@ fn emit_tool(
                 duration_ms: Some(dur_ms),
                 created_at: Some(created_at),
                 attachments: None,
+                image_refs: None,
             }],
             reset: false,
         },

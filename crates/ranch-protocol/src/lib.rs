@@ -249,6 +249,31 @@ pub enum Frame {
         path: String,
         size: u64,
     },
+    /// Client -> daemon: fetch the bytes of an image on the daemon
+    /// machine so the client can render it. `path` must be a *media*
+    /// path: a file stored via `FilePut`, a `ChatSend` attachment, or
+    /// an image the agent read during chat (see `ChatMsg.image_refs`).
+    /// The daemon registers exactly those paths in its media registry
+    /// — arbitrary file reads over the relay are refused. Images only
+    /// (non-image media → `error` frame); capped at 16 MiB.
+    FileGet {
+        id: String,
+        client: String,
+        /// echoed back in `FileGetOk` / `error` so clients match the reply
+        req_id: String,
+        path: String,
+    },
+    /// Daemon -> client: the requested image bytes, base64-encoded.
+    /// May be chunked on the wire (large images).
+    FileGetOk {
+        id: String,
+        req_id: String,
+        path: String,
+        /// e.g. `image/png`, `image/jpeg`
+        mime: String,
+        size: u64,
+        b64: String,
+    },
     /// Client -> daemon: list resumable forge sessions.
     ForgeList {
         id: String,
@@ -900,6 +925,12 @@ pub struct ChatMsg {
     /// File paths attached to this message (user role only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attachments: Option<Vec<String>>,
+    /// Absolute paths of images this row references — user rows that
+    /// attached an image, and tool rows whose call/result read an image
+    /// (e.g. the agent's `Read` tool on a png). All values are media
+    /// registry paths, so any client can fetch the bytes with `FileGet`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_refs: Option<Vec<String>>,
 }
 
 /// One window in a session's window stack (M5). A window is a named
@@ -1561,7 +1592,21 @@ mod tests {
             path: "/home/j/.local/state/ranch/uploads/1757500002-notes.txt".into(),
             size: 5,
         };
-        for f in [put, put_ok.clone()] {
+        let get = Frame::FileGet {
+            id: "i7".into(),
+            client: "web".into(),
+            req_id: "r4".into(),
+            path: "/home/j/.local/state/ranch/uploads/1757500003-s.png".into(),
+        };
+        let get_ok = Frame::FileGetOk {
+            id: "i8".into(),
+            req_id: "r4".into(),
+            path: "/home/j/.local/state/ranch/uploads/1757500003-s.png".into(),
+            mime: "image/png".into(),
+            size: 4,
+            b64: "iVBORw0KGgo=".into(),
+        };
+        for f in [put, put_ok.clone(), get, get_ok.clone()] {
             let line = encode_frame(&f, "c");
             assert_eq!(line.len(), 1);
             let back: Frame = serde_json::from_str(&line[0]).unwrap();
@@ -1677,6 +1722,7 @@ mod tests {
                     duration_ms: None,
                     created_at: None,
                     attachments: None,
+                    image_refs: None,
                 }],
             },
             Frame::AgentClose {

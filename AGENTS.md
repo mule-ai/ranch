@@ -136,7 +136,14 @@ Rust workspace: edition 2024, stable toolchain (rustc 1.98 era).
   {success:false, finalError}`, `message_end` with `stopReason:"error"`,
   or `extension_error`, and `pilocal.rs` maps all of them (plus retry
   attempts via `auto_retry_start`) to error rows so every client — TUI,
-  web, and both mobile apps — shows them. Both mobile notification
+  web, and both mobile apps — shows them. Compact failures are ⚠ rows
+  too (user-initiated AND the auto path). Auto compact+retry: when a
+  turn dies with a context-exhaustion error (`stopReason:"error"` +
+  overflow-ish `errorMessage`, incl. bare "400/413 status code
+  (no body)" — pi's own overflow detection misses those), the reader
+  issues `compact` and re-sends the last prompt once; a failed auto
+  compact emits a "too large to compact" row instead of looping. Both
+  mobile notification
   engines treat `⚠`-prefixed assistant rows as a default-on `errors`
   notification that suppresses that pane's `turn_end` notification (the
   error IS the turn-end news).

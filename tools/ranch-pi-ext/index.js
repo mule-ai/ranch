@@ -260,11 +260,13 @@ export default function (pi) {
 		name: "ranch_ask",
 		label: "Ranch Ask",
 		description:
-			"Ask the human user a question and block until they answer. " +
+			"Ask the human user a question and block until they answer — there is no timeout; " +
+			"the user may take hours. " +
 			"The question is shown live on every attached ranch interface (TUI, web, phone) and can trigger a " +
 			"phone notification. Provide 2-5 short choices, mark one as suggested, and keep free_text=true so the " +
 			"user can type a custom answer. Use multi=true when more than one choice may apply. " +
-			"Returns the user's answer (selected choices and/or free text) or 'no answer (timed out)' after 30 minutes.",
+			"Returns the user's answer (selected choices and/or free text). If the daemon restarts while blocked, " +
+			"returns 'no answer (ask lost)'.",
 		promptGuidelines: [
 			"Use ranch_ask when you genuinely need a human decision (ambiguous requirements, destructive actions, preferences).",
 			"Choices must be short (a few words each); put nuance in the question text.",
@@ -296,19 +298,17 @@ export default function (pi) {
 			if (!ok || !ok.ask_id) {
 				return { content: [{ type: "text", text: "ranch_ask: no ask_id in reply" }] };
 			}
-			// block (in the tool) until the user answers or 30 min elapse
-			const deadline = Date.now() + 30 * 60 * 1000;
+			// block (in the tool) until the user answers — no timeout:
+			// the user may take arbitrarily long. If the daemon restarted,
+			// the registry lost the ask and the poll reports "unknown".
 			for (;;) {
-				if (Date.now() > deadline) {
-					return { content: [{ type: "text", text: "no answer (timed out)" }] };
-				}
 				await sleep(3000);
 				const st = await ctl("ask-status", { ask_id: ok.ask_id });
 				if (st.error) continue;
 				const so = st.AgentAskStatusOk;
 				if (!so) continue;
-				if (so.state === "expired" || so.state === "unknown") {
-					return { content: [{ type: "text", text: `no answer (${so.state})` }] };
+				if (so.state === "unknown") {
+					return { content: [{ type: "text", text: "no answer (ask lost — daemon restarted?)" }] };
 				}
 				if (so.answered) {
 					const parts = [];

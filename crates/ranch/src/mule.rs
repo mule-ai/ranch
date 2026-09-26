@@ -135,6 +135,7 @@ fn write_row(w: &PipeWriter, pane: Uuid, text: &str) {
                 duration_ms: None,
                 created_at: Some(now_iso()),
                 attachments: None,
+                image_refs: None,
             }],
             reset: false,
         },

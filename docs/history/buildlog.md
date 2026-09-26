@@ -438,3 +438,15 @@ Confirmation is out-of-band: the system row + the usual
 
 Also swept the two TEMP relay diagnostics out of `send_frame`/
 `write_pipe_nb` (the /tmp frame log and the EINTR eprintln).
+
+## ranch_ask: no expiration (2026-09-25)
+
+Asks no longer expire. Removed ASK_TTL (30 min) from the daemon's
+AskRegistry: pending asks stay pending forever (the user may answer
+hours later); state() is pending/answered only; prune only drops
+answered asks after the 5-min grace. Extension: ranch_ask blocks
+indefinitely (deadline removed); a daemon restart surfaces as
+"unknown" → "no answer (ask lost)". Tool description + docs updated.
+Also completed a concurrent session's in-flight image_refs work that
+left the tree broken (8 ChatMsg initializers missing the field —
+mechanical image_refs: None; 20 tests green).
