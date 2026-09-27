@@ -1295,7 +1295,7 @@ function Terminal({
                     {m.attachments && m.attachments.length > 0 && (
                       <div className="attach-chips">
                         {m.attachments.map((a, j) =>
-                          isImg(a) ? imgChip(a, j) : <span key={j} className="attach-chip">📎 {a.split('/').pop()}</span>
+                          isImg(a) || m.image_refs?.includes(a) ? imgChip(a, j) : <span key={j} className="attach-chip">📎 {a.split('/').pop()}</span>
                         )}
                       </div>
                     )}

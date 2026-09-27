@@ -809,7 +809,7 @@ fn plan_attachments(text: &str, attachments: &[String]) -> (String, Vec<media::P
     let mut out = String::new();
     let mut images = Vec::new();
     for path in attachments {
-        if media::is_image_path(path) {
+        if media::file_is_image(path) {
             media::register(path);
             match media::load_image(path) {
                 Ok(img) => images.push(img),
@@ -822,6 +822,16 @@ fn plan_attachments(text: &str, attachments: &[String]) -> (String, Vec<media::P
         let p = std::path::Path::new(path);
         match std::fs::read(p) {
             Ok(bytes) => {
+                let name = p.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_else(|| path.clone());
+                if looks_binary(&bytes) {
+                    // binary non-image (zip, pdf, …): inlining raw bytes
+                    // would only pollute the prompt
+                    out.push_str(&format!(
+                        "[Attached file: {} ({} bytes, binary \u{2014} content not inlined; read it with a tool if needed)]\n",
+                        name, bytes.len()
+                    ));
+                    continue;
+                }
                 let cap = 50 * 1024; // 50 KiB
                 let content = if bytes.len() > cap {
                     let mut truncated = String::from_utf8_lossy(&bytes[..cap]).into_owned();
@@ -830,7 +840,6 @@ fn plan_attachments(text: &str, attachments: &[String]) -> (String, Vec<media::P
                 } else {
                     String::from_utf8_lossy(&bytes).into_owned()
                 };
-                let name = p.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_else(|| path.clone());
                 out.push_str(&format!("[Attached file: {} ({} bytes)]\n```
 {}
 ```
@@ -843,6 +852,12 @@ fn plan_attachments(text: &str, attachments: &[String]) -> (String, Vec<media::P
     }
     out.push_str(text);
     (out, images)
+}
+
+/// Binary heuristic for attached files: a NUL byte in the first 8 KiB
+/// means "not a text file" (every sane text encoding avoids NUL).
+fn looks_binary(b: &[u8]) -> bool {
+    b.get(..8192).is_some_and(|c| c.contains(&0))
 }
 
 fn home_dir_string() -> String {

@@ -2690,7 +2690,7 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                                         let names: Vec<String> = atts
                                             .iter()
                                             .map(|p| {
-                                                let icon = if crate::daemon::media::is_image_path(p) {
+                                                let icon = if crate::daemon::media::file_is_image(p) {
                                                     "🖼"
                                                 } else {
                                                     "📎"
@@ -5577,7 +5577,7 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                                                         )
                                                 })
                                                 .find(|p| {
-                                                    crate::daemon::media::is_image_path(p)
+                                                    crate::daemon::media::file_is_image(p)
                                                 })
                                             })
                                         } else {

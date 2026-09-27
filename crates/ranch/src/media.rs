@@ -149,6 +149,21 @@ pub fn is_image_path(p: &str) -> bool {
     )
 }
 
+/// True when the file at `path` is a recognized image — by extension OR by
+/// magic bytes. Mobile photo pickers hand out opaque names without an
+/// extension (e.g. uploads/1790510420-1000006546), so extension alone is
+/// not enough: an extensionless upload would otherwise be inlined as
+/// binary "text" instead of a vision payload.
+pub fn file_is_image(path: &str) -> bool {
+    if is_image_path(path) {
+        return true;
+    }
+    let Ok(head) = std::fs::read(Path::new(path)) else {
+        return false;
+    };
+    sniff_mime_bytes(&head).is_some()
+}
+
 /// Magic-byte mime sniffing with an extension fallback. `None` when the
 /// file is not readable or not a recognized image.
 pub fn sniff_mime(path: &str) -> Option<String> {
@@ -268,6 +283,27 @@ mod tests {
         assert!(is_image_path("x/a.webp"));
         assert!(!is_image_path("/tmp/a.rs"));
         assert!(!is_image_path("noext"));
+    }
+
+    #[test]
+    fn file_is_image_sniffs_extensionless() {
+        // mobile photo pickers hand out opaque names (e.g.
+        // "uploads/1790510420-1000006546"): no extension, so the
+        // classification must fall back to magic bytes
+        let dir = std::env::temp_dir().join("ranch-media-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = dir.join("upload-png");
+        std::fs::write(&png, [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]).unwrap();
+        let txt = dir.join("upload-txt");
+        std::fs::write(&txt, b"hello world").unwrap();
+        let bin = dir.join("upload-bin");
+        std::fs::write(&bin, [0x50, 0x4B, 0x03, 0x04, 0]).unwrap(); // zip magic: not an image
+        assert!(file_is_image(png.to_str().unwrap()));
+        assert!(!file_is_image(txt.to_str().unwrap()));
+        assert!(!file_is_image(bin.to_str().unwrap()));
+        assert!(!file_is_image("/definitely/missing/noext"));
+        // extension still wins without needing the file to exist
+        assert!(file_is_image("/definitely/missing/x.png"));
     }
 
     #[test]
