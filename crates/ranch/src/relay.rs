@@ -26,6 +26,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde_json::Value;
 
 use crate::daemon::{clog, civil_from_unix};
+use ranch_protocol::{Decoder, Frame};
 
 // ---------- config ----------
 
@@ -470,6 +471,10 @@ fn ws_session(
     );
     let (mut ws, _resp) = tungstenite::connect(&ws_url).map_err(|e| format!("ws connect: {e}"))?;
     clog(&format!("relay: connected, joining {topic}"));
+    // reassembles inbound Chunk frames (PROTOCOL §5); per-session — a
+    // torn batch across a reconnect is unrecoverable and clients recover
+    // via resync/re-attach
+    let mut decoder = Decoder::new();
 
     // join the private channel; the machine JWT rides in the join payload
     // NB: the frame must be (re)built with the CURRENT jwt — a refreshed
@@ -549,6 +554,7 @@ fn ws_session(
                             &mut ws,
                             &mut join_ok,
                             &mut last_server_seen,
+                            &mut decoder,
                         )?;
                     }
                     Ok(Message::Binary(b)) => {
@@ -560,6 +566,7 @@ fn ws_session(
                                 &mut ws,
                                 &mut join_ok,
                                 &mut last_server_seen,
+                                &mut decoder,
                             )?;
                         }
                     }
@@ -602,17 +609,6 @@ fn ws_session(
                 while let Some(nl) = pending.iter().position(|&b| b == b'\n') {
                     let line: Vec<u8> = pending.drain(..=nl).collect();
                     let body = &line[..line.len() - 1];
-                    // TEMP diagnostics: record every line as received
-                    if let Ok(mut f) = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open("/tmp/ranch-relay-received.log")
-                    {
-                        use std::io::Write;
-                        let _ = f.write_all(body);
-                        let _ = f.write_all(b"\n");
-                        let _ = f.flush();
-                    }
                     let line = match std::str::from_utf8(body) {
                         Ok(l) => l,
                         Err(_) => {
@@ -629,33 +625,20 @@ fn ws_session(
                         continue;
                     }
                     clog(&format!("relay: broadcasting frame ({} bytes)", line.len()));
-                    // each line is a complete ranch frame; wrap as broadcast
-                    match serde_json::from_str::<Value>(line) {
-                        Ok(frame) => {
-                            let msg = serde_json::json!({
-                                "topic": topic,
-                                "event": "broadcast",
-                                "ref": next_ref(),
-                                "payload": { "event": "frame", "payload": frame },
-                            });
-                            ws_send(&mut ws, &msg.to_string())?;
-                        }
-                        Err(e) => {
-                            let head: &str = line.get(..96).unwrap_or(line);
-                            let tail_from = line.len().saturating_sub(96);
-                            let tail: &str = line.get(tail_from..).unwrap_or("");
-                            clog(&format!(
-                                "relay: dropping unparseable daemon frame: head={head:?} tail={tail:?} err={e}"
-                            ));
-                            // TEMP diagnostics: dump the full corrupt line
-                            // (without its trailing newline) for inspection.
-                            let _ = std::fs::OpenOptions::new()
-                                .create(true)
-                                .append(true)
-                                .open("/tmp/ranch-corrupt-lines.log")
-                                .and_then(|mut f| std::io::Write::write_all(&mut f, body));
-                        }
-                    }
+                    // Each line is a complete on-the-wire frame, already
+                    // chunked at the source (the daemon's send_frame runs
+                    // it through encode_frame) — chunk lines are just
+                    // under the Realtime ~256 KiB broadcast cap, and this
+                    // relay must NOT re-chunk: clients reassemble exactly
+                    // one level.
+                    let frame: Value = serde_json::from_str(line).unwrap_or(Value::Null);
+                    let msg = serde_json::json!({
+                        "topic": topic,
+                        "event": "broadcast",
+                        "ref": next_ref(),
+                        "payload": { "event": "frame", "payload": frame },
+                    });
+                    ws_send(&mut ws, &msg.to_string())?;
                 }
             }
         }
@@ -728,6 +711,7 @@ fn handle_ws_text(
     ws: &mut tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>,
     join_ok: &mut bool,
     last_server_seen: &mut f64,
+    decoder: &mut Decoder,
 ) -> Result<(), String> {
     let msg: Value = match serde_json::from_str(text) {
         Ok(v) => v,
@@ -767,22 +751,43 @@ fn handle_ws_text(
             // remote client frame: payload = {event:"frame", payload:<frame>}
             if msg_topic == topic {
                 if let Some(frame) = payload.get("payload") {
-                    // TEMP DIAG: log every inbound frame type so uploads
-                    // from mobile can be traced (remove after debugging)
                     if let Some(t) = frame.get("t").and_then(|v| v.as_str()) {
                         clog(&format!("relay: <- {t}"));
                     }
+                    // run the frame through the chunk reassembler: whole
+                    // frames pass through untouched, Chunk frames are held
+                    // until the batch is complete (PROTOCOL §5).
+                    let was_chunk =
+                        frame.get("t").and_then(|v| v.as_str()) == Some("Chunk");
                     let mut line = serde_json::to_string(frame).unwrap_or_default();
                     line.push('\n');
-                    to_daemon_w
-                        .write_all(line.as_bytes())
-                        .map_err(|e| format!("pipe write: {e}"))?;
+                    for complete in decoder.feed(line.as_bytes()) {
+                        if was_chunk {
+                            if let Some(t) = complete_frame_type(&complete) {
+                                clog(&format!("relay: <- {t} (reassembled from chunks)"));
+                            }
+                        }
+                        let out = serde_json::to_string(&complete).unwrap_or_default();
+                        to_daemon_w
+                            .write_all(out.as_bytes())
+                            .map_err(|e| format!("pipe write: {e}"))?;
+                        to_daemon_w
+                            .write_all(b"\n")
+                            .map_err(|e| format!("pipe write: {e}"))?;
+                    }
                 }
             }
         }
         _ => {}
     }
     Ok(())
+}
+
+/// The `t` field of a frame, if it has one (for log lines).
+fn complete_frame_type(f: &Frame) -> Option<String> {
+    serde_json::to_value(f)
+        .ok()
+        .and_then(|v| v.get("t").and_then(|v| v.as_str()).map(str::to_string))
 }
 
 fn ws_send(
@@ -806,8 +811,17 @@ fn ws_send(
     // socket is not writable within 30s, tear the session down: the poll
     // loop's reconnect/backoff path knows how to recover, and local
     // clients keep working while the daemon->relay frames queue up.
-    ws.write(Message::Text(text.into()))
-        .map_err(|e| format!("ws send: {e}"))?;
+    // write() may hit EAGAIN mid-frame on a non-blocking socket for big
+    // payloads; tungstenite holds the remainder in its internal write
+    // buffer, so the flush loop below continues it in order. Only real
+    // protocol/TLS errors are fatal here.
+    match ws.write(Message::Text(text.into())) {
+        Ok(()) => {}
+        Err(tungstenite::Error::Io(e))
+            if e.kind() == std::io::ErrorKind::WouldBlock
+                || e.kind() == std::io::ErrorKind::Interrupted => {}
+        Err(e) => return Err(format!("ws send: {e}")),
+    }
     let flush_deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
         match ws.flush() {

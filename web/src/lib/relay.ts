@@ -45,6 +45,9 @@ export class Relay {
       if (!f || typeof f !== "object" || !("t" in f)) return;
       if (f.t === "Chunk") {
         const c = f as unknown as { chunk_id: string; i: number; n: number; data: string };
+        // absurd n would allocate n slots — drop corrupt/hostile batches
+        // (largest legitimate payload ≈ 70 chunks; matches MAX_CHUNKS)
+        if (!c.chunk_id || c.n <= 0 || c.n > 512 || c.i < 0 || c.i >= c.n) return;
         let entry = this.chunks.get(c.chunk_id);
         if (!entry) {
           entry = { parts: Array(c.n).fill(null), received: 0 };
@@ -141,12 +144,37 @@ export class Relay {
     return this.lastInbound;
   }
 
+  /** Max bytes of one broadcast's ranch frame before we chunk it.
+   *  Supabase Realtime silently drops single private-channel broadcasts
+   *  above ~256 KiB (measured 2026-09-27: 256,000 B arrives, 266,240 B
+   *  never does); 192 KiB matches the daemon's MAX_FRAME. */
+  private static readonly MAX_FRAME = 192 * 1024;
+
   send(f: Frame) {
-    this.channel?.send({
-      type: "broadcast",
-      event: "frame",
-      payload: f,
-    });
+    const json = JSON.stringify(f);
+    if (json.length <= Relay.MAX_FRAME) {
+      this.channel?.send({
+        type: "broadcast",
+        event: "frame",
+        payload: f,
+      });
+      return;
+    }
+    // Oversized frame (PROTOCOL §5): split into Chunk slices the daemon
+    // reassembles. JS slicing is UTF-16 code-unit safe — surrogate pairs
+    // survive the split+join round trip.
+    const cid = `c${Date.now().toString(36)}-${Math.floor(Math.random() * 1e9).toString(36)}`;
+    const n = Math.ceil(json.length / Relay.MAX_FRAME);
+    let start = 0;
+    for (let i = 0; i < n; i++) {
+      const end = Math.min(json.length, start + Relay.MAX_FRAME);
+      this.channel?.send({
+        type: "broadcast",
+        event: "frame",
+        payload: { t: "Chunk", chunk_id: cid, i, n, data: json.slice(start, end) },
+      });
+      start = end;
+    }
   }
 
   leave() {

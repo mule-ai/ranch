@@ -1305,29 +1305,51 @@ pub fn b64_decode(s: &str) -> Option<Vec<u8>> {
 // ---------- framing / chunking ----------
 
 /// Max bytes for a single on-the-wire frame (JSON-line) before we chunk.
-/// Chosen to stay well under the Realtime broadcast cap (~28 KB).
-pub const MAX_FRAME: usize = 16 * 1024;
+/// Measured 2026-09-27: Supabase Realtime's private-channel broadcast
+/// silently drops frames above ~256 KiB (a 256,000 B frame arrives, a
+/// 266,240 B one never does). 192 KiB keeps a chunked broadcast —
+/// envelope included — well under that cap.
+pub const MAX_FRAME: usize = 192 * 1024;
+
+/// Largest chunk batch a reassembler will accept. Bounds the reassembly
+/// allocation (512 × 192 KiB ≈ 96 MiB worst case) and makes hostile or
+/// corrupt batches (`n` arrives over the wire) cheap to drop. The largest
+/// legitimate payload is the 10 MiB FilePut cap (~70 chunks).
+pub const MAX_CHUNKS: u32 = 512;
 
 /// Serialize a frame into one or more JSON-lines. If the serialized frame is
 /// under `MAX_FRAME`, returns a single line. Otherwise returns `n` chunk
-/// frames whose `data` fields reassemble to the original JSON.
+/// frames whose `data` fields reassemble to the original JSON. Splits on
+/// char boundaries so multi-byte UTF-8 is never mangled.
 pub fn encode_frame(frame: &Frame, chunk_id: &str) -> Vec<String> {
     let json = serde_json::to_string(frame).expect("frame serializes");
     if json.len() <= MAX_FRAME {
         return vec![json];
     }
-    let mut out = Vec::new();
-    let n = (json.len() + MAX_FRAME - 1) / MAX_FRAME;
-    for (i, piece) in json.as_bytes().chunks(MAX_FRAME).enumerate() {
-        let f = Frame::Chunk {
-            chunk_id: chunk_id.to_string(),
-            i: i as u32,
-            n: n as u32,
-            data: String::from_utf8_lossy(piece).into_owned(),
-        };
-        out.push(serde_json::to_string(&f).expect("chunk serializes"));
+    let mut pieces: Vec<String> = Vec::new();
+    let mut start = 0;
+    while start < json.len() {
+        let mut end = json.len().min(start + MAX_FRAME);
+        while !json.is_char_boundary(end) {
+            end -= 1;
+        }
+        pieces.push(json[start..end].to_string());
+        start = end;
     }
-    out
+    let n = pieces.len() as u32;
+    pieces
+        .into_iter()
+        .enumerate()
+        .map(|(i, piece)| {
+            serde_json::to_string(&Frame::Chunk {
+                chunk_id: chunk_id.to_string(),
+                i: i as u32,
+                n,
+                data: piece,
+            })
+            .expect("chunk serializes")
+        })
+        .collect()
 }
 
 /// Incremental frame decoder. Feed it raw bytes (which may contain zero, one,
@@ -1350,6 +1372,11 @@ impl Decoder {
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<Frame> {
         let mut frames = Vec::new();
         self.buf.extend_from_slice(bytes);
+        // fast path: after any feed the buffer holds no newline, so one
+        // exists only if the new bytes carry one — no rescan needed
+        if !bytes.contains(&b'\n') {
+            return frames;
+        }
         while let Some(nl) = self.buf.iter().position(|&b| b == b'\n') {
             let mut line: Vec<u8> = self.buf.drain(..=nl).collect();
             line.pop(); // drop the \n
@@ -1375,6 +1402,11 @@ impl Decoder {
                 n,
                 data,
             } => {
+                // corrupt/hostile batch: zero/absurd `n` or out-of-range
+                // index — drop it without allocating the slot vector
+                if *n == 0 || *i >= *n || *n > MAX_CHUNKS {
+                    return None;
+                }
                 let complete = {
                     let entry = self
                         .pending
@@ -1472,7 +1504,8 @@ mod tests {
 
     #[test]
     fn roundtrip_chunked() {
-        let big = "x".repeat(40_000);
+        // > MAX_FRAME (192 KiB) so this actually splits
+        let big = "x".repeat(200_000);
         let f = Frame::Update {
             id: "i1".into(),
             client: "c".into(),
@@ -1495,6 +1528,62 @@ mod tests {
             got.extend(d.feed(payload.as_bytes()));
         }
         assert_eq!(got, vec![f]);
+    }
+
+    /// Non-ASCII content straddling the MAX_FRAME boundary must survive
+    /// the split: byte-aligned slicing would replace the boundary char
+    /// with U+FFFD and corrupt the reassembled frame.
+    #[test]
+    fn encode_frame_char_boundary_utf8() {
+        // "あ" is 3 bytes; pad with ASCII so the 192 KiB cut lands inside
+        // a run of multi-byte chars
+        let filler = "あ".repeat(70_000); // 210 KB in UTF-8
+        let f = Frame::FilePut {
+            id: "i1".into(),
+            client: "c".into(),
+            req_id: "fp-1".into(),
+            name: filler.clone(),
+            b64: "QUJD".into(),
+        };
+        let lines = encode_frame(&f, "c-utf8");
+        assert!(lines.len() > 1, "payload should split");
+        // every piece must be valid UTF-8 on its own (serde_json requires
+        // it; from_utf8_lossy corruption would also show up here as the
+        // replacement char)
+        for l in &lines {
+            let v = serde_json::from_str::<serde_json::Value>(l).unwrap();
+            let data = v.get("data").unwrap().as_str().unwrap();
+            assert!(!data.contains('\u{FFFD}'), "mangled chunk");
+        }
+        let mut d = Decoder::new();
+        let mut got = Vec::new();
+        for l in &lines {
+            let mut payload = l.clone();
+            payload.push('\n');
+            got.extend(d.feed(payload.as_bytes()));
+        }
+        assert_eq!(got, vec![f], "reassembled frame must be byte-identical");
+    }
+
+    /// A chunk batch whose `n` exceeds MAX_CHUNKS must be dropped, not
+    /// allocated (a hostile n=4 billion would request a 32 GB vec).
+    #[test]
+    fn decoder_rejects_hostile_chunk_n() {
+        let mut d = Decoder::new();
+        let hostile = serde_json::json!({"t":"Chunk","chunk_id":"evil","i":0,"n":4_000_000_000u32,"data":"x"});
+        let mut line = hostile.to_string();
+        line.push('\n');
+        let got = d.feed(line.as_bytes());
+        assert!(got.is_empty(), "hostile batch must not reassemble");
+        // and a normal small batch still works afterwards
+        let f = Frame::Hb;
+        let mut got2 = Vec::new();
+        for l in encode_frame(&f, "ok") {
+            let mut payload = l;
+            payload.push('\n');
+            got2.extend(d.feed(payload.as_bytes()));
+        }
+        assert_eq!(got2, vec![f]);
     }
 
     #[test]
@@ -1526,12 +1615,13 @@ mod tests {
             windows: vec![],
             window: None,
         };
-        // Serialize everything into one byte blob, feed byte-by-byte.
-        let blob: String = encode_frame(&f, "c9").join("\n");
+        // Serialize everything into one byte blob, feed in 4 KiB blocks
+        // (exercises partial lines and interleaved chunks).
+        let blob: Vec<u8> = encode_frame(&f, "c9").join("\n").into_bytes();
         let mut d = Decoder::new();
         let mut got = Vec::new();
-        for b in blob.bytes() {
-            got.extend(d.feed(&[b]));
+        for chunk in blob.chunks(4096) {
+            got.extend(d.feed(chunk));
         }
         got.extend(d.flush());
         assert_eq!(got, vec![f]);

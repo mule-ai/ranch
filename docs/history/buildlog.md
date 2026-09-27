@@ -487,3 +487,66 @@ both client-side and daemon-side.
 Tests: media module (sniff, tool-args refs, registry eviction, row
 flagging), FileGet/FileGetOk round-trip. `cargo test` + clippy green;
 web `tsc` + `vite build` green; native `assembleRelease` green.
+
+## Image uploads over the relay: chunking shipped + 256 KiB cap found (2026-09-27)
+
+Mobile image uploads >~190 KB failed with "upload timed out" while
+everything else worked. Probes against the live channel pinned the
+root cause: **Supabase Realtime's private-channel broadcast silently
+drops frames above ~256 KiB** (256,000 B arrives <1 s; 266,240 B never
+arrives, no error). The 133 KB test screenshots sat under the cap;
+real photos did not. A second, older bug compounded it: the mobile
+`Realtime` client never echoed server-originated `phx_heartbeat`
+requests, so Supabase dropped the phone's connection every ~2-5 min
+(relay log showed `Hello` spam), and frames racing the dead-socket
+window were lost.
+
+Fixes, all surfaces:
+
+- **Heartbeat echo** (mobile `Realtime.kt`, 0.7.12): respond to
+  `phx_heartbeat` on the phoenix topic with the matching ref (the
+  daemon's `relay.rs` and `tools/relay-test.mjs` already did this).
+  Reconnect loop gone.
+- **Chunking implemented end to end** (was spec'd in PROTOCOL §5,
+  half-built: TUI + mobile *receiver* existed, no one *sent* chunks):
+  - `ranch-protocol`: `MAX_FRAME` 16 KiB → **192 KiB** (measured cap
+    above; 192 KiB chunk + envelope stays well under 256 KiB).
+    `encode_frame` now splits on **char boundaries** (the old
+    byte-aligned split + `from_utf8_lossy` mangled multi-byte UTF-8
+    straddling a boundary). New `MAX_CHUNKS = 512` bound: a hostile
+    `n` no longer allocates (the reassemblers were `vec![None; n]`).
+    `Decoder` gains a fast path (no newline rescan when the incoming
+    bytes carry none — the byte-wise test was quadratic at the new
+    line size).
+  - Daemon `send_frame` already ran every frame through
+    `encode_frame`, so **the daemon is the single chunking
+    authority**; the relay now *transports lines as-is* outbound and
+    **reassembles inbound** chunks with a per-session `Decoder`
+    before dispatching to the main loop (a reassembled `FilePut`
+    logs `relay: <- FilePut (reassembled from chunks)`).
+  - Mobile `Realtime.kt` + web `relay.ts`: sender-side chunking for
+    oversized frames (char-safe slices, same 192 KiB cap, `n ≤ 512`
+    guard on the receive side).
+- **Relay pipe backlog torn-line bug** (latent, exposed by bigger
+  lines): `RELAY_BACKLOG_MAX` was 192 KiB — one 273 KB frame spilled
+  its remainder into the backlog, the cap trimmed it, and the relay
+  joined a *partial* line to the next frame (corrupt JSON at the 64
+  KiB boundary). The backlog now tracks an in-progress front entry
+  (the remainder of a line whose head is already in the pipe) that
+  trim never drops; cap raised to 16 MiB (covers one 10 MiB
+  upload's chunk lines; a healthy relay drains instantly, so the cap
+  only bites a long-wedged relay). Regression test:
+  `relay_backlog_protects_in_progress_line`.
+- **`ws_send` EAGAIN on big frames** (latent): a ~197 KB WebSocket
+  write on the non-blocking socket returned `WouldBlock` from
+  `ws.write` itself; the `?` propagated it as a session error and
+  tore the relay down (tungstenite holds the remainder in its
+  internal write buffer, so the flush loop simply continues it).
+- Mobile 0.7.11 (timeout + error surfacing for uploads), 0.7.13
+  (chunked send path). Web deploys from the same push.
+
+Verified with live probes: 500 KB chunked `FilePut` reassembles +
+stores; a 204,982 B PNG uploaded as 2 chunks and fetched back via
+`FileGet` arrives as 2 relay chunks and reassembles **sha256-identical**;
+small frames still flow as single broadcasts. `cargo test` 27+11
+green, clippy clean, web `tsc` green, native `assembleRelease` green.

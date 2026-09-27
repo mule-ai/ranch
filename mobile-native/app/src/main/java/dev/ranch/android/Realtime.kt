@@ -222,14 +222,47 @@ class Realtime(
         doSendFrame(frame)
     }
 
+    /** Max bytes of one broadcast's ranch frame before we chunk it.
+     *  Supabase Realtime silently drops single private-channel broadcasts
+     *  above ~256 KiB (measured 2026-09-27: 256,000 B arrives, 266,240 B
+     *  never does); 192 KiB matches the daemon's MAX_FRAME. */
+    private val maxFrame = 192 * 1024
+
     private fun doSendFrame(frame: JSONObject) {
+        val frameJson = frame.toString()
+        if (frameJson.length <= maxFrame) {
+            sendBroadcast(frame)
+            return
+        }
+        // Oversized frame (PROTOCOL §5): split into char-safe Chunk slices
+        // the daemon reassembles. Kotlin substrings index by char, so a
+        // multi-byte char is never cut in half.
+        val cid = "c${refCounter.incrementAndGet()}"
+        val n = (frameJson.length + maxFrame - 1) / maxFrame
+        var start = 0
+        var i = 0
+        while (start < frameJson.length) {
+            val end = minOf(frameJson.length, start + maxFrame)
+            sendBroadcast(JSONObject()
+                .put("t", "Chunk")
+                .put("chunk_id", cid)
+                .put("i", i)
+                .put("n", n)
+                .put("data", frameJson.substring(start, end)))
+            start = end
+            i++
+        }
+    }
+
+    /** Wrap a ranch frame in the Realtime broadcast envelope and send it. */
+    private fun sendBroadcast(payload: Any) {
         val msg = JSONObject()
             .put("topic", topic)
             .put("event", "broadcast")
             .put("ref", "fr${refCounter.incrementAndGet()}")
             .put("payload", JSONObject()
                 .put("event", "frame")
-                .put("payload", frame))
+                .put("payload", payload))
         ws?.send(msg.toString())
     }
 
@@ -346,6 +379,9 @@ class Realtime(
         val i = frame.optInt("i")
         val n = frame.optInt("n")
         val data = frame.optString("data")
+        // absurd n would allocate n slots — drop corrupt/hostile batches
+        // (the largest legitimate upload is ~70 chunks; matches MAX_CHUNKS)
+        if (n <= 0 || n > 512) return
         var chunk = chunks[cid]
         if (chunk == null) {
             chunk = Chunk(n, Array(n) { null })

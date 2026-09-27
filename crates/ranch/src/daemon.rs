@@ -511,6 +511,10 @@ struct Client {
     /// Frames written here are broadcast to remote clients over the relay.
     /// Set only for the relay client. The fd is NON-BLOCKING (see
     /// relay::make_pipes); writes that WouldBlock spill into `backlog`
+    /// (`relay_in_progress`: the front backlog entry is the remainder of a
+    /// line whose head is already in the pipe — trim must never drop it,
+    /// or the relay sees a torn line).
+    relay_in_progress: bool,
     /// instead of blocking the main loop, and are retried when the
     /// poll loop sees the pipe writable again.
     relay_out: Option<std::fs::File>,
@@ -1174,7 +1178,7 @@ fn send_frame(c: &mut Client, frame: &Frame) {
                 // (2026-09-23): pipe full -> main loop parked in
                 // anon_pipe_write -> every client hung, local included.
                 // Instead: queue what does not fit and keep serving.
-                write_relay_frame(w, &mut c.backlog, &bytes)
+                write_relay_frame(w, &mut c.backlog, &mut c.relay_in_progress, &bytes)
             }
             // control pseudo-client: collect (the request thread returns
             // them in the HTTP response)
@@ -1196,10 +1200,13 @@ fn send_frame(c: &mut Client, frame: &Frame) {
 }
 
 /// Relay-pipe capacity bound for the backlog queue (bytes across all
-/// queued frames). Roughly 3x the 64 KiB kernel pipe buffer: enough to
-/// ride out a normal reconnect backoff without dropping anything, small
-/// enough that a wedged relay cannot balloon memory.
-const RELAY_BACKLOG_MAX: usize = 192 * 1024;
+/// queued frames). Must cover one full frame's chunk lines in flight:
+/// the largest legitimate frame is the 10 MiB FilePut cap (~13.4 MB of
+/// ~197 KB chunk lines) — a healthy relay drains instantly, so this cap
+/// only bites when the relay is wedged for a long time, where dropping
+/// whole queued frames (never a line's continuation) is the right
+/// tradeoff against unbounded memory.
+const RELAY_BACKLOG_MAX: usize = 16 * 1024 * 1024;
 
 /// Outcome of a non-blocking pipe write.
 enum PipeWrite {
@@ -1244,29 +1251,36 @@ fn write_pipe_nb(w: &mut std::fs::File, bytes: &[u8]) -> Result<PipeWrite, std::
 fn write_relay_frame(
     w: &mut std::fs::File,
     backlog: &mut VecDeque<Vec<u8>>,
+    in_progress: &mut bool,
     bytes: &[u8],
 ) -> std::io::Result<()> {
     // previous backlog first: preserve ordering
     if !backlog.is_empty() {
         backlog.push_back(bytes.to_vec());
-        trim_relay_backlog(backlog);
+        trim_relay_backlog(backlog, *in_progress);
         return Ok(());
     }
     match write_pipe_nb(w, bytes)? {
         PipeWrite::Complete => Ok(()),
         PipeWrite::Partial(off) => {
             // Queue only the UNWRITTEN remainder: the first `off` bytes
-            // are already in the pipe.
+            // are already in the pipe. Mark it in-progress so trim never
+            // drops this line's tail (a torn line corrupts everything the
+            // relay assembles after it).
             backlog.push_back(bytes[off..].to_vec());
-            trim_relay_backlog(backlog);
+            *in_progress = true;
+            trim_relay_backlog(backlog, true);
             Ok(())
         }
     }
 }
 
-fn trim_relay_backlog(backlog: &mut VecDeque<Vec<u8>>) {
+fn trim_relay_backlog(backlog: &mut VecDeque<Vec<u8>>, in_progress: bool) {
     let mut total: usize = backlog.iter().map(|b| b.len()).sum();
-    while total > RELAY_BACKLOG_MAX && backlog.len() > 1 {
+    // the front entry may be a pipe-resident line's remainder — never
+    // drop it; only whole, not-yet-started lines are droppable
+    let protected = if in_progress { 1 } else { 0 };
+    while total > RELAY_BACKLOG_MAX && backlog.len() > protected {
         if let Some(dropped) = backlog.pop_front() {
             total -= dropped.len();
         }
@@ -1281,15 +1295,20 @@ fn flush_relay_backlog(c: &mut Client) -> bool {
         return true;
     };
     while let Some(front) = c.backlog.front() {
+        let was_in_progress = c.relay_in_progress;
         match write_pipe_nb(w, front) {
             Ok(PipeWrite::Complete) => {
                 c.backlog.pop_front();
+                if was_in_progress {
+                    c.relay_in_progress = false;
+                }
             }
             Ok(PipeWrite::Partial(off)) => {
                 // Keep only the unwritten remainder, else the next flush
                 // re-sends the first `off` bytes already in the pipe.
                 let entry = c.backlog.pop_front().expect("front taken above");
                 c.backlog.push_front(entry[off..].to_vec());
+                c.relay_in_progress = true;
                 return false; // pipe full again
             }
             Err(_) => return true, // real error: drop backlog, send_frame will report
@@ -2165,6 +2184,7 @@ impl Daemon {
                         stream: None,
                         relay_out: Some(relay_w),
                         backlog: std::collections::VecDeque::new(),
+                        relay_in_progress: false,
                         relay_in: Some(fd_file(daemon_r)),
                         sink: None,
                         decoder: Decoder::new(),
@@ -2228,6 +2248,7 @@ impl Daemon {
                     stream: None,
                     relay_out: None,
                     backlog: std::collections::VecDeque::new(),
+                    relay_in_progress: false,
                     relay_in: Some(fd_file(f_daemon_r)),
                     sink: None,
                     decoder: Decoder::new(),
@@ -6033,6 +6054,7 @@ fn run(
                         stream: Some(stream),
                         relay_out: None,
                         backlog: std::collections::VecDeque::new(),
+                        relay_in_progress: false,
                         relay_in: None,
                         sink: None,
                         decoder: Decoder::new(),
@@ -6125,6 +6147,7 @@ fn run(
                                 stream: None,
                                 relay_out: None,
                                 backlog: std::collections::VecDeque::new(),
+                                relay_in_progress: false,
                                 relay_in: None,
                                 sink: Some(sink.clone()),
                                 decoder: Decoder::new(),
@@ -6449,6 +6472,86 @@ mod tests {
         assert_eq!(sid, None);
         assert_eq!(title, None);
         assert_eq!(cwd, None);
+    }
+
+    /// Regression: a frame line bigger than the 64 KiB kernel pipe buffer
+    /// spills its remainder into the backlog marked in-progress. Trim must
+    /// never drop that remainder, or the relay assembles a torn line
+    /// (corrupted 2026-09-27: 192 KiB cap dropped a 273 KB FileGetOk's
+    /// chunk-0 tail, joining partial chunk-0 to chunk-1).
+    #[test]
+    fn relay_backlog_protects_in_progress_line() {
+        use std::io::Read;
+        let ((daemon_r, _daemon_w), (relay_r, relay_w)) =
+            crate::relay::make_pipes().unwrap();
+        let mut relay_w = relay_w;
+        let mut backlog: VecDeque<Vec<u8>> = VecDeque::new();
+        let mut in_progress = false;
+
+        // two lines far bigger than the pipe buffer, each newline-terminated
+        let line1 = vec![b'a'; 200_000];
+        let mut b1 = line1.clone();
+        b1.push(b'\n');
+        let line2 = vec![b'b'; 200_000];
+        let mut b2 = line2.clone();
+        b2.push(b'\n');
+
+        write_relay_frame(&mut relay_w, &mut backlog, &mut in_progress, &b1).unwrap();
+        assert!(in_progress, "200 KB line must spill into the backlog");
+        assert_eq!(backlog.len(), 1);
+        write_relay_frame(&mut relay_w, &mut backlog, &mut in_progress, &b2).unwrap();
+        assert_eq!(backlog.len(), 2);
+
+        // trim beyond the cap must keep the in-progress front
+        trim_relay_backlog(&mut backlog, in_progress);
+        assert_eq!(backlog.len(), 2, "in-progress front is protected");
+
+        // drain everything and prove both lines arrive whole and in order
+        // (the pipe is non-blocking: retry on EAGAIN until EOF)
+        let reader = std::thread::spawn(move || {
+            use std::os::fd::FromRawFd;
+            let mut f = unsafe { std::fs::File::from_raw_fd(relay_r) };
+            let mut all = Vec::new();
+            let mut buf = [0u8; 65_536];
+            loop {
+                match f.read(&mut buf) {
+                    Ok(0) => break, // EOF: writers closed and drained
+                    Ok(n) => all.extend_from_slice(&buf[..n]),
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            || e.kind() == std::io::ErrorKind::Interrupted =>
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            Ok(all)
+        });
+        // flush the backlog into the pipe (the flush_relay_backlog logic,
+        // sans Client)
+        loop {
+            if backlog.is_empty() {
+                break;
+            }
+            match write_pipe_nb(&mut relay_w, backlog.front().unwrap()) {
+                Ok(PipeWrite::Complete) => {
+                    backlog.pop_front();
+                }
+                Ok(PipeWrite::Partial(off)) => {
+                    let e = backlog.pop_front().unwrap();
+                    backlog.push_front(e[off..].to_vec());
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(_) => panic!("pipe write error"),
+            }
+        }
+        drop(relay_w);
+        drop(daemon_r);
+        let all = reader.join().unwrap().unwrap();
+        let mut expected = b1;
+        expected.extend_from_slice(&b2);
+        assert_eq!(all, expected, "both lines must arrive whole, in order");
     }
 
     #[test]

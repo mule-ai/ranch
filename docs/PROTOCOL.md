@@ -333,19 +333,28 @@ Images are first-class in every chat pane, on every surface:
 
 ## 5. Chunking & size limits
 
-Supabase Realtime caps broadcast payloads (~28 KB; verify at M2).
-Local unix socket has no practical limit, but the same chunking is used
-everywhere for uniformity.
+Supabase Realtime's private-channel broadcast **silently drops frames
+above ~256 KiB** (measured 2026-09-27: a 256,000 B frame arrives in
+<1 s; a 266,240 B one never arrives, no error). The local unix socket
+has no practical limit, but the same chunking is used everywhere for
+uniformity.
 
-- Any frame whose serialized form exceeds **16 KB** is split into
-  `chunk` frames:
+- Any frame whose serialized form exceeds **192 KiB** (`MAX_FRAME`) is
+  split into `Chunk` frames:
   ```jsonc
-  { "type":"chunk", "chunk_id":"c_...", "i": 0, "n": 3, "data": "..." }
+  { "t":"Chunk", "chunk_id":"c_...", "i": 0, "n": 3, "data": "..." }
   ```
   Reassembly is by `(chunk_id, i, n)`; a torn batch (missing part)
-  triggers `resync` if it was a `snapshot`/`update`.
-- `snapshot` is always chunked (grid is ~cols·rows·~10 B typical).
-- Default `update` frames are small; the 16 KB cap protects bursts.
+  triggers `resync` if it was a `snapshot`/`update`. Batches with
+  `n > 512` (`MAX_CHUNKS`) are dropped as corrupt/hostile (bounds the
+  reassembly allocation).
+- `snapshot` is chunked whenever it exceeds the cap (large grids).
+- `FilePut` (mobile/web uploads) and `FileGetOk` (large images) are the
+  main chunked payloads in practice: a 10 MiB upload ≈ 70 chunks.
+  Splitting happens on char boundaries, so multi-byte UTF-8 survives.
+- Shipped: daemon relay (both directions), mobile `Realtime.kt`,
+  web `relay.ts`; the TUI's local-socket path uses the same
+  `encode_frame`/`Decoder`.
 
 ## 6. Client-side invariants
 
