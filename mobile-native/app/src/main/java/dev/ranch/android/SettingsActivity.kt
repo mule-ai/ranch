@@ -34,11 +34,24 @@ class SettingsActivity : Activity() {
             val d = Monitor.diag()
             diagText.text = buildString {
                 appendLine("status: ${d["status"]}  machine: ${d["machine"]}")
+                appendLine("version: ${versionLabel()}")
                 appendLine("frames received: ${d["frames"]}")
                 appendLine("fired: turn=${d["firedTurn"]} msg=${d["firedMsg"]} q=${d["firedQ"]}")
                 appendLine("skipped: active=${d["skipActive"]} off=${d["skipOff"]}  errors=${d["errors"]}")
             }
             handler.postDelayed(this, 2000)
+        }
+    }
+
+    /// The installed build identity ("<versionName> (code N) · <baked tag>")
+    /// — so a given APK is distinguishable from an older one on the device
+    /// without adb.
+    private fun versionLabel(): String {
+        return try {
+            val p = packageManager.getPackageInfo(packageName, 0)
+            "${p.versionName ?: "?"} (code ${p.versionCode}) · ${Version.own}"
+        } catch (e: Exception) {
+            Version.own
         }
     }
 
