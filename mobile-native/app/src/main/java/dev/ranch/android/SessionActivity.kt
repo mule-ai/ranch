@@ -1482,26 +1482,42 @@ class SessionActivity : Activity() {
     /// round trip to fetch the same pixels back.
     private fun uploadLocalImage(uri: Uri) {
         uploadExec.execute {
-            val bytes = try {
-                contentResolver.openInputStream(uri)?.use { it.readBytes() }
-            } catch (e: Exception) { null }
-            if (bytes == null) {
-                handler.post { statusView.text = "upload failed: could not read image" }
-                return@execute
+            try {
+                val bytes = contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                if (bytes == null) {
+                    handler.post { statusView.text = "upload failed: could not read image" }
+                    return@execute
+                }
+                if (bytes.size > 10 * 1024 * 1024) {
+                    handler.post { statusView.text = "image too large (max 10 MiB)" }
+                    return@execute
+                }
+                val relay = relay
+                if (relay == null) {
+                    handler.post { statusView.text = "not connected to the daemon yet — try again" }
+                    return@execute
+                }
+                val name = uri.lastPathSegment?.substringAfterLast('/') ?: "image.jpg"
+                val rid = "fp-" + Term.newId()
+                // seed the chip thumbnail from the local bytes (off-main decode)
+                decodeDownscaled(bytes)?.let { pendingLocalBitmaps[rid] = it }
+                handler.post {
+                    attUploadReqs[rid] = name
+                    statusView.text = "uploading $name …"
+                    // a FilePut that gets no FilePutOk (dropped WS send, flap,
+                    // chunk loss) must not leave "uploading …" on the bar forever
+                    handler.postDelayed({
+                        if (attUploadReqs.containsKey(rid)) {
+                            attUploadReqs.remove(rid)
+                            pendingLocalBitmaps.remove(rid)
+                            statusView.text = "upload timed out — tap 🖼 to try again"
+                        }
+                    }, 20_000)
+                }
+                relay.send(Term.filePut(name, android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP), rid))
+            } catch (e: Exception) {
+                handler.post { statusView.text = "upload failed: ${e.message}" }
             }
-            if (bytes.size > 10 * 1024 * 1024) {
-                handler.post { statusView.text = "image too large (max 10 MiB)" }
-                return@execute
-            }
-            val name = uri.lastPathSegment?.substringAfterLast('/') ?: "image.jpg"
-            val rid = "fp-" + Term.newId()
-            // seed the chip thumbnail from the local bytes (off-main decode)
-            decodeDownscaled(bytes)?.let { pendingLocalBitmaps[rid] = it }
-            handler.post {
-                attUploadReqs[rid] = name
-                statusView.text = "uploading $name …"
-            }
-            relay?.send(Term.filePut(name, android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP), rid))
         }
     }
 
