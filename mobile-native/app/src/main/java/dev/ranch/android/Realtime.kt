@@ -23,8 +23,10 @@ import kotlin.concurrent.Volatile
  *   {"topic":..., "event":"broadcast",
  *    "payload":{"event":"frame", "payload":{...ranch frame...}}}
  *
- * Liveness: 25 s app-level heartbeats; 75 s with no server traffic is a
- * zombie connection → full reconnect + re-join. JWT is refreshed ~2 min
+ * Liveness: 25 s app-level heartbeats, plus echoing server-originated
+ * `phx_heartbeat` requests (mandatory — Supabase drops connections that
+ * don't answer); 75 s with no server traffic is a zombie connection →
+ * full reconnect + re-join. JWT is refreshed ~2 min
  * before expiry (access_token event + re-join).
  */
 class Realtime(
@@ -303,6 +305,21 @@ class Realtime(
 
             // server-side heartbeat ack
             if (event == "heartbeat") {
+                lastServerSeen = System.currentTimeMillis()
+                return
+            }
+
+            // server-originated heartbeat request: echo it back on the
+            // phoenix topic with the same ref (mirrors relay.rs). Without
+            // this the Realtime server times out the connection (~2-5 min)
+            // and drops it — the reconnect loop that lost in-flight frames.
+            if (event == "phx_heartbeat") {
+                ws?.send(JSONObject()
+                    .put("topic", "phoenix")
+                    .put("event", "phx_heartbeat")
+                    .put("payload", JSONObject())
+                    .put("ref", msg.optString("ref"))
+                    .toString())
                 lastServerSeen = System.currentTimeMillis()
                 return
             }
