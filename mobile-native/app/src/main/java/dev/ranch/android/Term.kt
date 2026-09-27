@@ -161,9 +161,9 @@ object Term {
         return o
     }
 
-    fun filePut(name: String, b64: String): JSONObject =
+    fun filePut(name: String, b64: String, reqId: String = "fp-" + newId()): JSONObject =
         JSONObject().put("t", "FilePut").put("id", newId()).put("client", CLIENT)
-            .put("req_id", "fp-" + newId()).put("name", name).put("b64", b64)
+            .put("req_id", reqId).put("name", name).put("b64", b64)
 
     // ---- Phase 4: workflows / mule ----
     fun workflowList(): JSONObject =

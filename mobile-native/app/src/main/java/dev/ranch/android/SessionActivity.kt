@@ -375,6 +375,7 @@ class SessionActivity : Activity() {
                     if (p.isNotEmpty() && p !in pendingAtt) pendingAtt.add(p)
                     requestImage(p)
                     renderChips()
+                    if (statusView.text.startsWith("uploading")) statusView.text = ""
                 }
             }
             "Error" -> {
@@ -388,6 +389,8 @@ class SessionActivity : Activity() {
                         statusView.text = "compaction failed: ${f.optString("message")}"
                         finishCompact()
                     }
+                    rid.startsWith("fp-") && attUploadReqs.remove(rid) != null ->
+                        statusView.text = "upload failed: ${f.optString("message")}"
                     rid.isEmpty() -> statusView.text = "err: ${f.optString("message")}"
                 }
             }
@@ -1390,13 +1393,14 @@ class SessionActivity : Activity() {
         // to WRAP_CONTENT, which squeezed the composer to its content width
         inputArea.addView(row, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
-        // attachment chips: a dedicated row above the input so wrapping
-        // images can't squeeze the text field
+        // attachment chips: a dedicated row ABOVE the input so wrapping
+        // images can't squeeze the text field (and are visible while the
+        // keyboard is up)
         chipRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            setPadding(dp(10), 0, dp(10), 0)
+            setPadding(dp(10), dp(4), dp(10), dp(2))
         }
-        inputArea.addView(chipRow, 1)
+        inputArea.addView(chipRow, 0)
         renderChips()
         updateStopButton()
     }
@@ -1467,38 +1471,63 @@ class SessionActivity : Activity() {
             val rid = "fp-" + Term.newId()
             attUploadReqs[rid] = name
             statusView.text = "uploading $name …"
-            relay?.send(Term.filePut(name, android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP)))
+            relay?.send(Term.filePut(name, android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP), rid))
         } catch (e: Exception) {
             statusView.text = "upload failed: ${e.message}"
         }
     }
 
-    /// The composer's attachment chip row (image paths with ✕ to drop).
+    /// The composer's attachment chip row. Each chip: [thumbnail][name][✕] —
+    /// tap the thumbnail for the full image, tap ✕ to drop the attachment.
     private fun renderChips() {
         val row = chipRow ?: return
         row.removeAllViews()
         for (p in pendingAtt) {
-            row.addView(TextView(this).apply {
-                val bmp = imgCache[p]
-                if (bmp != null) {
-                    // chip with a tiny preview
-                    setCompoundDrawablesWithIntrinsicBounds(null, null, null, null)
-                    text = " ✕"
-                } else {
-                    text = "📎 " + p.substringAfterLast('/') + " ✕"
-                }
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
-                setTextColor(0xFFEAF2FF.toInt())
-                setPadding(dp(8), dp(4), dp(8), dp(4))
+            val chip = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(4), dp(2), dp(2), dp(2))
                 background = android.graphics.drawable.GradientDrawable().apply {
-                    cornerRadius = dp(12).toFloat()
+                    cornerRadius = dp(14).toFloat()
                     setColor(0xFF24557E.toInt())
                 }
+            }
+            val thumb = ImageView(this).apply {
+                layoutParams = LinearLayout.LayoutParams(dp(30), dp(30))
+                background = android.graphics.drawable.GradientDrawable().apply {
+                    cornerRadius = dp(4).toFloat()
+                    setColor(0xFF14181D.toInt())
+                }
+                scaleType = ImageView.ScaleType.CENTER_CROP
+                contentDescription = "open ${p}"
+                setOnClickListener { showImageFull(p) }
+            }
+            imgCache[p]?.let { thumb.setImageBitmap(it) }
+            val name = TextView(this).apply {
+                text = p.substringAfterLast('/')
+                maxLines = 1
+                ellipsize = android.text.TextUtils.TruncateAt.MIDDLE
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+                setTextColor(0xFFEAF2FF.toInt())
+                setPadding(dp(6), 0, dp(2), 0)
+            }
+            val drop = TextView(this).apply {
+                text = " ✕ "
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+                setTextColor(0xFFE06C75.toInt())
+                contentDescription = "remove ${p}"
                 setOnClickListener {
                     pendingAtt.remove(p)
                     renderChips()
                 }
-            })
+            }
+            chip.addView(thumb)
+            chip.addView(name, LinearLayout.LayoutParams(dp(90), LinearLayout.LayoutParams.WRAP_CONTENT))
+            chip.addView(drop)
+            val lp = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+            lp.rightMargin = dp(6)
+            row.addView(chip, lp)
         }
     }
 
@@ -1563,6 +1592,13 @@ class SessionActivity : Activity() {
         val t = chatEdit.text.toString().trim()
         val atts = pendingAtt.toList()
         if (t.isEmpty() && atts.isEmpty()) return
+        // don't fire the message while an image is still uploading — the
+        // path only lands in pendingAtt on FilePutOk, so sending now would
+        // silently drop the attachment
+        if (atts.isEmpty() && attUploadReqs.isNotEmpty()) {
+            statusView.text = "waiting for image upload…"
+            return
+        }
         // mid-compaction: hold the message and send it when the queue flushes
         if (compacting && activePane == compactingPane) {
             queued.add(Queued(activePane, t))
