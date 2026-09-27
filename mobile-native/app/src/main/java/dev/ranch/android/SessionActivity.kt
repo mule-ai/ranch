@@ -178,6 +178,8 @@ class SessionActivity : Activity() {
     private val attUploadReqs = mutableMapOf<String, String>() // FilePut req_id -> name
     private val imgCache = mutableMapOf<String, Bitmap>()     // path -> decoded bitmap
     private val imgViews = mutableMapOf<String, MutableList<ImageView>>() // path -> live thumbs
+    private val uploadExec = java.util.concurrent.Executors.newSingleThreadExecutor()
+    private val pendingLocalBitmaps = mutableMapOf<String, Bitmap>() // FilePut req_id -> locally decoded thumb
     private val imgRequesting = mutableSetOf<String>()
     private val PICK_IMAGE_REQ = 42
     private lateinit var modelBar: LinearLayout
@@ -319,6 +321,7 @@ class SessionActivity : Activity() {
     override fun onDestroy() {
         relay?.let { it.removeSink(sink); it.detach() }
         handler.removeCallbacksAndMessages(null)
+        uploadExec.shutdownNow()
         super.onDestroy()
     }
 
@@ -344,20 +347,7 @@ class SessionActivity : Activity() {
                 val b64 = f.optString("b64")
                 if (path.isNotEmpty() && b64.isNotEmpty()) {
                     try {
-                        val raw = android.util.Base64.decode(b64, android.util.Base64.DEFAULT)
-                        var bmp = BitmapFactory.decodeByteArray(raw, 0, raw.size)
-                        // keep the cache bounded: downscale huge rasters
-                        if (bmp != null && bmp.width * bmp.height > 4096 * 4096) {
-                            val scale = (4096.0 / maxOf(bmp.width, bmp.height)).toFloat()
-                            val small = Bitmap.createScaledBitmap(
-                                bmp,
-                                (bmp.width * scale).toInt().coerceAtLeast(1),
-                                (bmp.height * scale).toInt().coerceAtLeast(1),
-                                true,
-                            )
-                            if (small !== bmp) bmp.recycle()
-                            bmp = small
-                        }
+                        val bmp = decodeDownscaled(android.util.Base64.decode(b64, android.util.Base64.DEFAULT))
                         if (bmp != null) {
                             imgCache[path] = bmp
                             imgViews[path]?.forEach { it.setImageBitmap(bmp) }
@@ -373,7 +363,11 @@ class SessionActivity : Activity() {
                 if (attUploadReqs.remove(rid) != null) {
                     val p = f.optString("path")
                     if (p.isNotEmpty() && p !in pendingAtt) pendingAtt.add(p)
-                    requestImage(p)
+                    // the local seed means the chip shows a thumbnail the
+                    // moment the upload lands — no second round trip
+                    if (pendingLocalBitmaps.remove(rid)?.let { imgCache[p] = it } == null) {
+                        requestImage(p)
+                    }
                     renderChips()
                     if (statusView.text.startsWith("uploading")) statusView.text = ""
                 }
@@ -389,8 +383,12 @@ class SessionActivity : Activity() {
                         statusView.text = "compaction failed: ${f.optString("message")}"
                         finishCompact()
                     }
-                    rid.startsWith("fp-") && attUploadReqs.remove(rid) != null ->
-                        statusView.text = "upload failed: ${f.optString("message")}"
+                    rid.startsWith("fp-") -> {
+                        val ours = attUploadReqs.remove(rid) != null
+                        pendingLocalBitmaps.remove(rid)
+                        if (ours) statusView.text = "upload failed: ${f.optString("message")}"
+                        Unit
+                    }
                     rid.isEmpty() -> statusView.text = "err: ${f.optString("message")}"
                 }
             }
@@ -1443,6 +1441,25 @@ class SessionActivity : Activity() {
         relay?.send(Term.fileGet(path))
     }
 
+    /// Decode raw image bytes, downscaling so the in-memory cache stays
+    /// bounded (4096 px long edge). Shared by FileGetOk replies and the
+    /// local-seed path of image uploads.
+    private fun decodeDownscaled(raw: ByteArray): Bitmap? {
+        var bmp = BitmapFactory.decodeByteArray(raw, 0, raw.size)
+        if (bmp != null && bmp.width * bmp.height > 4096 * 4096) {
+            val scale = (4096.0 / maxOf(bmp.width, bmp.height)).toFloat()
+            val small = Bitmap.createScaledBitmap(
+                bmp,
+                (bmp.width * scale).toInt().coerceAtLeast(1),
+                (bmp.height * scale).toInt().coerceAtLeast(1),
+                true,
+            )
+            if (small !== bmp) bmp.recycle()
+            bmp = small
+        }
+        return bmp
+    }
+
     private fun pickImage() {
         val i = Intent(Intent.ACTION_GET_CONTENT).apply {
             type = "image/*"
@@ -1459,21 +1476,32 @@ class SessionActivity : Activity() {
     }
 
     /// Read a picked/captured image off the phone and push it to the
-    /// daemon's uploads dir (FilePut -> FilePutOk -> composer chip).
+    /// daemon's uploads dir (FilePut -> FilePutOk -> composer chip). File I/O,
+    /// base64 and frame building run off the main thread, and the chip
+    /// thumbnail is seeded from the bytes we already hold — no second FileGet
+    /// round trip to fetch the same pixels back.
     private fun uploadLocalImage(uri: Uri) {
-        try {
-            val bytes = contentResolver.openInputStream(uri)?.use { it.readBytes() } ?: return
+        uploadExec.execute {
+            val bytes = try {
+                contentResolver.openInputStream(uri)?.use { it.readBytes() }
+            } catch (e: Exception) { null }
+            if (bytes == null) {
+                handler.post { statusView.text = "upload failed: could not read image" }
+                return@execute
+            }
             if (bytes.size > 10 * 1024 * 1024) {
-                statusView.text = "image too large (max 10 MiB)"
-                return
+                handler.post { statusView.text = "image too large (max 10 MiB)" }
+                return@execute
             }
             val name = uri.lastPathSegment?.substringAfterLast('/') ?: "image.jpg"
             val rid = "fp-" + Term.newId()
-            attUploadReqs[rid] = name
-            statusView.text = "uploading $name …"
+            // seed the chip thumbnail from the local bytes (off-main decode)
+            decodeDownscaled(bytes)?.let { pendingLocalBitmaps[rid] = it }
+            handler.post {
+                attUploadReqs[rid] = name
+                statusView.text = "uploading $name …"
+            }
             relay?.send(Term.filePut(name, android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP), rid))
-        } catch (e: Exception) {
-            statusView.text = "upload failed: ${e.message}"
         }
     }
 
