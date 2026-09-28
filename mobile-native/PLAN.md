@@ -124,8 +124,13 @@ screen + a handful of request/response frames; all reuse the existing
   binary-safe, chunked when large). The editor is **CodeMirror 5 in a
   WebView** (`assets/editor/`, same assets as the RN app, core-first load
   order): real syntax highlighting, line numbers, undo, bracket matching,
-  offline. `EditorActivity` swaps a native file-browser view and the
-  WebView in place; the daemon is the source of truth.
+  offline. **Settings** expose an editor font size + a markdown font size
+  (persisted, applied live into the page via CSS vars — `__ranchFont` / `__ranchMdFont`).
+  **Markdown preview**: `.md`/`.mdx`/`.markdown` files get a “preview” toggle
+  that renders the buffer with `marked` (`assets/editor/marked.min.js`, GFM
+  incl. tables) into a styled overlay — the RN editor has no preview, so this
+  is native-only for now. `EditorActivity` swaps a native file-browser view and
+  the WebView in place; the daemon is the source of truth.
 - **Workflows / mule** (`screens/Workflows.tsx`, 273): `WorkflowList`/
   `Get`/`Put`/`Delete`/`Run` + `MuleAgents`/`MuleAgentsOk` (step agents).
 - **Triggers** (`screens/Triggers.tsx`, 305): `TriggerList`/`Put`/`Delete`/
@@ -155,8 +160,10 @@ since Agents/Editor are used most.
   is preferred. Low priority; password works.
 - **App icon / branding.** Proper launcher icon + adaptive icon + a real
   notification small-icon (currently a placeholder).
-- **Editor polish (IDE).** The CodeMirror bridge is ready for the next
-  cheap wins: **soft-wrap toggle** (`window.__ranchOption("lineWrapping", …)`
+- **Editor polish (IDE).** **Font size (code + markdown) and markdown
+  preview are now shipped** (Settings → Editor; `__ranchFont`/`__ranchMdFont`/
+  `__ranchPreview` in `editor.html`, `marked` for the render). Remaining cheap
+  wins: **soft-wrap toggle** (`window.__ranchOption("lineWrapping", …)`
   is already exposed), **find/replace** (drop the CodeMirror search addon into
   `assets/editor/`), and **autocomplete** — CodeMirror hint addons, or a hint
   provider that calls back into the daemon (a local LSP or a `pi` one-shot)

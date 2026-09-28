@@ -64,6 +64,7 @@ class EditorActivity : Activity() {
     private lateinit var statusTv: TextView
 
     private lateinit var saveBtn: Button
+    private lateinit var previewBtn: Button
     private lateinit var dirtyDot: TextView
     private lateinit var conflictReload: Button
     private lateinit var conflictKeep: Button
@@ -73,6 +74,7 @@ class EditorActivity : Activity() {
     private var showHidden: Boolean = false
 
     // ---- edit state ----
+    @Volatile private var previewing = false          // markdown preview showing
     @Volatile private var openFile: String? = null     // path being edited
     @Volatile private var openOriginal: String = ""    // content at load/save
     @Volatile private var draft: String = ""           // current editor content
@@ -216,6 +218,11 @@ class EditorActivity : Activity() {
         buildEditButtons()
         refreshBar()
         browse(null)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        applyFontSizes() // pick up font-size changes made in Settings
     }
 
     // ---- browse box ----
@@ -371,6 +378,8 @@ class EditorActivity : Activity() {
             visibility = View.GONE
         }
         editBar.addView(saveBtn)
+        previewBtn = smallBtn("preview") { togglePreview() }.apply { visibility = View.GONE }
+        editBar.addView(previewBtn)
         editBar.addView(smallBtn("⬇ save to phone") {
             openFile?.let { downloadFile(it, it.substringAfterLast('/')) }
         })
@@ -390,12 +399,14 @@ class EditorActivity : Activity() {
 
         if (editing) {
             pathTv.text = openFile
+            previewBtn.visibility = if (isMarkdown(openFile!!)) View.VISIBLE else View.GONE
             val dirty = draft != openOriginal
-            saveBtn.visibility = if (dirty) View.VISIBLE else View.GONE
-            dirtyDot.visibility = if (dirty) View.VISIBLE else View.GONE
+            saveBtn.visibility = if (dirty && !previewing) View.VISIBLE else View.GONE
+            dirtyDot.visibility = if (dirty && !previewing) View.VISIBLE else View.GONE
         } else {
             dirtyDot.visibility = View.GONE
             saveBtn.visibility = View.GONE
+            previewBtn.visibility = View.GONE
         }
     }
 
@@ -404,6 +415,8 @@ class EditorActivity : Activity() {
         openFile = null
         draft = ""
         openOriginal = ""
+        previewing = false
+        previewBtn.text = "preview"
         clearConflict()
         statusTv.text = ""
         refreshBar()
@@ -562,6 +575,8 @@ class EditorActivity : Activity() {
                 draft = openOriginal
                 curMtime = f.optLong("mtime")
                 refreshStatus("${f.optLong("size")} bytes · ${Lang.langForPath(path)}")
+                previewing = false
+                previewBtn.text = "preview"
                 refreshBar()
                 pathTv.text = path
                 if (webReady) pushDoc(draft, Lang.modeForPath(path))
@@ -633,6 +648,7 @@ class EditorActivity : Activity() {
                 when (o.optString("t")) {
                     "ready" -> handler.post {
                         webReady = true
+                        applyFontSizes()
                         openFile?.let { pushDoc(draft, Lang.modeForPath(it)) }
                     }
                     "change" -> handler.post {
@@ -687,6 +703,30 @@ class EditorActivity : Activity() {
             }
         }
         return sb.append('"').toString()
+    }
+
+    /** Push the persisted font sizes into the editor page as live CSS vars. */
+    private fun applyFontSizes() {
+        if (!webReady) return
+        val code = app.prefs.getInt("editor_font_px", 14)
+        val md = app.prefs.getInt("markdown_font_px", 16)
+        web.evaluateJavascript("window.__ranchFont($code)", null)
+        web.evaluateJavascript("window.__ranchMdFont($md)", null)
+    }
+
+    /** Toggle the markdown preview overlay (markdown files only). */
+    private fun togglePreview() {
+        if (!webReady) return
+        previewing = !previewing
+        previewBtn.text = if (previewing) "edit" else "preview"
+        if (previewing) { saveBtn.visibility = View.GONE; dirtyDot.visibility = View.GONE }
+        else refreshBar()
+        web.evaluateJavascript("window.__ranchPreview($previewing)", null)
+    }
+
+    private fun isMarkdown(p: String): Boolean {
+        val n = p.substringAfterLast('/').lowercase()
+        return n.endsWith(".md") || n.endsWith(".mdx") || n.endsWith(".markdown")
     }
 
     // ---- shared helpers ----

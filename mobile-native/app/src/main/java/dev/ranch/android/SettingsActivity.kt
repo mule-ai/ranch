@@ -93,6 +93,11 @@ class SettingsActivity : Activity() {
         root.addView(tools1)
         root.addView(tools2)
 
+        // ---- editor (IDE) ----
+        root.addView(sectionHeader("Editor"))
+        root.addView(buildFontRow("Font size", "editor_font_px", 14, 10, 28, 1))
+        root.addView(buildFontRow("Markdown font size", "markdown_font_px", 16, 12, 30, 1))
+
         // ---- notifications ----
         root.addView(sectionHeader("Notifications"))
         root.addView(buildSwitch("turn_end", "Agent finished turn (includes last message)", app.prefs.getBool("turn_end", true)))
@@ -148,6 +153,51 @@ class SettingsActivity : Activity() {
             isChecked = app.prefs.getBool(key, default)
             setPadding(0, dp(2), 0, dp(2))
             setOnCheckedChangeListener { _, checked -> app.prefs.setBool(key, checked) }
+        }
+
+    /** A `label  [-] value [+]` stepper persisted as an int pref (font sizes). */
+    private fun buildFontRow(label: String, key: String, def: Int, min: Int, max: Int, step: Int): LinearLayout =
+        LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(4), 0, dp(4))
+            addView(TextView(this@SettingsActivity).apply {
+                text = label
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+                setTextColor(0xFFC9CDD3.toInt())
+            }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+
+            val value = intArrayOf(app.prefs.getInt(key, def))
+            val valueTv = TextView(this@SettingsActivity).apply {
+                text = "${value[0]}"
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+                setTextColor(0xFFE5E5E5.toInt())
+                setPadding(dp(10), 0, dp(10), 0)
+            }
+
+            val minus = Button(this@SettingsActivity).apply {
+                text = "\u2212"; textSize = 18f; setTextColor(0xFF7FD4FF.toInt())
+                setBackgroundColor(0xFF1B2126.toInt()); setPadding(dp(14), 0, dp(14), 0)
+                minWidth = 0; minimumWidth = 0
+                setOnClickListener {
+                    if (value[0] > min) {
+                        value[0] -= step; app.prefs.setInt(key, value[0])
+                        valueTv.text = value[0].toString()
+                    }
+                }
+            }
+            val plus = Button(this@SettingsActivity).apply {
+                text = "+"; textSize = 18f; setTextColor(0xFF7FD4FF.toInt())
+                setBackgroundColor(0xFF1B2126.toInt()); setPadding(dp(14), 0, dp(14), 0)
+                minWidth = 0; minimumWidth = 0
+                setOnClickListener {
+                    if (value[0] < max) {
+                        value[0] += step; app.prefs.setInt(key, value[0])
+                        valueTv.text = value[0].toString()
+                    }
+                }
+            }
+            addView(minus); addView(valueTv); addView(plus)
         }
 
     private fun requestNotifPermission() {

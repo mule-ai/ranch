@@ -16,4 +16,8 @@ class Prefs(context: Context) {
     fun setBool(key: String, value: Boolean) {
         sp.edit().putBoolean(key, value).apply()
     }
+    fun getInt(key: String, default: Int): Int = sp.getInt(key, default)
+    fun setInt(key: String, value: Int) {
+        sp.edit().putInt(key, value).apply()
+    }
 }

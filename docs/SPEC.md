@@ -209,8 +209,10 @@ Shipped:
 - Mobile (RN + native): directory browser with a **show-hidden-files**
   toggle, a real code editor (CodeMirror 5 in a WebView — syntax
   highlighting, line numbers, undo, bracket matching), upload (`FilePut`,
-  SAF pick) and download (`FileDownload`, SAF save-as) to the phone, and
-  markdown review (RN renders via `marked`).
+  SAF pick) and download (`FileDownload`, SAF save-as) to the phone.
+  Native extras: **markdown preview** (buffer rendered via `marked` in the
+  same offline WebView, GFM incl. tables) and **per-app font-size settings**
+  (code + markdown, applied live), both on the native settings screen.
 - Web: editor surfaces ride the same frames.
 
 **Done** — TUI `:files` browser over the same frames (rofi-style
