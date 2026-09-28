@@ -181,10 +181,12 @@ per app install for mobile so reconnects are stable).
 
 The daemon is the file server; clients (mobile/CLI) are thin editors.
 
-- **`DirList`** `{req_id, path?}` → **`DirListOk`** `{req_id, path,
-  parent?, dirs[], files[]}` — list a directory (default `$HOME`).
-  `dirs` = subdirectories, `files` = regular files; both sorted; hidden
-  entries excluded (same filter as `dirs`).
+- **`DirList`** `{req_id, path?, hidden?}` → **`DirListOk`** `{req_id,
+  path, parent?, dirs[], files[]}` — list a directory (default `$HOME`).
+  `dirs` = subdirectories, `files` = regular files; both sorted. Hidden
+  entries (dotfiles/dotdirs) are excluded unless `hidden` is `true` — the
+  mobile IDE's "show hidden files" toggle opts in so `~/.config`,
+  `~/.bashrc`, etc. are reachable.
 - **`FileRead`** `{req_id, path}` → **`FileReadOk`** `{req_id, path,
   content, mtime, size}` — read a file as UTF-8. `mtime` is a unix
   timestamp; clients store it and pass it to `FileWrite` for conflict
@@ -223,6 +225,14 @@ The daemon is the file server; clients (mobile/CLI) are thin editors.
   image). Unregistered paths, non-images (magic-byte sniffed:
   png/jpeg/gif/webp/bmp/avif/heif/svg), and files over 16 MiB →
   `error`. May arrive chunked (large images).
+- **`FileDownload`** `{req_id, path}` → **`FileDownloadOk`** `{req_id,
+  path, mime, size, b64}` — binary-safe read of ANY file on the daemon
+  machine, for the mobile IDE's "save to phone" path. Unlike `FileGet`
+  (restricted to registered *image* media) it works on arbitrary files and
+  does **not** consult the media registry — it shares the same owner +
+  machine, RLS-gated trust boundary as `FileRead`/`FileWrite`. Capped at
+  16 MiB; `mime` is a best-effort guess from the extension. May arrive
+  chunked when large.
 
 ### Images in chat (M-images)
 

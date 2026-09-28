@@ -3625,7 +3625,7 @@ impl Daemon {
             // attach; the frame carries the session in `session` —
             // the worker leaves it blank, so resolve from the pane)
             // client -> daemon: local directory listing (cheap, sync)
-            Frame::DirList { req_id, path, .. } => {
+            Frame::DirList { req_id, path, hidden, .. } => {
                 let base = path
                     .clone()
                     .filter(|p| !p.is_empty())
@@ -3636,7 +3636,9 @@ impl Daemon {
                         let mut fs: Vec<String> = Vec::new();
                         for e in rd.flatten() {
                             let name = e.file_name().to_string_lossy().to_string();
-                            if name.starts_with('.') {
+                            // Hidden entries (dotfiles/dotdirs) are listed
+                            // only when the client opts in via `hidden`.
+                            if !hidden && name.starts_with('.') {
                                 continue;
                             }
                             match e.file_type() {
@@ -3945,6 +3947,81 @@ impl Daemon {
                 use base64::Engine as _;
                 let enc = base64::engine::general_purpose::STANDARD;
                 get_reply(Frame::FileGetOk {
+                    id: String::new(),
+                    req_id: req_id.clone(),
+                    path: path.clone(),
+                    mime,
+                    size: bytes.len() as u64,
+                    b64: enc.encode(bytes),
+                });
+            }
+            // client -> daemon: download an arbitrary file's raw bytes to a
+            // remote client (mobile IDE "save to phone"). Binary-safe, and
+            // NOT gated to the media registry (that's FileGet's job) — same
+            // owner+machine, RLS-gated trust boundary as FileRead/FileWrite.
+            // Capped at 16 MiB; the reply is chunked when it exceeds the
+            // frame cap, reassembled client-side.
+            Frame::FileDownload { req_id, path, .. } => {
+                let mut dl_reply = |f: Frame| {
+                    if let Some(c) = self.clients.get_mut(&from) {
+                        send_frame(c, &f);
+                    }
+                };
+                let mut dl_err = |msg: String| {
+                    dl_reply(Frame::Error { req_id: Some(req_id.clone()), message: msg });
+                };
+                const CAP: u64 = 16 * 1024 * 1024; // 16 MiB
+                let file = std::path::Path::new(path);
+                let meta = match std::fs::metadata(file) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        dl_err(format!("could not stat {path}: {e}"));
+                        return;
+                    }
+                };
+                if !meta.is_file() {
+                    dl_err(format!("{path} is not a regular file"));
+                    return;
+                }
+                if meta.len() > CAP {
+                    dl_err(format!("{path}: exceeds the 16 MiB download cap"));
+                    return;
+                }
+                let bytes = match std::fs::read(file) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        dl_err(format!("could not read {path}: {e}"));
+                        return;
+                    }
+                };
+                let mime = {
+                    let ext = file
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .map(|e| e.to_ascii_lowercase())
+                        .unwrap_or_default();
+                    match ext.as_str() {
+                        "png" => "image/png",
+                        "jpg" | "jpeg" => "image/jpeg",
+                        "gif" => "image/gif",
+                        "webp" => "image/webp",
+                        "bmp" => "image/bmp",
+                        "svg" => "image/svg+xml",
+                        "pdf" => "application/pdf",
+                        "zip" => "application/zip",
+                        "tar" => "application/x-tar",
+                        "gz" => "application/gzip",
+                        "json" => "application/json",
+                        "txt" | "log" => "text/plain",
+                        "md" | "mdx" => "text/markdown",
+                        "toml" => "application/toml",
+                        _ => "application/octet-stream",
+                    }
+                    .to_string()
+                };
+                use base64::Engine as _;
+                let enc = base64::engine::general_purpose::STANDARD;
+                dl_reply(Frame::FileDownloadOk {
                     id: String::new(),
                     req_id: req_id.clone(),
                     path: path.clone(),

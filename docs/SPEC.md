@@ -199,12 +199,18 @@ philosophy as terminal emulation — server owns state, clients render).
 
 Shipped:
 
-- `DirList` / `FileRead` / `FileWrite` frames; atomic writes (temp +
-  rename); mtime conflict detection (no silent clobber); daemon-side
-  watch set with mtime polling → `FileChanged` push; dirty-editor
-  banner (reload / keep-mine) on mobile.
-- Mobile: directory browser, monospace editor (JetBrains Mono),
-  markdown review via `marked` token rendering.
+- `DirList` / `FileRead` / `FileWrite` / `FileDownload` frames; atomic
+  writes (temp + rename); mtime conflict detection (no silent clobber);
+  daemon-side watch set with mtime polling → `FileChanged` push;
+  dirty-editor banner (reload / keep-mine) on mobile. `DirList.hidden`
+  opts in to listing dotfiles/dotdirs; `FileDownload` is a binary-safe
+  read of any file (the "save to phone" path; shares the FileRead/FileWrite
+  trust boundary, 16 MiB cap, chunked when large).
+- Mobile (RN + native): directory browser with a **show-hidden-files**
+  toggle, a real code editor (CodeMirror 5 in a WebView — syntax
+  highlighting, line numbers, undo, bracket matching), upload (`FilePut`,
+  SAF pick) and download (`FileDownload`, SAF save-as) to the phone, and
+  markdown review (RN renders via `marked`).
 - Web: editor surfaces ride the same frames.
 
 **Done** — TUI `:files` browser over the same frames (rofi-style
@@ -506,6 +512,13 @@ Unchanged foundations:
   relay in transit (documented accepted risk; E2E designed-for-later).
 - Forge/mule API keys live only in `daemon.toml` (0600) on the daemon
   host; never sent to clients.
+- **File access is host-wide for a machine's authorized clients.**
+  `DirList` / `FileRead` / `FileWrite` / `FileDownload` can read/write any
+  path the daemon user can reach — that *is* the remote-IDE feature, and
+  the machine key + Realtime RLS are the gate (owner + machine). `FileGet`
+  stays deliberately narrow (registered image media only) so the chat
+  surface can't be prodded into arbitrary reads; `FileDownload` is the
+  explicit, IDE-only arbitrary-file byte read (16 MiB cap, chunked).
 
 New in this spec:
 

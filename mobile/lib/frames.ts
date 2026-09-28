@@ -211,7 +211,7 @@ export type Frame =
   | { t: "SessionsCreate"; req_id: string; name?: string; kind?: "shell" | "forge" | "pi"; cwd?: string; forge_session?: string; pi_session_file?: string }
   | { t: "ForgeList"; id: string; client: string; req_id: string }
   | { t: "PiList"; id: string; client: string; req_id: string }
-  | { t: "DirList"; id: string; client: string; req_id: string; path?: string }
+  | { t: "DirList"; id: string; client: string; req_id: string; path?: string; hidden?: boolean }
   | { t: "DirListOk"; id: string; req_id: string; path: string; parent?: string | null; dirs: string[]; files?: string[] }
   | { t: "FileRead"; id: string; client: string; req_id: string; path: string }
   | { t: "FileReadOk"; id: string; req_id: string; path: string; content: string; mtime: number; size: number }

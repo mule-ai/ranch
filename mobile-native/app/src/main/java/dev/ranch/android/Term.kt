@@ -143,10 +143,11 @@ object Term {
     }
 
     // ---- Phase 4: file editor ----
-    fun dirList(path: String? = null): JSONObject {
+    fun dirList(path: String? = null, hidden: Boolean = false): JSONObject {
         val o = JSONObject().put("t", "DirList").put("id", newId()).put("client", CLIENT)
             .put("req_id", "dl-" + newId())
         if (path != null) o.put("path", path)
+        if (hidden) o.put("hidden", true)
         return o
     }
 
@@ -164,6 +165,13 @@ object Term {
     fun filePut(name: String, b64: String, reqId: String = "fp-" + newId()): JSONObject =
         JSONObject().put("t", "FilePut").put("id", newId()).put("client", CLIENT)
             .put("req_id", reqId).put("name", name).put("b64", b64)
+
+    /// Binary-safe read of ANY file on the daemon host (the IDE "save to
+    /// phone" path; distinct from media-only `fileGet`). Replied to with
+    /// `FileDownloadOk` (base64, may arrive chunked).
+    fun fileDownload(path: String): JSONObject =
+        JSONObject().put("t", "FileDownload").put("id", newId()).put("client", CLIENT)
+            .put("req_id", "fd-" + newId()).put("path", path)
 
     // ---- Phase 4: workflows / mule ----
     fun workflowList(): JSONObject =

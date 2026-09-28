@@ -1814,6 +1814,7 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
     // mode: browse | view; viewer state for the selected file
     let files_mode = std::cell::Cell::new(0u8); // 0 browse, 1 view, 2 edit
     let files_sel = std::cell::Cell::new(0usize); // row in the merged list
+    let files_hidden = std::cell::Cell::new(false); // list dotfiles/dotdirs
     let files_view_path: std::rc::Rc<std::cell::RefCell<String>> =
         std::rc::Rc::new(std::cell::RefCell::new(String::new()));
     let files_view_mtime = std::cell::Cell::new(0i64);
@@ -2447,6 +2448,7 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                                         client: "attach".into(),
                                         req_id: rid,
                                         path: Some(dir),
+                                        hidden: files_hidden.get(),
                                     };
                                     send_frame(&mut stream, &f).ok();
                                 }
@@ -3273,8 +3275,9 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                         files_view_path.borrow()
                     ),
                     _ => format!(
-                        " {} · enter open · esc close ",
-                        files_dir.borrow()
+                        " {} · enter open · {} · esc close ",
+                        files_dir.borrow(),
+                        if files_hidden.get() { "hidden:ON" } else { "hidden:off" }
                     ),
                 };
                 let block = ratatui::widgets::Block::bordered()
@@ -3483,7 +3486,7 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                     "  y          copy last agent response to clipboard",
                     "  d          detach",
                     "commands (type : to enter)",
-                    "  :files [dir]   file browser (enter view/edit)",
+                    "  :files [dir]   file browser (h: hidden, enter open/edit)",
                     "  :agents        agent profiles — a new · e edit · x delete",
                     "  :agent <name>  new agent session (forge)",
                     "  :resume        resume a session (forge + pi)",
@@ -3905,6 +3908,22 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                                         files_sel.set(files_sel.get() + 1);
                                     }
                                 }
+                                KeyCode::Char('h') => {
+                                    // toggle hidden entries + re-list this dir
+                                    files_hidden.set(!files_hidden.get());
+                                    let dir = files_dir.borrow().clone();
+                                    let rid = Uuid::new_v4().to_string();
+                                    *files_pending.borrow_mut() = Some(rid.clone());
+                                    let f = Frame::DirList {
+                                        id: Uuid::new_v4().to_string(),
+                                        client: "attach".into(),
+                                        req_id: rid,
+                                        path: Some(dir),
+                                        hidden: files_hidden.get(),
+                                    };
+                                    send_frame(&mut stream, &f).ok();
+                                    files_sel.set(0);
+                                }
                                 KeyCode::Enter => {
                                     let parent = files_parent.borrow().is_some();
                                     let nd = files_dirs.borrow().len();
@@ -3920,6 +3939,7 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                                             client: "attach".into(),
                                             req_id: rid,
                                             path: Some(p),
+                                            hidden: files_hidden.get(),
                                         };
                                         send_frame(&mut stream, &f).ok();
                                     } else if idx < usize::from(parent) + nd {
@@ -3939,6 +3959,7 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                                             client: "attach".into(),
                                             req_id: rid,
                                             path: Some(next),
+                                            hidden: files_hidden.get(),
                                         };
                                         send_frame(&mut stream, &f).ok();
                                     } else {
@@ -5002,6 +5023,7 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                                                         client: "attach".into(),
                                                         req_id: rid,
                                                         path: Some(start),
+                                                        hidden: files_hidden.get(),
                                                     };
                                                     send_frame(&mut stream, &f).ok();
                                                     files_sel.set(0);

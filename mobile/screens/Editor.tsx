@@ -64,6 +64,7 @@ function isMarkdown(path: string): boolean {
 export function EditorScreen({ relay, onExit }: Props) {
   const [browse, setBrowse] = useState<BrowseState | null>(null);
   const [browseLoading, setBrowseLoading] = useState(false);
+  const [showHidden, setShowHidden] = useState(false);
   const [openFile, setOpenFile] = useState<OpenFile | null>(null);
   const [draft, setDraft] = useState("");
   const [showReview, setShowReview] = useState(false); // markdown: rendered view
@@ -99,13 +100,19 @@ export function EditorScreen({ relay, onExit }: Props) {
     openFileRef.current = openFile;
   }, [openFile]);
 
-  const loadDir = (path?: string) => {
+  const loadDir = (path?: string, hidden?: boolean) => {
     if (!path && !browse) path = undefined;
     const rid = nextId();
     dirReqRef.current = rid;
     setBrowseLoading(true);
     setError(null);
-    relay.send({ t: "DirList", id: nextId(), client: "mobile", req_id: rid, path } as Frame);
+    relay.send({ t: "DirList", id: nextId(), client: "mobile", req_id: rid, path, hidden: hidden ?? showHidden } as Frame);
+  };
+
+  const toggleHidden = () => {
+    const next = !showHidden;
+    setShowHidden(next);
+    loadDir(browse?.path, next);
   };
 
   const loadFile = (name: string) => {
@@ -416,6 +423,10 @@ export function EditorScreen({ relay, onExit }: Props) {
           contentContainerStyle={styles.browseContent}
           keyboardShouldPersistTaps="handled"
         >
+          <Pressable style={styles.row} onPress={toggleHidden}>
+            <Text style={styles.rowTitle}>{showHidden ? "◉ show hidden files" : "○ show hidden files"}</Text>
+            <Text style={styles.dim}>{showHidden ? "on" : "off"}</Text>
+          </Pressable>
           {browse.parent !== null && (
             <Pressable style={styles.row} onPress={() => loadDir(browse.parent ?? undefined)}>
               <Text style={styles.rowTitle}>../</Text>

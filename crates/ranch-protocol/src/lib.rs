@@ -163,6 +163,10 @@ pub enum Frame {
         req_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         path: Option<String>,
+        /// list hidden entries (dotfiles/dotdirs) too. Off by default —
+        /// the daemon always hides hidden entries unless a client opts in.
+        #[serde(default)]
+        hidden: bool,
     },
     /// Daemon -> client: directory listing.
     DirListOk {
@@ -270,6 +274,30 @@ pub enum Frame {
         req_id: String,
         path: String,
         /// e.g. `image/png`, `image/jpeg`
+        mime: String,
+        size: u64,
+        b64: String,
+    },
+    /// Client -> daemon: fetch the raw bytes of ANY file on the daemon
+    /// machine so a client (mobile IDE) can download it to the device.
+    /// This is the "save file to phone" path — unlike `FileGet` (restricted
+    /// to registered image media) it is binary-safe and works on arbitrary
+    /// files. Same trust boundary as `FileRead`/`FileWrite` (owner + machine,
+    /// RLS-gated); capped at 16 MiB. The reply may arrive chunked when large.
+    FileDownload {
+        id: String,
+        client: String,
+        /// echoed back in `FileDownloadOk` / `error` so clients match the reply
+        req_id: String,
+        path: String,
+    },
+    /// Daemon -> client: the requested file's raw bytes, base64-encoded.
+    /// May be chunked on the wire (large files).
+    FileDownloadOk {
+        id: String,
+        req_id: String,
+        path: String,
+        /// best-effort MIME type guessed from the file extension
         mime: String,
         size: u64,
         b64: String,
@@ -1705,11 +1733,47 @@ mod tests {
             size: 4,
             b64: "iVBORw0KGgo=".into(),
         };
-        for f in [put, put_ok.clone(), get, get_ok.clone()] {
+        let download = Frame::FileDownload {
+            id: "i9".into(),
+            client: "mobile".into(),
+            req_id: "r5".into(),
+            path: "/home/j/config.toml".into(),
+        };
+        let download_ok = Frame::FileDownloadOk {
+            id: "i10".into(),
+            req_id: "r5".into(),
+            path: "/home/j/config.toml".into(),
+            mime: "application/toml".into(),
+            size: 12,
+            b64: "a2V5ID0gInYiCg==".into(),
+        };
+        for f in [put, put_ok.clone(), get, get_ok.clone(), download, download_ok] {
             let line = encode_frame(&f, "c");
             assert_eq!(line.len(), 1);
             let back: Frame = serde_json::from_str(&line[0]).unwrap();
             assert_eq!(back, f);
+        }
+        // DirList.hidden defaults to false when the client omits it
+        let dl = Frame::DirList {
+            id: "i".into(),
+            client: "c".into(),
+            req_id: "r".into(),
+            path: Some("/home/j".into()),
+            hidden: true,
+        };
+        let line = encode_frame(&dl, "c");
+        let back: Frame = serde_json::from_str(&line[0]).unwrap();
+        match back {
+            Frame::DirList { hidden, .. } => assert!(hidden),
+            _ => panic!("wrong variant"),
+        }
+        let absent: Frame = serde_json::from_str(
+            r#"{"t":"DirList","id":"i","client":"c","req_id":"r","path":"/x"}"#,
+        )
+        .unwrap();
+        match absent {
+            Frame::DirList { hidden, .. } => assert!(!hidden),
+            _ => panic!("wrong variant"),
         }
         // optional mtime must deserialize as None when absent (back-compat)
         let json =

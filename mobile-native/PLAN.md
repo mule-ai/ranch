@@ -115,9 +115,17 @@ screen + a handful of request/response frames; all reuse the existing
 - **Agents / pi manager** (`screens/Agents.tsx`, 451): `PiList`/`PiListOk`,
   `PiMonitor`/`PiMonitorOk` (adopt/stop external pi sessions), resume via
   `SessionsCreate{pi_session_file}`.
-- **File editor** (`screens/Editor.tsx`, 702): `DirList`/`DirListOk`
-  (browse), `FileRead`/`FileReadOk`, `FileWrite`/`FileWriteOk`,
-  `FilePut`/`FilePutOk` (upload from phone), `FileChanged` (live re-load).
+- **File editor / IDE** (`screens/Editor.tsx` RN → `EditorActivity.kt`):
+  `DirList`/`DirListOk` (browse, now with a **show-hidden-files** toggle via
+  `DirList.hidden`), `FileRead`/`FileReadOk`, `FileWrite`/`FileWriteOk` (mtime
+  conflict), `FileChanged` (live re-load → reload/keep-mine), `FilePut`/
+  `FilePutOk` (upload, SAF `ACTION_OPEN_DOCUMENT`), and `FileDownload`/
+  `FileDownloadOk` (download to phone, SAF `ACTION_CREATE_DOCUMENT`;
+  binary-safe, chunked when large). The editor is **CodeMirror 5 in a
+  WebView** (`assets/editor/`, same assets as the RN app, core-first load
+  order): real syntax highlighting, line numbers, undo, bracket matching,
+  offline. `EditorActivity` swaps a native file-browser view and the
+  WebView in place; the daemon is the source of truth.
 - **Workflows / mule** (`screens/Workflows.tsx`, 273): `WorkflowList`/
   `Get`/`Put`/`Delete`/`Run` + `MuleAgents`/`MuleAgentsOk` (step agents).
 - **Triggers** (`screens/Triggers.tsx`, 305): `TriggerList`/`Put`/`Delete`/
@@ -147,6 +155,13 @@ since Agents/Editor are used most.
   is preferred. Low priority; password works.
 - **App icon / branding.** Proper launcher icon + adaptive icon + a real
   notification small-icon (currently a placeholder).
+- **Editor polish (IDE).** The CodeMirror bridge is ready for the next
+  cheap wins: **soft-wrap toggle** (`window.__ranchOption("lineWrapping", …)`
+  is already exposed), **find/replace** (drop the CodeMirror search addon into
+  `assets/editor/`), and **autocomplete** — CodeMirror hint addons, or a hint
+  provider that calls back into the daemon (a local LSP or a `pi` one-shot)
+  for completions. Autocomplete is explicitly deferred to a later pass, as
+  requested.
 
 ## Phase 6 — retire the RN app
 

@@ -1,0 +1,109 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<style>
+  html, body { margin: 0; padding: 0; background: #0a0a0e; height: 100%; overflow: hidden;
+    overscroll-behavior: none; -webkit-user-select: text; }
+</style>
+<link rel="stylesheet" href="codemirror.min.css">
+<style>
+/* app-matched dark theme; colors echo the native palette.
+   IMPORTANT: emitted AFTER codemirror.min.css so the pin rule wins over
+   CM's built-in `.CodeMirror { height: 300px }` (the editor must fill the
+   WebView, not render as a 300px sliver). */
+.CodeMirror { position: fixed; top: 0; left: 0; right: 0; bottom: 0; height: auto; }
+.cm-s-ranch.CodeMirror { background: #0a0a0e; color: #d1d5db;
+  font-family: "Noto Sans Mono", ui-monospace, Menlo, Consolas, monospace; font-size: 14px; line-height: 1.5; }
+.cm-s-ranch .CodeMirror-gutters { background: #0a0a0e; border-right: 1px solid #1f2430; }
+.cm-s-ranch .CodeMirror-linenumber { color: #4b5563; }
+.cm-s-ranch .CodeMirror-cursor { border-left: 2px solid #4ade80; }
+.cm-s-ranch .CodeMirror-selected { background: #234d2c !important; }
+.cm-s-ranch .CodeMirror-activeline-background { background: #101018; }
+.cm-s-ranch .cm-keyword { color: #4ade80; font-weight: 700; }
+.cm-s-ranch .cm-atom { color: #f472b6; }
+.cm-s-ranch .cm-number { color: #fbbf24; }
+.cm-s-ranch .cm-string, .cm-s-ranch .cm-string-2 { color: #86efac; }
+.cm-s-ranch .cm-comment { color: #6b7280; font-style: italic; }
+.cm-s-ranch .cm-def { color: #e5e7eb; }
+.cm-s-ranch .cm-variable { color: #d1d5db; }
+.cm-s-ranch .cm-variable-2 { color: #93c5fd; }
+.cm-s-ranch .cm-variable-3, .cm-s-ranch .cm-type { color: #7dd3fc; }
+.cm-s-ranch .cm-property { color: #d1d5db; }
+.cm-s-ranch .cm-operator { color: #9ca3af; }
+.cm-s-ranch .cm-meta { color: #f59e0b; }
+.cm-s-ranch .cm-tag { color: #f87171; }
+.cm-s-ranch .cm-attribute { color: #fbbf24; }
+.cm-s-ranch .cm-bracket { color: #9ca3af; }
+.cm-s-ranch .cm-matchingBracket { background: #1a3a24; color: inherit !important; outline: none; }
+</style>
+</head>
+<body>
+<!-- core first, then modes (clike before its dependents; js/css/xml before
+     htmlmixed). Order guarantees every CodeMirror.defineMode sees the core. -->
+<script src="codemirror.min.js"></script>
+<script src="clike.min.js"></script>
+<script src="javascript.min.js"></script>
+<script src="css.min.js"></script>
+<script src="xml.min.js"></script>
+<script src="htmlmixed.min.js"></script>
+<script src="go.min.js"></script>
+<script src="rust.min.js"></script>
+<script src="python.min.js"></script>
+<script src="shell.min.js"></script>
+<script src="toml.min.js"></script>
+<script src="yaml.min.js"></script>
+<script src="markdown.min.js"></script>
+<script src="matchbrackets.min.js"></script>
+<script>
+(function () {
+  var editor = CodeMirror(document.body, {
+    value: "",
+    mode: "null",
+    theme: "ranch",
+    lineNumbers: true,
+    matchBrackets: true,
+    inputStyle: "contenteditable",
+    indentUnit: 4,
+    lineWrapping: false
+  });
+  var w = editor.getWrapperElement();
+  w.setAttribute("spellcheck", "false");
+  w.setAttribute("autocorrect", "off");
+  w.setAttribute("autocapitalize", "none");
+  w.setAttribute("autocorrect", "false");
+
+  // JS -> Kotlin bridge. The Kotlin side exposes `window.Ranch` via
+  // addJavascriptInterface with a postMessage-style `post(String)` method.
+  function send(msg) {
+    try { if (window.Ranch) window.Ranch.postMessage(JSON.stringify(msg)); } catch (e) {}
+  }
+
+  // every doc change is pushed back immediately (no debounce) so the Kotlin
+  // draft/save state is never stale.
+  editor.on("change", function () { send({ t: "change", value: editor.getValue() }); });
+  // flush the final value if the app backgrounds mid-keystroke
+  document.addEventListener("visibilitychange", function () {
+    if (document.hidden) send({ t: "change", value: editor.getValue() });
+  });
+
+  // Kotlin -> JS: replace the document + set its mode. Only applies when the
+  // value actually differs, so our own echoed changes can't loop.
+  window.__ranch = function (value, mode) {
+    if (mode) editor.setOption("mode", mode);
+    var cur = editor.getValue();
+    if (cur !== value) {
+      editor.setValue(value);
+      editor.clearHistory(); // fresh document, fresh undo stack
+      editor.scrollTo(0, 0);
+    }
+  };
+  // Kotlin -> JS: set any editor option (e.g. lineWrapping).
+  window.__ranchOption = function (name, value) { editor.setOption(name, value); };
+
+  send({ t: "ready" });
+})();
+</script>
+</body>
+</html>

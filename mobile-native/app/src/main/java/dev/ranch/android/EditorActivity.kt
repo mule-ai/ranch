@@ -1,221 +1,775 @@
 package dev.ranch.android
 
 import android.app.Activity
+import android.app.AlertDialog
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.text.InputType
-import android.util.Base64
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
+import android.webkit.JavascriptInterface
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
+import android.widget.Switch
 import android.widget.TextView
+import android.widget.Toast
 import org.json.JSONObject
-import java.io.File
+import java.io.IOException
+import java.util.concurrent.Executors
+import kotlin.concurrent.Volatile
 
 /**
- * Phase 4 — File editor.
- * Browse the daemon host's filesystem with `DirList`/`DirListOk`
- * (dirs + files + parent), open a file with `FileRead`/`FileReadOk`,
- * edit and save with `FileWrite`/`FileWriteOk` (mtime conflict check),
- * and push a local phone file up with `FilePut`/`FilePutOk` (base64).
- * `FileChanged` (external modification) triggers a re-read notice.
+ * Phase 4+ — IDE. Browse the daemon host's filesystem, open a file in a real
+ * code editor (CodeMirror 5 in a WebView → true syntax highlighting, line
+ * numbers, undo, bracket matching), edit + save with mtime conflict
+ * detection, download a host file to the phone (SAF save-as), and upload a
+ * phone file to the host (SAF open). A toggle reveals hidden (dot) files —
+ * the one gap the RN editor left, and the most common way you'll edit
+ * `~/.config`, `~/.bashrc`, etc.
+ *
+ * Frames: `DirList`(hidden) → `DirListOk`; `FileRead` → `FileReadOk`;
+ * `FileWrite`(mtime) → `FileWriteOk`; `FileDownload` → `FileDownloadOk`
+ * (binary-safe, may arrive chunked); `FilePut` → `FilePutOk`; `FileChanged`
+ * push (external edits → reload/keep-mine).
  */
 class EditorActivity : Activity() {
 
+    private val app get() = application as App
     private val handler = Handler(Looper.getMainLooper())
+    private val exec = Executors.newSingleThreadExecutor()
+
     private var relay: RelaySession? = null
     private lateinit var sink: (JSONObject) -> Unit
-    private lateinit var status: TextView
-    private lateinit var pathBar: TextView
-    private lateinit var fileBox: LinearLayout   // dir listing OR editor
-    private var curPath: String? = null
-    private var curFile: String? = null
-    private var curMtime: Long? = null
+
+    // ---- view refs ----
+    private lateinit var bar: LinearLayout
+    private lateinit var titleTv: TextView
+    private lateinit var pathTv: TextView
+    private lateinit var contentBox: LinearLayout
+    private lateinit var browseBox: LinearLayout
+    private lateinit var startEdit: EditText
+    private lateinit var hiddenToggle: Switch
+    private lateinit var web: WebView
+    private lateinit var editBar: LinearLayout
+    private lateinit var statusTv: TextView
+
+    private lateinit var saveBtn: Button
+    private lateinit var dirtyDot: TextView
+    private lateinit var conflictReload: Button
+    private lateinit var conflictKeep: Button
+
+    // ---- browse state ----
+    private var curDir: String = ""
+    private var showHidden: Boolean = false
+
+    // ---- edit state ----
+    @Volatile private var openFile: String? = null     // path being edited
+    @Volatile private var openOriginal: String = ""    // content at load/save
+    @Volatile private var draft: String = ""           // current editor content
+    @Volatile private var curMtime: Long = 0
+
+    // ---- req_id correlation ----
+    @Volatile private var dirReqId: String? = null
+    @Volatile private var readReqId: String? = null
+    @Volatile private var writeReqId: String? = null
+    @Volatile private var downloadReqId: String? = null
+
+    // ---- pending SAF downloads (chosen save URI + host path) ----
+    @Volatile private var pendingDownloadUri: Uri? = null
+
+    // ---- WebView bridge state ----
+    @Volatile private var webReady = false
+
+    companion object {
+        private const val REQ_UPLOAD = 1001
+        private const val REQ_DOWNLOAD = 1002
+        private const val LIST_CAP = 800 // stop rendering a pathological dir
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val r = Monitor.relay
-        if (r == null) { setContentView(errorView("Start monitoring first.")); return }
+        if (r == null) { setContentView(errorView("Start monitoring a machine first.")); return }
         relay = r
+        showHidden = app.prefs.getBool("show_hidden", false)
 
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(0xFF101418.toInt())
-            setPadding(dp(12), dp(12), dp(12), dp(12))
         }
-        val bar = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        bar.addView(Button(this).apply { text = "←"; setOnClickListener { finish() } })
-        bar.addView(TextView(this).apply {
-            text = "Files"; setTextSize(TypedValue.COMPLEX_UNIT_SP, 18f)
-            setTextColor(0xFFE5E5E5.toInt()); gravity = Gravity.CENTER_VERTICAL; setPadding(dp(8), 0, 0, 0)
-        }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f))
+
+        bar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(dp(8), dp(10), dp(8), dp(10))
+            setBackgroundColor(0xFF101418.toInt())
+        }
+        bar.addView(Button(this).apply {
+            text = "\u2039"; setTextColor(0xFF4ADE80.toInt()); setTextSize(TypedValue.COMPLEX_UNIT_SP, 20f)
+            setPadding(dp(6), 0, dp(6), 0); minWidth = 0; minimumWidth = 0
+            setOnClickListener { goBack() }
+        })
+        titleTv = TextView(this).apply {
+            text = "Files"; setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+            setTextColor(0xFFE5E5E5.toInt())
+            typeface = android.graphics.Typeface.DEFAULT_BOLD
+            gravity = Gravity.CENTER_VERTICAL
+            ellipsize = android.text.TextUtils.TruncateAt.END; isSingleLine = true
+            setPadding(dp(8), 0, dp(8), 0)
+        }
+        bar.addView(titleTv, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
         root.addView(bar)
 
-        status = TextView(this).apply {
-            text = "browse the daemon host"; setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-            setTextColor(0xFF9aa0a6.toInt())
-        }
-        root.addView(status)
-        pathBar = TextView(this).apply {
-            text = ""; setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f); setTextColor(0xFF7fd4ff.toInt())
-        }
-        root.addView(pathBar)
-
-        // start dir + upload button
-        val startRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        val startPath = EditText(this).apply {
-            hint = "start dir (blank = home)"; setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
-        }
-        startRow.addView(startPath, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-        startRow.addView(Button(this).apply {
-            text = "Go"; setPadding(dp(6), 0, dp(6), 0)
-            setOnClickListener { browse(startPath.text.toString().trim().ifEmpty { null }) }
+        // a hairline under the bar
+        root.addView(View(this).apply {
+            setBackgroundColor(0xFF1F2430.toInt())
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(1))
         })
-        startRow.addView(Button(this).apply {
-            text = "Upload"; setPadding(dp(6), 0, dp(6), 0)
-            setOnClickListener { uploadLast() }
-        })
-        root.addView(startRow)
 
-        fileBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        root.addView(ScrollView(this).apply { addView(fileBox) },
-            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
+        pathTv = TextView(this).apply {
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            setTextColor(0xFF7FD4FF.toInt())
+            typeface = android.graphics.Typeface.MONOSPACE
+            setPadding(dp(12), dp(6), dp(12), dp(6))
+            ellipsize = android.text.TextUtils.TruncateAt.MIDDLE
+            isSingleLine = true
+            setBackgroundColor(0xFF0C1015.toInt())
+        }
+        pathTv.setOnClickListener { copyPath() }
+        root.addView(pathTv)
+
+        contentBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        root.addView(contentBox, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
+
+        // --- browse box (start row + hidden toggle + list) ---
+        browseBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        buildBrowseBox()
+        contentBox.addView(browseBox, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
+
+        // --- edit bar (save / download / wrap) ---
+        editBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(dp(8), dp(6), dp(8), dp(6))
+            visibility = View.GONE
+        }
+        contentBox.addView(editBar)
+
+        // --- editor WebView (CodeMirror) ---
+        web = WebView(this).apply {
+            setBackgroundColor(0xFF0A0A0E.toInt())
+            visibility = View.GONE
+            isFocusableInTouchMode = true
+            // keep it fully offline: block any non-asset navigation, but let
+            // the editor's local file:// loads through (false = load it).
+            webViewClient = object : WebViewClient() {
+                override fun shouldOverrideUrlLoading(view: WebView?, url: String?): Boolean {
+                    if (url?.startsWith("file:///android_asset/") == true) return false
+                    Toast.makeText(context, "blocked: $url", Toast.LENGTH_SHORT).show()
+                    return true
+                }
+            }
+        }
+        // the JS bridge must be registered before the page loads (its glue
+        // calls window.Ranch on boot); settings + load happen in configureWebView
+        web.addJavascriptInterface(JsBridge(), "Ranch")
+        configureWebView(web)
+        contentBox.addView(web, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
+
+        // --- bottom status / conflict row ---
+        val statusRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(dp(12), dp(6), dp(12), dp(6))
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        statusTv = TextView(this).apply {
+            text = ""; setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            setTextColor(0xFF9AA0A6.toInt())
+        }
+        statusRow.addView(statusTv, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        conflictReload = smallBtn("reload") { clearConflict(); reloadFile() }
+        conflictReload.visibility = View.GONE
+        statusRow.addView(conflictReload)
+        conflictKeep = smallBtn("keep") { clearConflict() }
+        conflictKeep.visibility = View.GONE
+        statusRow.addView(conflictKeep)
+        contentBox.addView(statusRow)
 
         setContentView(root)
         applyEdgeToEdgeInsets(findViewById(android.R.id.content))
+
         sink = { f -> handler.post { onFrame(f) } }
         r.addSink(sink)
+
+        buildEditButtons()
+        refreshBar()
         browse(null)
     }
 
-    override fun onDestroy() {
-        relay?.removeSink(sink); handler.removeCallbacksAndMessages(null); super.onDestroy()
-    }
+    // ---- browse box ----
+    private fun buildBrowseBox() {
+        browseBox.removeAllViews()
 
-    // ---- browse ----
-    private fun browse(path: String?) {
-        curFile = null; curMtime = null
-        status.text = "listing…"
-        relay?.send(Term.dirList(path))
-    }
-
-    private fun onDirListOk(f: JSONObject) {
-        curPath = f.optString("path")
-        pathBar.text = curPath
-        val parent = f.optString("parent")
-        val dirs = f.optJSONArray("dirs")?.let { a -> (0 until a.length()).map { a.optString(it) } } ?: emptyList()
-        val files = f.optJSONArray("files")?.let { a -> (0 until a.length()).map { a.optString(it) } } ?: emptyList()
-        val box = fileBox
-        box.removeAllViews()
-        if (parent.isNotEmpty()) {
-            box.addView(itemBtn("⌂ ..") { browse(parent) })
+        // start row: [start dir edit (flex)] [Go]
+        val startRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        startEdit = EditText(this).apply {
+            hint = "start dir (blank = home)"
+            inputType = android.text.InputType.TYPE_CLASS_TEXT or
+                android.text.InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            setTextColor(0xFFE5E5E5.toInt())
+            setHintTextColor(0xFF6B7280.toInt())
+            setBackgroundColor(0xFF1A1B23.toInt())
+            setPadding(dp(10), dp(8), dp(10), dp(8))
         }
-        for (d in dirs) box.addView(itemBtn("📁 $d") { browse("$curPath/$d") })
-        for (fl in files) box.addView(itemBtn("📄 $fl") { openFile("$curPath/$fl") })
-        if (dirs.isEmpty() && files.isEmpty())
-            box.addView(TextView(this).apply { text = "(empty)"; setTextColor(0xFF6b7280.toInt()) })
-        status.text = "${dirs.size} dirs, ${files.size} files"
-    }
+        startRow.addView(startEdit, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        startRow.addView(smallBtn("Go") { browse(startEdit.text.toString().trim().ifEmpty { null }) })
+        browseBox.addView(startRow, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        ).apply { setMargins(dp(8), dp(8), dp(8), dp(4)) })
 
-    private fun itemBtn(label: String, onClick: () -> Unit): Button =
-        Button(this).apply {
-            text = label; setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
-            setTextColor(0xFFd1d5db.toInt())
-            setPadding(dp(8), dp(6), dp(8), dp(6))
-            setOnClickListener { onClick() }
+        // toggle row: [hidden switch (flex)] [⬆ upload]
+        val optRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        hiddenToggle = Switch(this).apply {
+            text = "show hidden files"
+            setTextColor(0xFFC9CDD3.toInt())
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            isChecked = showHidden
+            setPadding(dp(0), dp(2), dp(0), dp(2))
         }
+        hiddenToggle.setOnCheckedChangeListener { _, checked ->
+            showHidden = checked
+            app.prefs.setBool("show_hidden", checked)
+            refreshStatus(if (checked) "showing hidden entries" else "hiding hidden entries")
+            browse(curDir.ifEmpty { null })
+        }
+        optRow.addView(hiddenToggle, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        optRow.addView(smallBtn("⬆ upload") { pickUpload() })
+        browseBox.addView(optRow, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+        ).apply { setMargins(dp(8), dp(2), dp(8), dp(4)) })
 
-    // ---- read / edit / write ----
-    private fun openFile(path: String) {
-        curFile = path
-        status.text = "reading…"
-        relay?.send(Term.fileRead(path))
+        // list
+        val list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        browseBox.addView(ScrollView(this).apply {
+            addView(list)
+            isVerticalScrollBarEnabled = true
+        }, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f).apply { setMargins(dp(8), dp(4), dp(8), dp(8)) })
     }
 
-    private fun onFileReadOk(f: JSONObject) {
-        val path = f.optString("path"); curFile = path
-        curMtime = f.optLong("mtime")
-        val content = f.optString("content")
-        pathBar.text = path
-        fileBox.removeAllViews()
-        fileBox.addView(TextView(this).apply {
-            text = "editing — ${f.optLong("size")} bytes"; setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
-            setTextColor(0xFF9aa0a6.toInt()); setPadding(dp(4), 0, dp(4), dp(4))
+    // rebuilds the per-dir rows (idempotent: clears the list container)
+    private fun renderDir(path: String, parent: String?, dirs: List<String>, files: List<String>) {
+        curDir = path
+        pathTv.text = path
+        browseBox.removeViewAt(browseBox.childCount - 1) // drop the old list/scrollview
+        val list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        var shown = 0
+
+        if (!parent.isNullOrEmpty()) {
+            list.addView(fileRow("⌂  ..", "parent", hidden = false) { browse(parent) })
+            shown++
+        }
+        for (d in dirs) {
+            if (shown >= LIST_CAP) break
+            list.addView(fileRow("📁  $d", "open", hidden = d.startsWith(".")) {
+                browse("$path/$d")
+            })
+            shown++
+        }
+        for (fl in files) {
+            if (shown >= LIST_CAP) break
+            list.addView(fileRow(
+                iconFor(fl) + "  " + fl, "",
+                hidden = fl.startsWith("."),
+                onDownload = { downloadFile("$path/$fl", fl) },
+            ) { openFile("$path/$fl") })
+            shown++
+        }
+        if (dirs.isEmpty() && files.isEmpty()) {
+            list.addView(TextView(this).apply {
+                text = if (showHidden) "(empty)" else "(empty — or enable “show hidden files”)"
+                setTextColor(0xFF6B7280.toInt()); setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+                setPadding(dp(6), dp(14), dp(6), dp(14))
+            })
+        }
+        val extra = dirs.size + files.size + if (!parent.isNullOrEmpty()) 1 else 0 - shown
+        if (extra > 0) {
+            list.addView(TextView(this).apply {
+                text = "+$extra more (list is capped at $LIST_CAP)"
+                setTextColor(0xFF6B7280.toInt()); setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+                setPadding(dp(6), dp(8), dp(6), dp(8))
+            })
+        }
+        browseBox.addView(ScrollView(this).apply { addView(list); isVerticalScrollBarEnabled = true },
+            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f).apply {
+                setMargins(dp(8), dp(4), dp(8), dp(8))
+            })
+    }
+
+    private fun iconFor(name: String): String = when (name.substringAfterLast('.', name).lowercase()) {
+        "md", "mdx" -> "📝"
+        "rs" -> "🦀"; "py" -> "🐍"; "js", "ts", "jsx", "tsx", "mjs" -> "🟨"
+        "go" -> "🔵"; "java", "kt" -> "☕"; "c", "h", "cpp", "cc" -> "⚙️"
+        "json", "toml", "yaml", "yml", "ini", "conf" -> "⚙️"
+        "sh", "bash" -> "💻"; "html", "css" -> "🌐"; "lock" -> "🔒"
+        else -> "📄"
+    }
+
+    /** A tappable row: [name (flex)] [optional download button]. */
+    private fun fileRow(name: String, hint: String, hidden: Boolean,
+                        onDownload: (() -> Unit)? = null, open: () -> Unit): View {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(10), dp(11), dp(10), dp(11))
+            background = roundedBg(0xFF171A21.toInt(), dp(8))
+            setOnClickListener { open() }
+        }
+        val nameTv = TextView(this).apply {
+            text = name
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+            setTextColor(if (hidden) 0xFF8A929E.toInt() else 0xFFE5E5E5.toInt())
+            ellipsize = android.text.TextUtils.TruncateAt.END
+            isSingleLine = true
+        }
+        row.addView(nameTv, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        if (hint.isNotEmpty()) {
+            row.addView(TextView(this).apply {
+                text = hint; setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f); setTextColor(0xFF5B626E.toInt())
+            })
+        }
+        if (onDownload != null) {
+            row.addView(smallBtn("⬇") { onDownload() }.apply {
+                setPadding(dp(8), dp(4), dp(8), dp(4))
+            })
+        }
+        return row
+    }
+
+    // ---- edit bar buttons ----
+    private fun buildEditButtons() {
+        dirtyDot = TextView(this).apply {
+            text = "●"; setTextColor(0xFFF59E0B.toInt()); setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+            visibility = View.GONE
+        }
+        editBar.addView(dirtyDot)
+        saveBtn = smallBtn("save") { save() }.apply {
+            setTextColor(0xFFFFFFFF.toInt()); setBackgroundColor(0xFF1B6FD4.toInt())
+            visibility = View.GONE
+        }
+        editBar.addView(saveBtn)
+        editBar.addView(smallBtn("⬇ save to phone") {
+            openFile?.let { downloadFile(it, it.substringAfterLast('/')) }
         })
-        val edit = EditText(this).apply {
-            setText(content)
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-            setTypeface(android.graphics.Typeface.MONOSPACE)
-            setBackgroundColor(0xFF1a1b23.toInt())
-            setPadding(dp(8), dp(8), dp(8), dp(8))
+    }
+
+    private fun refreshBar() {
+        val editing = openFile != null
+        val modeLabel = if (editing) openFile?.substringAfterLast('/') ?: "" else "Files"
+        titleTv.text = modeLabel
+        titleTv.visibility = View.VISIBLE
+
+        // browse-only controls
+        browseBox.visibility = if (editing) View.GONE else View.VISIBLE
+        // edit-only controls
+        web.visibility = if (editing) View.VISIBLE else View.GONE
+        editBar.visibility = if (editing) View.VISIBLE else View.GONE
+
+        if (editing) {
+            pathTv.text = openFile
+            val dirty = draft != openOriginal
+            saveBtn.visibility = if (dirty) View.VISIBLE else View.GONE
+            dirtyDot.visibility = if (dirty) View.VISIBLE else View.GONE
+        } else {
+            dirtyDot.visibility = View.GONE
+            saveBtn.visibility = View.GONE
         }
-        fileBox.addView(edit)
-        val actions = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        actions.addView(Button(this).apply {
-            text = "Save"; setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f); setPadding(dp(10), dp(4), dp(10), dp(4))
-            setOnClickListener {
-                relay?.send(Term.fileWrite(path, edit.text.toString(), curMtime))
-                status.text = "saving…"
+    }
+
+    // ---- mode switching + back ----
+    private fun toBrowse() {
+        openFile = null
+        draft = ""
+        openOriginal = ""
+        clearConflict()
+        statusTv.text = ""
+        refreshBar()
+        browse(curDir.ifEmpty { null })
+    }
+
+    private fun goBack() {
+        if (openFile != null) {
+            if (draft != openOriginal) {
+                confirmDiscardAndBack()
+                return
             }
-        })
-        actions.addView(Button(this).apply {
-            text = "Back"; setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f); setPadding(dp(10), dp(4), dp(10), dp(4))
-            setOnClickListener { browse(null) }
-        })
-        fileBox.addView(actions)
-        status.text = "loaded"
+            toBrowse()
+        } else {
+            finish()
+        }
     }
 
-    // ---- upload a local phone file ----
-    private var lastUploadName = ""
-    private fun uploadLast() {
-        // pick from app-specific external dir (no SAF picker for MVP):
-        // the user places a file at /sdcard/Download/ranch-upload/<name>
-        val dir = android.os.Environment.getExternalStoragePublicDirectory(
-            android.os.Environment.DIRECTORY_DOWNLOADS)
-        val f = File(dir, "ranch-upload")
-        if (!f.exists()) {
-            status.text = "put a file in /sdcard/Download/ranch-upload/ first"
-            return
+    private fun confirmDiscardAndBack() {
+        AlertDialog.Builder(this)
+            .setTitle("Unsaved changes")
+            .setMessage("Discard changes to ${openFile?.substringAfterLast('/')}?")
+            .setNegativeButton("Keep editing", null)
+            .setPositiveButton("Discard & close") { _, _ ->
+                // leave the file open on the host; just go back to the list
+                toBrowse()
+            }
+            .show()
+    }
+
+    @Suppress("OVERRIDE_DEPRECATION")
+    override fun onBackPressed() {
+        goBack()
+    }
+
+    // ---- frame-driven browse / edit ----
+    private fun browse(path: String?) {
+        openFile = null
+        refreshBar()
+        val f = Term.dirList(path, showHidden)
+        dirReqId = f.optString("req_id")
+        refreshStatus("listing…")
+        relay?.send(f)
+    }
+
+    private fun openFile(path: String) {
+        pathTv.text = path
+        val f = Term.fileRead(path)
+        readReqId = f.optString("req_id")
+        refreshStatus("reading ${path.substringAfterLast('/')}…")
+        relay?.send(f)
+    }
+
+    private fun save() {
+        val p = openFile ?: return
+        val f = Term.fileWrite(p, draft, curMtime)
+        writeReqId = f.optString("req_id")
+        refreshStatus("saving…")
+        relay?.send(f)
+    }
+
+    private fun reloadFile() {
+        openFile?.let { p -> openFile(p) }
+    }
+
+    // ---- download a host file to the phone (SAF save-as) ----
+    private fun downloadFile(path: String, name: String) {
+        pendingDownloadPath = path
+        val mime = Lang.guessMime(name)
+        val i = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = mime
+            putExtra(Intent.EXTRA_TITLE, name)
         }
-        val pick = f.listFiles()?.firstOrNull()
-        if (pick == null) { status.text = "ranch-upload/ is empty"; return }
-        val b64 = Base64.encodeToString(pick.readBytes(), Base64.NO_WRAP)
-        lastUploadName = pick.name
-        relay?.send(Term.filePut(pick.name, b64))
-        status.text = "uploading ${pick.name} (${pick.length()} bytes)…"
+        try {
+            startActivityForResult(i, REQ_DOWNLOAD)
+            statusTv.text = "choosing where to save $name…"
+        } catch (e: Exception) {
+            Toast.makeText(this, "no file manager: ${e.message}", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun startDownloadToUri(uri: Uri) {
+        val path = pendingDownloadPath ?: return
+        pendingDownloadUri = uri
+        val f = Term.fileDownload(path)
+        downloadReqId = f.optString("req_id")
+        refreshStatus("downloading ${path.substringAfterLast('/')}…")
+        relay?.send(f)
+    }
+
+    @Volatile private var pendingDownloadPath: String? = null
+
+    // ---- upload a phone file to the host (SAF open) ----
+    private fun pickUpload() {
+        val i = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "*/*"
+        }
+        try {
+            startActivityForResult(i, REQ_UPLOAD)
+            statusTv.text = "pick a file to upload…"
+        } catch (e: Exception) {
+            Toast.makeText(this, "no file manager: ${e.message}", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun startUpload(uri: Uri) {
+        val name = queryName(uri)
+        val mime = Lang.guessMime(name)
+        pendingDownloadPath = null
+        refreshStatus("uploading $name…")
+        exec.execute {
+            try {
+                val bytes = contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                    ?: throw IOException("could not open $name")
+                if (bytes.size > 10 * 1024 * 1024) {
+                    handler.post { statusTv.text = "too large to upload (max 10 MiB)" }; return@execute
+                }
+                val b64 = android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP)
+                relay?.send(Term.filePut(name, b64))
+            } catch (e: Exception) {
+                handler.post { statusTv.text = "upload failed: ${e.message}" }
+            }
+        }
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (resultCode != RESULT_OK) { pendingDownloadUri = null; return }
+        val uri = data?.data ?: return
+        when (requestCode) {
+            REQ_UPLOAD -> startUpload(uri)
+            REQ_DOWNLOAD -> startDownloadToUri(uri)
+        }
     }
 
     // ---- frame dispatch ----
     private fun onFrame(f: JSONObject) {
+        val rid = f.optString("req_id")
         when (f.optString("t")) {
-            "DirListOk" -> onDirListOk(f)
-            "FileReadOk" -> onFileReadOk(f)
-            "FileWriteOk" -> status.text = "saved ${f.optString("path")}"
-            "FilePutOk" -> status.text = "uploaded ${f.optString("path")} (${f.optLong("size")} bytes)"
+            "DirListOk" -> {
+                if (rid != dirReqId) return
+                dirReqId = null
+                val parent = f.optString("parent").takeIf { it.isNotEmpty() }
+                val dirs = optStrList(f, "dirs")
+                val files = optStrList(f, "files")
+                renderDir(f.optString("path"), parent, dirs, files)
+            }
+            "FileReadOk" -> {
+                if (rid != readReqId) return
+                readReqId = null
+                val path = f.optString("path")
+                openFile = path
+                openOriginal = f.optString("content")
+                draft = openOriginal
+                curMtime = f.optLong("mtime")
+                refreshStatus("${f.optLong("size")} bytes · ${Lang.langForPath(path)}")
+                refreshBar()
+                pathTv.text = path
+                if (webReady) pushDoc(draft, Lang.modeForPath(path))
+            }
+            "FileWriteOk" -> {
+                if (rid != writeReqId) return
+                writeReqId = null
+                curMtime = f.optLong("mtime")
+                openOriginal = draft // now clean
+                refreshBar()
+                refreshStatus("saved ✓")
+                handler.postDelayed({ if (openOriginal == draft) statusTv.text = "" }, 2000)
+            }
+            "FileDownloadOk" -> {
+                if (rid != downloadReqId) return
+                downloadReqId = null
+                val uri = pendingDownloadUri ?: return
+                pendingDownloadUri = null
+                val b64 = f.optString("b64")
+                exec.execute {
+                    try {
+                        val bytes = android.util.Base64.decode(b64, android.util.Base64.NO_WRAP)
+                        contentResolver.openOutputStream(uri)?.use { it.write(bytes) }
+                            ?: throw IOException("no output stream")
+                        handler.post {
+                            refreshStatus("saved ${bytes.size} bytes to phone ✓")
+                            Toast.makeText(this, "downloaded ${bytes.size} bytes", Toast.LENGTH_SHORT).show()
+                        }
+                    } catch (e: Exception) {
+                        handler.post { refreshStatus("download failed: ${e.message}") }
+                    }
+                }
+            }
+            "FilePutOk" -> {
+                val p = f.optString("path")
+                refreshStatus("uploaded to host:\n$p")
+                Toast.makeText(this, "uploaded → $p", Toast.LENGTH_LONG).show()
+            }
             "FileChanged" -> {
                 val p = f.optString("path")
-                if (p == curFile) status.text = "changed on host — tap Reload"; reload()
+                if (openFile == p) {
+                    if (draft == openOriginal) reloadFile()      // clean: refresh silently
+                    else showConflict()
+                }
             }
-            "Error" -> status.text = "error: ${f.optString("message")}"
+            "Error" -> {
+                when {
+                    rid == dirReqId -> { dirReqId = null; refreshStatus("error: ${f.optString("message")}") }
+                    rid == readReqId -> { readReqId = null; refreshStatus("error: ${f.optString("message")}") }
+                    rid == writeReqId -> {
+                        writeReqId = null
+                        val msg = f.optString("message")
+                        if (msg.startsWith("file changed on disk")) showConflict()
+                        else refreshStatus("error: $msg")
+                    }
+                    rid == downloadReqId -> { downloadReqId = null; refreshStatus("download error: ${f.optString("message")}") }
+                }
+            }
         }
     }
 
-    private fun reload() {
-        curFile?.let { openFile(it) }
+    // ---- WebView bridge ----
+    private inner class JsBridge {
+        @JavascriptInterface
+        @Suppress("unused")
+        fun postMessage(msg: String) {
+            try {
+                val o = JSONObject(msg)
+                when (o.optString("t")) {
+                    "ready" -> handler.post {
+                        webReady = true
+                        openFile?.let { pushDoc(draft, Lang.modeForPath(it)) }
+                    }
+                    "change" -> handler.post {
+                        val v = o.optString("value")
+                        if (openFile != null && v != draft) {
+                            draft = v
+                            refreshBar()
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+        }
     }
 
-    private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+    /**
+     * Configure + load the editor page. Fully offline: CodeMirror 5 + the
+     * language modes ship in `assets/editor/`. The two `*FromFileURLs` flags
+     * are deprecated-but-required for a `file://` page to load its sibling
+     * asset scripts and expose the JS bridge — accepted for our local-only,
+     * never-loads-remote page (see shouldOverrideUrlLoading above).
+     */
+    @Suppress("DEPRECATION")
+    private fun configureWebView(w: WebView) {
+        w.settings.apply {
+            javaScriptEnabled = true
+            allowFileAccess = true
+            allowFileAccessFromFileURLs = true
+            allowUniversalAccessFromFileURLs = true
+            domStorageEnabled = false
+        }
+        w.loadUrl("file:///android_asset/editor/editor.html")
+    }
+
+    private fun pushDoc(value: String, mode: String) {
+        if (!webReady) return
+        web.evaluateJavascript("window.__ranch(${jsLit(value)}, ${jsLit(mode)})", null)
+    }
+
+    /** Render a String as a valid JS string literal (safe embed in JS). */
+    private fun jsLit(s: String): String {
+        val sb = StringBuilder("\"")
+        for (c in s) {
+            when (c) {
+                '"' -> sb.append("\\\"")
+                '\\' -> sb.append("\\\\")
+                '\n' -> sb.append("\\n")
+                '\r' -> sb.append("\\r")
+                '\t' -> sb.append("\\t")
+                '\b' -> sb.append("\\b")
+                '\u000C' -> sb.append("\\f")
+                else -> if (c.code < 0x20) sb.append(String.format("\\u%04x", c.code)) else sb.append(c)
+            }
+        }
+        return sb.append('"').toString()
+    }
+
+    // ---- shared helpers ----
+    private fun refreshStatus(s: String) {
+        statusTv.text = s
+        statusTv.setTextColor(0xFF9AA0A6.toInt())
+        conflictReload.visibility = View.GONE
+        conflictKeep.visibility = View.GONE
+    }
+
+    private fun showConflict() {
+        statusTv.text = "changed on host — reload or keep your edits?"
+        statusTv.setTextColor(0xFFF59E0B.toInt())
+        conflictReload.visibility = View.VISIBLE
+        conflictKeep.visibility = View.VISIBLE
+    }
+
+    private fun clearConflict() {
+        statusTv.setTextColor(0xFF9AA0A6.toInt())
+        conflictReload.visibility = View.GONE
+        conflictKeep.visibility = View.GONE
+    }
+
+    private fun copyPath() {
+        val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        cm.setPrimaryClip(ClipData.newPlainText("path", pathTv.text.toString()))
+        Toast.makeText(this, "copied path", Toast.LENGTH_SHORT).show()
+    }
+
+    private fun queryName(uri: Uri): String {
+        var name = "upload"
+        try {
+            contentResolver.query(uri, null, null, null, null)?.use { c ->
+                val idx = c.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+                if (idx >= 0 && c.moveToFirst()) name = c.getString(idx)
+            }
+        } catch (_: Exception) {}
+        return name.ifEmpty { uri.lastPathSegment ?: "upload" }
+    }
+
+    private fun smallBtn(label: String, click: () -> Unit): Button = Button(this).apply {
+        text = label
+        setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+        setTextColor(0xFF7FD4FF.toInt())
+        setBackgroundColor(0xFF1B2126.toInt())
+        setPadding(dp(10), dp(5), dp(10), dp(5))
+        minWidth = 0
+        minimumWidth = 0
+        setOnClickListener { click() }
+    }
+
+    private fun roundedBg(color: Int, radius: Int): android.graphics.drawable.GradientDrawable {
+        val bg = android.graphics.drawable.GradientDrawable()
+        bg.cornerRadius = radius.toFloat()
+        bg.setColor(color)
+        return bg
+    }
+
+    private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+
+    private fun optStrList(o: JSONObject, key: String): List<String> =
+        o.optJSONArray(key)?.let { a -> (0 until a.length()).map { a.optString(it) } } ?: emptyList()
+
     private fun errorView(msg: String): View =
         LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL; setPadding(dp(20), dp(20), dp(20), dp(20))
-            addView(TextView(this@EditorActivity).apply { text = msg; setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f) })
+            setBackgroundColor(0xFF101418.toInt())
+            addView(TextView(this@EditorActivity).apply {
+                text = msg; setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+            })
             addView(Button(this@EditorActivity).apply { text = "Back"; setOnClickListener { finish() } })
         }
+
+    override fun onDestroy() {
+        relay?.removeSink(sink)
+        handler.removeCallbacksAndMessages(null)
+        exec.shutdownNow()
+        // detach + destroy the WebView to avoid leaks / "destroy twice"
+        try {
+            web.onPause()
+            (web.parent as? android.view.ViewGroup)?.removeView(web)
+            web.destroy()
+        } catch (_: Exception) {}
+        super.onDestroy()
+    }
 }
