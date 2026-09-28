@@ -7,9 +7,12 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Bundle
+import android.app.AlertDialog
 import android.os.Handler
 import android.os.Looper
+import android.text.Editable
 import android.text.InputType
+import android.text.TextWatcher
 import android.text.Spannable
 import android.text.SpannableStringBuilder
 import android.text.style.ForegroundColorSpan
@@ -20,11 +23,13 @@ import android.view.View
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
 import android.graphics.Typeface
+import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.EditText
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.HorizontalScrollView
+import android.widget.ListView
 import android.widget.PopupWindow
 import android.widget.ScrollView
 import android.widget.TextView
@@ -79,8 +84,7 @@ class SessionActivity : Activity() {
 
     // model picker
     private val modelOpts = LinkedHashMap<String, List<Term.ModelChoice>>()
-    private var modelPw: PopupWindow? = null
-    private var modelPickerOpen = false
+    private var modelDialog: AlertDialog? = null
 
     // chat scrollback
     private var chatHistReqId: String? = null
@@ -821,29 +825,63 @@ class SessionActivity : Activity() {
         showModelPicker(models)
     }
 
+    /** Scrollable model picker with type-to-filter. */
     private fun showModelPicker(models: List<Term.ModelChoice>) {
-        modelPw?.dismiss()
-        val list = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(8), dp(8), dp(8), dp(8))
-            setBackgroundColor(0xFF1a1b23.toInt())
-            isVerticalScrollBarEnabled = true
+        modelDialog?.dismiss()
+        var shown = models
+        val labels = shown.map { "${it.name}  (${it.provider})" }.toMutableList()
+        val adapter = ArrayAdapter(this, android.R.layout.simple_list_item_1, labels)
+        val list = ListView(this).apply {
+            this.adapter = adapter
+            setDividerHeight(0)
         }
-        for (m in models) {
-            list.addView(Button(this).apply {
-                text = "${m.name}  (${m.provider})"
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-                setPadding(dp(8), dp(6), dp(8), dp(6))
-                setOnClickListener {
-                    relay?.send(Term.modelSet(sessionId, activePane, m.provider, m.id))
-                    modelChip.text = "◈ ${m.name}"
-                    modelPw?.dismiss()
+        val empty = TextView(this).apply {
+            text = "no models match"
+            setTextColor(0xFF9AA0A6.toInt())
+            setPadding(dp(12), dp(12), dp(12), dp(12))
+            visibility = View.GONE
+        }
+        val filter = EditText(this).apply {
+            hint = "Filter models…"
+            isSingleLine = true
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+            setPadding(dp(12), dp(10), dp(12), dp(6))
+        }
+        filter.addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+            override fun afterTextChanged(s: Editable?) {}
+            override fun onTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {
+                val q = s?.toString()?.trim() ?: ""
+                shown = if (q.isEmpty()) models else models.filter {
+                    it.name.contains(q, true) || it.provider.contains(q, true) || it.id.contains(q, true)
                 }
-            })
+                labels.clear()
+                labels.addAll(shown.map { "${it.name}  (${it.provider})" })
+                adapter.notifyDataSetChanged()
+                empty.visibility = if (shown.isEmpty()) View.VISIBLE else View.GONE
+            }
+        })
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(filter, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+            addView(list, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
+            addView(empty)
         }
-        val popup = PopupWindow(list, dp(280), dp(320), true)
-        modelPw = popup
-        popup.showAsDropDown(modelChip)
+        list.setOnItemClickListener { _, _, position, _ ->
+            val m = shown[position]
+            relay?.send(Term.modelSet(sessionId, activePane, m.provider, m.id))
+            modelChip.text = "◈ ${m.name}"
+            modelDialog?.dismiss()
+        }
+        val dialog = AlertDialog.Builder(this)
+            .setTitle("Pick a model")
+            .setView(container)
+            .setNegativeButton("Cancel", null)
+            .create()
+        modelDialog = dialog
+        dialog.show()
     }
 
     // ---- Chat scrollback ----
