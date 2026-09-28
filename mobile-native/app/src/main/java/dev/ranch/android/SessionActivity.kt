@@ -108,7 +108,10 @@ class SessionActivity : Activity() {
     private data class Queued(val pane: String, val text: String)
 
     private val compactTimeoutRun = Runnable {
-        if (compacting) finishCompact("compaction timed out — sending queued messages")
+        if (compacting) finishCompact(
+            "compaction timed out" +
+                (if (queued.isNotEmpty()) " — sending queued messages" else " — check the chat for the outcome")
+        )
     }
 
     // ---- compaction persistence (survives back-swipe + process kill) ----
@@ -153,12 +156,15 @@ class SessionActivity : Activity() {
             }
             compactingPane = pane
             compacting = pane.isNotEmpty()
-            // compaction that outlived the app for >10 min is stale
+            // compaction that outlived the app for >30 min is stale
             if (compacting &&
                 (compactingSince <= 0 ||
-                 System.currentTimeMillis() - compactingSince > 600_000)
+                 System.currentTimeMillis() - compactingSince > 1_800_000)
             ) {
-                finishCompact("compaction timed out — sending queued messages")
+                finishCompact(
+                    "compaction timed out" +
+                        if (queued.isNotEmpty()) " — sending queued messages" else ""
+                )
             }
         } catch (_: Exception) {
             clearPersistedCompaction()
@@ -177,11 +183,10 @@ class SessionActivity : Activity() {
     private lateinit var inputArea: LinearLayout
     private lateinit var hiddenEdit: EditText
     private lateinit var chatEdit: EditText
-    private var stopBtn: Button? = null
+    private var actionBtn: Button? = null
     // image attachments (M-images): composer state + rendered thumbnails
     private var attachBtn: Button? = null
     private var chipRow: LinearLayout? = null
-    private var chipsRow: LinearLayout? = null
     private val pendingAtt = mutableListOf<String>()          // composer attachment paths
     private val attUploadReqs = mutableMapOf<String, String>() // FilePut req_id -> name
     private val imgCache = mutableMapOf<String, Bitmap>()     // path -> decoded bitmap
@@ -585,7 +590,7 @@ class SessionActivity : Activity() {
         if (pane.chat.lastOrNull()?.role == "user") pane.agentWorking = true
         if (paneId == activePane && uiKind == "forge-chat") {
             renderChat(pane, false)
-            updateStopButton()
+            updateActionButton()
         }
     }
 
@@ -603,7 +608,7 @@ class SessionActivity : Activity() {
                     compactingPane = pane
                     persistCompaction()
                     handler.removeCallbacks(compactTimeoutRun)
-                    handler.postDelayed(compactTimeoutRun, 600_000)
+                    handler.postDelayed(compactTimeoutRun, 1_800_000)
                     renderQueue()
                     if (pane == activePane) {
                         statusView.text = "🗜 compacting…"
@@ -623,7 +628,7 @@ class SessionActivity : Activity() {
                     "idle" -> "● idle"
                     else -> ""
                 }
-                if (pane == activePane && uiKind == "forge-chat") updateStopButton()
+                if (pane == activePane && uiKind == "forge-chat") updateActionButton()
             }
             "model" -> {
                 val p = f.optString("pane")
@@ -813,8 +818,9 @@ class SessionActivity : Activity() {
         compactingPane = activePane
         compactingSince = System.currentTimeMillis()
         persistCompaction()
+        relay?.send(frame)
         handler.removeCallbacks(compactTimeoutRun)
-        handler.postDelayed(compactTimeoutRun, 600_000)
+        handler.postDelayed(compactTimeoutRun, 1_800_000)
         renderQueue()
         updateModelBar()
     }
@@ -1500,21 +1506,12 @@ class SessionActivity : Activity() {
             }
             setOnClickListener { pickImage() }
         }
-        // stop button: only visible while this pane's agent has a turn in
-        // flight. Interrupts the running work immediately but keeps the
-        // session + conversation (pi `abort` RPC / forge /interrupt).
-        // It lives in the row ABOVE the input so appearing can never
-        // squeeze the text field.
-        stopBtn = Button(this).apply {
-            text = "⏹ stop"
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-            setTextColor(0xFFE06C75.toInt())
-            setPadding(dp(8), dp(2), dp(8), dp(2))
-            minWidth = 0
-            includeFontPadding = false
-            visibility = View.GONE
-            setOnClickListener { sendInterrupt() }
-        }
+        // The right-edge action button has two states: ➤ send when idle,
+        // ⏹ stop while this pane's agent has a turn in flight (interrupts
+        // the running work — pi `abort` RPC / forge /interrupt — but keeps
+        // the session + conversation). One slot, one width, on the right:
+        // the working state never reflows the input. Sending while a turn
+        // is in flight still works via the keyboard's send action.
         val send = Button(this).apply {
             text = "➤"
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
@@ -1522,7 +1519,10 @@ class SessionActivity : Activity() {
             setPadding(0, 0, 0, 0)
             includeFontPadding = false
         }
-        send.setOnClickListener { sendChat() }
+        send.setOnClickListener {
+            if (panes[activePane]?.agentWorking == true && uiKind == "forge-chat") sendInterrupt() else sendChat()
+        }
+        actionBtn = send
         row.addView(attachBtn, LinearLayout.LayoutParams(dp(36), dp(36)).apply {
             rightMargin = dp(8)
         })
@@ -1535,41 +1535,27 @@ class SessionActivity : Activity() {
         // to WRAP_CONTENT, which squeezed the composer to its content width
         inputArea.addView(row, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
-        // row above the input: stop button (left) + attachment chips. GONE
-        // when both are empty so it costs zero height.
+        // attachment chip row above the input (GONE when empty)
         val cRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(10), dp(2), dp(10), dp(2))
+            setPadding(dp(10), dp(4), dp(10), dp(2))
             visibility = View.GONE
         }
         chipRow = cRow
-        val chRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        chipsRow = chRow
-        cRow.addView(stopBtn, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT))
-        cRow.addView(chRow, LinearLayout.LayoutParams(
-            0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
         inputArea.addView(cRow, 0)
         renderChips()
-        updateStopButton()
+        updateActionButton()
     }
 
-    /// Show the ⏹ stop button iff the active pane is an agent pane with a
-    /// turn in flight. Called from input-area builds, pane switches, chat
-    /// frames (user row landing), and `meta { kind: "agent" }` updates.
-    private fun updateStopButton() {
-        val b = stopBtn ?: return
+    /// The right-edge button shows ⏹ (stop) iff the active pane is an
+    /// agent pane with a turn in flight, else ➤ (send). Called from
+    /// input-area builds, pane switches, chat frames (user row landing),
+    /// and `meta { kind: "agent" }` updates.
+    private fun updateActionButton() {
+        val b = actionBtn ?: return
         val working = panes[activePane]?.agentWorking == true && uiKind == "forge-chat"
-        b.visibility = if (working) View.VISIBLE else View.GONE
-        refreshChipRow()
-    }
-
-    /** The above-input row shows only when the stop button or chips exist. */
-    private fun refreshChipRow() {
-        val row = chipRow ?: return
-        row.visibility =
-            if ((stopBtn?.visibility == View.VISIBLE) || pendingAtt.isNotEmpty()) View.VISIBLE else View.GONE
+        b.text = if (working) "⏹" else "➤"
+        b.setTextColor(if (working) 0xFFE06C75.toInt() else 0xFFE5E5E5.toInt())
     }
 
     private fun sendInterrupt() {
@@ -1578,7 +1564,7 @@ class SessionActivity : Activity() {
         // the idle meta + the "⏹ interrupted" system row follow; hide the
         // button optimistically so a double-tap can't re-fire the RPC
         panes[activePane]?.agentWorking = false
-        updateStopButton()
+        updateActionButton()
     }
 
     private fun focusHidden() {
@@ -1684,7 +1670,7 @@ class SessionActivity : Activity() {
     /// The composer's attachment chip row. Each chip: [thumbnail][name][✕] —
     /// tap the thumbnail for the full image, tap ✕ to drop the attachment.
     private fun renderChips() {
-        val row = chipsRow ?: return
+        val row = chipRow ?: return
         row.removeAllViews()
         for (p in pendingAtt) {
             val chip = LinearLayout(this).apply {
@@ -1733,7 +1719,7 @@ class SessionActivity : Activity() {
             lp.rightMargin = dp(6)
             row.addView(chip, lp)
         }
-        refreshChipRow()
+        row.visibility = if (pendingAtt.isNotEmpty()) View.VISIBLE else View.GONE
     }
 
     /// One thumbnail (placeholder until FileGetOk lands); tap = full view.
