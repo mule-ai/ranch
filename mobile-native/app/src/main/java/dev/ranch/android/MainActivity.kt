@@ -637,9 +637,30 @@ class MainActivity : Activity() {
             text = "⚠ view last crash log"
             setTextColor(0xFFEF4444.toInt())
             setOnClickListener {
+                val text = crashFile.readText()
+                val tv = TextView(this@MainActivity).apply {
+                    this.text = text
+                    setTextIsSelectable(true)
+                    typeface = android.graphics.Typeface.MONOSPACE
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+                    setTextColor(0xFFE5E5E5.toInt())
+                    setPadding(dp(16), dp(12), dp(16), dp(12))
+                }
+                val box = ScrollView(this@MainActivity).apply {
+                    isVerticalScrollBarEnabled = true
+                    setBackgroundColor(0xFF14181D.toInt())
+                    addView(tv)
+                }
                 android.app.AlertDialog.Builder(this@MainActivity)
                     .setTitle("last crash")
-                    .setMessage(crashFile.readText().take(4000))
+                    .setView(box)
+                    .setNeutralButton("copy") { _, _ ->
+                        val cm = getSystemService(android.content.Context.CLIPBOARD_SERVICE)
+                            as android.content.ClipboardManager
+                        cm.setPrimaryClip(android.content.ClipData
+                            .newPlainText("ranch crash log", text))
+                        Toast.makeText(this@MainActivity, "copied — paste it into the bug report", Toast.LENGTH_SHORT).show()
+                    }
                     .setPositiveButton("clear") { _, _ -> crashFile.delete() }
                     .setNegativeButton("close", null)
                     .show()
