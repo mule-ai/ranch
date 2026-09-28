@@ -341,9 +341,13 @@ class EditorActivity : Activity() {
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(10), dp(11), dp(10), dp(11))
+            setPadding(dp(10), dp(6), dp(10), dp(6))
             background = roundedBg(0xFF171A21.toInt(), dp(8))
             setOnClickListener { open() }
+            // tight list: short rows + a small gap between cards
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(3) }
         }
         val nameTv = TextView(this).apply {
             text = name
