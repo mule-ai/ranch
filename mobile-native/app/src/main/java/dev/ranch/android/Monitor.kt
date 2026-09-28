@@ -147,10 +147,21 @@ class RelaySession(
                 }
             }
             "Meta" -> {
-                if (frame.optString("kind") == "exited") {
+                val kind = frame.optString("kind")
+                if (kind == "exited") {
                     val sid = frame.optString("session")
                     if (sid.isNotEmpty())
                         Monitor.publishSessions(Monitor.sessions.filterNot { it.id == sid })
+                } else if (kind == "agent") {
+                    // working/idle is broadcast to every client, so the
+                    // session list stays live without re-helloing
+                    val sid = frame.optString("session")
+                    if (sid.isNotEmpty()) {
+                        val busy = frame.optString("status") == "working"
+                        Monitor.publishSessions(
+                            Monitor.sessions.map { if (it.id == sid) it.copy(busy = busy) else it }
+                        )
+                    }
                 }
             }
         }

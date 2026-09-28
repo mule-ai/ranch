@@ -217,6 +217,8 @@ object Term {
         val kind: String,
         val activePane: String,
         val panes: List<String>,
+        val cwd: String? = null,
+        val busy: Boolean = false,
     )
 
     data class ChatMsg(
@@ -299,6 +301,8 @@ object Term {
             panes = o.optJSONArray("panes")
                 ?.let { a -> (0 until a.length()).map { a.getString(it) } }
                 ?: emptyList(),
+            cwd = o.optString("cwd").takeIf { it.isNotEmpty() },
+            busy = o.optBoolean("busy", false),
         )
 
     fun parseSessionList(frame: JSONObject): List<Term.SessionMeta> {

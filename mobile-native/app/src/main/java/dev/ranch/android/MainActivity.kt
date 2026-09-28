@@ -411,7 +411,10 @@ class MainActivity : Activity() {
                     "pi" -> "π pi"
                     else -> "💻 shell"
                 }
-                text = "${s.name.ifEmpty { s.id.take(8) }}\n$badge"
+                val mark = if (s.busy) "⚙ working · " else ""
+                val dir = s.cwd?.let { abbrevPath(it) }
+                text = "${mark}${s.name.ifEmpty { s.id.take(8) }}\n${badge}${dir?.let { " · $it" } ?: ""}"
+                setTextColor(if (s.busy) 0xFFF59E0B.toInt() else 0xFFE5E5E5.toInt())
                 setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
                 setPadding(dp(14), dp(12), dp(14), dp(12))
                 setOnClickListener {
@@ -423,6 +426,10 @@ class MainActivity : Activity() {
         }
         maybeAutoOpen()
     }
+
+    /** Truncate a path to its last 33 chars for the row (leading …). */
+    private fun abbrevPath(p: String): String =
+        if (p.length <= 33) p else "…" + p.takeLast(33)
 
     // ---- new agent dialog: kind + name + working-dir picker (RN parity) ----
 

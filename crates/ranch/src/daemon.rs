@@ -151,6 +151,10 @@ struct ChatPane {
     /// working dir (local-pi panes: where the rpc child was spawned;
     /// recorded so restore can respawn in the same place)
     cwd: Option<String>,
+    /// true while the agent is mid-turn (set from the worker's `meta
+    /// kind="agent"` working/idle broadcasts; surfaced in
+    /// `SessionMeta.busy`)
+    busy: bool,
 }
 
 struct Window {
@@ -1646,6 +1650,7 @@ impl Daemon {
                         model: None,
                         context: None,
                         cwd: Some(dir_str),
+                        busy: false,
                     }
                 );
             }
@@ -1667,6 +1672,7 @@ impl Daemon {
                         model: None,
                         context: None,
                         cwd: dir.map(|p| p.to_string_lossy().to_string()),
+                        busy: false,
                     }
                 );
                 if let Some(tx) = &self.forge_tx {
@@ -1743,6 +1749,7 @@ impl Daemon {
                     model: None,
                     context: None,
                     cwd: Some(dir_str),
+                    busy: false,
                 }
             );
         } else {
@@ -1756,6 +1763,7 @@ impl Daemon {
                     model: None,
                     context: None,
                     cwd,
+                    busy: false,
                 }
             );
             if let Some(tx) = &self.forge_tx {
@@ -2611,6 +2619,7 @@ impl Daemon {
                             model: None,
                             context: None,
                             cwd: cwd.clone(),
+                            busy: false,
                         }
                     );
                     if fsid.is_nil() {
@@ -2788,6 +2797,7 @@ impl Daemon {
                             model: None,
                             context: None,
                             cwd: cwd.clone(),
+                            busy: false,
                         }
                     );
                     chat_ids.push(pid);
@@ -3033,14 +3043,30 @@ impl Daemon {
     fn session_meta(&self) -> Vec<SessionMeta> {
         self.sessions
             .values()
-            .map(|s| SessionMeta {
-                id: s.id.to_string(),
-                name: s.name.clone(),
-                kind: s.kind.clone(),
-                windows: s.windows.iter().map(|w| w.name.clone()).collect(),
-                active_pane: s.active.to_string(),
-                panes: s.panes.keys().map(|p| p.to_string()).collect(),
-                ref_id: None,
+            .map(|s| {
+                // busy = an agent pane is mid-turn: the cached working
+                // flag, or the snapshot heuristic (last row is a user row)
+                let busy = s.chats.values().any(|cp| {
+                    cp.busy || cp.chat.last().is_some_and(|m| m.role == "user")
+                });
+                // cwd = the active pane's directory (live /proc for PTY
+                // panes, recorded spawn dir for chat panes)
+                let cwd = s
+                    .panes
+                    .get(&s.active)
+                    .and_then(|p| pane_cwd(p.child).map(|p| p.to_string_lossy().into_owned()))
+                    .or_else(|| s.chats.get(&s.active).and_then(|cp| cp.cwd.clone()));
+                SessionMeta {
+                    id: s.id.to_string(),
+                    name: s.name.clone(),
+                    kind: s.kind.clone(),
+                    windows: s.windows.iter().map(|w| w.name.clone()).collect(),
+                    active_pane: s.active.to_string(),
+                    panes: s.panes.keys().map(|p| p.to_string()).collect(),
+                    ref_id: None,
+                    cwd,
+                    busy,
+                }
             })
             .collect()
     }
@@ -4575,6 +4601,7 @@ impl Daemon {
                         model: None,
                         context: None,
                         cwd: None,
+                        busy: false,
                     }
                 );
                 sess.active = pid;
@@ -4630,6 +4657,16 @@ impl Daemon {
                                 if let Some(cp) = s.chats.get_mut(&pid) {
                                     cp.context = Some(st.clone());
                                 }
+                            }
+                        }
+                    }
+                    // working/idle drives the session-list busy badge: cache
+                    // it per pane so HelloOk answers between broadcasts
+                    // are correct too
+                    if kind == "agent" {
+                        if let Some(s) = self.sessions.get_mut(&sid) {
+                            if let Some(cp) = s.chats.get_mut(&pid) {
+                                cp.busy = status.as_deref() == Some("working");
                             }
                         }
                     }
@@ -5191,6 +5228,7 @@ impl Daemon {
                                     model: None,
                                     context: None,
                                     cwd: cwd.clone(),
+                                    busy: false,
                                 }
                             );
                             s.windows[0].layout = Layout::Leaf {
@@ -5485,6 +5523,7 @@ impl Daemon {
                                     model: None,
                                     context: None,
                                     cwd: None,
+                                    busy: false,
                                 }
                             );
                             s.win_mut()
@@ -5537,6 +5576,7 @@ impl Daemon {
                                 model: None,
                                 context: None,
                                 cwd: None,
+                                busy: false,
                             }
                         );
                         s.win_mut()

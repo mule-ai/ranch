@@ -1118,6 +1118,15 @@ pub struct SessionMeta {
     /// Window names in order (M5; absent from older daemons).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub windows: Vec<String>,
+    /// Session working directory — the active pane's cwd for PTY panes
+    /// (live /proc read), the recorded spawn dir for chat panes. Absent
+    /// from older daemons / when unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// True when any agent pane in the session is mid-turn. Absent from
+    /// older daemons (deserializes as false).
+    #[serde(default)]
+    pub busy: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
