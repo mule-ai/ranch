@@ -179,6 +179,11 @@ object Term {
         JSONObject().put("t", "FileMove").put("id", newId()).put("client", CLIENT)
             .put("req_id", "mv-" + newId()).put("from", from).put("to", to)
 
+    /// Copy a file/directory to a new location (source kept in place).
+    fun fileCopy(from: String, to: String): JSONObject =
+        JSONObject().put("t", "FileCopy").put("id", newId()).put("client", CLIENT)
+            .put("req_id", "cp-" + newId()).put("from", from).put("to", to)
+
     /// Delete a file or directory (recursive). The caller confirms first.
     fun fileDelete(path: String): JSONObject =
         JSONObject().put("t", "FileDelete").put("id", newId()).put("client", CLIENT)

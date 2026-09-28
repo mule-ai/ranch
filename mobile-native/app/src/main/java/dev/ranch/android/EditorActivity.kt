@@ -91,6 +91,7 @@ class EditorActivity : Activity() {
     @Volatile private var downloadReqId: String? = null
     @Volatile private var imageReqId: String? = null
     @Volatile private var moveReqId: String? = null
+    @Volatile private var copyReqId: String? = null
     @Volatile private var deleteReqId: String? = null
 
     // ---- pending SAF downloads (chosen save URI + host path) ----
@@ -515,16 +516,17 @@ class EditorActivity : Activity() {
 
     /** Row “⋯” menu: rename / move / delete. */
     private fun entryMenu(path: String, name: String, isDir: Boolean) {
-        val items = arrayOf("Rename", "Move", "Delete")
+        val items = arrayOf("Copy", "Move", "Rename", "Delete")
         AlertDialog.Builder(this)
             .setTitle(name)
             .setItems(items) { _, which ->
                 when (which) {
                     0 -> promptString(
-                        "Rename", "New name for \"$name\":", name, "new name", "Rename"
-                    ) { nn ->
-                        if (nn.isEmpty() || nn.contains('/')) { refreshStatus("invalid name"); return@promptString }
-                        doMove(path, path.substringBeforeLast('/', "") + "/" + nn)
+                        "Copy", "Copy \"$name\" into which directory?", curDir, "destination directory", "Copy"
+                    ) { dest ->
+                        val d = dest.trimEnd('/')
+                        if (d.isEmpty()) { refreshStatus("destination required"); return@promptString }
+                        doCopy(path, "$d/$name")
                     }
                     1 -> promptString(
                         "Move", "Move \"$name\" into which directory?", curDir, "destination directory", "Move"
@@ -533,10 +535,23 @@ class EditorActivity : Activity() {
                         if (d.isEmpty()) { refreshStatus("destination required"); return@promptString }
                         doMove(path, "$d/$name")
                     }
-                    2 -> confirmDelete(path, name, isDir)
+                    2 -> promptString(
+                        "Rename", "New name for \"$name\":", name, "new name", "Rename"
+                    ) { nn ->
+                        if (nn.isEmpty() || nn.contains('/')) { refreshStatus("invalid name"); return@promptString }
+                        doMove(path, path.substringBeforeLast('/', "") + "/" + nn)
+                    }
+                    3 -> confirmDelete(path, name, isDir)
                 }
             }
             .show()
+    }
+
+    private fun doCopy(from: String, to: String) {
+        val f = Term.fileCopy(from, to)
+        copyReqId = f.optString("req_id")
+        refreshStatus("copying ${from.substringAfterLast('/')}…")
+        relay?.send(f)
     }
 
     private fun doMove(from: String, to: String) {
@@ -790,6 +805,12 @@ class EditorActivity : Activity() {
                 refreshStatus("moved ✓")
                 browse(curDir.ifEmpty { null })
             }
+            "FileCopyOk" -> {
+                if (rid != copyReqId) return
+                copyReqId = null
+                refreshStatus("copied ✓")
+                browse(curDir.ifEmpty { null })
+            }
             "FileDeleteOk" -> {
                 if (rid != deleteReqId) return
                 deleteReqId = null
@@ -816,6 +837,7 @@ class EditorActivity : Activity() {
                     rid == downloadReqId -> { downloadReqId = null; refreshStatus("download error: ${f.optString("message")}") }
                     rid == imageReqId -> { imageReqId = null; refreshStatus("error: ${f.optString("message")}") }
                     rid == moveReqId -> { moveReqId = null; refreshStatus("move failed: ${f.optString("message")}") }
+                    rid == copyReqId -> { copyReqId = null; refreshStatus("copy failed: ${f.optString("message")}") }
                     rid == deleteReqId -> { deleteReqId = null; refreshStatus("delete failed: ${f.optString("message")}") }
                 }
             }

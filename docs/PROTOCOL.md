@@ -240,6 +240,12 @@ The daemon is the file server; clients (mobile/CLI) are thin editors.
   move into a missing parent dir; a cross-device (`EXDEV`) rename falls
   back to a recursive copy+delete. `path` in the reply is the new path
   (`to`).
+- **`FileCopy`** `{req_id, from, to}` → **`FileCopyOk`** `{req_id, path}`
+  — copy a file/directory to a new location, leaving the source in place.
+  The daemon refuses to clobber an existing destination, to copy a
+  directory into its own subtree, or to copy into a missing parent dir; a
+  partial copy is removed on failure. `path` in the reply is the copy's
+  new path (`to`).
 - **`FileDelete`** `{req_id, path}` → **`FileDeleteOk`** `{req_id, path}`
   — delete a file or directory (directories removed recursively; a
   symlink to a directory is removed as a link). The client confirms with

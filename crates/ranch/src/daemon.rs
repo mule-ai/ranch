@@ -4179,6 +4179,54 @@ impl Daemon {
                     Err(e) => del_err(format!("delete failed: {e}")),
                 }
             }
+            // client -> daemon: copy a file/directory to a new location.
+            Frame::FileCopy { req_id, from: from_path, to, .. } => {
+                let mut cp_reply = |f: Frame| {
+                    if let Some(c) = self.clients.get_mut(&from) {
+                        send_frame(c, &f);
+                    }
+                };
+                let mut cp_err = |msg: String| {
+                    cp_reply(Frame::Error { req_id: Some(req_id.clone()), message: msg });
+                };
+                let src = std::path::Path::new(from_path);
+                let dst = std::path::Path::new(to);
+                if src.symlink_metadata().is_err() {
+                    cp_err(format!("no such path: {from_path}"));
+                    return;
+                }
+                // refuse copying a directory into its own subtree
+                let dst_str = dst.to_string_lossy().to_string();
+                let src_str = src.to_string_lossy().to_string();
+                if std::fs::symlink_metadata(src).ok().is_some_and(|m| m.is_dir()) {
+                    let prefix = if src_str.ends_with('/') { src_str.clone() } else { format!("{src_str}/") };
+                    if dst_str == src_str || dst_str.starts_with(&prefix) {
+                        cp_err("cannot copy a directory into itself".into());
+                        return;
+                    }
+                }
+                if dst.symlink_metadata().is_ok() {
+                    cp_err(format!("destination already exists: {to}"));
+                    return;
+                }
+                if let Some(pp) = dst.parent() {
+                    if pp.as_os_str().is_empty() || !pp.is_dir() {
+                        cp_err(format!("destination directory does not exist: {}", pp.display()));
+                        return;
+                    }
+                }
+                match copy_tree(src, dst) {
+                    Ok(()) => cp_reply(Frame::FileCopyOk {
+                        id: String::new(),
+                        req_id: req_id.clone(),
+                        path: to.clone(),
+                    }),
+                    Err(e) => {
+                        let _ = rm_tree(dst); // clean up a partial copy
+                        cp_err(format!("copy failed: {e}"));
+                    }
+                }
+            }
             // client -> forge: list resumable sessions (blocking HTTP
             // on the worker thread)
             Frame::ForgeList { req_id, .. } => {

@@ -337,6 +337,25 @@ pub enum Frame {
         req_id: String,
         path: String,
     },
+    /// Client -> daemon: copy a file/directory to a new location. The source
+    /// is left in place. `to` must not already exist; copying a directory
+    /// into its own subtree is refused.
+    FileCopy {
+        id: String,
+        client: String,
+        /// echoed back in `FileCopyOk` / `error` so clients match the reply
+        req_id: String,
+        /// existing source path (file or directory)
+        from: String,
+        /// destination path (must not already exist)
+        to: String,
+    },
+    /// Daemon -> client: the copy succeeded; `path` is the new copy's path.
+    FileCopyOk {
+        id: String,
+        req_id: String,
+        path: String,
+    },
     /// Client -> daemon: list resumable forge sessions.
     ForgeList {
         id: String,
@@ -1805,6 +1824,18 @@ mod tests {
             req_id: "r7".into(),
             path: "/home/j/a.txt".into(),
         };
+        let cp = Frame::FileCopy {
+            id: "i15".into(),
+            client: "mobile".into(),
+            req_id: "r8".into(),
+            from: "/home/j/a.txt".into(),
+            to: "/home/j/copy-of-a.txt".into(),
+        };
+        let cp_ok = Frame::FileCopyOk {
+            id: "i16".into(),
+            req_id: "r8".into(),
+            path: "/home/j/copy-of-a.txt".into(),
+        };
         for f in [
             put,
             put_ok.clone(),
@@ -1816,6 +1847,8 @@ mod tests {
             mv_ok,
             del,
             del_ok,
+            cp,
+            cp_ok,
         ] {
             let line = encode_frame(&f, "c");
             assert_eq!(line.len(), 1);
