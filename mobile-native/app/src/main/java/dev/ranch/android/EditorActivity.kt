@@ -18,6 +18,7 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.Button
 import android.widget.EditText
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.Switch
@@ -60,6 +61,7 @@ class EditorActivity : Activity() {
     private lateinit var startEdit: EditText
     private lateinit var hiddenToggle: Switch
     private lateinit var web: WebView
+    private lateinit var imgView: ImageView
     private lateinit var editBar: LinearLayout
     private lateinit var statusTv: TextView
 
@@ -76,6 +78,7 @@ class EditorActivity : Activity() {
     // ---- edit state ----
     @Volatile private var previewing = false          // markdown preview showing
     @Volatile private var openFile: String? = null     // path being edited
+    @Volatile private var viewingImage: String? = null // path shown in the image view
     @Volatile private var openOriginal: String = ""    // content at load/save
     @Volatile private var draft: String = ""           // current editor content
     @Volatile private var curMtime: Long = 0
@@ -85,6 +88,7 @@ class EditorActivity : Activity() {
     @Volatile private var readReqId: String? = null
     @Volatile private var writeReqId: String? = null
     @Volatile private var downloadReqId: String? = null
+    @Volatile private var imageReqId: String? = null
 
     // ---- pending SAF downloads (chosen save URI + host path) ----
     @Volatile private var pendingDownloadUri: Uri? = null
@@ -188,6 +192,16 @@ class EditorActivity : Activity() {
         web.addJavascriptInterface(JsBridge(), "Ranch")
         configureWebView(web)
         contentBox.addView(web, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
+
+        // --- image viewer (raster files: png/jpg/gif/webp/bmp) ---
+        imgView = ImageView(this).apply {
+            scaleType = ImageView.ScaleType.FIT_CENTER
+            adjustViewBounds = true
+            visibility = View.GONE
+            setBackgroundColor(0xFF0A0A0E.toInt())
+        }
+        contentBox.addView(imgView, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
 
         // --- bottom status / conflict row ---
@@ -298,11 +312,12 @@ class EditorActivity : Activity() {
         }
         for (fl in files) {
             if (shown >= LIST_CAP) break
+            val p = "$path/$fl"
             list.addView(fileRow(
                 iconFor(fl) + "  " + fl, "",
                 hidden = fl.startsWith("."),
-                onDownload = { downloadFile("$path/$fl", fl) },
-            ) { openFile("$path/$fl") })
+                onDownload = { downloadFile(p, fl) },
+            ) { if (isImage(p)) openImage(p) else openFile(p) })
             shown++
         }
         if (dirs.isEmpty() && files.isEmpty()) {
@@ -332,6 +347,7 @@ class EditorActivity : Activity() {
         "go" -> "🔵"; "java", "kt" -> "☕"; "c", "h", "cpp", "cc" -> "⚙️"
         "json", "toml", "yaml", "yml", "ini", "conf" -> "⚙️"
         "sh", "bash" -> "💻"; "html", "css" -> "🌐"; "lock" -> "🔒"
+        "png", "jpg", "jpeg", "gif", "webp", "bmp" -> "🖼"
         else -> "📄"
     }
 
@@ -363,8 +379,14 @@ class EditorActivity : Activity() {
             })
         }
         if (onDownload != null) {
-            row.addView(smallBtn("⬇") { onDownload() }.apply {
-                setPadding(dp(8), dp(4), dp(8), dp(4))
+            // a plain TextView, not a Button: the default Button enforces a
+            // ~48dp min height that used to make the rows tall.
+            row.addView(TextView(this).apply {
+                text = "⬇"; setTextColor(0xFF7FD4FF.toInt()); textSize = 13f
+                gravity = Gravity.CENTER
+                setPadding(dp(9), dp(3), dp(9), dp(3))
+                background = roundedBg(0xFF1B2126.toInt(), dp(6))
+                setOnClickListener { onDownload() }
             })
         }
         return row
@@ -391,22 +413,29 @@ class EditorActivity : Activity() {
 
     private fun refreshBar() {
         val editing = openFile != null
-        val modeLabel = if (editing) openFile?.substringAfterLast('/') ?: "" else "Files"
-        titleTv.text = modeLabel
+        val isImg = viewingImage != null
+        titleTv.text = if (editing) openFile?.substringAfterLast('/') ?: "" else "Files"
         titleTv.visibility = View.VISIBLE
 
         // browse-only controls
         browseBox.visibility = if (editing) View.GONE else View.VISIBLE
         // edit-only controls
-        web.visibility = if (editing) View.VISIBLE else View.GONE
+        web.visibility = if (editing && !isImg) View.VISIBLE else View.GONE
+        imgView.visibility = if (isImg) View.VISIBLE else View.GONE
         editBar.visibility = if (editing) View.VISIBLE else View.GONE
 
         if (editing) {
             pathTv.text = openFile
-            previewBtn.visibility = if (isMarkdown(openFile!!)) View.VISIBLE else View.GONE
-            val dirty = draft != openOriginal
-            saveBtn.visibility = if (dirty && !previewing) View.VISIBLE else View.GONE
-            dirtyDot.visibility = if (dirty && !previewing) View.VISIBLE else View.GONE
+            if (isImg) {
+                saveBtn.visibility = View.GONE
+                previewBtn.visibility = View.GONE
+                dirtyDot.visibility = View.GONE
+            } else {
+                previewBtn.visibility = if (isMarkdown(openFile!!)) View.VISIBLE else View.GONE
+                val dirty = draft != openOriginal
+                saveBtn.visibility = if (dirty && !previewing) View.VISIBLE else View.GONE
+                dirtyDot.visibility = if (dirty && !previewing) View.VISIBLE else View.GONE
+            }
         } else {
             dirtyDot.visibility = View.GONE
             saveBtn.visibility = View.GONE
@@ -417,6 +446,7 @@ class EditorActivity : Activity() {
     // ---- mode switching + back ----
     private fun toBrowse() {
         openFile = null
+        viewingImage = null
         draft = ""
         openOriginal = ""
         previewing = false
@@ -459,6 +489,7 @@ class EditorActivity : Activity() {
     // ---- frame-driven browse / edit ----
     private fun browse(path: String?) {
         openFile = null
+        viewingImage = null
         refreshBar()
         val f = Term.dirList(path, showHidden)
         dirReqId = f.optString("req_id")
@@ -472,6 +503,49 @@ class EditorActivity : Activity() {
         readReqId = f.optString("req_id")
         refreshStatus("reading ${path.substringAfterLast('/')}…")
         relay?.send(f)
+    }
+
+    /** Open a raster image (png/jpg/…) in the on-screen viewer. */
+    private fun openImage(path: String) {
+        openFile = path
+        viewingImage = path
+        draft = ""; openOriginal = ""   // clean → back never prompts
+        titleTv.text = path.substringAfterLast('/')
+        pathTv.text = path
+        val f = Term.fileDownload(path)   // binary-safe read (not text FileRead)
+        imageReqId = f.optString("req_id")
+        refreshStatus("loading ${path.substringAfterLast('/')}…")
+        refreshBar()
+        relay?.send(f)
+    }
+
+    private fun isImage(p: String): Boolean =
+        p.substringAfterLast('.', p).lowercase() in setOf("png", "jpg", "jpeg", "gif", "webp", "bmp")
+
+    private fun renderImage(b64: String, size: Long) {
+        exec.execute {
+            try {
+                val bytes = android.util.Base64.decode(b64, android.util.Base64.NO_WRAP)
+                val bmp = decodeBounded(bytes) ?: throw IOException("not a decodable image")
+                handler.post {
+                    if (viewingImage == null) return@post
+                    imgView.setImageBitmap(bmp)
+                    refreshStatus("$size bytes · image")
+                }
+            } catch (e: Exception) {
+                handler.post { refreshStatus("image failed: ${e.message}") }
+            }
+        }
+    }
+
+    /** Decode a bitmap, down-sampling huge images to bound memory. */
+    private fun decodeBounded(bytes: ByteArray, maxDim: Int = 4096): android.graphics.Bitmap? {
+        val o = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size, o)
+        var sample = 1
+        while (o.outWidth / sample >= maxDim || o.outHeight / sample >= maxDim) sample *= 2
+        val o2 = android.graphics.BitmapFactory.Options().apply { inSampleSize = sample }
+        return android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size, o2)
     }
 
     private fun save() {
@@ -595,6 +669,11 @@ class EditorActivity : Activity() {
                 handler.postDelayed({ if (openOriginal == draft) statusTv.text = "" }, 2000)
             }
             "FileDownloadOk" -> {
+                if (rid == imageReqId) {
+                    imageReqId = null
+                    renderImage(f.optString("b64"), f.optLong("size"))
+                    return
+                }
                 if (rid != downloadReqId) return
                 downloadReqId = null
                 val uri = pendingDownloadUri ?: return
@@ -637,6 +716,7 @@ class EditorActivity : Activity() {
                         else refreshStatus("error: $msg")
                     }
                     rid == downloadReqId -> { downloadReqId = null; refreshStatus("download error: ${f.optString("message")}") }
+                    rid == imageReqId -> { imageReqId = null; refreshStatus("error: ${f.optString("message")}") }
                 }
             }
         }

@@ -129,7 +129,12 @@ screen + a handful of request/response frames; all reuse the existing
   **Markdown preview**: `.md`/`.mdx`/`.markdown` files get a “preview” toggle
   that renders the buffer with `marked` (`assets/editor/marked.min.js`, GFM
   incl. tables) into a styled overlay — the RN editor has no preview, so this
-  is native-only for now. `EditorActivity` swaps a native file-browser view and
+  is native-only for now. **Image viewing**: `.png`/`.jpg`/`.jpeg`/`.gif`/
+  `.webp`/`.bmp` open in a native on-screen viewer (binary-safe `FileDownload`
+  → down-sampled `BitmapFactory` decode, fit-to-view) instead of the text
+  editor — also native-only. The per-row “⬇” affordance is a compact `TextView`
+  (a real `Button` forced ~48dp row height and made the list rows tall).
+  `EditorActivity` swaps a native file-browser view and
   the WebView in place; the daemon is the source of truth.
 - **Workflows / mule** (`screens/Workflows.tsx`, 273): `WorkflowList`/
   `Get`/`Put`/`Delete`/`Run` + `MuleAgents`/`MuleAgentsOk` (step agents).
