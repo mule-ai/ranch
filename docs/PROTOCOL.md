@@ -233,6 +233,18 @@ The daemon is the file server; clients (mobile/CLI) are thin editors.
   machine, RLS-gated trust boundary as `FileRead`/`FileWrite`. Capped at
   16 MiB; `mime` is a best-effort guess from the extension. May arrive
   chunked when large.
+- **`FileMove`** `{req_id, from, to}` → **`FileMoveOk`** `{req_id, path}`
+  — move or rename a file/directory. `to` may be in the same directory
+  (rename) or a different one (move). The daemon refuses to clobber an
+  existing destination, to move a directory into its own subtree, or to
+  move into a missing parent dir; a cross-device (`EXDEV`) rename falls
+  back to a recursive copy+delete. `path` in the reply is the new path
+  (`to`).
+- **`FileDelete`** `{req_id, path}` → **`FileDeleteOk`** `{req_id, path}`
+  — delete a file or directory (directories removed recursively; a
+  symlink to a directory is removed as a link). The client confirms with
+  the user before sending; the daemon still refuses to delete `/` or a
+  missing path.
 
 ### Images in chat (M-images)
 

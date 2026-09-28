@@ -302,6 +302,41 @@ pub enum Frame {
         size: u64,
         b64: String,
     },
+    /// Client -> daemon: move or rename a file/directory. `to` may be in the
+    /// same directory (rename) or a different one (move). Refuses to clobber
+    /// an existing destination or move a directory into its own subtree;
+    /// cross-device moves fall back to copy+delete.
+    FileMove {
+        id: String,
+        client: String,
+        /// echoed back in `FileMoveOk` / `error` so clients match the reply
+        req_id: String,
+        /// existing source path (file or directory)
+        from: String,
+        /// destination path (must not already exist)
+        to: String,
+    },
+    /// Daemon -> client: the move/rename succeeded; `path` is the new path.
+    FileMoveOk {
+        id: String,
+        req_id: String,
+        path: String,
+    },
+    /// Client -> daemon: delete a file or directory (directories are removed
+    /// recursively). The client confirms with the user before sending.
+    FileDelete {
+        id: String,
+        client: String,
+        /// echoed back in `FileDeleteOk` / `error` so clients match the reply
+        req_id: String,
+        path: String,
+    },
+    /// Daemon -> client: the delete succeeded.
+    FileDeleteOk {
+        id: String,
+        req_id: String,
+        path: String,
+    },
     /// Client -> daemon: list resumable forge sessions.
     ForgeList {
         id: String,
@@ -1747,7 +1782,41 @@ mod tests {
             size: 12,
             b64: "a2V5ID0gInYiCg==".into(),
         };
-        for f in [put, put_ok.clone(), get, get_ok.clone(), download, download_ok] {
+        let mv = Frame::FileMove {
+            id: "i11".into(),
+            client: "mobile".into(),
+            req_id: "r6".into(),
+            from: "/home/j/a.txt".into(),
+            to: "/home/j/b/a.txt".into(),
+        };
+        let mv_ok = Frame::FileMoveOk {
+            id: "i12".into(),
+            req_id: "r6".into(),
+            path: "/home/j/b/a.txt".into(),
+        };
+        let del = Frame::FileDelete {
+            id: "i13".into(),
+            client: "mobile".into(),
+            req_id: "r7".into(),
+            path: "/home/j/a.txt".into(),
+        };
+        let del_ok = Frame::FileDeleteOk {
+            id: "i14".into(),
+            req_id: "r7".into(),
+            path: "/home/j/a.txt".into(),
+        };
+        for f in [
+            put,
+            put_ok.clone(),
+            get,
+            get_ok.clone(),
+            download,
+            download_ok,
+            mv,
+            mv_ok,
+            del,
+            del_ok,
+        ] {
             let line = encode_frame(&f, "c");
             assert_eq!(line.len(), 1);
             let back: Frame = serde_json::from_str(&line[0]).unwrap();

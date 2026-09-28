@@ -18,6 +18,7 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.Button
 import android.widget.EditText
+import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
@@ -89,6 +90,8 @@ class EditorActivity : Activity() {
     @Volatile private var writeReqId: String? = null
     @Volatile private var downloadReqId: String? = null
     @Volatile private var imageReqId: String? = null
+    @Volatile private var moveReqId: String? = null
+    @Volatile private var deleteReqId: String? = null
 
     // ---- pending SAF downloads (chosen save URI + host path) ----
     @Volatile private var pendingDownloadUri: Uri? = null
@@ -305,8 +308,10 @@ class EditorActivity : Activity() {
         }
         for (d in dirs) {
             if (shown >= LIST_CAP) break
-            list.addView(fileRow("📁  $d", "open", hidden = d.startsWith(".")) {
-                browse("$path/$d")
+            val dpath = "$path/$d"
+            list.addView(fileRow("📁  $d", "open", hidden = d.startsWith("."),
+                onMore = { entryMenu(dpath, d, true) }) {
+                browse(dpath)
             })
             shown++
         }
@@ -317,6 +322,7 @@ class EditorActivity : Activity() {
                 iconFor(fl) + "  " + fl, "",
                 hidden = fl.startsWith("."),
                 onDownload = { downloadFile(p, fl) },
+                onMore = { entryMenu(p, fl, false) },
             ) { if (isImage(p)) openImage(p) else openFile(p) })
             shown++
         }
@@ -351,9 +357,10 @@ class EditorActivity : Activity() {
         else -> "📄"
     }
 
-    /** A tappable row: [name (flex)] [optional download button]. */
+    /** A tappable row: [name (flex)] [hint] [⬇ download] [⋯ actions]. */
     private fun fileRow(name: String, hint: String, hidden: Boolean,
-                        onDownload: (() -> Unit)? = null, open: () -> Unit): View {
+                        onDownload: (() -> Unit)? = null, onMore: (() -> Unit)? = null,
+                        open: () -> Unit): View {
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -387,6 +394,15 @@ class EditorActivity : Activity() {
                 setPadding(dp(9), dp(3), dp(9), dp(3))
                 background = roundedBg(0xFF1B2126.toInt(), dp(6))
                 setOnClickListener { onDownload() }
+            })
+        }
+        if (onMore != null) {
+            row.addView(TextView(this).apply {
+                text = "⋯"; setTextColor(0xFF7FD4FF.toInt()); textSize = 15f
+                gravity = Gravity.CENTER
+                setPadding(dp(10), dp(3), dp(10), dp(3))
+                background = roundedBg(0xFF1B2126.toInt(), dp(6))
+                setOnClickListener { onMore() }
             })
         }
         return row
@@ -495,6 +511,76 @@ class EditorActivity : Activity() {
         dirReqId = f.optString("req_id")
         refreshStatus("listing…")
         relay?.send(f)
+    }
+
+    /** Row “⋯” menu: rename / move / delete. */
+    private fun entryMenu(path: String, name: String, isDir: Boolean) {
+        val items = arrayOf("Rename", "Move", "Delete")
+        AlertDialog.Builder(this)
+            .setTitle(name)
+            .setItems(items) { _, which ->
+                when (which) {
+                    0 -> promptString(
+                        "Rename", "New name for \"$name\":", name, "new name", "Rename"
+                    ) { nn ->
+                        if (nn.isEmpty() || nn.contains('/')) { refreshStatus("invalid name"); return@promptString }
+                        doMove(path, path.substringBeforeLast('/', "") + "/" + nn)
+                    }
+                    1 -> promptString(
+                        "Move", "Move \"$name\" into which directory?", curDir, "destination directory", "Move"
+                    ) { dest ->
+                        val d = dest.trimEnd('/')
+                        if (d.isEmpty()) { refreshStatus("destination required"); return@promptString }
+                        doMove(path, "$d/$name")
+                    }
+                    2 -> confirmDelete(path, name, isDir)
+                }
+            }
+            .show()
+    }
+
+    private fun doMove(from: String, to: String) {
+        if (from == to) { refreshStatus("no change"); return }
+        val f = Term.fileMove(from, to)
+        moveReqId = f.optString("req_id")
+        refreshStatus("moving ${from.substringAfterLast('/')}…")
+        relay?.send(f)
+    }
+
+    private fun confirmDelete(path: String, name: String, isDir: Boolean) {
+        val what = if (isDir) "\"$name\" and everything inside it" else "\"$name\""
+        AlertDialog.Builder(this)
+            .setTitle("Delete")
+            .setMessage("Delete $what? This cannot be undone.")
+            .setPositiveButton("Delete") { _, _ ->
+                val f = Term.fileDelete(path)
+                deleteReqId = f.optString("req_id")
+                refreshStatus("deleting $name…")
+                relay?.send(f)
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    /** AlertDialog with a single text input; onOk receives the trimmed value. */
+    private fun promptString(title: String, message: String, initial: String, hint: String,
+                             label: String, onOk: (String) -> Unit) {
+        val input = EditText(this).apply {
+            setText(initial); this.hint = hint
+            inputType = android.text.InputType.TYPE_CLASS_TEXT or
+                android.text.InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+            setTextColor(0xFFE5E5E5.toInt())
+        }
+        val box = FrameLayout(this).apply {
+            setPadding(dp(16), dp(12), dp(16), 0)
+            addView(input, FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT))
+        }
+        AlertDialog.Builder(this)
+            .setTitle(title).setMessage(message).setView(box)
+            .setPositiveButton(label) { _, _ -> onOk(input.text.toString().trim()) }
+            .setNegativeButton("Cancel", null)
+            .show()
     }
 
     private fun openFile(path: String) {
@@ -698,6 +784,18 @@ class EditorActivity : Activity() {
                 refreshStatus("uploaded to host:\n$p")
                 Toast.makeText(this, "uploaded → $p", Toast.LENGTH_LONG).show()
             }
+            "FileMoveOk" -> {
+                if (rid != moveReqId) return
+                moveReqId = null
+                refreshStatus("moved ✓")
+                browse(curDir.ifEmpty { null })
+            }
+            "FileDeleteOk" -> {
+                if (rid != deleteReqId) return
+                deleteReqId = null
+                refreshStatus("deleted ✓")
+                browse(curDir.ifEmpty { null })
+            }
             "FileChanged" -> {
                 val p = f.optString("path")
                 if (openFile == p) {
@@ -717,6 +815,8 @@ class EditorActivity : Activity() {
                     }
                     rid == downloadReqId -> { downloadReqId = null; refreshStatus("download error: ${f.optString("message")}") }
                     rid == imageReqId -> { imageReqId = null; refreshStatus("error: ${f.optString("message")}") }
+                    rid == moveReqId -> { moveReqId = null; refreshStatus("move failed: ${f.optString("message")}") }
+                    rid == deleteReqId -> { deleteReqId = null; refreshStatus("delete failed: ${f.optString("message")}") }
                 }
             }
         }

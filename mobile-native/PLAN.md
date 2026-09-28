@@ -119,9 +119,10 @@ screen + a handful of request/response frames; all reuse the existing
   `DirList`/`DirListOk` (browse, now with a **show-hidden-files** toggle via
   `DirList.hidden`), `FileRead`/`FileReadOk`, `FileWrite`/`FileWriteOk` (mtime
   conflict), `FileChanged` (live re-load → reload/keep-mine), `FilePut`/
-  `FilePutOk` (upload, SAF `ACTION_OPEN_DOCUMENT`), and `FileDownload`/
+  `FilePutOk` (upload, SAF `ACTION_OPEN_DOCUMENT`), `FileDownload`/
   `FileDownloadOk` (download to phone, SAF `ACTION_CREATE_DOCUMENT`;
-  binary-safe, chunked when large). The editor is **CodeMirror 5 in a
+  binary-safe, chunked when large), `FileMove`/`FileMoveOk` (rename/move)
+  and `FileDelete`/`FileDeleteOk` (recursive). The editor is **CodeMirror 5 in a
   WebView** (`assets/editor/`, same assets as the RN app, core-first load
   order): real syntax highlighting, line numbers, undo, bracket matching,
   offline. **Settings** expose an editor font size + a markdown font size
@@ -134,6 +135,8 @@ screen + a handful of request/response frames; all reuse the existing
   → down-sampled `BitmapFactory` decode, fit-to-view) instead of the text
   editor — also native-only. The per-row “⬇” affordance is a compact `TextView`
   (a real `Button` forced ~48dp row height and made the list rows tall).
+  A per-row **“⋯” menu** offers **Rename** / **Move** (`FileMove`) and
+  **Delete** (`FileDelete`, confirm; dirs recursive).
   `EditorActivity` swaps a native file-browser view and
   the WebView in place; the daemon is the source of truth.
 - **Workflows / mule** (`screens/Workflows.tsx`, 273): `WorkflowList`/

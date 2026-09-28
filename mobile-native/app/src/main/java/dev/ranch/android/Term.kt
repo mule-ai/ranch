@@ -173,6 +173,17 @@ object Term {
         JSONObject().put("t", "FileDownload").put("id", newId()).put("client", CLIENT)
             .put("req_id", "fd-" + newId()).put("path", path)
 
+    /// Move or rename a file/directory. `to` may be in the same dir (rename)
+    /// or a different one (move). Replied to with `FileMoveOk` / `Error`.
+    fun fileMove(from: String, to: String): JSONObject =
+        JSONObject().put("t", "FileMove").put("id", newId()).put("client", CLIENT)
+            .put("req_id", "mv-" + newId()).put("from", from).put("to", to)
+
+    /// Delete a file or directory (recursive). The caller confirms first.
+    fun fileDelete(path: String): JSONObject =
+        JSONObject().put("t", "FileDelete").put("id", newId()).put("client", CLIENT)
+            .put("req_id", "del-" + newId()).put("path", path)
+
     // ---- Phase 4: workflows / mule ----
     fun workflowList(): JSONObject =
         JSONObject().put("t", "WorkflowList").put("req_id", "wl-" + newId())

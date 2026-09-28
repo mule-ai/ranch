@@ -710,6 +710,53 @@ fn file_mtime_secs(path: &str) -> String {
         .unwrap_or_default()
 }
 
+/// Recursively copy a file or directory tree (`src` -> `dst`), preserving
+/// unix permissions. Used as the cross-device fallback when `fs::rename`
+/// returns EXDEV.
+fn copy_tree(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    let meta = std::fs::symlink_metadata(src)?;
+    if meta.file_type().is_symlink() {
+        // keep it simple: copy the link target's contents as a regular entry
+        std::fs::copy(src, dst)?;
+        copy_mode(src, dst)?;
+    } else if meta.is_dir() {
+        std::fs::create_dir(dst)?;
+        copy_mode(src, dst)?;
+        for e in std::fs::read_dir(src)? {
+            let e = e?;
+            copy_tree(&e.path(), &dst.join(e.file_name()))?;
+        }
+    } else {
+        std::fs::copy(src, dst)?;
+        copy_mode(src, dst)?;
+    }
+    Ok(())
+}
+
+fn copy_mode(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let p = std::fs::metadata(src)?.permissions();
+        std::fs::set_permissions(dst, p)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (src, dst);
+        Ok(())
+    }
+}
+
+/// Remove a path: `remove_dir_all` for directories, `remove_file` otherwise
+/// (a symlink to a directory is removed as a link, not traversed).
+fn rm_tree(p: &std::path::Path) -> std::io::Result<()> {
+    let meta = std::fs::symlink_metadata(p)?;
+    if meta.file_type().is_dir() {
+        std::fs::remove_dir_all(p)
+    } else {
+        std::fs::remove_file(p)
+    }
+}
+
 fn home_dir() -> PathBuf {
     std::env::var("HOME")
         .map(PathBuf::from)
@@ -4029,6 +4076,108 @@ impl Daemon {
                     size: bytes.len() as u64,
                     b64: enc.encode(bytes),
                 });
+            }
+            // client -> daemon: move or rename a file/directory.
+            Frame::FileMove { req_id, from: from_path, to, .. } => {
+                let mut mv_reply = |f: Frame| {
+                    if let Some(c) = self.clients.get_mut(&from) {
+                        send_frame(c, &f);
+                    }
+                };
+                let mut mv_err = |msg: String| {
+                    mv_reply(Frame::Error { req_id: Some(req_id.clone()), message: msg });
+                };
+                let src = std::path::Path::new(from_path);
+                let dst = std::path::Path::new(to);
+                if from_path == to {
+                    mv_err("source and destination are the same".into());
+                    return;
+                }
+                if !src.symlink_metadata().is_ok() {
+                    mv_err(format!("no such path: {from_path}"));
+                    return;
+                }
+                // refuse moving a directory into its own subtree
+                let dst_str = dst.to_string_lossy().to_string();
+                let src_str = src.to_string_lossy().to_string();
+                if std::fs::symlink_metadata(src).ok().is_some_and(|m| m.is_dir()) {
+                    let prefix = if src_str.ends_with('/') { src_str.clone() } else { format!("{src_str}/") };
+                    if dst_str == src_str || dst_str.starts_with(&prefix) {
+                        mv_err("cannot move a directory into itself".into());
+                        return;
+                    }
+                }
+                if dst.symlink_metadata().is_ok() {
+                    mv_err(format!("destination already exists: {to}"));
+                    return;
+                }
+                if let Some(pp) = dst.parent() {
+                    if pp.as_os_str().is_empty() || !pp.is_dir() {
+                        mv_err(format!("destination directory does not exist: {}", pp.display()));
+                        return;
+                    }
+                }
+                match std::fs::rename(src, dst) {
+                    Ok(()) => mv_reply(Frame::FileMoveOk {
+                        id: String::new(),
+                        req_id: req_id.clone(),
+                        path: to.clone(),
+                    }),
+                    Err(e) => {
+                        // EXDEV (cross-device): fall back to copy + delete.
+                        // On Linux EXDEV == 18.
+                        if e.raw_os_error() == Some(18) {
+                            match copy_tree(src, dst) {
+                                Ok(()) => {
+                                    if let Err(e2) = rm_tree(src) {
+                                        let _ = rm_tree(dst);
+                                        mv_err(format!("move failed: {e2}"));
+                                        return;
+                                    }
+                                    mv_reply(Frame::FileMoveOk {
+                                        id: String::new(),
+                                        req_id: req_id.clone(),
+                                        path: to.clone(),
+                                    });
+                                }
+                                Err(e2) => {
+                                    let _ = rm_tree(dst);
+                                    mv_err(format!("move failed: {e2}"));
+                                }
+                            }
+                        } else {
+                            mv_err(format!("move failed: {e}"));
+                        }
+                    }
+                }
+            }
+            // client -> daemon: delete a file or directory (recursive).
+            Frame::FileDelete { req_id, path, .. } => {
+                let mut del_reply = |f: Frame| {
+                    if let Some(c) = self.clients.get_mut(&from) {
+                        send_frame(c, &f);
+                    }
+                };
+                let mut del_err = |msg: String| {
+                    del_reply(Frame::Error { req_id: Some(req_id.clone()), message: msg });
+                };
+                if path.is_empty() || path == "/" {
+                    del_err("refusing to delete the filesystem root".into());
+                    return;
+                }
+                let target = std::path::Path::new(path);
+                if target.symlink_metadata().is_err() {
+                    del_err(format!("no such path: {path}"));
+                    return;
+                }
+                match rm_tree(target) {
+                    Ok(()) => del_reply(Frame::FileDeleteOk {
+                        id: String::new(),
+                        req_id: req_id.clone(),
+                        path: path.clone(),
+                    }),
+                    Err(e) => del_err(format!("delete failed: {e}")),
+                }
             }
             // client -> forge: list resumable sessions (blocking HTTP
             // on the worker thread)
