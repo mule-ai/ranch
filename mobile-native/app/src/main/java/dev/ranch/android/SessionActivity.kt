@@ -33,6 +33,7 @@ import android.widget.ListView
 import android.widget.PopupWindow
 import android.widget.ScrollView
 import android.widget.TextView
+import android.widget.TextView.BufferType
 import org.json.JSONObject
 
 /**
@@ -165,7 +166,8 @@ class SessionActivity : Activity() {
 
     // views
     private lateinit var titleView: TextView
-    private lateinit var statusView: TextView
+    private lateinit var statusView: StatusTextView
+    private lateinit var secondRow: LinearLayout
     private lateinit var paneTabs: LinearLayout
     private lateinit var content: LinearLayout
     private var term: TerminalView? = null
@@ -208,8 +210,13 @@ class SessionActivity : Activity() {
             setBackgroundColor(0xFF101418.toInt())
         }
 
-        // top bar
-        val top = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        // top bar: [←] [title…] [✎] [✕] — one fixed-height row. All status
+        // text (working/idle, uploading, compacting, errors) lives on the
+        // second row so it can't squeeze the buttons or wrap the row taller.
+        val top = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
         val back = Button(this).apply {
             text = "←"; minWidth = 0; setPadding(0,0,0,0)
             setOnClickListener { finish() }
@@ -217,39 +224,55 @@ class SessionActivity : Activity() {
         titleView = TextView(this).apply {
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
             setTextColor(0xFFE5E5E5.toInt()); gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(8), 0, 0, 0); text = sessionName.ifEmpty { sessionId.take(8) }
+            maxLines = 1
+            ellipsize = android.text.TextUtils.TruncateAt.END
+            setPadding(dp(10), 0, dp(6), 0); text = sessionName.ifEmpty { sessionId.take(8) }
         }
-        statusView = TextView(this).apply {
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-            setTextColor(0xFF7fd4ff.toInt()); gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(8), 0, dp(8), 0); text = ""
+        val iconBtn: (String, Int, () -> Unit) -> Button = { label, color, onClick ->
+            Button(this@SessionActivity).apply {
+                text = label; setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+                setTextColor(color); minWidth = 0
+                setPadding(dp(14), 0, dp(14), 0)
+                includeFontPadding = false
+                setOnClickListener { onClick() }
+            }
         }
         top.addView(back)
         top.addView(titleView, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f))
-        top.addView(Button(this).apply {
-            text = "✎"; setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-            setPadding(dp(6), 0, dp(6), 0)
-            setOnClickListener { renameSession() }
+        top.addView(iconBtn("✎", 0xFFE5E5E5.toInt()) { renameSession() })
+        top.addView(iconBtn("✕", 0xFFef4444.toInt()) {
+            relay?.send(Term.sessionsKill(sessionId))
+            statusView.text = "killing…"
+            handler.postDelayed({ finish() }, 800)
         })
-        top.addView(Button(this).apply {
-            text = "✕"; setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-            setPadding(dp(6), 0, dp(6), 0)
-            setTextColor(0xFFef4444.toInt())
-            setOnClickListener {
-                relay?.send(Term.sessionsKill(sessionId))
-                statusView.text = "killing…"
-                handler.postDelayed({ finish() }, 800)
-            }
-        })
-        top.addView(statusView)
         root.addView(top)
 
+        // second row: pane tabs (left, weight) + status text (right). The
+        // whole row is GONE when it has nothing to say, so the top bar
+        // stays a single line in the common case.
+        secondRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            visibility = View.GONE
+        }
         paneTabs = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            visibility = View.GONE
-            setPadding(dp(8), 0, dp(8), 0)
+            setPadding(dp(8), dp(2), 0, dp(2))
         }
-        root.addView(paneTabs)
+        statusView = StatusTextView(this).apply {
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            setTextColor(0xFF7fd4ff.toInt())
+            maxLines = 1
+            ellipsize = android.text.TextUtils.TruncateAt.START
+            setPadding(0, dp(2), dp(10), dp(2))
+            text = ""
+        }
+        statusView.onText = { refreshSecondRow() }
+        secondRow.addView(paneTabs, LinearLayout.LayoutParams(
+            0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        secondRow.addView(statusView, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+        root.addView(secondRow)
 
         // model bar (visible for chat panes)
         modelBar = LinearLayout(this).apply {
@@ -936,8 +959,7 @@ class SessionActivity : Activity() {
     // ---- rendering ----
     private fun rebuildTabs() {
         paneTabs.removeAllViews()
-        if (panes.size <= 1) { paneTabs.visibility = View.GONE; return }
-        paneTabs.visibility = View.VISIBLE
+        if (panes.size <= 1) { refreshSecondRow(); return }
         for ((id, p) in panes) {
             val b = Button(this).apply {
                 text = if (id == activePane) "▣ ${shortLabel(id, p)}" else shortLabel(id, p)
@@ -948,6 +970,13 @@ class SessionActivity : Activity() {
             }
             paneTabs.addView(b)
         }
+        refreshSecondRow()
+    }
+
+    /** Show the tab/status row only when it has something to say. */
+    private fun refreshSecondRow() {
+        secondRow.visibility =
+            if (paneTabs.childCount > 0 || statusView.text.isNotEmpty()) View.VISIBLE else View.GONE
     }
 
     private fun shortLabel(id: String, p: Pane): String =
@@ -1376,7 +1405,7 @@ class SessionActivity : Activity() {
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(10), dp(6), dp(10), dp(8))
+            setPadding(dp(8), dp(6), dp(8), dp(8))
         }
         chatEdit = EditText(this).apply {
             hint = "message the agent…"
@@ -1394,12 +1423,21 @@ class SessionActivity : Activity() {
             imeOptions = EditorInfo.IME_FLAG_NO_EXTRACT_UI
             setOnEditorActionListener { _, _, _ -> sendChat(); true }
         }
-        // attach an image from the phone (gallery/camera): picked file is
-        // pushed to the daemon via FilePut and lands as a composer chip
+        // "+" attach button: small circle pinned to the left edge, like a
+        // messaging app. Picked files are pushed to the daemon via FilePut
+        // and land as chips in the row above the input.
         attachBtn = Button(this).apply {
-            text = "🖼"
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
-            minWidth = dp(44)
+            text = "+"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 17f)
+            setTextColor(0xFFB8C0C8.toInt())
+            minWidth = 0
+            setPadding(0, 0, 0, 0)
+            includeFontPadding = false
+            background = android.graphics.drawable.GradientDrawable().apply {
+                shape = android.graphics.drawable.GradientDrawable.OVAL
+                setColor(0xFF1C2127.toInt())
+                setStroke(dp(1), 0xFF2A3138.toInt())
+            }
             setOnClickListener { pickImage() }
         }
         // stop button: only visible while this pane's agent has a turn in
@@ -1416,15 +1454,21 @@ class SessionActivity : Activity() {
         }
         val send = Button(this).apply {
             text = "➤"
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 18f)
-            minWidth = dp(60)
-            setPadding(0, dp(6), 0, dp(6))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+            minWidth = 0
+            setPadding(0, 0, 0, 0)
+            includeFontPadding = false
         }
         send.setOnClickListener { sendChat() }
-        row.addView(attachBtn)
+        row.addView(attachBtn, LinearLayout.LayoutParams(dp(36), dp(36)).apply {
+            rightMargin = dp(8)
+        })
         row.addView(chatEdit, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
         row.addView(stopBtn)
-        row.addView(send)
+        row.addView(send, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+            leftMargin = dp(6)
+        })
         // explicit params: bare addView on a horizontal LinearLayout defaults
         // to WRAP_CONTENT, which squeezed the composer to its content width
         inputArea.addView(row, LinearLayout.LayoutParams(
@@ -1732,4 +1776,17 @@ class SessionActivity : Activity() {
                 text = "Back"; setOnClickListener { finish() }
             })
         }
+}
+
+/**
+ * TextView that fires [onText] on every text set — the status label uses it
+ * to auto show/hide its row without touching every `statusView.text = …`
+ * call site.
+ */
+private class StatusTextView(context: Context) : TextView(context) {
+    var onText: (String) -> Unit = {}
+    override fun setText(text: CharSequence?, type: BufferType?) {
+        super.setText(text, type)
+        onText(text?.toString() ?: "")
+    }
 }
