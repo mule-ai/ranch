@@ -1840,12 +1840,13 @@ class SessionActivity : Activity() {
 /**
  * TextView that fires [onText] on every text set — the status label uses it
  * to auto show/hide its row without touching every `statusView.text = …`
- * call site.
+ * call site. Nullable because TextView's own constructor calls setText()
+ * before Kotlin field initializers have run.
  */
 private class StatusTextView(context: Context) : TextView(context) {
-    var onText: (String) -> Unit = {}
+    var onText: ((String) -> Unit)? = null
     override fun setText(text: CharSequence?, type: BufferType?) {
         super.setText(text, type)
-        onText(text?.toString() ?: "")
+        onText?.invoke(text?.toString() ?: "")
     }
 }
