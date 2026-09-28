@@ -72,7 +72,19 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        monitorWanted = Monitor.running
+        // monitoring survives app restarts: remember it across process death
+        // (APK updates / Android reclaiming memory stop the service)
+        monitorWanted = Monitor.running || app.prefs.getBool("monitor_wanted", false)
+        if (monitorWanted && !Monitor.running) {
+            val mid = app.prefs.get("machine_id", "")
+            if (mid.isNotEmpty()) {
+                startForegroundService(Intent(this, MonitorService::class.java)
+                    .putExtra("machineId", mid)
+                    .putExtra("machineName", app.prefs.get("machine_name", "")))
+            } else {
+                monitorWanted = false
+            }
+        }
         pendingOpen = pendingFromIntent(intent)
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -306,6 +318,7 @@ class MainActivity : Activity() {
     private fun selectMachine(m: Machine) {
         app.prefs.set("machine_id", m.id)
         app.prefs.set("machine_name", m.name)
+        app.prefs.setBool("monitor_wanted", true)
         monitorWanted = true
         startForegroundService(Intent(this, MonitorService::class.java)
             .putExtra("machineId", m.id)
@@ -328,6 +341,7 @@ class MainActivity : Activity() {
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
             setOnClickListener {
                 monitorWanted = false
+                app.prefs.setBool("monitor_wanted", false)
                 startService(Intent(this@MainActivity, MonitorService::class.java).setAction("stop"))
                 renderState()
             }
@@ -397,7 +411,10 @@ class MainActivity : Activity() {
                     "pi" -> "π pi"
                     else -> "💻 shell"
                 }
-                text = "${s.name.ifEmpty { s.id.take(8) }}\n$badge"
+                val mark = if (s.busy) "⚙ working · " else ""
+                val dir = s.cwd?.let { abbrevPath(it) }
+                text = "${mark}${s.name.ifEmpty { s.id.take(8) }}\n${badge}${dir?.let { " · $it" } ?: ""}"
+                setTextColor(if (s.busy) 0xFFF59E0B.toInt() else 0xFFE5E5E5.toInt())
                 setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
                 setPadding(dp(14), dp(12), dp(14), dp(12))
                 setOnClickListener {
@@ -409,6 +426,10 @@ class MainActivity : Activity() {
         }
         maybeAutoOpen()
     }
+
+    /** Truncate a path to its last 33 chars for the row (leading …). */
+    private fun abbrevPath(p: String): String =
+        if (p.length <= 33) p else "…" + p.takeLast(33)
 
     // ---- new agent dialog: kind + name + working-dir picker (RN parity) ----
 

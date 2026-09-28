@@ -46,6 +46,7 @@ import org.json.JSONObject
  */
 class SessionActivity : Activity() {
 
+    private val app get() = application as App
     private val handler = Handler(Looper.getMainLooper())
     private var relay: RelaySession? = null
     private var sessionId = ""
@@ -198,13 +199,71 @@ class SessionActivity : Activity() {
         super.onCreate(savedInstanceState)
         sessionName = intent.getStringExtra("sessionName") ?: ""
         sessionId = intent.getStringExtra("sessionId") ?: ""
+        if (sessionId.isEmpty()) {
+            setContentView(errorView("No session selected."))
+            return
+        }
         val r = Monitor.relay
-        if (r == null || sessionId.isEmpty()) {
+        if (r != null) {
+            relay = r
+            setupUi()
+            return
+        }
+        // Monitor is stopped (app was reinstalled or the process restarted).
+        // If a machine is remembered, restart monitoring and wait for the
+        // relay instead of dead-ending on the error screen.
+        val mid = app.prefs.get("machine_id", "")
+        if (mid.isEmpty()) {
             setContentView(errorView("Monitor is not running.\nStart monitoring first, then open a session."))
             return
         }
-        relay = r
+        app.prefs.setBool("monitor_wanted", true)
+        startForegroundService(Intent(this, MonitorService::class.java)
+            .putExtra("machineId", mid)
+            .putExtra("machineName", app.prefs.get("machine_name", "")))
+        setContentView(connectingView(mid))
+        handler.postDelayed(connectPoll, 500)
+    }
 
+    private val connectPoll = object : Runnable {
+        override fun run() {
+            val r = Monitor.relay
+            if (r == null) {
+                handler.postDelayed(this, 500)
+                return
+            }
+            connectingView = null
+            relay = r
+            setupUi()
+        }
+    }
+
+    private var connectingView: LinearLayout? = null
+
+    private fun connectingView(mid: String): LinearLayout {
+        val name = app.prefs.get("machine_name", mid)
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            setBackgroundColor(0xFF101418.toInt())
+            setPadding(dp(24), dp(24), dp(24), dp(24))
+        }
+        box.addView(TextView(this).apply {
+            text = "Starting monitor on ${name}…"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+            setTextColor(0xFFE5E5E5.toInt())
+            setPadding(0, 0, 0, dp(16))
+        })
+        box.addView(Button(this).apply {
+            text = "Cancel"
+            setOnClickListener { finish() }
+        })
+        connectingView = box
+        return box
+    }
+
+    private fun setupUi() {
+        val r = relay ?: return
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(0xFF101418.toInt())
