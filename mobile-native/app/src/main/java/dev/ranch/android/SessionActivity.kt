@@ -181,6 +181,7 @@ class SessionActivity : Activity() {
     // image attachments (M-images): composer state + rendered thumbnails
     private var attachBtn: Button? = null
     private var chipRow: LinearLayout? = null
+    private var chipsRow: LinearLayout? = null
     private val pendingAtt = mutableListOf<String>()          // composer attachment paths
     private val attUploadReqs = mutableMapOf<String, String>() // FilePut req_id -> name
     private val imgCache = mutableMapOf<String, Bitmap>()     // path -> decoded bitmap
@@ -1502,12 +1503,15 @@ class SessionActivity : Activity() {
         // stop button: only visible while this pane's agent has a turn in
         // flight. Interrupts the running work immediately but keeps the
         // session + conversation (pi `abort` RPC / forge /interrupt).
+        // It lives in the row ABOVE the input so appearing can never
+        // squeeze the text field.
         stopBtn = Button(this).apply {
             text = "⏹ stop"
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
             setTextColor(0xFFE06C75.toInt())
-            setPadding(dp(10), dp(4), dp(10), dp(4))
-            minWidth = dp(56)
+            setPadding(dp(8), dp(2), dp(8), dp(2))
+            minWidth = 0
+            includeFontPadding = false
             visibility = View.GONE
             setOnClickListener { sendInterrupt() }
         }
@@ -1523,7 +1527,6 @@ class SessionActivity : Activity() {
             rightMargin = dp(8)
         })
         row.addView(chatEdit, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-        row.addView(stopBtn)
         row.addView(send, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
             leftMargin = dp(6)
@@ -1532,14 +1535,22 @@ class SessionActivity : Activity() {
         // to WRAP_CONTENT, which squeezed the composer to its content width
         inputArea.addView(row, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
-        // attachment chips: a dedicated row ABOVE the input so wrapping
-        // images can't squeeze the text field (and are visible while the
-        // keyboard is up)
-        chipRow = LinearLayout(this).apply {
+        // row above the input: stop button (left) + attachment chips. GONE
+        // when both are empty so it costs zero height.
+        val cRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            setPadding(dp(10), dp(4), dp(10), dp(2))
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(10), dp(2), dp(10), dp(2))
+            visibility = View.GONE
         }
-        inputArea.addView(chipRow, 0)
+        chipRow = cRow
+        val chRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        chipsRow = chRow
+        cRow.addView(stopBtn, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+        cRow.addView(chRow, LinearLayout.LayoutParams(
+            0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        inputArea.addView(cRow, 0)
         renderChips()
         updateStopButton()
     }
@@ -1551,6 +1562,14 @@ class SessionActivity : Activity() {
         val b = stopBtn ?: return
         val working = panes[activePane]?.agentWorking == true && uiKind == "forge-chat"
         b.visibility = if (working) View.VISIBLE else View.GONE
+        refreshChipRow()
+    }
+
+    /** The above-input row shows only when the stop button or chips exist. */
+    private fun refreshChipRow() {
+        val row = chipRow ?: return
+        row.visibility =
+            if ((stopBtn?.visibility == View.VISIBLE) || pendingAtt.isNotEmpty()) View.VISIBLE else View.GONE
     }
 
     private fun sendInterrupt() {
@@ -1665,7 +1684,7 @@ class SessionActivity : Activity() {
     /// The composer's attachment chip row. Each chip: [thumbnail][name][✕] —
     /// tap the thumbnail for the full image, tap ✕ to drop the attachment.
     private fun renderChips() {
-        val row = chipRow ?: return
+        val row = chipsRow ?: return
         row.removeAllViews()
         for (p in pendingAtt) {
             val chip = LinearLayout(this).apply {
@@ -1714,6 +1733,7 @@ class SessionActivity : Activity() {
             lp.rightMargin = dp(6)
             row.addView(chip, lp)
         }
+        refreshChipRow()
     }
 
     /// One thumbnail (placeholder until FileGetOk lands); tap = full view.
