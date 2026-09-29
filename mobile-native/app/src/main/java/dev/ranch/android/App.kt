@@ -18,6 +18,12 @@ class App : Application() {
     private var fgCount = 0
     val isForeground: Boolean get() = fgCount > 0
 
+    /// session id currently open on screen (null = home / background) —
+    /// lets Notify suppress notifications for the conversation the user
+    /// is literally looking at while still firing for all others
+    @Volatile
+    var foregroundSession: String? = null
+
     override fun onCreate() {
         super.onCreate()
         prefs = Prefs(this)

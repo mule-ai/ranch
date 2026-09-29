@@ -205,6 +205,7 @@ class SessionActivity : Activity() {
         super.onCreate(savedInstanceState)
         sessionName = intent.getStringExtra("sessionName") ?: ""
         sessionId = intent.getStringExtra("sessionId") ?: ""
+        app.foregroundSession = sessionId.ifEmpty { null }
         if (sessionId.isEmpty()) {
             setContentView(errorView("No session selected."))
             return
@@ -412,6 +413,7 @@ class SessionActivity : Activity() {
     override fun onPause() { term?.focused = false; super.onPause() }
     override fun onDestroy() {
         relay?.let { it.removeSink(sink); it.detach() }
+        if (app.foregroundSession == sessionId) app.foregroundSession = null
         handler.removeCallbacksAndMessages(null)
         uploadExec.shutdownNow()
         super.onDestroy()

@@ -2108,6 +2108,11 @@ impl Daemon {
             answer: None,
             created_at: Instant::now(),
             answered_at: None,
+            question: question.to_string(),
+            choices: choices.clone(),
+            suggested,
+            multi,
+            free_text,
         };
         self.asks.insert(rec.clone());
 
@@ -5239,6 +5244,30 @@ impl Daemon {
                         },
                     );
                 }
+                // Durability for pending ask-user questions: a client that
+                // (re)connects may have missed the original broadcast —
+                // re-send every pending ask so the blocked agent is never
+                // invisible (the ask has no timeout).
+                for rec in self.asks.pending.values() {
+                    if rec.answer.is_some() || rec.session.is_nil() {
+                        continue;
+                    }
+                    if let Some(c) = self.clients.get_mut(&from) {
+                        send_frame(
+                            c,
+                            &Frame::AgentAskRequest {
+                                ask_id: rec.ask_id.clone(),
+                                session: rec.session.to_string(),
+                                pane: rec.caller_pane.to_string(),
+                                question: rec.question.clone(),
+                                choices: rec.choices.clone(),
+                                suggested: rec.suggested,
+                                multi: rec.multi,
+                                free_text: rec.free_text,
+                            },
+                        );
+                    }
+                }
             }
             Frame::Attach {
                 id,
@@ -5269,6 +5298,29 @@ impl Daemon {
                     c.scrollback_mode = false;
                 }
                 self.resnap(&sid);
+                // a client attaching to this session may never have seen
+                // the original broadcast — re-send its pending asks so the
+                // question card is visible for as long as the agent waits
+                for rec in self.asks.pending.values() {
+                    if rec.answer.is_some() || rec.session != sid {
+                        continue;
+                    }
+                    if let Some(c) = self.clients.get_mut(&from) {
+                        send_frame(
+                            c,
+                            &Frame::AgentAskRequest {
+                                ask_id: rec.ask_id.clone(),
+                                session: rec.session.to_string(),
+                                pane: rec.caller_pane.to_string(),
+                                question: rec.question.clone(),
+                                choices: rec.choices.clone(),
+                                suggested: rec.suggested,
+                                multi: rec.multi,
+                                free_text: rec.free_text,
+                            },
+                        );
+                    }
+                }
             }
             Frame::Detach { .. } => {
                 if let Some(c) = self.clients.get_mut(&from) {

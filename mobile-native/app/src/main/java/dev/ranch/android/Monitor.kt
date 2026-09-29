@@ -29,6 +29,11 @@ object Monitor {
     var sessions: List<Term.SessionMeta> = emptyList()
         private set
 
+    /** Pending agent questions: ask_id -> (session id, question text).
+     *  Feeds the home-screen badge so an unanswered ask is visible even
+     *  when its session isn't open. */
+    val pendingAsks = java.util.concurrent.ConcurrentHashMap<String, Pair<String, String>>()
+
     /** Version string the daemon reported in HelloOk ("" = unknown). */
     @Volatile
     var daemonVersion: String = ""
@@ -40,6 +45,7 @@ object Monitor {
         this.machineId = machineId
         this.machineName = machineName
         sessions = emptyList()
+        pendingAsks.clear()
         daemonVersion = ""
         val s = RelaySession(app, machineId)
         session = s
@@ -53,6 +59,7 @@ object Monitor {
         running = false
         status = "stopped"
         sessions = emptyList()
+        pendingAsks.clear()
         daemonVersion = ""
     }
 
@@ -97,6 +104,7 @@ class RelaySession(
         onFrame = { frame: JSONObject ->
             // keep the session list fresh (HelloOk / SessionsAck / exited)
             refreshSessions(frame)
+            trackAsks(frame)
             for (s in sinks) s(frame)
             notify.onFrame(frame, Monitor.machineName.ifEmpty { "agent" })
         },
@@ -123,6 +131,22 @@ class RelaySession(
         send(Term.chatSend(sessionId, pane, text, attachments))
     fun createSession(kind: String = "shell") =
         send(Term.sessionsCreate(kind))
+
+    private fun trackAsks(f: JSONObject) {
+        when (f.optString("t")) {
+            "AgentAskRequest" -> {
+                val sid = f.optString("session")
+                val q = f.optString("question")
+                val askId = f.optString("ask_id")
+                if (sid.isNotEmpty() && askId.isNotEmpty()) Monitor.pendingAsks[askId] = sid to q
+            }
+            "AgentAskAnswer" -> Monitor.pendingAsks.remove(f.optString("ask_id"))
+            "Meta" -> if (f.optString("kind") == "exited") {
+                val sid = f.optString("session")
+                Monitor.pendingAsks.values.removeIf { it.first == sid }
+            }
+        }
+    }
 
     private fun refreshSessions(frame: JSONObject) {
         when (val t = frame.optString("t")) {

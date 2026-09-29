@@ -308,6 +308,15 @@ pub struct AskRecord {
     pub created_at: Instant,
     /// when the answer landed (drives the post-answer prune window)
     pub answered_at: Option<Instant>,
+    /// the question payload — kept so the ask can be re-broadcast to
+    /// clients that connect/attach AFTER it was asked (durability: the
+    /// asking agent blocks indefinitely, so the card must be visible
+    /// whenever the user eventually shows up)
+    pub question: String,
+    pub choices: Vec<String>,
+    pub suggested: Option<usize>,
+    pub multi: bool,
+    pub free_text: bool,
 }
 
 /// How long an answered ask stays in the registry after resolution
@@ -377,6 +386,11 @@ mod ask_tests {
             }),
             created_at: Instant::now(),
             answered_at: answered.then_some(Instant::now()),
+            question: "pick one".into(),
+            choices: vec!["a".into(), "b".into()],
+            suggested: None,
+            multi: false,
+            free_text: true,
         }
     }
 

@@ -550,3 +550,22 @@ stores; a 204,982 B PNG uploaded as 2 chunks and fetched back via
 `FileGet` arrives as 2 relay chunks and reassembles **sha256-identical**;
 small frames still flow as single broadcasts. `cargo test` 27+11
 green, clippy clean, web `tsc` green, native `assembleRelease` green.
+
+## Durable ranch_ask surfacing (2026-09-29)
+
+Report: ask fired in "ranch on mini", no notification, no way to see
+the question → stalled session. Root cause: the ask card existed only
+as a live frame — attach after the fact and it's gone; and the
+foreground gate suppressed the notification whenever ANY app screen
+was up.
+
+Daemon: AskRecord now stores the question payload and pending asks are
+RE-BROADCAST — on client Hello (phone reconnects) and on Attach
+(opening the session). Verified live: fresh client receives the pending
+ask on both paths; answer flow unchanged. Phone: Notify fires ask
+notifications even in-app unless that exact conversation is on screen
+(App.foregroundSession); a suppressed ask re-arms on the next
+re-broadcast; Monitor tracks pendingAsks and the home session rows
+show "❓ <question>". NOTE: fixes apply per-machine after `ranch
+upgrade` — the stalled "ranch on mini" daemon needs upgrading.
+v0.7.7 / versionCode 21.

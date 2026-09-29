@@ -87,7 +87,14 @@ class Notify(private val app: App) {
                     val askId = f.optString("ask_id")
                     if (askId.isNotEmpty() && notifiedAsks.add(askId)) {
                         val q = f.optString("question").take(110)
-                        notify("questions", sessionName, "agent question: $q", sessionName, f.optString("pane"))
+                        val fired = notify(
+                            "questions", sessionName, "agent question: $q", sessionName,
+                            f.optString("pane"), f.optString("session"),
+                        )
+                        if (!fired) notifiedAsks.remove(askId)
+                        // ask re-broadcasts (attach/reconnect) re-arm the
+                        // notification so a question the user never saw can
+                        // still ping later
                     }
                 }
                 "AgentAskAnswer" -> f.optString("ask_id").takeIf { it.isNotEmpty() }?.let(notifiedAsks::remove)
@@ -187,7 +194,14 @@ class Notify(private val app: App) {
         }
     }
 
-    private fun notify(kind: String, title: String, body: String, tag: String, pane: String? = null): Boolean {
+    private fun notify(
+        kind: String,
+        title: String,
+        body: String,
+        tag: String,
+        pane: String? = null,
+        session: String? = null,
+    ): Boolean {
         return try {
         val enabled = when (kind) {
             "turn_end" -> turnEnd
@@ -197,7 +211,13 @@ class Notify(private val app: App) {
             else -> false
         }
         if (!enabled) { skippedOff++; return false }
-        if (app.isForeground) { skippedActive++; return false }
+        if (app.isForeground) {
+            // a pending question is actionable no matter where the user is
+            // in the app — suppress only when THAT conversation is the one
+            // on screen (the card is right there)
+            val onScreen = session != null && app.foregroundSession == session
+            if (!(kind == "questions" && !onScreen)) { skippedActive++; return false }
+        }
         postLocal(title, body, tag, pane)
         when (kind) {
             "turn_end" -> firedTurn++
