@@ -1129,16 +1129,20 @@ fn run_pi_reader(
                             .to_string();
                         eprintln!("ranchd: local pi {t_pane} compact failed: {msg}");
                         if compact_retry.lock().ok().and_then(|mut g| g.take()).is_some() {
-                            // auto compact+retry died: the context is too
-                            // big for the compact request itself to fit the
-                            // window — nothing ranch can do; say so instead
-                            // of re-entering the 400 loop.
+                            // auto compact+retry died: don't re-enter the
+                            // 400 loop for this prompt. Report the failure
+                            // factually — a single 400 is NOT proof the
+                            // context can't be compacted (summarization
+                            // calls can be rejected for payload-specific
+                            // reasons, e.g. image-heavy history, or
+                            // transiently), and the next user message gets
+                            // a fresh auto-compact attempt anyway.
                             emit_chat(
                                 &pipe,
                                 t_pane,
                                 "assistant",
                                 &format!(
-                                    "⚠ compact failed ({msg}) — context is too large to compact; start a new session or switch to a larger-context model"
+                                    "⚠ compact failed ({msg}) — will retry automatically with your next message; if it keeps failing, start a new session"
                                 ),
                                 now_iso(),
                             );
