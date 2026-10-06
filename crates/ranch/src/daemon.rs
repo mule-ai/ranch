@@ -6302,7 +6302,37 @@ pub fn run_daemon_with_args(args: Vec<String>) {
             std::process::exit(1);
         }
     };
+    pi_pin_warning();
     run(daemon, control_rx);
+}
+
+/// H0.5 pin guard (PLAN-HERD): the herd runs ONE pinned pi version. The
+/// daemon spawns local pi panes via `pilocal::LocalPi`, so a drifted pi
+/// silently changes the RPC surface under every pane. Warn (never fail —
+/// the daemon must boot) when the resolved binary's version ≠ the pin.
+fn pi_pin_warning() {
+    /// The herd-wide pi pin. Update here when H0.5 re-pins (it is also
+    /// recorded in docs/PLAN-HERD.md §0 and the lab machine configs).
+    const PI_PIN: &str = "1.0.4";
+    let bin = pilocal::LocalPi::pi_bin_path();
+    let ok = std::process::Command::new(&bin)
+        .arg("--version")
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+    match ok {
+        Some(v) if v.contains(PI_PIN) => {}
+        Some(v) => eprintln!(
+            "ranchd: WARNING: pi version drift — pin is {PI_PIN}, resolved {} reports '{v}'. \
+             Local pi panes may break; see docs/PLAN-HERD.md H0.5.",
+            bin
+        ),
+        None => eprintln!(
+            "ranchd: WARNING: could not read version of pi at '{}' (pin {PI_PIN}) — \
+             local pi panes will fail to spawn; set pi_bin in daemon.toml. See docs/PLAN-HERD.md H0.5.",
+            bin
+        ),
+    }
 }
 
 /// Loopback control API for agent tools (Phase A). MUST run before any

@@ -196,6 +196,13 @@ impl LocalPi {
         None
     }
 
+    /// Public wrapper for the daemon's boot-time pi version check
+    /// (`daemon.rs pi_pin_warning`, PLAN-HERD H0.5): resolves the same
+    /// binary the spawner would use.
+    pub fn pi_bin_path() -> String {
+        Self::pi_bin()
+    }
+
     /// Locate the `pi` binary. systemd-launched daemons run with a minimal
     /// PATH (`/usr/local/bin:/usr/bin`) that usually omits mise's install
     /// dirs, so a bare `Command::new("pi")` fails with

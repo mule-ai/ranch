@@ -6,9 +6,79 @@ terminal (Linux-first), a browser, and an Android app. This is a tmux
 **replacement**, not a companion; Forge agent sessions and Mule
 workflows are first-class pane types.
 
+## What THIS checkout is (ranch-2 ≠ ranch)
+
+This directory is `~/src/ranch-2/`, a deep copy of `~/src/ranch/`.
+It exists as an isolated environment for the **Herd** initiative
+(always-on, always-learning agents — see next section). `~/src/ranch/`
+is the live/production checkout running on this machine — **do not
+touch it**; all new work happens here. Treat this repo as the future
+center of gravity; divergence from `~/src/ranch/` is expected and
+desired.
+
+## The Herd initiative (why you're probably here)
+
+Goal: an open, **self-hosted** answer to OpenAI's *Dots* — multiple
+always-on agents per user that interact with each other and learn from
+themselves and others. The full concept, research, gap analysis,
+architecture, and build order live in:
+
+- **`docs/research/always-on-agents-research.md`** — read this first;
+  it is the source of truth for the concept (annotated sources:
+  OpenAI Dots + safety post, Pi Durable RFC, audits of forge/mule/ranch).
+- **`docs/PLAN-HERD.md`** — the Herd implementation plan (H0–H6
+  phases with per-task file/line anchors, demo scripts, risk
+  register, status ledger). Read it before doing Herd work; update
+  its status ledger as phases land.
+
+The one-paragraph version:
+
+- **Division of labor:** *forge hosts the agents' lives, mule scripts
+  their behavior, ranch is everywhere they can be seen and heard.*
+- **The Agent entity** (codename: a "dot" in the herd) becomes a
+  first-class row in forge — `agents(id, name, avatar, owner,
+  home_machine, primary_profile, visibility, memory_scope)` — distinct
+  from forge sessions (conversations) and ranch panes (surfaces). One
+  agent, many conversations, many surfaces.
+- **Forge refactor:** adopt pi-durable's semantic model (durable tasks
+  + checkpoints, ownership trees, background tasks, hooks, documents,
+  compaction, malleable extensions) on **Postgres** (pi-durable's
+  storage interface was designed for this; conformance suite = porting
+  spec). This *deletes* complexity: resume.rs, session_replay.rs, the
+  harness/executor dual-writer split, idle-timeout process babysitting.
+- **Learning is the differentiator:** episodic + semantic + org memory
+  in Postgres/pgvector, written by **reflection loops that are mule
+  workflows** (inspectable, approvable, versioned). Belief changes
+  surface as approval cards via `ranch_ask`.
+- **Mule becomes the behavior/policy plane:** wake policies (cron,
+  event, webhook, memory-trigger), reflection/reporting workflows, and
+  the custom-rules / auto-review policy engine that constrains agents
+  from *outside* (via forge hooks), mirroring dots' safety separation.
+- **Ranch becomes presence:** an agent registry (talk to an agent from
+  any surface), agent-scoped mobile notifications + voice input
+  (native Android client's foreground-service plumbing already exists),
+  an Activity View for background/proactive work, and a voice loop over
+  forge's Parakeet-STT/Kokoro-TTS proxies.
+
+**Posture:** open source, self-hosted, own your own infra. Cost/scale
+budgets are explicitly out of scope — if you see budget/pricing
+reasoning in older drafts or upstream sources, ignore it; it was
+removed from the research doc on purpose.
+
+**Durable-runtime decision (settled 2026-10-06):** use
+pi-durable upstream (`@earendil-works/pi-durable`) directly in a Node
+harness process — no Rust reimplementation. Recorded in
+`docs/PLAN-HERD.md` §H0.3, with the kill-criteria that would reopen
+it.
+
+---
+
 Read before making non-trivial changes (they are the source of truth;
 keep them in sync when behavior changes):
 
+- `docs/research/always-on-agents-research.md` — the Herd initiative:
+  target concept, tooling audits, gap analysis, concept architecture,
+  forge refactor plan, build order.
 - `docs/SPEC.md` — the target system: architecture, tenants, the forge/
   mule/webhook/agent-tool surfaces, security model.
 - `docs/PLAN.md` — the implementation plan, grounded in the code.
@@ -19,9 +89,10 @@ keep them in sync when behavior changes):
 - `docs/history/` — archived spec versions and the milestone build log
   (M0–M11 completion notes; historical record, do not update).
 
-New documentation goes in SPEC/PLAN/PROTOCOL/design; milestone
-completion notes continue in the build log (`docs/history/`, append a
-dated entry) rather than the target-system spec.
+New documentation goes in SPEC/PLAN/PROTOCOL/design; concept/initiative
+research goes in `docs/research/`. Milestone completion notes continue
+in the build log (`docs/history/`, append a dated entry) rather than
+the target-system spec.
 
 ## Repository layout
 
@@ -60,7 +131,8 @@ dated entry) rather than the target-system spec.
   `supabase/functions/` will hold the webhook-relay edge function
   (PLAN Phase E).
 - `docs/` — SPEC (target system), PLAN, PROTOCOL, design/ diagrams,
-  history/ build log.
+  research/ (initiative concepts — currently the Herd/always-on-agents
+  research doc), history/ build log.
 - `systemd/ranchd.service` — user unit for the daemon.
 - `tools/relay-test.mjs` — raw Supabase Realtime test client.
 - `vendor/ghostty/` — shallow clone of pinned ghostty source (gitignored).
