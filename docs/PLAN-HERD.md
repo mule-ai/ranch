@@ -1654,7 +1654,7 @@ kill-criteria). Nothing open blocks starting H0.
 | Phase | Status | Notes |
 |---|---|---|
 | H0 | ◐ in progress | H0.1 ✅ (vendor @ ae92585d = pi-durable 1.0.4, digest notes written), H0.2 ✅ (forge `57d5035b`: `durable-pg` Postgres Storage backend — vendor conformance suite 23/23 green, kill-9 ×2 green, README w/ PG-vs-sqlite benchmarks; note: npm dist ships 20 conformance cases, vendored src has 23 w/ scan `order`), H0.3 ✅ (decision record at `forge/docs/HERD-DURABLE-DECISION.md`), H0.4 ◐ config written (`lab/ct/forge` pgvector ✅, `lab/ct/mule` machine config ✅ @ port 8091) — **pending human: image build + `lab-alc-reconcile` on mini + secrets + consumer repoint**, H0.5 ✅ code-side (extension pins + ranchd drift warning; image rebuilds ride H0.4's reconcile) |
-| H1 | ☐ not started | |
+| H1 | ◐ in progress | H1.1/H1.2 ✅ (forge `418c7bce`: migration 016 agents table + sessions.agent_id, api/agents.rs — CRUD w/ owner-or-admin tenancy + restricted-key gate, /conversations list+create (fork_from = message copy w/ sequence reset), /tasks stub, /active from in-flight marks; 10 integration tests), H1.3 ✅ (ranch-2 `eca27c1`: AgentList/AgentTalk/AgentBusy/AgentActivity frames + PROTOCOL.md §8.6, daemon agent_talk (continue/new/fork + home-machine guard + first-message), `ranch agent [name] [msg]` CLI w/ `--new` legacy preserved, dashboard Agents section, one_shot 30s read timeout; live smoke a–f green vs local forge), H1.4 ⏳ (mobile-native + Supabase mirror + Expo), H1.5 ☐ (mule external_ref) |
 | H2 | ☐ not started | |
 | H3 | ☐ not started | |
 | H4 | ☐ not started | |
