@@ -23,9 +23,17 @@ use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TriggerKind {
-    Cron { expr: String },
-    Event { event: String, filter: serde_json::Value },
-    Webhook { source: String, event_tag: Option<String> },
+    Cron {
+        expr: String,
+    },
+    Event {
+        event: String,
+        filter: serde_json::Value,
+    },
+    Webhook {
+        source: String,
+        event_tag: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -90,7 +98,10 @@ impl Trigger {
     /// Does this trigger match an inbound webhook?
     pub fn matches_webhook(&self, source: &str, event_tag: &str) -> bool {
         match &self.kind {
-            TriggerKind::Webhook { source: s, event_tag: want } => {
+            TriggerKind::Webhook {
+                source: s,
+                event_tag: want,
+            } => {
                 if s != source {
                     return false;
                 }
@@ -104,7 +115,10 @@ impl Trigger {
     }
 
     /// The job input, with `{event.payload.x}` substitutions applied.
-    pub fn job_input(&self, event_payload: Option<&serde_json::Value>) -> Option<serde_json::Value> {
+    pub fn job_input(
+        &self,
+        event_payload: Option<&serde_json::Value>,
+    ) -> Option<serde_json::Value> {
         let base = self.input.clone()?;
         let Some(event_payload) = event_payload else {
             return Some(base);
@@ -142,9 +156,11 @@ fn substitute(input: &serde_json::Value, payload: &serde_json::Value) -> serde_j
                 input.clone()
             }
         }
-        serde_json::Value::Object(map) => {
-            serde_json::Value::Object(map.iter().map(|(k, v)| (k.clone(), substitute(v, payload))).collect())
-        }
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.iter()
+                .map(|(k, v)| (k.clone(), substitute(v, payload)))
+                .collect(),
+        ),
         serde_json::Value::Array(arr) => {
             serde_json::Value::Array(arr.iter().map(|v| substitute(v, payload)).collect())
         }
@@ -163,10 +179,10 @@ pub fn cron_matches(expr: &str, ts: i64) -> bool {
     if fields.len() != 5 {
         return false;
     }
-    field_matches(fields[0], mi as u32, 0, 59)
-        && field_matches(fields[1], h as u32, 0, 23)
-        && field_matches(fields[2], d as u32, 1, 31)
-        && field_matches(fields[3], mo as u32, 1, 12)
+    field_matches(fields[0], mi, 0, 59)
+        && field_matches(fields[1], h, 0, 23)
+        && field_matches(fields[2], d, 1, 31)
+        && field_matches(fields[3], mo, 1, 12)
         && field_matches(fields[4], dow, 0, 6)
 }
 
@@ -219,7 +235,7 @@ fn field_matches(field: &str, value: u32, min: u32, max: u32) -> bool {
                 _ => continue,
             }
         };
-        if value >= lo && value <= hi && (value - lo) % step == 0 {
+        if value >= lo && value <= hi && (value - lo).is_multiple_of(step) {
             return true;
         }
     }
@@ -267,18 +283,25 @@ impl Scheduler {
         let now = Self::now();
         let ids: Vec<Uuid> = self.triggers.keys().copied().collect();
         for id in ids {
-            let (Some(mule_tx), Some(trig)) = (self.mule_tx.as_ref(), self.triggers.get(&id)) else {
+            let (Some(mule_tx), Some(trig)) = (self.mule_tx.as_ref(), self.triggers.get(&id))
+            else {
                 continue;
             };
-            let TriggerKind::Cron { expr } = &trig.kind else { continue };
+            let TriggerKind::Cron { expr } = &trig.kind else {
+                continue;
+            };
             if !trig.enabled || !trig.catch_up {
                 continue;
             }
             // if a scheduled fire was missed since the last one we saw
-            let last_seen = self.last_cron.get(&id).copied().unwrap_or_else(|| {
-                trig.last_run.as_ref().map(|(_, ts, _)| *ts).unwrap_or(now)
-            });
-            let Some(due) = cron_prev(expr, now) else { continue };
+            let last_seen = self
+                .last_cron
+                .get(&id)
+                .copied()
+                .unwrap_or_else(|| trig.last_run.as_ref().map(|(_, ts, _)| *ts).unwrap_or(now));
+            let Some(due) = cron_prev(expr, now) else {
+                continue;
+            };
             if due > last_seen && now - due < 86_400 {
                 // missed one within the last day: fire it
                 let wf = trig.workflow_id.clone();
@@ -310,7 +333,9 @@ impl Scheduler {
             let (Some(_), Some(trig)) = (self.mule_tx.as_ref(), self.triggers.get(&id)) else {
                 continue;
             };
-            let TriggerKind::Cron { expr } = &trig.kind else { continue };
+            let TriggerKind::Cron { expr } = &trig.kind else {
+                continue;
+            };
             if !trig.enabled || !cron_matches(expr, this_min) {
                 continue;
             }
@@ -351,12 +376,18 @@ impl Scheduler {
     }
 
     /// Fire an event-matched trigger (agent turn ended, webhook, …).
-    pub fn fire_event(&mut self, event_type: &str, payload: &serde_json::Value) -> (Vec<Frame>, Vec<crate::relay::RelayOut>) {
+    pub fn fire_event(
+        &mut self,
+        event_type: &str,
+        payload: &serde_json::Value,
+    ) -> (Vec<Frame>, Vec<crate::relay::RelayOut>) {
         let mut frames = Vec::new();
         let mut mirrors = Vec::new();
         let ids: Vec<Uuid> = self.triggers.keys().copied().collect();
         for id in ids {
-            let Some(trig) = self.triggers.get(&id) else { continue };
+            let Some(trig) = self.triggers.get(&id) else {
+                continue;
+            };
             let is_webhook = matches!(trig.kind, TriggerKind::Webhook { .. });
             let hit = if is_webhook {
                 let src = payload.get("source").and_then(|x| x.as_str()).unwrap_or("");
@@ -419,24 +450,50 @@ impl Scheduler {
         })
     }
 
-    pub fn from_value(v: &serde_json::Value, mule_tx: Option<std::sync::mpsc::Sender<crate::daemon::mule::MuleJob>>) -> Self {
+    pub fn from_value(
+        v: &serde_json::Value,
+        mule_tx: Option<std::sync::mpsc::Sender<crate::daemon::mule::MuleJob>>,
+    ) -> Self {
         let mut s = Scheduler::new(mule_tx);
         if let Some(items) = v.get("triggers").and_then(|x| x.as_array()) {
             for it in items {
-                let id = it.get("id").and_then(|x| x.as_str()).and_then(|x| Uuid::parse_str(x).ok());
-                let name = it.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                let id = it
+                    .get("id")
+                    .and_then(|x| x.as_str())
+                    .and_then(|x| Uuid::parse_str(x).ok());
+                let name = it
+                    .get("name")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 let Some(id) = id else { continue };
-                if name.is_empty() { continue; }
+                if name.is_empty() {
+                    continue;
+                }
                 let kind = it.get("kind").and_then(|x| x.as_str()).unwrap_or("");
                 let spec = it.get("spec").cloned().unwrap_or(serde_json::Value::Null);
                 let tk = match kind {
-                    "cron" => spec.get("cron").and_then(|x| x.as_str()).map(|e| TriggerKind::Cron { expr: e.into() }),
+                    "cron" => spec
+                        .get("cron")
+                        .and_then(|x| x.as_str())
+                        .map(|e| TriggerKind::Cron { expr: e.into() }),
                     "event" => Some(TriggerKind::Event {
-                        event: spec.get("event").and_then(|x| x.as_str()).unwrap_or("").into(),
-                        filter: spec.get("filter").cloned().unwrap_or(serde_json::Value::Null),
+                        event: spec
+                            .get("event")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("")
+                            .into(),
+                        filter: spec
+                            .get("filter")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null),
                     }),
                     "webhook" => Some(TriggerKind::Webhook {
-                        source: spec.get("source").and_then(|x| x.as_str()).unwrap_or("").into(),
+                        source: spec
+                            .get("source")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("")
+                            .into(),
                         event_tag: spec.get("event").and_then(|x| x.as_str()).map(String::from),
                     }),
                     _ => None,
@@ -449,16 +506,26 @@ impl Scheduler {
                         lr.get("status")?.as_str()?.to_string(),
                     ))
                 });
-                s.triggers.insert(id, Trigger {
+                s.triggers.insert(
                     id,
-                    name,
-                    workflow_id: it.get("workflow_id").and_then(|x| x.as_str()).unwrap_or("").into(),
-                    kind,
-                    input: it.get("input").cloned().filter(|x| !x.is_null()),
-                    enabled: it.get("enabled").and_then(|x| x.as_bool()).unwrap_or(true),
-                    catch_up: it.get("catch_up").and_then(|x| x.as_bool()).unwrap_or(false),
-                    last_run,
-                });
+                    Trigger {
+                        id,
+                        name,
+                        workflow_id: it
+                            .get("workflow_id")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("")
+                            .into(),
+                        kind,
+                        input: it.get("input").cloned().filter(|x| !x.is_null()),
+                        enabled: it.get("enabled").and_then(|x| x.as_bool()).unwrap_or(true),
+                        catch_up: it
+                            .get("catch_up")
+                            .and_then(|x| x.as_bool())
+                            .unwrap_or(false),
+                        last_run,
+                    },
+                );
             }
         }
         s
@@ -518,19 +585,22 @@ mod tests {
     fn event_matching_with_filters() {
         let mut s = Scheduler::new(None);
         let id = Uuid::new_v4();
-        s.triggers.insert(id, Trigger {
+        s.triggers.insert(
             id,
-            name: "chain".into(),
-            workflow_id: "wf1".into(),
-            kind: TriggerKind::Event {
-                event: "workflow_completed".into(),
-                filter: json!({ "workflow_id": "wf0" }),
+            Trigger {
+                id,
+                name: "chain".into(),
+                workflow_id: "wf1".into(),
+                kind: TriggerKind::Event {
+                    event: "workflow_completed".into(),
+                    filter: json!({ "workflow_id": "wf0" }),
+                },
+                input: Some(json!({ "branch": "main", "summary": "{event.output.summary}" })),
+                enabled: true,
+                catch_up: false,
+                last_run: None,
             },
-            input: Some(json!({ "branch": "main", "summary": "{event.output.summary}" })),
-            enabled: true,
-            catch_up: false,
-            last_run: None,
-        });
+        );
 
         // non-matching event type
         let (f, _) = s.fire_event("agent_turn_ended", &json!({}));
@@ -539,7 +609,10 @@ mod tests {
         let (f, _) = s.fire_event("workflow_completed", &json!({ "workflow_id": "other" }));
         assert!(f.is_empty());
         // hit
-        let (f, m) = s.fire_event("workflow_completed", &json!({ "workflow_id": "wf0", "output": { "summary": "did the thing" } }));
+        let (f, m) = s.fire_event(
+            "workflow_completed",
+            &json!({ "workflow_id": "wf0", "output": { "summary": "did the thing" } }),
+        );
         assert_eq!(f.len(), 1);
         assert_eq!(m.len(), 1);
         match &f[0] {
@@ -559,16 +632,22 @@ mod tests {
     fn webhook_matching() {
         let mut s = Scheduler::new(None);
         let id = Uuid::new_v4();
-        s.triggers.insert(id, Trigger {
+        s.triggers.insert(
             id,
-            name: "gh-push".into(),
-            workflow_id: "wf2".into(),
-            kind: TriggerKind::Webhook { source: "github".into(), event_tag: Some("push".into()) },
-            input: Some(json!({ "ref": "{event.payload.ref}" })),
-            enabled: true,
-            catch_up: false,
-            last_run: None,
-        });
+            Trigger {
+                id,
+                name: "gh-push".into(),
+                workflow_id: "wf2".into(),
+                kind: TriggerKind::Webhook {
+                    source: "github".into(),
+                    event_tag: Some("push".into()),
+                },
+                input: Some(json!({ "ref": "{event.payload.ref}" })),
+                enabled: true,
+                catch_up: false,
+                last_run: None,
+            },
+        );
         // hit
         let (f, _) = s.fire_event("webhook", &json!({ "source": "github", "event": "push", "payload": { "ref": "refs/heads/main" } }));
         assert_eq!(f.len(), 1);
@@ -586,13 +665,18 @@ mod tests {
             id: Uuid::new_v4(),
             name: "t".into(),
             workflow_id: "wf".into(),
-            kind: TriggerKind::Event { event: "x".into(), filter: json!({}) },
+            kind: TriggerKind::Event {
+                event: "x".into(),
+                filter: json!({}),
+            },
             input: Some(json!({ "branch": "{event.ref}", "fixed": "main", "n": 3 })),
             enabled: true,
             catch_up: false,
             last_run: None,
         };
-        let out = t.job_input(Some(&json!({ "ref": "refs/heads/dev" }))).unwrap();
+        let out = t
+            .job_input(Some(&json!({ "ref": "refs/heads/dev" })))
+            .unwrap();
         assert_eq!(out["branch"], "refs/heads/dev");
         assert_eq!(out["fixed"], "main");
         assert_eq!(out["n"], 3);
@@ -605,16 +689,21 @@ mod tests {
     fn scheduler_persists() {
         let mut s = Scheduler::new(None);
         let id = Uuid::new_v4();
-        s.triggers.insert(id, Trigger {
+        s.triggers.insert(
             id,
-            name: "nightly".into(),
-            workflow_id: "wf9".into(),
-            kind: TriggerKind::Cron { expr: "0 3 * * *".into() },
-            input: Some(json!({"branch": "main"})),
-            enabled: true,
-            catch_up: true,
-            last_run: Some(("job1".into(), 1789268400, "completed".into())),
-        });
+            Trigger {
+                id,
+                name: "nightly".into(),
+                workflow_id: "wf9".into(),
+                kind: TriggerKind::Cron {
+                    expr: "0 3 * * *".into(),
+                },
+                input: Some(json!({"branch": "main"})),
+                enabled: true,
+                catch_up: true,
+                last_run: Some(("job1".into(), 1789268400, "completed".into())),
+            },
+        );
         let v = s.to_value();
         let back = Scheduler::from_value(&v, None);
         let t = back.triggers.get(&id).unwrap();

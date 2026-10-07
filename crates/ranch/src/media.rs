@@ -77,12 +77,12 @@ fn reg() -> &'static Mutex<Reg> {
             order: VecDeque::new(),
         };
         // load the persisted registry (best effort)
-        if let Ok(raw) = std::fs::read_to_string(state_file()) {
-            if let Ok(list) = serde_json::from_str::<Vec<String>>(raw.trim()) {
-                for p in list.into_iter().take(CAP) {
-                    if r.paths.insert(p.clone()) {
-                        r.order.push_back(p);
-                    }
+        if let Ok(raw) = std::fs::read_to_string(state_file())
+            && let Ok(list) = serde_json::from_str::<Vec<String>>(raw.trim())
+        {
+            for p in list.into_iter().take(CAP) {
+                if r.paths.insert(p.clone()) {
+                    r.order.push_back(p);
                 }
             }
         }
@@ -167,7 +167,7 @@ pub fn file_is_image(path: &str) -> bool {
 /// Magic-byte mime sniffing with an extension fallback. `None` when the
 /// file is not readable or not a recognized image.
 pub fn sniff_mime(path: &str) -> Option<String> {
-    let head = std::fs::read(Path::new(path)).ok().map(|b| b)?;
+    let head = std::fs::read(Path::new(path)).ok()?;
     sniff_mime_bytes(&head).or_else(|| mime_from_ext(path))
 }
 
@@ -223,14 +223,22 @@ pub fn image_refs_from_tool_args(args_json: &str) -> Vec<String> {
         _ => return Vec::new(),
     };
     const KEYS: &[&str] = &[
-        "path", "file_path", "filePath", "file", "image", "image_path", "imagePath", "filename",
+        "path",
+        "file_path",
+        "filePath",
+        "file",
+        "image",
+        "image_path",
+        "imagePath",
+        "filename",
     ];
     let mut out = Vec::new();
     for k in KEYS {
-        if let Some(p) = obj.get(*k).and_then(|v| v.as_str()) {
-            if is_image_path(p) && !out.iter().any(|x| x == p) {
-                out.push(p.to_string());
-            }
+        if let Some(p) = obj.get(*k).and_then(|v| v.as_str())
+            && is_image_path(p)
+            && !out.iter().any(|x| x == p)
+        {
+            out.push(p.to_string());
         }
     }
     out
@@ -266,8 +274,14 @@ mod tests {
 
     #[test]
     fn sniff_magic() {
-        assert_eq!(sniff_mime_bytes(&[0x89, b'P', b'N', b'G']), Some("image/png".into()));
-        assert_eq!(sniff_mime_bytes(&[0xFF, 0xD8, 0xFF]), Some("image/jpeg".into()));
+        assert_eq!(
+            sniff_mime_bytes(&[0x89, b'P', b'N', b'G']),
+            Some("image/png".into())
+        );
+        assert_eq!(
+            sniff_mime_bytes(&[0xFF, 0xD8, 0xFF]),
+            Some("image/jpeg".into())
+        );
         assert_eq!(sniff_mime_bytes(b"GIF89a...."), Some("image/gif".into()));
         assert_eq!(
             sniff_mime_bytes(b"RIFF\x00\x00\x00\x00WEBPVP8 "),
@@ -349,7 +363,10 @@ mod tests {
             },
         ];
         flag_image_refs(&mut msgs);
-        assert_eq!(msgs[0].image_refs.as_deref(), Some([String::from("/tmp/s.png")].as_slice()));
+        assert_eq!(
+            msgs[0].image_refs.as_deref(),
+            Some([String::from("/tmp/s.png")].as_slice())
+        );
         assert!(msgs[1].image_refs.is_none());
     }
 

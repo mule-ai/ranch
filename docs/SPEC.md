@@ -167,6 +167,7 @@ parity for every user-facing capability:
 | image attachments + in-chat image viewing | ✅ `@path` + `/open` | ✅ pick/paste/drop + lightbox | ✅ gallery + thumbnails + full view |
 | agent spawn/steer/close tools | daemon-side | daemon-side | daemon-side |
 | webhook receiver config | ✅ | ✅ | ✅ |
+| agent registry (Herd H1): list + talk | ✅ (CLI + dashboard) | H1.4 | H1.4 |
 
 The web client is the reference thin client (browser = phone = TUI).
 Local TUI additionally owns tmux-style keyboard bindings; mobile adds
@@ -319,6 +320,30 @@ bridge (the agent's tools forward to forge, forge queues + streams
 the request to the daemon on the SSE stream it already consumes, the
 daemon executes and POSTs the result back). Forge implements the same
 bridge for its own agents; ranch is the policy point either way.
+
+### 5.4 Agent registry (Herd H1) — frames + CLI + dashboard landed
+
+Forge's `agents` table (a first-class agent "dot" — distinct from a
+profile and from a session) is exposed through a ranch frame family:
+`AgentList`/`AgentListOk` (registry rows), `AgentTalk`/`AgentTalkOk`
+(open a conversation: `continue` = the agent's most-active
+conversation — a fresh one is created when it has none; `new` = fresh;
+`fork` = sibling forked from the agent's current conversation;
+optional `text` is sent as the first message), `AgentBusy`/`AgentBusyOk`
+(busy flag + most-active conversation; `AgentBusy` because
+`AgentStatus` is the Phase A pane-level frame), and
+`AgentActivity`/`AgentActivityOk` (shipped empty; H5 fills it).
+`AgentList`/`AgentBusy` are proxied by the forge worker; `AgentTalk`
+resolves the agent and conversation (sync localhost HTTP, the
+`SessionsCreate` pattern) and creates the ranch session + forge-chat
+pane, so history replays on every surface. **home_machine guard:**
+when `agent.home_machine` is set to another machine the daemon
+refuses with an error frame ("agent X lives on machine Y — open
+there") and creates no pane — cross-machine federation is out of
+scope. Surfaces: `ranch agent [name] [msg…]` (no name = dashboard
+Agents section; `--new` keeps the legacy fresh-forge-session form)
+and an **Agents** section in the TUI dashboard (Tab to switch,
+arrow + Enter to talk). Mobile surfaces land in H1.4.
 
 ---
 

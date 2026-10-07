@@ -514,3 +514,52 @@ WebhookEvent { webhook, source, event, payload, received_at }
 
 Transport/auth for `WebhookEvent`: see docs/design/webhook-receiver.md
 (HMAC `X-Ranch-Signature`, 64 KB cap, rate limits, `webhook_log`).
+
+### 8.6 Agent registry (Herd H1)
+
+Forge's `agents` table (a first-class agent entity — distinct from a
+profile and from a session) reaches every surface through this family.
+UUIDs travel as strings, per the file-wide convention.
+`AgentList`/`AgentBusy` are proxied by the forge worker; `AgentTalk`
+is handled by the daemon (sync localhost HTTP, the `SessionsCreate`
+pattern) because it creates the ranch session + chat pane.
+
+```
+AgentList { req_id }                           → AgentListOk { req_id, agents: [AgentInfo] }
+
+AgentInfo { id, name, avatar_url?, home_machine?,
+            last_active?, conversation_count? }   // H1: last_active/
+                                                  // conversation_count = null (H5)
+
+AgentTalk { req_id, agent, mode: "continue"|"new"|"fork",
+            text?, title?, fork_from? }
+  → AgentTalkOk { req_id, session, pane }       // the new ranch session + chat pane
+
+AgentBusy { req_id, agent }                     → AgentBusyOk { req_id, busy,
+                                                               current_conversation? }
+AgentActivity { req_id, agent?, kinds? }        → AgentActivityOk { req_id, items: [ActivityItem] }
+ActivityItem { id, kind, agent?, text, ts }     // H5's Activity View data; H1: items always []
+```
+
+Semantics:
+
+- `AgentTalk.mode`:
+  - `continue` — attach the agent's most-active conversation
+    (`GET /agents/:id/conversations?latest=1`); when the agent has
+    none, one is created first (`POST /agents/:id/conversations`).
+  - `new` — `POST /agents/:id/conversations { title? }`.
+  - `fork` — `POST /agents/:id/conversations { fork_from, title? }`;
+    `fork_from` defaults to the agent's most-active conversation
+    (error when the agent has none).
+- `text` (optional): the daemon sends it as the first message of the
+  attached conversation immediately (the forge `Send` worker job, the
+  same path `ChatSend` uses).
+- **home_machine guard**: when `agent.home_machine` is set to a
+  machine other than this ranchd (hostname or the relay
+  `machine_id`), the daemon replies `Error { req_id, message: "agent
+  X lives on machine Y — open there" }` and creates **no** pane.
+- `Error { req_id, message }` on any failure (unknown agent, unknown
+  mode, forge down/unconfigured, conversation create failed).
+- No new frames for H5's activity *push* — it rides
+  `Meta { kind: "activity" }` when H5 lands.
+

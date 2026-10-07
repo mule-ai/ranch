@@ -66,11 +66,7 @@ pub fn spawn() -> Result<(u16, Receiver<ControlRequest>), String> {
 /// Handle one connection: read one HTTP request, auth, parse, forward
 /// to the daemon loop, serialize the reply. One request per connection
 /// (agents use keep-it-simple clients; curl/pi-fetch reconnect fine).
-fn handle_conn(
-    s: &mut std::net::TcpStream,
-    token: &str,
-    tx: &Sender<ControlRequest>,
-) {
+fn handle_conn(s: &mut std::net::TcpStream, token: &str, tx: &Sender<ControlRequest>) {
     let Some((caller, frame, body_buf_len)) = read_and_parse(s, token) else {
         return; // response already written on error paths
     };
@@ -217,11 +213,19 @@ fn build_frame(tool: &str, body: &[u8], caller: uuid::Uuid) -> Option<ranch_prot
             req_id: uuid::Uuid::new_v4().to_string(),
             caller_pane: caller.to_string(),
             question: get("question"),
-            choices: v.get("choices")
+            choices: v
+                .get("choices")
                 .and_then(|c| c.as_array())
-                .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default(),
-            suggested: v.get("suggested").and_then(|s| s.as_u64()).map(|n| n as usize),
+            suggested: v
+                .get("suggested")
+                .and_then(|s| s.as_u64())
+                .map(|n| n as usize),
             multi: v.get("multi").and_then(|m| m.as_bool()).unwrap_or(false),
             free_text: v.get("free_text").and_then(|f| f.as_bool()).unwrap_or(true),
         }),

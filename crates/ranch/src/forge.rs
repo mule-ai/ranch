@@ -86,7 +86,11 @@ pub enum ForgeJob {
     /// List resumable forge sessions (GET /sessions).
     List { req_id: String },
     /// Model catalog + effective model for a chat pane's forge session.
-    ModelList { pane: Uuid, forge_sid: Uuid, req_id: String },
+    ModelList {
+        pane: Uuid,
+        forge_sid: Uuid,
+        req_id: String,
+    },
     /// Switch the session's model (PATCH /sessions/:id model switcher).
     ModelSet {
         pane: Uuid,
@@ -102,7 +106,11 @@ pub enum ForgeJob {
     /// Manually compact the session's pi context (POST /sessions/:id/compact).
     /// Success → a `meta { kind: "context" }` with the new usage (plus a
     /// refresh); failure → `error { req_id }`.
-    Compact { pane: Uuid, forge_sid: Uuid, req_id: String },
+    Compact {
+        pane: Uuid,
+        forge_sid: Uuid,
+        req_id: String,
+    },
     /// Interrupt the in-flight turn (POST /sessions/:id/interrupt).
     /// Immediate and non-destructive; the forge system row + idle status
     /// ride back on the SSE watch, so no reply frame is needed.
@@ -114,14 +122,24 @@ pub enum ForgeJob {
     ProfileList { req_id: String },
     /// Fetch one profile (GET /profiles/{id}; api_key arrives redacted).
     ProfileGet { req_id: String, profile_id: String },
-    /// Create (no id) or update (id) a profile.
-    ProfilePut {
-        req_id: String,
-        profile_id: Option<String>,
-        draft: ranch_protocol::ProfileDraft,
-    },
+    /// Create (no id) or update (id) a profile. Payload is boxed: the
+    /// draft is ~12 strings and would bloat the enum.
+    ProfilePut(Box<ProfilePutBody>),
     /// Delete a profile (DELETE /profiles/{id}).
     ProfileDelete { req_id: String, profile_id: String },
+    // ----- agent registry (Herd H1) -----
+    /// List the agents registered in forge (GET /agents).
+    AgentList { req_id: String },
+    /// Is this agent busy right now? (GET /agents/{id}/active).
+    AgentBusy { req_id: String, agent: String },
+}
+
+/// Payload for `ForgeJob::ProfilePut` (boxed out of the enum to keep it
+/// small — ProfileDraft carries a dozen strings).
+pub struct ProfilePutBody {
+    pub req_id: String,
+    pub profile_id: Option<String>,
+    pub draft: ranch_protocol::ProfileDraft,
 }
 
 /// Shared per-watch state: the SSE thread owns one; the job thread
@@ -362,8 +380,16 @@ fn handle_event(
             let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else {
                 return;
             };
-            let id = v.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string();
-            let tool = v.get("tool").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let id = v
+                .get("id")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            let tool = v
+                .get("tool")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
             if id.is_empty() || !tool.starts_with("ranch_") {
                 return;
             }
@@ -420,10 +446,11 @@ fn execute_ranch_tool_via_ctl(
             let mut text = String::new();
             use std::io::Read as _;
             let _ = res.body_mut().as_reader().read_to_string(&mut text);
-            serde_json::from_str(&text)
-                .unwrap_or(serde_json::json!({ "raw": text }))
+            serde_json::from_str(&text).unwrap_or(serde_json::json!({ "raw": text }))
         }
-        Err(e) => serde_json::json!({ "success": false, "error": format!("control call failed: {e}") }),
+        Err(e) => {
+            serde_json::json!({ "success": false, "error": format!("control call failed: {e}") })
+        }
     }
 }
 
@@ -628,14 +655,13 @@ pub fn spawn_worker(cfg: ForgeConfig, pipe_w: std::fs::File, rx: mpsc::Receiver<
                     ForgeJob::Context { pane, forge_sid } => {
                         emit_context(&pipe, &cfg, pane, forge_sid);
                     }
-                    ForgeJob::Compact { pane, forge_sid, req_id } => {
+                    ForgeJob::Compact {
+                        pane,
+                        forge_sid,
+                        req_id,
+                    } => {
                         let path = format!("/sessions/{forge_sid}/compact");
-                        match http_json(
-                            &cfg,
-                            "POST",
-                            &path,
-                            Some(&serde_json::json!({})),
-                        ) {
+                        match http_json(&cfg, "POST", &path, Some(&serde_json::json!({}))) {
                             Ok(v) => {
                                 let after = v
                                     .get("estimated_tokens_after")
@@ -755,12 +781,33 @@ pub fn spawn_worker(cfg: ForgeConfig, pipe_w: std::fs::File, rx: mpsc::Receiver<
                                     .filter_map(|p| {
                                         Some(ranch_protocol::ProfileSummary {
                                             id: p.get("id")?.as_str()?.to_string(),
-                                            name: p.get("name").and_then(|n| n.as_str()).unwrap_or("").into(),
-                                            description: p.get("description").and_then(|d| d.as_str()).map(String::from),
-                                            provider: p.get("provider").and_then(|n| n.as_str()).unwrap_or("").into(),
-                                            model: p.get("model").and_then(|n| n.as_str()).unwrap_or("").into(),
-                                            working_dir: p.get("working_dir").and_then(|d| d.as_str()).map(String::from),
-                                            updated_at: p.get("updated_at").and_then(|d| d.as_str()).map(String::from),
+                                            name: p
+                                                .get("name")
+                                                .and_then(|n| n.as_str())
+                                                .unwrap_or("")
+                                                .into(),
+                                            description: p
+                                                .get("description")
+                                                .and_then(|d| d.as_str())
+                                                .map(String::from),
+                                            provider: p
+                                                .get("provider")
+                                                .and_then(|n| n.as_str())
+                                                .unwrap_or("")
+                                                .into(),
+                                            model: p
+                                                .get("model")
+                                                .and_then(|n| n.as_str())
+                                                .unwrap_or("")
+                                                .into(),
+                                            working_dir: p
+                                                .get("working_dir")
+                                                .and_then(|d| d.as_str())
+                                                .map(String::from),
+                                            updated_at: p
+                                                .get("updated_at")
+                                                .and_then(|d| d.as_str())
+                                                .map(String::from),
                                         })
                                     })
                                     .collect();
@@ -768,7 +815,10 @@ pub fn spawn_worker(cfg: ForgeConfig, pipe_w: std::fs::File, rx: mpsc::Receiver<
                             }
                             Err(e) => write_frame(
                                 &pipe,
-                                &Frame::Error { req_id: Some(req_id), message: e },
+                                &Frame::Error {
+                                    req_id: Some(req_id),
+                                    message: e,
+                                },
                             ),
                         }
                     }
@@ -776,20 +826,38 @@ pub fn spawn_worker(cfg: ForgeConfig, pipe_w: std::fs::File, rx: mpsc::Receiver<
                         match http_json(&cfg, "GET", &format!("/profiles/{profile_id}"), None) {
                             Ok(v) => match serde_json::from_value::<ranch_protocol::Profile>(v) {
                                 Ok(prof) => {
-                                    write_frame(&pipe, &Frame::ProfileGetOk { req_id, profile: prof });
+                                    write_frame(
+                                        &pipe,
+                                        &Frame::ProfileGetOk {
+                                            req_id,
+                                            profile: prof,
+                                        },
+                                    );
                                 }
                                 Err(e) => write_frame(
                                     &pipe,
-                                    &Frame::Error { req_id: Some(req_id), message: format!("profile decode: {e}") },
+                                    &Frame::Error {
+                                        req_id: Some(req_id),
+                                        message: format!("profile decode: {e}"),
+                                    },
                                 ),
                             },
                             Err(e) => write_frame(
                                 &pipe,
-                                &Frame::Error { req_id: Some(req_id), message: e },
+                                &Frame::Error {
+                                    req_id: Some(req_id),
+                                    message: e,
+                                },
                             ),
                         }
                     }
-                    ForgeJob::ProfilePut { req_id, profile_id, draft } => {
+                    ForgeJob::ProfilePut(body) => {
+                        let ProfilePutBody {
+                            req_id,
+                            profile_id,
+                            draft,
+                        } = *body;
+
                         let body = serde_json::json!({
                             "name": draft.name,
                             "description": draft.description,
@@ -821,10 +889,19 @@ pub fn spawn_worker(cfg: ForgeConfig, pipe_w: std::fs::File, rx: mpsc::Receiver<
                             }),
                         };
                         match res {
-                            Ok(id) => write_frame(&pipe, &Frame::ProfilePutOk { req_id, profile_id: id }),
+                            Ok(id) => write_frame(
+                                &pipe,
+                                &Frame::ProfilePutOk {
+                                    req_id,
+                                    profile_id: id,
+                                },
+                            ),
                             Err(e) => write_frame(
                                 &pipe,
-                                &Frame::Error { req_id: Some(req_id), message: e },
+                                &Frame::Error {
+                                    req_id: Some(req_id),
+                                    message: e,
+                                },
                             ),
                         }
                     }
@@ -833,7 +910,82 @@ pub fn spawn_worker(cfg: ForgeConfig, pipe_w: std::fs::File, rx: mpsc::Receiver<
                             Ok(_) => write_frame(&pipe, &Frame::ProfileDeleteOk { req_id }),
                             Err(e) => write_frame(
                                 &pipe,
-                                &Frame::Error { req_id: Some(req_id), message: e },
+                                &Frame::Error {
+                                    req_id: Some(req_id),
+                                    message: e,
+                                },
+                            ),
+                        }
+                    }
+                    // ----- agent registry (Herd H1) -----
+                    ForgeJob::AgentList { req_id } => {
+                        eprintln!("DEBUG: worker AgentList arm {req_id}");
+                        match http_json(&cfg, "GET", "/agents", None) {
+                            Ok(v) => {
+                                let arr = v
+                                    .get("agents")
+                                    .and_then(|x| x.as_array())
+                                    .cloned()
+                                    .or_else(|| v.as_array().cloned())
+                                    .unwrap_or_default();
+                                let agents: Vec<ranch_protocol::AgentInfo> = arr
+                                    .iter()
+                                    .filter_map(|a| {
+                                        Some(ranch_protocol::AgentInfo {
+                                            id: a.get("id")?.as_str()?.to_string(),
+                                            name: a
+                                                .get("name")
+                                                .and_then(|n| n.as_str())
+                                                .unwrap_or("")
+                                                .to_string(),
+                                            avatar_url: a
+                                                .get("avatar_url")
+                                                .and_then(|x| x.as_str())
+                                                .map(String::from),
+                                            home_machine: a
+                                                .get("home_machine")
+                                                .and_then(|x| x.as_str())
+                                                .map(String::from),
+                                            // TODO(H5): derive from the agent's
+                                            // most-active conversation
+                                            // (GET /agents/:id/conversations?latest=1
+                                            // per agent — not worth N round
+                                            // trips on a list call in H1)
+                                            last_active: None,
+                                            conversation_count: None,
+                                        })
+                                    })
+                                    .collect();
+                                write_frame(&pipe, &Frame::AgentListOk { req_id, agents });
+                            }
+                            Err(e) => write_frame(
+                                &pipe,
+                                &Frame::Error {
+                                    req_id: Some(req_id),
+                                    message: e,
+                                },
+                            ),
+                        }
+                    }
+                    ForgeJob::AgentBusy { req_id, agent } => {
+                        match http_json(&cfg, "GET", &format!("/agents/{agent}/active"), None) {
+                            Ok(v) => write_frame(
+                                &pipe,
+                                &Frame::AgentBusyOk {
+                                    req_id,
+                                    busy: v.get("busy").and_then(|b| b.as_bool()).unwrap_or(false),
+                                    current_conversation: v
+                                        .get("current_conversation")
+                                        .and_then(|c| c.as_str())
+                                        .map(String::from),
+                                },
+                            ),
+                            Err(e) => write_frame(
+                                &pipe,
+                                &Frame::Error {
+                                    req_id: Some(req_id),
+                                    message: e,
+                                },
                             ),
                         }
                     }
@@ -849,17 +1001,19 @@ pub fn spawn_worker(cfg: ForgeConfig, pipe_w: std::fs::File, rx: mpsc::Receiver<
 /// (estimate fallback: `"~62k est."`). Runs on its own thread — blocking
 /// HTTP must never stall the poll loop.
 fn emit_context(pipe: &PipeWriter, cfg: &ForgeConfig, pane: Uuid, forge_sid: Uuid) {
-    let Ok(mut res) = ureq::get(&format!(
-        "{}/sessions/{forge_sid}/context",
-        cfg.base
-    ))
-    .header("X-API-Key", &cfg.key)
-    .call()
+    let Ok(mut res) = ureq::get(&format!("{}/sessions/{forge_sid}/context", cfg.base))
+        .header("X-API-Key", &cfg.key)
+        .call()
     else {
         return;
     };
     let mut text = String::new();
-    if res.body_mut().as_reader().read_to_string(&mut text).is_err() {
+    if res
+        .body_mut()
+        .as_reader()
+        .read_to_string(&mut text)
+        .is_err()
+    {
         return;
     }
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
@@ -932,7 +1086,9 @@ fn http_json(
     // us surface Forge's actual error body (e.g. "missing field
     // `working_dir`", "tools: invalid type") instead of a bare "422".
     let agent = ureq::Agent::new_with_config(
-        ureq::Agent::config_builder().http_status_as_error(false).build(),
+        ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .build(),
     );
     let sent = match (m.as_str(), body) {
         ("GET", _) => agent.get(&url).header("X-API-Key", &cfg.key).call(),
@@ -958,7 +1114,10 @@ fn http_json(
         return Err(if detail.is_empty() {
             format!("forge {method} {path}: HTTP {}", res.status())
         } else {
-            format!("forge {method} {path}: HTTP {} \u{2014} {detail}", res.status())
+            format!(
+                "forge {method} {path}: HTTP {} \u{2014} {detail}",
+                res.status()
+            )
         });
     }
     serde_json::from_str(&text).map_err(|e| format!("forge decode {path}: {e}"))
@@ -969,7 +1128,10 @@ fn http_json(
 /// flattened model list plus a (provider, id) -> name lookup map.
 fn fetch_catalog(
     cfg: &ForgeConfig,
-) -> (Vec<ModelChoice>, std::collections::HashMap<(String, String), String>) {
+) -> (
+    Vec<ModelChoice>,
+    std::collections::HashMap<(String, String), String>,
+) {
     let mut models = Vec::new();
     let mut names: std::collections::HashMap<(String, String), String> =
         std::collections::HashMap::new();
@@ -1080,14 +1242,14 @@ pub fn create_forge_session(
         None => match &cfg.profile {
             Some(p) => p.clone(),
             None => {
-            let v = http_json(cfg, "GET", "/profiles", None)?;
-            // response is {profiles: [...]} (or a bare array)
-            let arr = v
-                .get("profiles")
-                .and_then(|p| p.as_array())
-                .cloned()
-                .or_else(|| v.as_array().cloned())
-                .ok_or("GET /profiles: unexpected shape")?;
+                let v = http_json(cfg, "GET", "/profiles", None)?;
+                // response is {profiles: [...]} (or a bare array)
+                let arr = v
+                    .get("profiles")
+                    .and_then(|p| p.as_array())
+                    .cloned()
+                    .or_else(|| v.as_array().cloned())
+                    .ok_or("GET /profiles: unexpected shape")?;
                 arr.first()
                     .and_then(|p| p.get("id"))
                     .and_then(|i| i.as_str())
@@ -1108,4 +1270,334 @@ pub fn create_forge_session(
         .and_then(|i| i.as_str())
         .ok_or("POST /sessions: no id")?;
     Uuid::parse_str(id).map_err(|e| format!("forge session id: {e}"))
+}
+
+// ----- agent registry (Herd H1): sync helpers for the main loop -----
+//
+// The same sync-localhost pattern as `create_forge_session`: the
+// daemon's AgentTalk arm orchestrates a couple of one-shot calls and
+// then creates the pane locally (the forge worker is for long-lived
+// jobs — watches + request/reply broadcasts — pane creation belongs
+// to the daemon).
+
+/// GET /agents/{id} → the agent row (404 → "unknown agent" error).
+pub fn agent_get(cfg: &ForgeConfig, agent: &str) -> Result<serde_json::Value, String> {
+    let v = http_json(cfg, "GET", &format!("/agents/{agent}"), None)?;
+    let a = v
+        .get("agent")
+        .ok_or("GET /agents/{agent}: unexpected shape")?;
+    Ok(a.clone())
+}
+
+/// The agent's most-active conversation (GET /agents/{id}/conversations
+/// ?latest=1 → first row's id; None when the agent has none).
+pub fn agent_latest_conversation(cfg: &ForgeConfig, agent: &str) -> Result<Option<Uuid>, String> {
+    let v = http_json(
+        cfg,
+        "GET",
+        &format!("/agents/{agent}/conversations?latest=1"),
+        None,
+    )?;
+    let arr = v
+        .get("conversations")
+        .and_then(|x| x.as_array())
+        .cloned()
+        .or_else(|| v.as_array().cloned())
+        .unwrap_or_default();
+    let id = arr
+        .first()
+        .and_then(|s| s.get("id"))
+        .and_then(|i| i.as_str())
+        .map(Uuid::parse_str)
+        .transpose()
+        .map_err(|e| format!("agent conversation id: {e}"))?;
+    Ok(id)
+}
+
+/// POST /agents/{id}/conversations { title?, fork_from? } → the new
+/// forge session id (201 body: {session: {...}, working_dir}).
+pub fn agent_create_conversation(
+    cfg: &ForgeConfig,
+    agent: &str,
+    title: Option<&str>,
+    fork_from: Option<Uuid>,
+) -> Result<Uuid, String> {
+    let mut body = serde_json::json!({});
+    if let Some(t) = title.filter(|t| !t.is_empty()) {
+        body["title"] = serde_json::Value::String(t.to_string());
+    }
+    if let Some(f) = fork_from {
+        body["fork_from"] = serde_json::Value::String(f.to_string());
+    }
+    let v = http_json(
+        cfg,
+        "POST",
+        &format!("/agents/{agent}/conversations"),
+        Some(&body),
+    )?;
+    let sess = v
+        .get("session")
+        .ok_or("POST /agents/{agent}/conversations: no session")?;
+    let id = sess
+        .get("id")
+        .and_then(|i| i.as_str())
+        .ok_or("POST /agents/{agent}/conversations: no id")?;
+    Uuid::parse_str(id).map_err(|e| format!("forge conversation id: {e}"))
+}
+
+/// Decide how AgentTalk resolves a conversation (pure — unit-tested):
+/// continue-with-none falls back to creating, fork-without-source
+/// falls back to the latest (or fails when the agent has none).
+#[derive(Debug, Clone, PartialEq)]
+pub enum TalkPlan {
+    /// attach the existing conversation
+    Attach(Uuid),
+    /// create one first (title + optional fork point)
+    Create {
+        title: Option<String>,
+        fork_from: Option<Uuid>,
+    },
+}
+
+pub fn talk_plan(
+    mode: &str,
+    latest: Option<Uuid>,
+    fork_from: Option<Uuid>,
+    title: Option<String>,
+) -> Result<TalkPlan, String> {
+    match mode {
+        "continue" => match latest {
+            Some(l) => Ok(TalkPlan::Attach(l)),
+            None => Ok(TalkPlan::Create {
+                title,
+                fork_from: None,
+            }),
+        },
+        "new" => Ok(TalkPlan::Create {
+            title,
+            fork_from: None,
+        }),
+        "fork" => {
+            let src = fork_from.or(latest).ok_or_else(|| {
+                "nothing to fork: the agent has no conversation (talk to it first, or mode:new)"
+                    .to_string()
+            })?;
+            Ok(TalkPlan::Create {
+                title,
+                fork_from: Some(src),
+            })
+        }
+        other => Err(format!(
+            "unknown agent talk mode {other:?} (continue|new|fork)"
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+
+    // ---------- talk_plan (pure mode-resolution logic) ----------
+
+    #[test]
+    fn talk_plan_continue_uses_latest() {
+        let l = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+        assert_eq!(
+            talk_plan("continue", Some(l), None, None),
+            Ok(TalkPlan::Attach(l))
+        );
+    }
+
+    #[test]
+    fn talk_plan_continue_without_latest_creates() {
+        assert_eq!(
+            talk_plan("continue", None, None, Some("t".into())),
+            Ok(TalkPlan::Create {
+                title: Some("t".into()),
+                fork_from: None,
+            })
+        );
+    }
+
+    #[test]
+    fn talk_plan_new_ignores_latest_and_fork() {
+        let l = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+        let f = Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
+        assert_eq!(
+            talk_plan("new", Some(l), Some(f), None),
+            Ok(TalkPlan::Create {
+                title: None,
+                fork_from: None,
+            })
+        );
+    }
+
+    #[test]
+    fn talk_plan_fork_prefers_explicit_source() {
+        let l = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+        let f = Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
+        assert_eq!(
+            talk_plan("fork", Some(l), Some(f), None),
+            Ok(TalkPlan::Create {
+                title: None,
+                fork_from: Some(f),
+            })
+        );
+    }
+
+    #[test]
+    fn talk_plan_fork_falls_back_to_latest() {
+        let l = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+        assert_eq!(
+            talk_plan("fork", Some(l), None, None),
+            Ok(TalkPlan::Create {
+                title: None,
+                fork_from: Some(l),
+            })
+        );
+    }
+
+    #[test]
+    fn talk_plan_fork_with_no_conversation_errors() {
+        let e = talk_plan("fork", None, None, None).unwrap_err();
+        assert!(e.contains("nothing to fork"), "{e}");
+    }
+
+    #[test]
+    fn talk_plan_rejects_unknown_mode() {
+        assert!(talk_plan("teleport", None, None, None).is_err());
+    }
+
+    // ---------- sync HTTP helpers, against a one-shot mock server ----------
+
+    /// One-shot mock: answers exactly one request with canned JSON,
+    /// capturing `METHOD path body` for assertions.
+    fn mock_forge(canned: &str, seen: Arc<Mutex<String>>) -> ForgeConfig {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let canned = canned.to_string();
+        let seen2 = seen.clone();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf: Vec<u8> = Vec::new();
+            let mut tmp = [0u8; 4096];
+            // read until we have the header block + the body it promises
+            loop {
+                let n = stream.read(&mut tmp).unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                if let Some(pos) = find_bytes(&buf, b"\r\n\r\n") {
+                    let hdr = String::from_utf8_lossy(&buf[..pos]).to_string();
+                    let clen = hdr
+                        .lines()
+                        .find_map(|l| {
+                            let low = l.to_lowercase();
+                            low.strip_prefix("content-length:")
+                                .map(|v| v.trim().to_string())
+                        })
+                        .and_then(|l| l.parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if buf.len() >= pos + 4 + clen {
+                        break;
+                    }
+                }
+            }
+            let text = String::from_utf8_lossy(&buf).to_string();
+            let mut lines = text.lines();
+            let reqline = lines.next().unwrap_or_default();
+            let mut parts = reqline.split_whitespace();
+            let method = parts.next().unwrap_or_default().to_string();
+            let path = parts.next().unwrap_or_default().to_string();
+            let body = text
+                .split_once("\r\n\r\n")
+                .map(|(_, b)| b.to_string())
+                .unwrap_or_default();
+            *seen2.lock().unwrap() = format!("{method} {path} {body}");
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{canned}",
+                canned.len()
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.flush();
+        });
+        ForgeConfig {
+            base: format!("http://127.0.0.1:{port}"),
+            key: "test-key".into(),
+            profile: None,
+        }
+    }
+
+    fn find_bytes(hay: &[u8], needle: &[u8]) -> Option<usize> {
+        hay.windows(needle.len()).position(|w| w == needle)
+    }
+
+    #[test]
+    fn agent_get_parses_row() {
+        let seen = Arc::new(Mutex::new(String::new()));
+        let cfg = mock_forge(
+            r#"{"agent":{"id":"a","name":"iris","home_machine":"box1","avatar_url":null}}"#,
+            seen.clone(),
+        );
+        let v = agent_get(&cfg, "a").unwrap();
+        assert_eq!(v["name"], "iris");
+        assert_eq!(v["home_machine"], "box1");
+        let s = seen.lock().unwrap().clone();
+        assert!(s.starts_with("GET /agents/a"), "{s}");
+    }
+
+    #[test]
+    fn agent_latest_conversation_first_row() {
+        let seen = Arc::new(Mutex::new(String::new()));
+        let cfg = mock_forge(
+            r#"{"conversations":[{"id":"11111111-1111-1111-1111-111111111111","last_active":"2026-10-07T00:00:00Z"},{"id":"22222222-2222-2222-2222-222222222222"}]}"#,
+            seen.clone(),
+        );
+        let got = agent_latest_conversation(&cfg, "a").unwrap();
+        assert_eq!(
+            got,
+            Some(Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap())
+        );
+        let s = seen.lock().unwrap().clone();
+        assert!(s.contains("/conversations?latest=1"), "{s}");
+    }
+
+    #[test]
+    fn agent_latest_conversation_none_when_empty() {
+        let seen = Arc::new(Mutex::new(String::new()));
+        let cfg = mock_forge(r#"{"conversations":[]}"#, seen.clone());
+        assert_eq!(agent_latest_conversation(&cfg, "a").unwrap(), None);
+    }
+
+    #[test]
+    fn agent_create_conversation_posts_fork_and_title() {
+        let seen = Arc::new(Mutex::new(String::new()));
+        let cfg = mock_forge(
+            r#"{"session":{"id":"33333333-3333-3333-3333-333333333333"},"working_dir":"/w"}"#,
+            seen.clone(),
+        );
+        let fork = Uuid::parse_str("44444444-4444-4444-4444-444444444444").unwrap();
+        let got = agent_create_conversation(&cfg, "a", Some("branch"), Some(fork)).unwrap();
+        assert_eq!(got.to_string(), "33333333-3333-3333-3333-333333333333");
+        let s = seen.lock().unwrap().clone();
+        assert!(s.starts_with("POST /agents/a/conversations"), "{s}");
+        assert!(s.contains(&fork.to_string()), "fork_from uuid in body: {s}");
+        assert!(s.contains("branch"), "title in body: {s}");
+    }
+
+    #[test]
+    fn agent_create_conversation_empty_body_for_plain_new() {
+        let seen = Arc::new(Mutex::new(String::new()));
+        let cfg = mock_forge(
+            r#"{"session":{"id":"33333333-3333-3333-3333-333333333333"}}"#,
+            seen.clone(),
+        );
+        let got = agent_create_conversation(&cfg, "a", None, None).unwrap();
+        assert_eq!(got.to_string(), "33333333-3333-3333-3333-333333333333");
+        let s = seen.lock().unwrap().clone();
+        assert!(s.ends_with(" {}"), "no title/fork → empty object body: {s}");
+    }
 }

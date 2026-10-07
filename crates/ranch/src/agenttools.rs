@@ -54,10 +54,10 @@ impl SpawnPolicy {
         };
         for line in text.lines() {
             let line = line.trim();
-            if let Some(rest) = line.strip_prefix("spawn_policy") {
-                if let Some(rest) = rest.trim_start().strip_prefix('=') {
-                    return SpawnPolicy::parse(rest.trim().trim_matches('"'));
-                }
+            if let Some(rest) = line.strip_prefix("spawn_policy")
+                && let Some(rest) = rest.trim_start().strip_prefix('=')
+            {
+                return SpawnPolicy::parse(rest.trim().trim_matches('"'));
             }
         }
         SpawnPolicy::Allow
@@ -163,7 +163,12 @@ impl SpawnRegistry {
 
 /// Build the system chat row rendered in the caller's pane when a
 /// spawned agent completes.
-pub fn agent_done_row(spawn: &SpawnRecord, pane: Uuid, outcome: &str, last: Option<&ChatMsg>) -> ChatMsg {
+pub fn agent_done_row(
+    spawn: &SpawnRecord,
+    pane: Uuid,
+    outcome: &str,
+    last: Option<&ChatMsg>,
+) -> ChatMsg {
     let label = match outcome {
         "completed" => "finished",
         "failed" => "failed",
@@ -259,8 +264,12 @@ pub fn registry_from_value(v: &serde_json::Value) -> SpawnRegistry {
     if let Some(items) = v.get("spawned").and_then(|s| s.as_array()) {
         for it in items {
             let (Some(pane), Some(spawn_id)) = (
-                it.get("pane").and_then(|x| x.as_str()).and_then(|s| Uuid::parse_str(s).ok()),
-                it.get("spawn_id").and_then(|x| x.as_str()).map(String::from),
+                it.get("pane")
+                    .and_then(|x| x.as_str())
+                    .and_then(|s| Uuid::parse_str(s).ok()),
+                it.get("spawn_id")
+                    .and_then(|x| x.as_str())
+                    .map(String::from),
             ) else {
                 continue;
             };
@@ -269,7 +278,10 @@ pub fn registry_from_value(v: &serde_json::Value) -> SpawnRegistry {
                 .and_then(|x| x.as_str())
                 .and_then(|s| Uuid::parse_str(s).ok())
                 .unwrap_or(Uuid::nil());
-            let callback = it.get("callback").and_then(|x| x.as_bool()).unwrap_or(false);
+            let callback = it
+                .get("callback")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(false);
             let rec = SpawnRecord {
                 spawn_id: spawn_id.clone(),
                 caller_pane: caller,
@@ -305,6 +317,9 @@ pub struct AskRecord {
     pub session: Uuid,
     /// None until answered
     pub answer: Option<AskAnswer>,
+    /// when the ask was posed (diagnostics; H5's activity timeline
+    /// will order on it)
+    #[allow(dead_code)]
     pub created_at: Instant,
     /// when the answer landed (drives the post-answer prune window)
     pub answered_at: Option<Instant>,
@@ -408,14 +423,21 @@ mod ask_tests {
         reg.insert(answered.clone());
         assert!(reg.prune().is_empty());
         // stale answer: pruned
-        answered.answered_at = Some(Instant::now() - ASK_DONE_GRACE - std::time::Duration::from_secs(1));
+        answered.answered_at =
+            Some(Instant::now() - ASK_DONE_GRACE - std::time::Duration::from_secs(1));
         *reg.get_mut("a1").unwrap() = answered;
         assert_eq!(reg.prune().len(), 1);
     }
 }
 
 /// The frame a completed/closed/denied spawn emits to clients.
-pub fn agent_done_frame(spawn: &SpawnRecord, session: Uuid, pane: Uuid, outcome: &str, last: Option<ChatMsg>) -> Frame {
+pub fn agent_done_frame(
+    spawn: &SpawnRecord,
+    session: Uuid,
+    pane: Uuid,
+    outcome: &str,
+    last: Option<ChatMsg>,
+) -> Frame {
     let _ = spawn; // spawn_id is carried in the row for correlation
     Frame::AgentDone {
         spawn_id: spawn.spawn_id.clone(),
@@ -461,7 +483,8 @@ mod tests {
         let caller = Uuid::nil();
         for i in 0..MAX_SPAWNED_PANES {
             let p = Uuid::from_u128(i as u128 + 1);
-            reg.register(p, rec(caller, false)).unwrap_or_else(|_| panic!("cap at {i}"));
+            reg.register(p, rec(caller, false))
+                .unwrap_or_else(|_| panic!("cap at {i}"));
         }
         let extra = Uuid::new_v4();
         assert!(reg.register(extra, rec(caller, false)).is_err());
@@ -483,7 +506,8 @@ mod tests {
         // not expired yet
         assert!(reg.expire_pending().is_empty());
         // force expiry
-        reg.pending.insert(sid.clone(), (r, Instant::now() - SPAWN_REQUEST_TTL));
+        reg.pending
+            .insert(sid.clone(), (r, Instant::now() - SPAWN_REQUEST_TTL));
         let expired = reg.expire_pending();
         assert_eq!(expired, vec![(sid, caller)]);
         assert!(reg.pending.is_empty());

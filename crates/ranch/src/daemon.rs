@@ -18,7 +18,6 @@
 //! - when ~/.config/ranch/daemon.toml exists, a relay thread bridges the
 //!   same frames to the machine's Supabase Realtime channel (relay.rs)
 
-
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
@@ -28,7 +27,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use libc::{SIGINT, WNOHANG, c_int, pollfd};
-use ranch_protocol::{ChatMsg, Cursor, Decoder, Frame, Layout, PaneSnap, PiSessionInfo, SessionMeta};
+use ranch_protocol::{
+    ChatMsg, Cursor, Decoder, Frame, Layout, PaneSnap, PiSessionInfo, SessionMeta,
+};
 use ranch_vt::Vt;
 use uuid::Uuid;
 
@@ -36,10 +37,10 @@ use uuid::Uuid;
 pub(crate) mod agenttools;
 #[path = "control_api.rs"]
 pub mod control_api;
-#[path = "mule.rs"]
-mod mule;
 #[path = "media.rs"]
 pub(crate) mod media;
+#[path = "mule.rs"]
+mod mule;
 #[path = "triggers.rs"]
 mod triggers;
 
@@ -363,7 +364,7 @@ impl Session {
     /// (top/bottom, pct to a).
     fn pane_sizes(&self) -> Vec<(Uuid, u16, u16)> {
         let mut out = Vec::new();
-        fn walk(l: &Layout, x: u16, y: u16, w: u16, h: u16, out: &mut Vec<(Uuid, u16, u16)>) {
+        fn walk(l: &Layout, _x: u16, _y: u16, w: u16, h: u16, out: &mut Vec<(Uuid, u16, u16)>) {
             match l {
                 Layout::Leaf { pane } => {
                     if let Ok(pid) = Uuid::parse_str(pane) {
@@ -374,12 +375,12 @@ impl Session {
                     let pct = (*pct as u16).clamp(1, 99);
                     if *dir == 1 {
                         let lw = (w * pct / 100).max(1).min(w.saturating_sub(1).max(1));
-                        walk(a, x, y, lw, h, out);
-                        walk(b, x + lw, y, w - lw, h, out);
+                        walk(a, _x, _y, lw, h, out);
+                        walk(b, _x + lw, _y, w - lw, h, out);
                     } else {
                         let th = (h * pct / 100).max(1).min(h.saturating_sub(1).max(1));
-                        walk(a, x, y, w, th, out);
-                        walk(b, x, y + th, w, h - th, out);
+                        walk(a, _x, _y, w, th, out);
+                        walk(b, _x, _y + th, w, h - th, out);
                     }
                 }
             }
@@ -391,29 +392,28 @@ impl Session {
     /// Apply computed sizes to every pane's PTY + VT (with SIGWINCH).
     fn apply_sizes(&mut self) {
         // bootstrap: root leaf may still point at the nil placeholder
-        if let Layout::Leaf { pane } = &self.win().layout {
-            if Uuid::parse_str(&pane).map(|u| u.is_nil()).unwrap_or(true) {
-                if let Some(first) = self.panes.keys().next().copied() {
-                    self.win_mut().layout = Layout::Leaf {
-                        pane: first.to_string(),
-                    };
-                }
-            }
+        if let Layout::Leaf { pane } = &self.win().layout
+            && Uuid::parse_str(pane).map(|u| u.is_nil()).unwrap_or(true)
+            && let Some(first) = self.panes.keys().next().copied()
+        {
+            self.win_mut().layout = Layout::Leaf {
+                pane: first.to_string(),
+            };
         }
         let sizes = self.pane_sizes();
         for (pid, cols, rows) in sizes {
-            if let Some(p) = self.panes.get_mut(&pid) {
-                if p.vt.dims() != (cols, rows) {
-                    p.vt.resize(cols, rows);
-                    let win = Winsize {
-                        ws_row: rows,
-                        ws_col: cols,
-                        ..Default::default()
-                    };
-                    unsafe { ioctl(p.master, TIOCSWINSZ, &win) };
-                    p.prev_screen.clear();
-                    p.dirty = true;
-                }
+            if let Some(p) = self.panes.get_mut(&pid)
+                && p.vt.dims() != (cols, rows)
+            {
+                p.vt.resize(cols, rows);
+                let win = Winsize {
+                    ws_row: rows,
+                    ws_col: cols,
+                    ..Default::default()
+                };
+                unsafe { ioctl(p.master, TIOCSWINSZ, &win) };
+                p.prev_screen.clear();
+                p.dirty = true;
             }
         }
     }
@@ -638,14 +638,14 @@ fn pi_session_meta(path: &str) -> (Option<String>, Option<String>, Option<String
             if sid.is_some() && cwd.is_some() {
                 break;
             }
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(line.trim()) {
-                if json.get("type").and_then(|t| t.as_str()) == Some("session") {
-                    if sid.is_none() {
-                        sid = json.get("id").and_then(|x| x.as_str()).map(String::from);
-                    }
-                    if cwd.is_none() {
-                        cwd = json.get("cwd").and_then(|c| c.as_str()).map(String::from);
-                    }
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(line.trim())
+                && json.get("type").and_then(|t| t.as_str()) == Some("session")
+            {
+                if sid.is_none() {
+                    sid = json.get("id").and_then(|x| x.as_str()).map(String::from);
+                }
+                if cwd.is_none() {
+                    cwd = json.get("cwd").and_then(|c| c.as_str()).map(String::from);
                 }
             }
         }
@@ -653,7 +653,10 @@ fn pi_session_meta(path: &str) -> (Option<String>, Option<String>, Option<String
 
     // Pass 2: last user message from the tail (last 512 KB).
     let mut title: Option<String> = None;
-    if file.seek(SeekFrom::Start(size.saturating_sub(512 * 1024))).is_ok() {
+    if file
+        .seek(SeekFrom::Start(size.saturating_sub(512 * 1024)))
+        .is_ok()
+    {
         let mut reader = std::io::BufReader::new(file);
         let mut line = String::new();
         loop {
@@ -663,35 +666,35 @@ fn pi_session_meta(path: &str) -> (Option<String>, Option<String>, Option<String
                 Ok(_) => {}
             }
             // A partial first line (seek mid-line) fails JSON parse; skipped.
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(line.trim()) {
-                if json.get("type").and_then(|t| t.as_str()) == Some("message")
-                    && json
-                        .get("message")
-                        .and_then(|m| m.get("role"))
-                        .and_then(|r| r.as_str())
-                        == Some("user")
-                {
-                    let text = json
-                        .get("message")
-                        .and_then(|m| m.get("content"))
-                        .and_then(|c| {
-                            if let Some(arr) = c.as_array() {
-                                arr.iter().find_map(|b| b.get("text").and_then(|t| t.as_str()))
-                            } else {
-                                c.as_str()
-                            }
-                        })
-                        .unwrap_or("")
-                        .trim()
-                        .to_string();
-                    if !text.is_empty() {
-                        let truncated: String = text.chars().take(48).collect();
-                        title = Some(if text.chars().count() > 48 {
-                            format!("{truncated}…")
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(line.trim())
+                && json.get("type").and_then(|t| t.as_str()) == Some("message")
+                && json
+                    .get("message")
+                    .and_then(|m| m.get("role"))
+                    .and_then(|r| r.as_str())
+                    == Some("user")
+            {
+                let text = json
+                    .get("message")
+                    .and_then(|m| m.get("content"))
+                    .and_then(|c| {
+                        if let Some(arr) = c.as_array() {
+                            arr.iter()
+                                .find_map(|b| b.get("text").and_then(|t| t.as_str()))
                         } else {
-                            truncated
-                        });
-                    }
+                            c.as_str()
+                        }
+                    })
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if !text.is_empty() {
+                    let truncated: String = text.chars().take(48).collect();
+                    title = Some(if text.chars().count() > 48 {
+                        format!("{truncated}…")
+                    } else {
+                        truncated
+                    });
                 }
             }
         }
@@ -785,8 +788,10 @@ fn socket_has_live_listener(path: &Path) -> bool {
             drop(stream);
             true
         }
-        Err(e) => e.kind() != std::io::ErrorKind::ConnectionRefused
-            && e.kind() != std::io::ErrorKind::NotFound,
+        Err(e) => {
+            e.kind() != std::io::ErrorKind::ConnectionRefused
+                && e.kind() != std::io::ErrorKind::NotFound
+        }
     }
 }
 
@@ -868,16 +873,17 @@ fn plan_attachments(text: &str, attachments: &[String]) -> (String, Vec<media::P
             media::register(path);
             match media::load_image(path) {
                 Ok(img) => images.push(img),
-                Err(e) => out.push_str(&format!(
-                    "[Attached image: {} \u{2014} {}]\n", path, e
-                )),
+                Err(e) => out.push_str(&format!("[Attached image: {} \u{2014} {}]\n", path, e)),
             }
             continue;
         }
         let p = std::path::Path::new(path);
         match std::fs::read(p) {
             Ok(bytes) => {
-                let name = p.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_else(|| path.clone());
+                let name = p
+                    .file_name()
+                    .map(|f| f.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.clone());
                 if looks_binary(&bytes) {
                     // binary non-image (zip, pdf, …): inlining raw bytes
                     // would only pollute the prompt
@@ -895,13 +901,21 @@ fn plan_attachments(text: &str, attachments: &[String]) -> (String, Vec<media::P
                 } else {
                     String::from_utf8_lossy(&bytes).into_owned()
                 };
-                out.push_str(&format!("[Attached file: {} ({} bytes)]\n```
+                out.push_str(&format!(
+                    "[Attached file: {} ({} bytes)]\n```
 {}
 ```
-\n", name, bytes.len(), content));
+\n",
+                    name,
+                    bytes.len(),
+                    content
+                ));
             }
             Err(e) => {
-                out.push_str(&format!("[Attached file: {} \u{2014} read error: {}]\n", path, e));
+                out.push_str(&format!(
+                    "[Attached file: {} \u{2014} read error: {}]\n",
+                    path, e
+                ));
             }
         }
     }
@@ -964,15 +978,15 @@ fn state_value(
             })).collect::<Vec<_>>(),
         })).collect::<Vec<_>>(),
     });
-    if let Some(reg) = spawns {
-        if let Some(obj) = v.as_object_mut() {
-            obj.insert("spawns".into(), agenttools::registry_value(reg));
-        }
+    if let Some(reg) = spawns
+        && let Some(obj) = v.as_object_mut()
+    {
+        obj.insert("spawns".into(), agenttools::registry_value(reg));
     }
-    if let Some(trig) = triggers {
-        if let Some(obj) = v.as_object_mut() {
-            obj.insert("triggers".into(), trig.to_value());
-        }
+    if let Some(trig) = triggers
+        && let Some(obj) = v.as_object_mut()
+    {
+        obj.insert("triggers".into(), trig.to_value());
     }
     v
 }
@@ -1061,11 +1075,7 @@ fn spawn_pane(session: &mut Session, pane_kind: &str, cwd: Option<&str>) -> Resu
                 libc::close(aslave);
             }
             libc::close(amaster);
-            libc::setenv(
-                b"TERM\0".as_ptr() as *const libc::c_char,
-                b"xterm-256color\0".as_ptr() as *const libc::c_char,
-                1,
-            );
+            libc::setenv(c"TERM".as_ptr(), c"xterm-256color".as_ptr(), 1);
             // agent sessions run `pi` via a login shell (so the mise
             // shim PATH from the user profile applies); shells run bare.
             // CString: execvp takes a C string, and `String::as_ptr()` is
@@ -1088,15 +1098,25 @@ fn spawn_pane(session: &mut Session, pane_kind: &str, cwd: Option<&str>) -> Resu
                     eprintln!("ranchd: chdir {:?} failed", dir);
                 }
                 let arg = b"exec pi\0";
-                let argv: [*const u8; 4] =
-                    [shell_p, b"-lc\0".as_ptr(), arg.as_ptr(), std::ptr::null()];
+                let argv: [*const u8; 4] = [
+                    shell_p,
+                    c"-lc".as_ptr().cast::<u8>(),
+                    arg.as_ptr(),
+                    std::ptr::null(),
+                ];
                 if execvp(shell_p, argv.as_ptr()) != 0 {
-                    eprintln!("ranchd: execvp {shell:?} failed: {:?}", std::io::Error::last_os_error());
+                    eprintln!(
+                        "ranchd: execvp {shell:?} failed: {:?}",
+                        std::io::Error::last_os_error()
+                    );
                 }
             } else {
                 let argv: [*const u8; 2] = [shell_p, std::ptr::null()];
                 if execvp(shell_p, argv.as_ptr()) != 0 {
-                    eprintln!("ranchd: execvp {shell:?} failed: {:?}", std::io::Error::last_os_error());
+                    eprintln!(
+                        "ranchd: execvp {shell:?} failed: {:?}",
+                        std::io::Error::last_os_error()
+                    );
                 }
             }
             std::process::exit(1);
@@ -1168,13 +1188,18 @@ fn snapshot_session(s: &Session, chat_limit: Option<usize>) -> Option<Frame> {
         // snapshot carries only the last N rows — long conversations
         // would otherwise ship as megabytes over Realtime. Older rows
         // are paged back with `ChatHistory`.
-        let chat_has_more = chat_limit
-            .map(|n| cp.chat.len() > n)
-            .unwrap_or(false);
+        let chat_has_more = chat_limit.map(|n| cp.chat.len() > n).unwrap_or(false);
         let chat = match chat_limit {
-            Some(n) if n > 0 => {
-                cp.chat.iter().rev().take(n).collect::<Vec<_>>().into_iter().rev().cloned().collect()
-            }
+            Some(n) if n > 0 => cp
+                .chat
+                .iter()
+                .rev()
+                .take(n)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .cloned()
+                .collect(),
             _ => cp.chat.clone(),
         };
         snaps.push(PaneSnap {
@@ -1234,10 +1259,10 @@ fn send_frame(c: &mut Client, frame: &Frame) {
             // control pseudo-client: collect (the request thread returns
             // them in the HTTP response)
             (None, None) if c.sink.is_some() => {
-                if let Some(sink) = &c.sink {
-                    if let Ok(mut g) = sink.lock() {
-                        g.push(frame.clone());
-                    }
+                if let Some(sink) = &c.sink
+                    && let Ok(mut g) = sink.lock()
+                {
+                    g.push(frame.clone());
                 }
                 Ok(())
             }
@@ -1390,6 +1415,18 @@ pub fn caller_pane() -> Uuid {
     CALLER_PANE.with(|c| c.borrow().unwrap_or(Uuid::nil()))
 }
 
+/// Args for [`Daemon::handle_agent_send`] (the `AgentSend` frame's
+/// payload plus the sender).
+struct AgentSendArgs<'a> {
+    from: RawFd,
+    req_id: &'a str,
+    caller_pane: &'a str,
+    session: &'a str,
+    pane: &'a str,
+    text: &'a str,
+    delivery: &'a str,
+}
+
 impl Daemon {
     /// The effective caller for a frame from client fd `from`. The
     /// control API runs each request on a thread with CALLER_PANE set;
@@ -1402,6 +1439,212 @@ impl Daemon {
                 &Frame::Error {
                     req_id: Some(req_id.to_string()),
                     message: "forge not configured (set forge_api_key in daemon.toml)".into(),
+                },
+            );
+        }
+    }
+
+    /// Agent registry (Herd H1, PLAN-HERD H1.3): open/continue/fork a
+    /// conversation with a forge agent and hand the caller a pane on it.
+    ///
+    /// Sync localhost HTTP in the main loop — the same pattern as
+    /// `SessionsCreate` → `create_forge_session` (the forge worker is
+    /// for long-lived jobs; pane creation belongs to the daemon).
+    /// `AgentList`/`AgentBusy` ride the worker; this arm is the
+    /// only place that creates the ranch session + chat pane.
+    #[allow(clippy::too_many_arguments)]
+    fn agent_talk(
+        &mut self,
+        from: RawFd,
+        req_id: &str,
+        agent: &str,
+        mode: &str,
+        text: Option<String>,
+        title: Option<String>,
+        fork_from: Option<String>,
+    ) {
+        let err = |message: String| {
+            eprintln!("ranchd: agent_talk failed: {message}");
+            message
+        };
+        let cfg = match forge::load_forge_config() {
+            Some(c) => c,
+            None => {
+                self.forge_unconfigured(from, req_id);
+                return;
+            }
+        };
+        let fork_from = fork_from
+            .filter(|f| !f.is_empty())
+            .and_then(|f| Uuid::parse_str(&f).ok());
+        // resolve the agent (404 → unknown agent; home_machine guard
+        // below) — one sync round trip
+        let agent_row = match forge::agent_get(&cfg, agent) {
+            Ok(a) => a,
+            Err(e) => {
+                let msg = if e.contains("404") {
+                    format!("unknown agent {agent}")
+                } else {
+                    err(e)
+                };
+                if let Some(c) = self.clients.get_mut(&from) {
+                    send_frame(
+                        c,
+                        &Frame::Error {
+                            req_id: Some(req_id.to_string()),
+                            message: msg,
+                        },
+                    );
+                }
+                return;
+            }
+        };
+        let name = agent_row
+            .get("name")
+            .and_then(|n| n.as_str())
+            .unwrap_or(agent)
+            .to_string();
+        // home_machine guard: the agent "lives on" another machine —
+        // cross-machine federation is out of scope (single-user,
+        // multi-AGENT is the product; multi-HOST is not, H1).
+        if let Some(home) = agent_row.get("home_machine").and_then(|h| h.as_str()) {
+            let relay_id = relay::load_config().map(|r| r.machine_id);
+            if home != self.machine && relay_id.as_deref() != Some(home) {
+                let msg = format!("agent {name} lives on machine {home} — open there");
+                if let Some(c) = self.clients.get_mut(&from) {
+                    send_frame(
+                        c,
+                        &Frame::Error {
+                            req_id: Some(req_id.to_string()),
+                            message: msg,
+                        },
+                    );
+                }
+                return;
+            }
+        }
+        // most-active conversation (used by continue + fork fallback)
+        let latest = match forge::agent_latest_conversation(&cfg, agent) {
+            Ok(l) => l,
+            Err(e) => {
+                if let Some(c) = self.clients.get_mut(&from) {
+                    send_frame(
+                        c,
+                        &Frame::Error {
+                            req_id: Some(req_id.to_string()),
+                            message: err(e),
+                        },
+                    );
+                }
+                return;
+            }
+        };
+        let plan = match forge::talk_plan(mode, latest, fork_from, title.clone()) {
+            Ok(p) => p,
+            Err(e) => {
+                if let Some(c) = self.clients.get_mut(&from) {
+                    send_frame(
+                        c,
+                        &Frame::Error {
+                            req_id: Some(req_id.to_string()),
+                            message: e,
+                        },
+                    );
+                }
+                return;
+            }
+        };
+        let forge_sid = match &plan {
+            forge::TalkPlan::Attach(sid) => *sid,
+            forge::TalkPlan::Create { title, fork_from } => match forge::agent_create_conversation(
+                &cfg,
+                agent,
+                title.as_deref().or(Some(name.as_str())),
+                *fork_from,
+            ) {
+                Ok(sid) => sid,
+                Err(e) => {
+                    if let Some(c) = self.clients.get_mut(&from) {
+                        send_frame(
+                            c,
+                            &Frame::Error {
+                                req_id: Some(req_id.to_string()),
+                                message: err(e),
+                            },
+                        );
+                    }
+                    return;
+                }
+            },
+        };
+        // the ranch-side surface: a session + forge-chat pane (the same
+        // factory as `SessionsCreate kind=forge forge_session=…`) so
+        // history replays via the SSE watch on every surface.
+        let sid = Uuid::new_v4();
+        let pid = Uuid::new_v4();
+        let sname = name.clone();
+        let mut s = Session {
+            id: sid,
+            name: sname.clone(),
+            kind: "forge".into(),
+            panes: BTreeMap::new(),
+            active: Uuid::nil(),
+            size: (80, 24),
+            windows: vec![Window::new(
+                Layout::Leaf {
+                    pane: pid.to_string(),
+                },
+                "0".into(),
+            )],
+            win: 0,
+            chats: BTreeMap::new(),
+        };
+        s.chats.insert(
+            pid,
+            ChatPane {
+                forge_sid,
+                cols: 80,
+                rows: 24,
+                chat: vec![],
+                model: None,
+                context: None,
+                cwd: None,
+                busy: false,
+            },
+        );
+        s.active = pid;
+        eprintln!(
+            "ranchd: agent_talk {name} ({mode}) -> session {sid} pane {pid} -> forge {forge_sid}"
+        );
+        if let Some(tx) = &self.forge_tx {
+            let _ = tx.send(forge::ForgeJob::Watch {
+                pane: pid,
+                forge_sid,
+            });
+        }
+        let text = text.filter(|t| !t.trim().is_empty());
+        if let (Some(t), Some(tx)) = (&text, &self.forge_tx) {
+            let _ = tx.send(forge::ForgeJob::Send {
+                pane: pid,
+                forge_sid,
+                text: t.clone(),
+            });
+        }
+        let skind = s.kind.clone();
+        self.sessions.insert(sid, s);
+        self.write_state();
+        self.mirror(relay::RelayOut::UpsertSession {
+            id: sid.to_string(),
+            name: sname,
+            kind: skind,
+        });
+        if let Some(c) = self.clients.get_mut(&from) {
+            send_frame(
+                c,
+                &Frame::AgentTalkOk {
+                    req_id: req_id.to_string(),
+                    session: sid.to_string(),
+                    pane: pid.to_string(),
                 },
             );
         }
@@ -1438,10 +1681,10 @@ impl Daemon {
     /// caller_pane field (control API / forge bridge stamp it), falling
     /// back to the thread-local (reserved) and finally nil = human.
     fn frame_caller(frame_caller: &str, _req_id: &str) -> Uuid {
-        if let Ok(u) = Uuid::parse_str(frame_caller) {
-            if !u.is_nil() {
-                return u;
-            }
+        if let Ok(u) = Uuid::parse_str(frame_caller)
+            && !u.is_nil()
+        {
+            return u;
         }
         caller_pane()
     }
@@ -1462,10 +1705,10 @@ impl Daemon {
             .filter(|(_, c)| c.attach == Some(sid))
             .map(|(f, _)| *f)
             .collect();
-        if let Some(fd) = also {
-            if !recipients.contains(&fd) {
-                recipients.push(fd);
-            }
+        if let Some(fd) = also
+            && !recipients.contains(&fd)
+        {
+            recipients.push(fd);
         }
         for rfd in recipients {
             if let Some(c) = self.clients.get_mut(&rfd) {
@@ -1489,14 +1732,14 @@ impl Daemon {
         let row = agenttools::agent_done_row(spawn, spawned_pane, outcome, last_row.as_ref());
         // inject into the caller pane's chat cache (if it's a chat pane)
         let caller_sid = self.find_chat(caller_pane);
-        if let Some(cs) = caller_sid {
-            if let Some(s) = self.sessions.get_mut(&cs) {
-                if let Some(cp) = s.chats.get_mut(&caller_pane) {
-                    cp.chat.push(row.clone());
-                }
-            }
+        if let Some(cs) = caller_sid
+            && let Some(s) = self.sessions.get_mut(&cs)
+            && let Some(cp) = s.chats.get_mut(&caller_pane)
+        {
+            cp.chat.push(row.clone());
         }
-        let frame = agenttools::agent_done_frame(spawn, spawned_session, spawned_pane, outcome, last_row);
+        let frame =
+            agenttools::agent_done_frame(spawn, spawned_session, spawned_pane, outcome, last_row);
         match caller_sid {
             Some(cs) => self.broadcast_to_session(cs, &frame, None),
             None => {
@@ -1571,7 +1814,9 @@ impl Daemon {
                         callback_fired: false,
                     };
                     let preview: String = prompt.chars().take(120).collect();
-                    self.spawns.pending.insert(spawn_id.clone(), (rec, Instant::now()));
+                    self.spawns
+                        .pending
+                        .insert(spawn_id.clone(), (rec, Instant::now()));
                     let req = Frame::AgentSpawnRequest {
                         spawn_id,
                         caller_pane: caller.to_string(),
@@ -1599,15 +1844,32 @@ impl Daemon {
             cwd.clone().or_else(|| {
                 let caller = Uuid::parse_str(caller_pane).unwrap_or(Uuid::nil());
                 self.sessions.values().find_map(|s| {
-                    s.panes.get(&caller).and_then(|p| pane_cwd(p.child)).map(|p| p.to_string_lossy().to_string())
+                    s.panes
+                        .get(&caller)
+                        .and_then(|p| pane_cwd(p.child))
+                        .map(|p| p.to_string_lossy().to_string())
                 })
             })
         };
 
         let result: Result<(Uuid, Uuid), String> = if mode == "session" {
-            self.spawn_agent_session(kind, name.clone(), anchor, prompt, callback, spawn_id.clone())
+            self.spawn_agent_session(
+                kind,
+                name.clone(),
+                anchor,
+                prompt,
+                callback,
+                spawn_id.clone(),
+            )
         } else {
-            self.spawn_agent_split(kind, caller_session, anchor, prompt, callback, spawn_id.clone())
+            self.spawn_agent_split(
+                kind,
+                caller_session,
+                anchor,
+                prompt,
+                callback,
+                spawn_id.clone(),
+            )
         };
         match result {
             Ok((sid, pid)) => {
@@ -1686,7 +1948,13 @@ impl Daemon {
                     .forge_pipe_w
                     .clone()
                     .ok_or("no agent pipe (forge disabled?)")?;
-                pilocal::LocalPi::spawn(pid, &dir_str, pilocal::no_tools_configured(), pipe_w, &mut self.pi_agents)?;
+                pilocal::LocalPi::spawn(
+                    pid,
+                    &dir_str,
+                    pilocal::no_tools_configured(),
+                    pipe_w,
+                    &mut self.pi_agents,
+                )?;
                 s.chats.insert(
                     pid,
                     ChatPane {
@@ -1698,7 +1966,7 @@ impl Daemon {
                         context: None,
                         cwd: Some(dir_str),
                         busy: false,
-                    }
+                    },
                 );
             }
             "forge" => {
@@ -1720,15 +1988,19 @@ impl Daemon {
                         context: None,
                         cwd: dir.map(|p| p.to_string_lossy().to_string()),
                         busy: false,
-                    }
+                    },
                 );
                 if let Some(tx) = &self.forge_tx {
-                    let _ = tx.send(forge::ForgeJob::Watch { pane: pid, forge_sid });
+                    let _ = tx.send(forge::ForgeJob::Watch {
+                        pane: pid,
+                        forge_sid,
+                    });
                 }
             }
             _ => return Err(format!("unknown kind {kind:?}")),
         }
-        s.win_mut().split_leaf(&target.to_string(), &pid.to_string(), 1);
+        s.win_mut()
+            .split_leaf(&target.to_string(), &pid.to_string(), 1);
         s.active = pid;
         s.apply_sizes();
         self.resnap(&sid);
@@ -1754,12 +2026,7 @@ impl Daemon {
             "pi" => Uuid::nil(),
             "forge" => {
                 let fcfg = forge::load_forge_config().ok_or("forge not configured")?;
-                forge::create_forge_session(
-                    &fcfg,
-                    &name,
-                    cwd.as_deref(),
-                    None,
-                )?
+                forge::create_forge_session(&fcfg, &name, cwd.as_deref(), None)?
             }
             _ => return Err(format!("unknown kind {kind:?}")),
         };
@@ -1771,7 +2038,9 @@ impl Daemon {
             active: Uuid::nil(),
             size: (80, 24),
             windows: vec![Window::new(
-                Layout::Leaf { pane: pid.to_string() },
+                Layout::Leaf {
+                    pane: pid.to_string(),
+                },
                 "0".into(),
             )],
             win: 0,
@@ -1785,7 +2054,13 @@ impl Daemon {
                 .forge_pipe_w
                 .clone()
                 .ok_or("no agent pipe (forge disabled?)")?;
-            pilocal::LocalPi::spawn(pid, &dir_str, pilocal::no_tools_configured(), pipe_w, &mut self.pi_agents)?;
+            pilocal::LocalPi::spawn(
+                pid,
+                &dir_str,
+                pilocal::no_tools_configured(),
+                pipe_w,
+                &mut self.pi_agents,
+            )?;
             s.chats.insert(
                 pid,
                 ChatPane {
@@ -1797,7 +2072,7 @@ impl Daemon {
                     context: None,
                     cwd: Some(dir_str),
                     busy: false,
-                }
+                },
             );
         } else {
             s.chats.insert(
@@ -1811,10 +2086,13 @@ impl Daemon {
                     context: None,
                     cwd,
                     busy: false,
-                }
+                },
             );
             if let Some(tx) = &self.forge_tx {
-                let _ = tx.send(forge::ForgeJob::Watch { pane: pid, forge_sid });
+                let _ = tx.send(forge::ForgeJob::Watch {
+                    pane: pid,
+                    forge_sid,
+                });
             }
         }
         s.active = pid;
@@ -1830,15 +2108,17 @@ impl Daemon {
 
     /// Send a prompt to a chat pane's agent (shared by spawn + AgentSend).
     fn send_agent_prompt(&mut self, pid: Uuid, text: &str) {
-        let backing = self.sessions.values().find_map(|s| s.chats.get(&pid).map(|cp| cp.forge_sid));
+        let backing = self
+            .sessions
+            .values()
+            .find_map(|s| s.chats.get(&pid).map(|cp| cp.forge_sid));
         match backing {
             Some(fsid) if fsid.is_nil() => {
-                if let Some(lp) = self.pi_agents.get(&pid) {
-                    if let Some(pipe_w) = &self.forge_pipe_w {
-                        if let Err(e) = lp.prompt(pipe_w, text, text, &[], &[]) {
-                            eprintln!("ranchd: pi prompt failed: {e}");
-                        }
-                    }
+                if let Some(lp) = self.pi_agents.get(&pid)
+                    && let Some(pipe_w) = &self.forge_pipe_w
+                    && let Err(e) = lp.prompt(pipe_w, text, text, &[], &[])
+                {
+                    eprintln!("ranchd: pi prompt failed: {e}");
                 }
             }
             Some(fsid) => {
@@ -1854,18 +2134,18 @@ impl Daemon {
         }
     }
 
-    fn handle_agent_send(
-        &mut self,
-        from: RawFd,
-        req_id: &str,
-        caller_pane: &str,
-        session: &str,
-        pane: &str,
-        text: &str,
-        delivery: &str,
-    ) {
+    fn handle_agent_send(&mut self, a: &AgentSendArgs<'_>) {
+        let delivery = a.delivery;
+        let req_id = a.req_id;
+        let caller_pane = a.caller_pane;
+        let session = a.session;
+        let pane = a.pane;
+        let text = a.text;
+        let from = a.from;
         let _ = delivery; // steer vs queue: forge has no queue concept; pi steer == prompt-while-working
-        let Ok(pid) = Uuid::parse_str(pane) else { return };
+        let Ok(pid) = Uuid::parse_str(pane) else {
+            return;
+        };
         let caller = Self::frame_caller(caller_pane, req_id);
         if !self.spawns.authorized(caller, pid) {
             if let Some(c) = self.clients.get_mut(&from) {
@@ -1904,7 +2184,9 @@ impl Daemon {
         session: &str,
         pane: &str,
     ) {
-        let Ok(pid) = Uuid::parse_str(pane) else { return };
+        let Ok(pid) = Uuid::parse_str(pane) else {
+            return;
+        };
         let caller = Self::frame_caller(caller_pane, req_id);
         if !self.spawns.authorized(caller, pid) {
             if let Some(c) = self.clients.get_mut(&from) {
@@ -1945,35 +2227,35 @@ impl Daemon {
         // kill the backing agent + remove the pane (tmux semantics via
         // remove_pane_everywhere: killing the last pane kills the
         // session — that's the right default for agent fan-out too)
-        if let Some(s) = self.sessions.get_mut(&sid) {
-            if s.chats.remove(&pid).is_some() {
-                if let Some(lp) = self.pi_agents.remove(&pid) {
-                    if let Some(pid) = lp.kill() {
-                        self.orphans.push(pid);
-                    }
-                }
-                if let Some(tx) = &self.forge_tx {
-                    let _ = tx.send(forge::ForgeJob::Unwatch { pane: pid });
-                }
-                s.remove_pane_everywhere(&pid.to_string());
-                s.apply_sizes();
+        if let Some(s) = self.sessions.get_mut(&sid)
+            && s.chats.remove(&pid).is_some()
+        {
+            if let Some(lp) = self.pi_agents.remove(&pid)
+                && let Some(pid) = lp.kill()
+            {
+                self.orphans.push(pid);
             }
+            if let Some(tx) = &self.forge_tx {
+                let _ = tx.send(forge::ForgeJob::Unwatch { pane: pid });
+            }
+            s.remove_pane_everywhere(&pid.to_string());
+            s.apply_sizes();
         }
         // last chat pane gone (or window collapse) -> kill the session
-        let session_dead = self.sessions.get(&sid).is_none_or(|s| {
-            s.windows.is_empty()
-                || s.win().pane_ids().is_empty()
-        });
+        let session_dead = self
+            .sessions
+            .get(&sid)
+            .is_none_or(|s| s.windows.is_empty() || s.win().pane_ids().is_empty());
         if session_dead {
             if let Some(s) = self.sessions.remove(&sid) {
                 for p in s.panes.values() {
                     self.orphans.push(p.child);
                 }
                 for cpid in s.chats.keys() {
-                    if let Some(lp) = self.pi_agents.remove(cpid) {
-                        if let Some(pid) = lp.kill() {
-                            self.orphans.push(pid);
-                        }
+                    if let Some(lp) = self.pi_agents.remove(cpid)
+                        && let Some(pid) = lp.kill()
+                    {
+                        self.orphans.push(pid);
                     }
                     if let Some(tx) = &self.forge_tx {
                         let _ = tx.send(forge::ForgeJob::Unwatch { pane: *cpid });
@@ -1988,7 +2270,7 @@ impl Daemon {
                     kind: "exited".into(),
                     status: Some("session ended".into()),
                 };
-                let recipients: Vec<RawFd> = self.clients.iter().map(|(f, _)| *f).collect();
+                let recipients: Vec<RawFd> = self.clients.keys().copied().collect();
                 for rfd in recipients {
                     if let Some(c) = self.clients.get_mut(&rfd) {
                         if c.attach == Some(sid) {
@@ -2027,7 +2309,14 @@ impl Daemon {
             return;
         };
         if !allow {
-            self.deliver_agent_done(rec.caller_pane, &rec, Uuid::nil(), Uuid::nil(), "denied", None);
+            self.deliver_agent_done(
+                rec.caller_pane,
+                &rec,
+                Uuid::nil(),
+                Uuid::nil(),
+                "denied",
+                None,
+            );
             return;
         }
         // approved: re-dispatch the original spawn via the stored record.
@@ -2149,19 +2438,17 @@ impl Daemon {
     /// A client answered a pending question. First answer wins; the
     /// answer is recorded and re-broadcast so every client can dismiss
     /// its prompt and show the chosen value.
-    fn handle_agent_ask_answer(
-        &mut self,
-        ask_id: &str,
-        choices: Vec<usize>,
-        text: &str,
-    ) {
+    fn handle_agent_ask_answer(&mut self, ask_id: &str, choices: Vec<usize>, text: &str) {
         let Some(rec) = self.asks.get_mut(ask_id) else {
             return; // unknown or already pruned
         };
         if rec.answered_at.is_some() {
             return; // already answered (idempotent)
         }
-        rec.answer = Some(agenttools::AskAnswer { choices: choices.clone(), text: text.to_string() });
+        rec.answer = Some(agenttools::AskAnswer {
+            choices: choices.clone(),
+            text: text.to_string(),
+        });
         rec.answered_at = Some(Instant::now());
 
         // Re-broadcast the answer so all clients update/dismiss.
@@ -2180,7 +2467,13 @@ impl Daemon {
     }
 
     /// Agent polls whether its question has been answered yet.
-    fn handle_agent_ask_status(&mut self, from: RawFd, req_id: &str, caller_pane: &str, ask_id: &str) {
+    fn handle_agent_ask_status(
+        &mut self,
+        from: RawFd,
+        req_id: &str,
+        caller_pane: &str,
+        ask_id: &str,
+    ) {
         let caller = Uuid::parse_str(caller_pane).unwrap_or(Uuid::nil());
         let (state, choices, text) = match self.asks.get(ask_id) {
             None => ("unknown".to_string(), Vec::new(), String::new()),
@@ -2301,8 +2594,7 @@ impl Daemon {
         match relay::make_pipes() {
             Ok(((f_daemon_r, f_daemon_w), (_u1, _u2))) => {
                 if let Ok(clone) = f_daemon_w.try_clone() {
-                    daemon.forge_pipe_w =
-                        Some(std::sync::Arc::new(std::sync::Mutex::new(clone)));
+                    daemon.forge_pipe_w = Some(std::sync::Arc::new(std::sync::Mutex::new(clone)));
                 }
                 let fclient = Client {
                     stream: None,
@@ -2328,7 +2620,9 @@ impl Daemon {
                     eprintln!("ranchd: forge: worker started");
                     daemon.forge_tx = Some(tx);
                 } else {
-                    eprintln!("ranchd: forge: disabled (no forge_api_key in daemon.toml); agent pipe available for local pi panes");
+                    eprintln!(
+                        "ranchd: forge: disabled (no forge_api_key in daemon.toml); agent pipe available for local pi panes"
+                    );
                     // f_daemon_w drops here; the clone in forge_pipe_w
                     // keeps the pipe write side open for pi readers.
                 }
@@ -2342,13 +2636,13 @@ impl Daemon {
         // pane-addressed Chat/Meta rows + request replies; the pre-match
         // resolves + broadcasts them like forge's)
         if let Some(mcfg) = mule::load_mule_config() {
-            if let Some(pipe_w) = &daemon.forge_pipe_w {
-                if let Ok(clone) = pipe_w.lock().unwrap().try_clone() {
-                    let (tx, rx) = std::sync::mpsc::channel();
-                    mule::spawn_worker(mcfg, clone, rx);
-                    daemon.mule_tx = Some(tx);
-                    eprintln!("ranchd: mule: worker started");
-                }
+            if let Some(pipe_w) = &daemon.forge_pipe_w
+                && let Ok(clone) = pipe_w.lock().unwrap().try_clone()
+            {
+                let (tx, rx) = std::sync::mpsc::channel();
+                mule::spawn_worker(mcfg, clone, rx);
+                daemon.mule_tx = Some(tx);
+                eprintln!("ranchd: mule: worker started");
             }
         } else {
             eprintln!("ranchd: mule: disabled (no mule_url in daemon.toml)");
@@ -2391,7 +2685,13 @@ impl Daemon {
     }
 
     fn write_state(&self) {
-        let v = state_value(&self.sessions, &self.pi_agents, Some(&self.spawns), Some(&self.triggers), self.monitor_external_pi);
+        let v = state_value(
+            &self.sessions,
+            &self.pi_agents,
+            Some(&self.spawns),
+            Some(&self.triggers),
+            self.monitor_external_pi,
+        );
         if let Ok(json) = serde_json::to_string_pretty(&v) {
             std::fs::write(&self.state_path, json).ok();
         }
@@ -2422,7 +2722,7 @@ impl Daemon {
         let manifest_path = self.state_path.with_extension("manifest.json");
 
         let mut fds = serde_json::json!({ "panes": {}, "pi": [] });
-        for (_sid, s) in &self.sessions {
+        for s in self.sessions.values() {
             for (pid, p) in &s.panes {
                 if p.dead {
                     continue;
@@ -2447,7 +2747,13 @@ impl Daemon {
         }
 
         // manifest: Tier-1 state (same shape as state.json) + the fd map
-        let state = state_value(&self.sessions, &self.pi_agents, Some(&self.spawns), Some(&self.triggers), self.monitor_external_pi);
+        let state = state_value(
+            &self.sessions,
+            &self.pi_agents,
+            Some(&self.spawns),
+            Some(&self.triggers),
+            self.monitor_external_pi,
+        );
         let manifest = serde_json::json!({ "state": state, "fds": fds });
         std::fs::write(
             &manifest_path,
@@ -2476,7 +2782,7 @@ impl Daemon {
         ));
         let exe_c = std::ffi::CString::new(exe.as_os_str().as_encoded_bytes())
             .map_err(|_| "exe cstring".to_string())?;
-        let arg1: *const libc::c_char = b"--inherit\0".as_ptr() as *const libc::c_char;
+        let arg1: *const libc::c_char = c"--inherit".as_ptr();
         let arg2 = std::ffi::CString::new(manifest_path.as_os_str().as_encoded_bytes())
             .map_err(|_| "manifest cstring".to_string())?;
         let listener_arg = std::ffi::CString::new(format!("--listen-fd={inherited_listener}"))
@@ -2492,7 +2798,9 @@ impl Daemon {
         // exec failed — restore the real listener from the CLOEXEC-cleared
         // dup and resume serving (self.listener now owns the dup)
         self.listener = unsafe {
-            <std::os::unix::net::UnixListener as std::os::fd::FromRawFd>::from_raw_fd(real_listener_dup)
+            <std::os::unix::net::UnixListener as std::os::fd::FromRawFd>::from_raw_fd(
+                real_listener_dup,
+            )
         };
         Err(format!(
             "execvp failed: {}",
@@ -2672,7 +2980,7 @@ impl Daemon {
                             context: None,
                             cwd: cwd.clone(),
                             busy: false,
-                        }
+                        },
                     );
                     if fsid.is_nil() {
                         if let Some((si, so, cpid)) = pi_fds.get(&pid.to_string()).copied() {
@@ -2779,7 +3087,10 @@ impl Daemon {
         // trigger registry (Phase D)
         self.triggers = triggers::Scheduler::from_value(&v, self.mule_tx.clone());
         // pi monitor external sessions toggle
-        self.monitor_external_pi = v.get("monitor_external_pi").and_then(|x| x.as_bool()).unwrap_or(false);
+        self.monitor_external_pi = v
+            .get("monitor_external_pi")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false);
         let Some(sessions) = v.get("sessions").and_then(|s| s.as_array()) else {
             return;
         };
@@ -2850,7 +3161,7 @@ impl Daemon {
                             context: None,
                             cwd: cwd.clone(),
                             busy: false,
-                        }
+                        },
                     );
                     chat_ids.push(pid);
                     let is_pi = fsid.is_nil();
@@ -2893,15 +3204,23 @@ impl Daemon {
                                         if let Some(agent) = self.pi_agents.get(&pid) {
                                             match agent.switch_session(sf) {
                                                 Ok(()) => {
-                                                    eprintln!("ranchd: pi switch_session ok (attempt {}): {sf}", attempt + 1);
+                                                    eprintln!(
+                                                        "ranchd: pi switch_session ok (attempt {}): {sf}",
+                                                        attempt + 1
+                                                    );
                                                     switched = true;
                                                     break;
                                                 }
                                                 Err(e) if attempt < 4 => {
-                                                    eprintln!("ranchd: pi switch_session attempt {}/5 failed: {e} — retrying", attempt + 1);
+                                                    eprintln!(
+                                                        "ranchd: pi switch_session attempt {}/5 failed: {e} — retrying",
+                                                        attempt + 1
+                                                    );
                                                 }
                                                 Err(e) => {
-                                                    eprintln!("ranchd: pi switch_session failed after retries: {e}");
+                                                    eprintln!(
+                                                        "ranchd: pi switch_session failed after retries: {e}"
+                                                    );
                                                 }
                                             }
                                         }
@@ -2917,21 +3236,30 @@ impl Daemon {
                                     // user sees, and the next successful switch
                                     // (or fresh prompt) reconciles pi's side.
                                     if !switched {
-                                        eprintln!("ranchd: pi history: loading rows from {sf} despite switch failure");
+                                        eprintln!(
+                                            "ranchd: pi history: loading rows from {sf} despite switch failure"
+                                        );
                                     }
                                     {
                                         match pilocal::LocalPi::read_session_messages(sf) {
                                             Ok(msgs) if !msgs.is_empty() => {
-                                                eprintln!("ranchd: pi history: loaded {} rows from {sf}", msgs.len());
+                                                eprintln!(
+                                                    "ranchd: pi history: loaded {} rows from {sf}",
+                                                    msgs.len()
+                                                );
                                                 if let Some(cp) = s.chats.get_mut(&pid) {
                                                     cp.chat = msgs;
                                                 }
                                             }
                                             Ok(_) => {
-                                                eprintln!("ranchd: pi history: session file {sf} had no messages");
+                                                eprintln!(
+                                                    "ranchd: pi history: session file {sf} had no messages"
+                                                );
                                             }
                                             Err(e) => {
-                                                eprintln!("ranchd: pi history: failed to read {sf}: {e}");
+                                                eprintln!(
+                                                    "ranchd: pi history: failed to read {sf}: {e}"
+                                                );
                                             }
                                         }
                                     }
@@ -3098,9 +3426,10 @@ impl Daemon {
             .map(|s| {
                 // busy = an agent pane is mid-turn: the cached working
                 // flag, or the snapshot heuristic (last row is a user row)
-                let busy = s.chats.values().any(|cp| {
-                    cp.busy || cp.chat.last().is_some_and(|m| m.role == "user")
-                });
+                let busy = s
+                    .chats
+                    .values()
+                    .any(|cp| cp.busy || cp.chat.last().is_some_and(|m| m.role == "user"));
                 // cwd = the active pane's directory (live /proc for PTY
                 // panes, recorded spawn dir for chat panes)
                 let cwd = s
@@ -3165,10 +3494,7 @@ impl Daemon {
             // shared/public account (e.g. the ranch demo) must not be able
             // to do. Only direct (unix-socket) clients may upgrade.
             Frame::Upgrade {} => {
-                let relayed = self
-                    .clients
-                    .get(&from)
-                    .is_some_and(|c| c.name == "relay");
+                let relayed = self.clients.get(&from).is_some_and(|c| c.name == "relay");
                 if relayed {
                     eprintln!("ranchd: upgrade denied: relay clients may not hot-upgrade");
                     if let Some(c) = self.clients.get_mut(&from) {
@@ -3176,7 +3502,9 @@ impl Daemon {
                             c,
                             &Frame::Error {
                                 req_id: None,
-                                message: "upgrade denied: remote clients may not hot-upgrade the daemon".into(),
+                                message:
+                                    "upgrade denied: remote clients may not hot-upgrade the daemon"
+                                        .into(),
                             },
                         );
                     }
@@ -3215,39 +3543,42 @@ impl Daemon {
                 // Inline attached text-file content into the prompt; image
                 // attachments become vision payloads (pi) or path notes
                 // (forge) — see plan_attachments.
-                let (augmented, images) = plan_attachments(&text, &attachments);
-                if let Some(s) = self.sessions.get(&sid) {
-                    if let Some(cp) = s.chats.get(&pid) {
-                        if cp.forge_sid.is_nil() {
-                            // local pi backing: prompt the child directly
-                            // (images inline via the RPC `images` field)
-                            if let Some(lp) = self.pi_agents.get(&pid) {
-                                if let Some(pipe_w) = &self.forge_pipe_w {
-                                    if let Err(e) = lp.prompt(pipe_w, &augmented, &text, &attachments, &images) {
-                                        eprintln!("ranchd: pi prompt failed: {e}");
-                                    }
-                                }
-                            }
-                        } else if let Some(tx) = &self.forge_tx {
-                            // forge's POST /messages is text-only: the
-                            // agent sees the image via its Read tool, so
-                            // hand it the paths
-                            let text = if images.is_empty() {
-                                augmented
-                            } else {
-                                let mut t = String::with_capacity(augmented.len() + 128 * images.len());
-                                for img in &images {
-                                    t.push_str(&format!("[Attached image: {} ({} — view it with your Read tool)]\n", img.path, img.mime));
-                                }
-                                t.push_str(&augmented);
-                                t
-                            };
-                            let _ = tx.send(forge::ForgeJob::Send {
-                                pane: pid,
-                                forge_sid: cp.forge_sid,
-                                text,
-                            });
+                let (augmented, images) = plan_attachments(text, attachments);
+                if let Some(s) = self.sessions.get(&sid)
+                    && let Some(cp) = s.chats.get(&pid)
+                {
+                    if cp.forge_sid.is_nil() {
+                        // local pi backing: prompt the child directly
+                        // (images inline via the RPC `images` field)
+                        if let Some(lp) = self.pi_agents.get(&pid)
+                            && let Some(pipe_w) = &self.forge_pipe_w
+                            && let Err(e) =
+                                lp.prompt(pipe_w, &augmented, text, attachments, &images)
+                        {
+                            eprintln!("ranchd: pi prompt failed: {e}");
                         }
+                    } else if let Some(tx) = &self.forge_tx {
+                        // forge's POST /messages is text-only: the
+                        // agent sees the image via its Read tool, so
+                        // hand it the paths
+                        let text = if images.is_empty() {
+                            augmented
+                        } else {
+                            let mut t = String::with_capacity(augmented.len() + 128 * images.len());
+                            for img in &images {
+                                t.push_str(&format!(
+                                    "[Attached image: {} ({} — view it with your Read tool)]\n",
+                                    img.path, img.mime
+                                ));
+                            }
+                            t.push_str(&augmented);
+                            t
+                        };
+                        let _ = tx.send(forge::ForgeJob::Send {
+                            pane: pid,
+                            forge_sid: cp.forge_sid,
+                            text,
+                        });
                     }
                 }
             }
@@ -3263,21 +3594,20 @@ impl Daemon {
                 let Ok(pid) = Uuid::parse_str(pane) else {
                     return;
                 };
-                if let Some(s) = self.sessions.get(&sid) {
-                    if let Some(cp) = s.chats.get(&pid) {
-                        if cp.forge_sid.is_nil() {
-                            if let Some(lp) = self.pi_agents.get(&pid) {
-                                if let Some(pipe_w) = &self.forge_pipe_w {
-                                    if let Err(e) = lp.interrupt(pipe_w) {
-                                        eprintln!("ranchd: pi interrupt failed: {e}");
-                                    }
-                                }
-                            }
-                        } else if let Some(tx) = &self.forge_tx {
-                            let _ = tx.send(forge::ForgeJob::Interrupt {
-                                forge_sid: cp.forge_sid,
-                            });
+                if let Some(s) = self.sessions.get(&sid)
+                    && let Some(cp) = s.chats.get(&pid)
+                {
+                    if cp.forge_sid.is_nil() {
+                        if let Some(lp) = self.pi_agents.get(&pid)
+                            && let Some(pipe_w) = &self.forge_pipe_w
+                            && let Err(e) = lp.interrupt(pipe_w)
+                        {
+                            eprintln!("ranchd: pi interrupt failed: {e}");
                         }
+                    } else if let Some(tx) = &self.forge_tx {
+                        let _ = tx.send(forge::ForgeJob::Interrupt {
+                            forge_sid: cp.forge_sid,
+                        });
                     }
                 }
             }
@@ -3330,7 +3660,11 @@ impl Daemon {
                     *free_text,
                 );
             }
-            Frame::AgentAskAnswer { ask_id, choices, text } => {
+            Frame::AgentAskAnswer {
+                ask_id,
+                choices,
+                text,
+            } => {
                 self.handle_agent_ask_answer(ask_id, choices.clone(), text);
             }
             Frame::AgentAskStatus {
@@ -3338,12 +3672,7 @@ impl Daemon {
                 caller_pane,
                 ask_id,
             } => {
-                self.handle_agent_ask_status(
-                    from,
-                    req_id,
-                    caller_pane,
-                    ask_id,
-                );
+                self.handle_agent_ask_status(from, req_id, caller_pane, ask_id);
             }
             Frame::AgentSend {
                 req_id,
@@ -3353,25 +3682,32 @@ impl Daemon {
                 text,
                 delivery,
             } => {
-                self.handle_agent_send(from, req_id, caller_pane, session, pane, text, delivery);
-            }
-            Frame::AgentStatus {
-                req_id,
-                pane,
-                ..
-            } => {
-                let Ok(pid) = Uuid::parse_str(pane) else { return };
-                let info = self.sessions.values().find_map(|s| {
-                    s.chats.get(&pid).map(|cp| (s.id, cp.model.clone()))
+                self.handle_agent_send(&AgentSendArgs {
+                    from,
+                    req_id,
+                    caller_pane,
+                    session,
+                    pane,
+                    text,
+                    delivery,
                 });
+            }
+            Frame::AgentStatus { req_id, pane, .. } => {
+                let Ok(pid) = Uuid::parse_str(pane) else {
+                    return;
+                };
+                let info = self
+                    .sessions
+                    .values()
+                    .find_map(|s| s.chats.get(&pid).map(|cp| (s.id, cp.model.clone())));
                 // status is read-only and non-sensitive; allow
                 let (state, model) = match &info {
                     Some((_, model)) => {
                         // busy = last row is a user row (snapshot heuristic)
                         let busy = self.sessions.values().find_map(|s| {
-                            s.chats.get(&pid).map(|cp| {
-                                cp.chat.last().is_some_and(|l| l.role == "user")
-                            })
+                            s.chats
+                                .get(&pid)
+                                .map(|cp| cp.chat.last().is_some_and(|l| l.role == "user"))
                         });
                         (
                             match busy {
@@ -3404,7 +3740,9 @@ impl Daemon {
                 since_seq,
                 limit,
             } => {
-                let Ok(pid) = Uuid::parse_str(pane) else { return };
+                let Ok(pid) = Uuid::parse_str(pane) else {
+                    return;
+                };
                 let caller = Self::frame_caller(caller_pane, req_id);
                 let authorized = caller.is_nil() || self.spawns.authorized(caller, pid);
                 let msgs = if !authorized {
@@ -3460,9 +3798,10 @@ impl Daemon {
                 let Ok(pid) = Uuid::parse_str(pane) else {
                     return;
                 };
-                let backing = self.sessions.iter().find_map(|(_, s)| {
-                    s.chats.get(&pid).map(|cp| cp.forge_sid)
-                });
+                let backing = self
+                    .sessions
+                    .iter()
+                    .find_map(|(_, s)| s.chats.get(&pid).map(|cp| cp.forge_sid));
                 match backing {
                     Some(fsid) if fsid.is_nil() => {
                         // local pi pane: ask the rpc child (the reader
@@ -3677,7 +4016,12 @@ impl Daemon {
             // attach; the frame carries the session in `session` —
             // the worker leaves it blank, so resolve from the pane)
             // client -> daemon: local directory listing (cheap, sync)
-            Frame::DirList { req_id, path, hidden, .. } => {
+            Frame::DirList {
+                req_id,
+                path,
+                hidden,
+                ..
+            } => {
                 let base = path
                     .clone()
                     .filter(|p| !p.is_empty())
@@ -3811,23 +4155,20 @@ impl Daemon {
                         );
                     }
                 };
-                if let Some(expected) = mtime {
-                    match std::fs::metadata(file) {
-                        Ok(meta) => {
-                            let cur = meta
-                                .modified()
-                                .ok()
-                                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                                .map(|d| d.as_secs() as i64)
-                                .unwrap_or(0);
-                            if cur != 0 && cur != *expected {
-                                reply_err(format!(
-                                    "file changed on disk (mtime {cur}, you read {expected}) — reload before saving"
-                                ));
-                                return;
-                            }
-                        }
-                        Err(_) => {}
+                if let Some(expected) = mtime
+                    && let Ok(meta) = std::fs::metadata(file)
+                {
+                    let cur = meta
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
+                    if cur != 0 && cur != *expected {
+                        reply_err(format!(
+                            "file changed on disk (mtime {cur}, you read {expected}) — reload before saving"
+                        ));
+                        return;
                     }
                 }
                 let parent = file
@@ -3845,7 +4186,7 @@ impl Daemon {
                     ".{}.ranch-tmp",
                     file.file_name().and_then(|n| n.to_str()).unwrap_or("file")
                 ));
-                match std::fs::write(&tmp, &content) {
+                match std::fs::write(&tmp, content) {
                     Ok(()) => match std::fs::rename(&tmp, file) {
                         Ok(()) => {
                             let mtime = std::fs::metadata(file)
@@ -3883,14 +4224,14 @@ impl Daemon {
             // client -> daemon: upload a file from a remote client (mobile)
             // into the daemon's uploads dir; reply with the absolute path.
             Frame::FilePut {
-                req_id,
-                name,
-                b64,
-                ..
+                req_id, name, b64, ..
             } => {
                 use base64::Engine as _;
                 let dec = base64::engine::general_purpose::STANDARD;
-                eprintln!("ranchd: FilePut from client {from}: name={name} b64_len={}", b64.len());
+                eprintln!(
+                    "ranchd: FilePut from client {from}: name={name} b64_len={}",
+                    b64.len()
+                );
                 let mut reply_err = |msg: String| {
                     if let Some(c) = self.clients.get_mut(&from) {
                         send_frame(
@@ -3932,8 +4273,7 @@ impl Daemon {
                 } else {
                     clean
                 };
-                let uploads = home_dir()
-                    .join(".local/state/ranch/uploads");
+                let uploads = home_dir().join(".local/state/ranch/uploads");
                 if let Err(e) = std::fs::create_dir_all(&uploads) {
                     reply_err(format!("cannot create uploads dir: {e}"));
                     return;
@@ -3942,7 +4282,12 @@ impl Daemon {
                 let dest = uploads.join(format!("{ts}-{clean}"));
                 match std::fs::write(&dest, &bytes) {
                     Ok(()) => {
-                        eprintln!("ranchd: FilePut stored {} ({} bytes) at {}", name, bytes.len(), dest.display());
+                        eprintln!(
+                            "ranchd: FilePut stored {} ({} bytes) at {}",
+                            name,
+                            bytes.len(),
+                            dest.display()
+                        );
                         // uploads are viewable media (images among them)
                         media::register(dest.to_string_lossy().as_ref());
                         if let Some(c) = self.clients.get_mut(&from) {
@@ -3971,7 +4316,10 @@ impl Daemon {
                     }
                 };
                 let mut err_reply = |msg: String| {
-                    get_reply(Frame::Error { req_id: Some(req_id.clone()), message: msg })
+                    get_reply(Frame::Error {
+                        req_id: Some(req_id.clone()),
+                        message: msg,
+                    })
                 };
                 if !media::is_registered(path) {
                     err_reply(format!("{path}: not a registered media path"));
@@ -4020,7 +4368,10 @@ impl Daemon {
                     }
                 };
                 let mut dl_err = |msg: String| {
-                    dl_reply(Frame::Error { req_id: Some(req_id.clone()), message: msg });
+                    dl_reply(Frame::Error {
+                        req_id: Some(req_id.clone()),
+                        message: msg,
+                    });
                 };
                 const CAP: u64 = 16 * 1024 * 1024; // 16 MiB
                 let file = std::path::Path::new(path);
@@ -4083,14 +4434,22 @@ impl Daemon {
                 });
             }
             // client -> daemon: move or rename a file/directory.
-            Frame::FileMove { req_id, from: from_path, to, .. } => {
+            Frame::FileMove {
+                req_id,
+                from: from_path,
+                to,
+                ..
+            } => {
                 let mut mv_reply = |f: Frame| {
                     if let Some(c) = self.clients.get_mut(&from) {
                         send_frame(c, &f);
                     }
                 };
                 let mut mv_err = |msg: String| {
-                    mv_reply(Frame::Error { req_id: Some(req_id.clone()), message: msg });
+                    mv_reply(Frame::Error {
+                        req_id: Some(req_id.clone()),
+                        message: msg,
+                    });
                 };
                 let src = std::path::Path::new(from_path);
                 let dst = std::path::Path::new(to);
@@ -4105,8 +4464,15 @@ impl Daemon {
                 // refuse moving a directory into its own subtree
                 let dst_str = dst.to_string_lossy().to_string();
                 let src_str = src.to_string_lossy().to_string();
-                if std::fs::symlink_metadata(src).ok().is_some_and(|m| m.is_dir()) {
-                    let prefix = if src_str.ends_with('/') { src_str.clone() } else { format!("{src_str}/") };
+                if std::fs::symlink_metadata(src)
+                    .ok()
+                    .is_some_and(|m| m.is_dir())
+                {
+                    let prefix = if src_str.ends_with('/') {
+                        src_str.clone()
+                    } else {
+                        format!("{src_str}/")
+                    };
                     if dst_str == src_str || dst_str.starts_with(&prefix) {
                         mv_err("cannot move a directory into itself".into());
                         return;
@@ -4116,11 +4482,14 @@ impl Daemon {
                     mv_err(format!("destination already exists: {to}"));
                     return;
                 }
-                if let Some(pp) = dst.parent() {
-                    if pp.as_os_str().is_empty() || !pp.is_dir() {
-                        mv_err(format!("destination directory does not exist: {}", pp.display()));
-                        return;
-                    }
+                if let Some(pp) = dst.parent()
+                    && (pp.as_os_str().is_empty() || !pp.is_dir())
+                {
+                    mv_err(format!(
+                        "destination directory does not exist: {}",
+                        pp.display()
+                    ));
+                    return;
                 }
                 match std::fs::rename(src, dst) {
                     Ok(()) => mv_reply(Frame::FileMoveOk {
@@ -4164,7 +4533,10 @@ impl Daemon {
                     }
                 };
                 let mut del_err = |msg: String| {
-                    del_reply(Frame::Error { req_id: Some(req_id.clone()), message: msg });
+                    del_reply(Frame::Error {
+                        req_id: Some(req_id.clone()),
+                        message: msg,
+                    });
                 };
                 if path.is_empty() || path == "/" {
                     del_err("refusing to delete the filesystem root".into());
@@ -4185,14 +4557,22 @@ impl Daemon {
                 }
             }
             // client -> daemon: copy a file/directory to a new location.
-            Frame::FileCopy { req_id, from: from_path, to, .. } => {
+            Frame::FileCopy {
+                req_id,
+                from: from_path,
+                to,
+                ..
+            } => {
                 let mut cp_reply = |f: Frame| {
                     if let Some(c) = self.clients.get_mut(&from) {
                         send_frame(c, &f);
                     }
                 };
                 let mut cp_err = |msg: String| {
-                    cp_reply(Frame::Error { req_id: Some(req_id.clone()), message: msg });
+                    cp_reply(Frame::Error {
+                        req_id: Some(req_id.clone()),
+                        message: msg,
+                    });
                 };
                 let src = std::path::Path::new(from_path);
                 let dst = std::path::Path::new(to);
@@ -4203,8 +4583,15 @@ impl Daemon {
                 // refuse copying a directory into its own subtree
                 let dst_str = dst.to_string_lossy().to_string();
                 let src_str = src.to_string_lossy().to_string();
-                if std::fs::symlink_metadata(src).ok().is_some_and(|m| m.is_dir()) {
-                    let prefix = if src_str.ends_with('/') { src_str.clone() } else { format!("{src_str}/") };
+                if std::fs::symlink_metadata(src)
+                    .ok()
+                    .is_some_and(|m| m.is_dir())
+                {
+                    let prefix = if src_str.ends_with('/') {
+                        src_str.clone()
+                    } else {
+                        format!("{src_str}/")
+                    };
                     if dst_str == src_str || dst_str.starts_with(&prefix) {
                         cp_err("cannot copy a directory into itself".into());
                         return;
@@ -4214,11 +4601,14 @@ impl Daemon {
                     cp_err(format!("destination already exists: {to}"));
                     return;
                 }
-                if let Some(pp) = dst.parent() {
-                    if pp.as_os_str().is_empty() || !pp.is_dir() {
-                        cp_err(format!("destination directory does not exist: {}", pp.display()));
-                        return;
-                    }
+                if let Some(pp) = dst.parent()
+                    && (pp.as_os_str().is_empty() || !pp.is_dir())
+                {
+                    cp_err(format!(
+                        "destination directory does not exist: {}",
+                        pp.display()
+                    ));
+                    return;
                 }
                 match copy_tree(src, dst) {
                     Ok(()) => cp_reply(Frame::FileCopyOk {
@@ -4255,58 +4645,72 @@ impl Daemon {
             // client -> daemon: list resumable local pi sessions
             Frame::PiList { req_id, .. } => {
                 // Collect all ranch-tracked pi session file paths
-                let mut known_files: std::collections::HashSet<String> = std::collections::HashSet::new();
-                for (_, s) in &self.sessions {
+                let mut known_files: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                for s in self.sessions.values() {
                     for (_pid, cp) in &s.chats {
-                        if cp.forge_sid.is_nil() {
-                            if let Some(a) = self.pi_agents.get(&_pid) {
-                                if let Ok(g) = a.session_file.lock() {
-                                    if let Some(sf) = g.clone() {
-                                        known_files.insert(sf);
-                                    }
-                                }
-                            }
+                        if cp.forge_sid.is_nil()
+                            && let Some(a) = self.pi_agents.get(_pid)
+                            && let Ok(g) = a.session_file.lock()
+                            && let Some(sf) = g.clone()
+                        {
+                            known_files.insert(sf);
                         }
                     }
                 }
                 // Live pi agents
-                let mut sessions: Vec<PiSessionInfo> = self.pi_agents.iter().map(|(pid, lp)| {
-                    let cwd = lp.cwd.clone();
-                    let session_file = lp.session_file.lock().ok().and_then(|g| g.clone()).unwrap_or_default();
-                    // Prefer a title derived from the last user message; fall
-                    // back to the working directory while the session file
-                    // hasn't been created yet (pi writes it lazily).
-                    let (title, updated) = if session_file.is_empty() {
-                        (cwd.clone(), String::new())
-                    } else {
-                        (
-                            pi_session_meta(&session_file).1.unwrap_or(cwd.clone()),
-                            file_mtime_secs(&session_file),
-                        )
-                    };
-                    PiSessionInfo {
-                        id: pid.to_string(),
-                        title,
-                        path: cwd,
-                        session_file,
-                        active: true,
-                        external: false,
-                        updated,
-                    }
-                }).collect();
+                let mut sessions: Vec<PiSessionInfo> = self
+                    .pi_agents
+                    .iter()
+                    .map(|(pid, lp)| {
+                        let cwd = lp.cwd.clone();
+                        let session_file = lp
+                            .session_file
+                            .lock()
+                            .ok()
+                            .and_then(|g| g.clone())
+                            .unwrap_or_default();
+                        // Prefer a title derived from the last user message; fall
+                        // back to the working directory while the session file
+                        // hasn't been created yet (pi writes it lazily).
+                        let (title, updated) = if session_file.is_empty() {
+                            (cwd.clone(), String::new())
+                        } else {
+                            (
+                                pi_session_meta(&session_file).1.unwrap_or(cwd.clone()),
+                                file_mtime_secs(&session_file),
+                            )
+                        };
+                        PiSessionInfo {
+                            id: pid.to_string(),
+                            title,
+                            path: cwd,
+                            session_file,
+                            active: true,
+                            external: false,
+                            updated,
+                        }
+                    })
+                    .collect();
                 // External pi sessions: scan ~/.pi/agent/sessions/ when enabled
                 if self.monitor_external_pi {
                     let sessions_dir = home_dir().join(".pi/agent/sessions");
                     if let Ok(entries) = std::fs::read_dir(&sessions_dir) {
                         for entry in entries.flatten() {
                             let sub_dir = entry.path();
-                            if !sub_dir.is_dir() { continue; }
+                            if !sub_dir.is_dir() {
+                                continue;
+                            }
                             if let Ok(files) = std::fs::read_dir(&sub_dir) {
                                 for file_entry in files.flatten() {
                                     let fpath = file_entry.path();
-                                    if fpath.extension().and_then(|e| e.to_str()) != Some("jsonl") { continue; }
+                                    if fpath.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                                        continue;
+                                    }
                                     let path_str = fpath.to_string_lossy().to_string();
-                                    if known_files.contains(&path_str) { continue; }
+                                    if known_files.contains(&path_str) {
+                                        continue;
+                                    }
                                     // (id, last-user-message title, cwd) from
                                     // the session file; falls back below.
                                     let (sid, title, cwd) = pi_session_meta(&path_str);
@@ -4314,11 +4718,19 @@ impl Daemon {
                                     let mtime = file_mtime_secs(&path_str);
                                     // Use directory name as a path fallback;
                                     // prefer the last user message as the title.
-                                    let dir_name = sub_dir.file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string();
+                                    let dir_name = sub_dir
+                                        .file_name()
+                                        .and_then(|n| n.to_str())
+                                        .unwrap_or("unknown")
+                                        .to_string();
                                     sessions.push(PiSessionInfo {
                                         id: sid.unwrap_or(path_str.clone()),
-                                        title: title.filter(|t| !t.is_empty()).unwrap_or(dir_name.clone()),
-                                        path: cwd.filter(|c| !c.is_empty()).unwrap_or(dir_name.clone()),
+                                        title: title
+                                            .filter(|t| !t.is_empty())
+                                            .unwrap_or(dir_name.clone()),
+                                        path: cwd
+                                            .filter(|c| !c.is_empty())
+                                            .unwrap_or(dir_name.clone()),
                                         session_file: path_str,
                                         active: false,
                                         external: true,
@@ -4358,7 +4770,9 @@ impl Daemon {
             Frame::ModelCatalog { req_id } => {
                 match &self.forge_tx {
                     Some(tx) => {
-                        let _ = tx.send(forge::ForgeJob::ModelCatalog { req_id: req_id.clone() });
+                        let _ = tx.send(forge::ForgeJob::ModelCatalog {
+                            req_id: req_id.clone(),
+                        });
                     }
                     None => {
                         if let Some(c) = self.clients.get_mut(&from) {
@@ -4375,61 +4789,110 @@ impl Daemon {
                     }
                 }
             }
-            Frame::ProfileList { req_id } => {
-                match &self.forge_tx {
-                    Some(tx) => {
-                        let _ = tx.send(forge::ForgeJob::ProfileList { req_id: req_id.clone() });
-                    }
-                    None => {
-                        if let Some(c) = self.clients.get_mut(&from) {
-                            send_frame(
-                                c,
-                                &Frame::Error {
-                                    req_id: Some(req_id.clone()),
-                                    message: "forge not configured".into(),
-                                },
-                            );
-                        }
+            Frame::ProfileList { req_id } => match &self.forge_tx {
+                Some(tx) => {
+                    let _ = tx.send(forge::ForgeJob::ProfileList {
+                        req_id: req_id.clone(),
+                    });
+                }
+                None => {
+                    if let Some(c) = self.clients.get_mut(&from) {
+                        send_frame(
+                            c,
+                            &Frame::Error {
+                                req_id: Some(req_id.clone()),
+                                message: "forge not configured".into(),
+                            },
+                        );
                     }
                 }
-            }
-            Frame::ProfileGet { req_id, profile } => {
-                match &self.forge_tx {
-                    Some(tx) => {
-                        let _ = tx.send(forge::ForgeJob::ProfileGet {
-                            req_id: req_id.clone(),
-                            profile_id: profile.clone(),
-                        });
-                    }
-                    None => Self::forge_unconfigured(self, from, req_id),
+            },
+            Frame::ProfileGet { req_id, profile } => match &self.forge_tx {
+                Some(tx) => {
+                    let _ = tx.send(forge::ForgeJob::ProfileGet {
+                        req_id: req_id.clone(),
+                        profile_id: profile.clone(),
+                    });
                 }
-            }
+                None => Self::forge_unconfigured(self, from, req_id),
+            },
             Frame::ProfilePut {
                 req_id,
                 profile_id,
                 draft,
-            } => {
-                match &self.forge_tx {
-                    Some(tx) => {
-                        let _ = tx.send(forge::ForgeJob::ProfilePut {
+            } => match &self.forge_tx {
+                Some(tx) => {
+                    let _ = tx.send(forge::ForgeJob::ProfilePut(Box::new(
+                        forge::ProfilePutBody {
                             req_id: req_id.clone(),
                             profile_id: profile_id.clone(),
                             draft: draft.clone(),
+                        },
+                    )));
+                }
+                None => Self::forge_unconfigured(self, from, req_id),
+            },
+            Frame::ProfileDelete { req_id, profile } => match &self.forge_tx {
+                Some(tx) => {
+                    let _ = tx.send(forge::ForgeJob::ProfileDelete {
+                        req_id: req_id.clone(),
+                        profile_id: profile.clone(),
+                    });
+                }
+                None => Self::forge_unconfigured(self, from, req_id),
+            },
+            // ----- agent registry (Herd H1) -----
+            Frame::AgentList { req_id } => {
+                eprintln!("DEBUG: handle_frame AgentList {req_id}");
+                match &self.forge_tx {
+                    Some(tx) => {
+                        let _ = tx.send(forge::ForgeJob::AgentList {
+                            req_id: req_id.clone(),
                         });
                     }
                     None => Self::forge_unconfigured(self, from, req_id),
                 }
             }
-            Frame::ProfileDelete { req_id, profile } => {
-                match &self.forge_tx {
-                    Some(tx) => {
-                        let _ = tx.send(forge::ForgeJob::ProfileDelete {
-                            req_id: req_id.clone(),
-                            profile_id: profile.clone(),
-                        });
-                    }
-                    None => Self::forge_unconfigured(self, from, req_id),
+            Frame::AgentBusy { req_id, agent } => match &self.forge_tx {
+                Some(tx) => {
+                    let _ = tx.send(forge::ForgeJob::AgentBusy {
+                        req_id: req_id.clone(),
+                        agent: agent.clone(),
+                    });
                 }
+                None => Self::forge_unconfigured(self, from, req_id),
+            },
+            Frame::AgentActivity { req_id, .. } => {
+                // TODO(H5): the Activity worker (forge tasks + memory +
+                // mule workflow runs) fills this in — H1 answers empty
+                // so clients can build against the frame today.
+                if let Some(c) = self.clients.get_mut(&from) {
+                    send_frame(
+                        c,
+                        &Frame::AgentActivityOk {
+                            req_id: req_id.clone(),
+                            items: vec![],
+                        },
+                    );
+                }
+            }
+            Frame::AgentTalk {
+                req_id,
+                agent,
+                mode,
+                text,
+                title,
+                fork_from,
+            } => {
+                self.agent_talk(
+                    from,
+                    req_id,
+                    agent,
+                    mode,
+                    text.clone(),
+                    title.clone(),
+                    fork_from.clone(),
+                );
             }
             // ----- triggers (Phase D) -----
             Frame::TriggerList { req_id } => {
@@ -4486,7 +4949,10 @@ impl Daemon {
                         return Err("trigger workflow_id is required".into());
                     }
                     let kind_tag = trigger.get("kind").and_then(|x| x.as_str()).unwrap_or("");
-                    let spec = trigger.get("spec").cloned().unwrap_or(serde_json::Value::Null);
+                    let spec = trigger
+                        .get("spec")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
                     let kind = match kind_tag {
                         "cron" => {
                             let expr = spec.get("cron").and_then(|x| x.as_str()).unwrap_or("");
@@ -4496,14 +4962,29 @@ impl Daemon {
                             triggers::TriggerKind::Cron { expr: expr.into() }
                         }
                         "event" => triggers::TriggerKind::Event {
-                            event: spec.get("event").and_then(|x| x.as_str()).unwrap_or("").into(),
-                            filter: spec.get("filter").cloned().unwrap_or(serde_json::Value::Null),
+                            event: spec
+                                .get("event")
+                                .and_then(|x| x.as_str())
+                                .unwrap_or("")
+                                .into(),
+                            filter: spec
+                                .get("filter")
+                                .cloned()
+                                .unwrap_or(serde_json::Value::Null),
                         },
                         "webhook" => triggers::TriggerKind::Webhook {
-                            source: spec.get("source").and_then(|x| x.as_str()).unwrap_or("").into(),
+                            source: spec
+                                .get("source")
+                                .and_then(|x| x.as_str())
+                                .unwrap_or("")
+                                .into(),
                             event_tag: spec.get("event").and_then(|x| x.as_str()).map(String::from),
                         },
-                        other => return Err(format!("unknown trigger kind {other:?} (cron|event|webhook)")),
+                        other => {
+                            return Err(format!(
+                                "unknown trigger kind {other:?} (cron|event|webhook)"
+                            ));
+                        }
                     };
                     Ok(triggers::Trigger {
                         id: trigger_id
@@ -4514,8 +4995,14 @@ impl Daemon {
                         workflow_id,
                         kind,
                         input: trigger.get("input").cloned().filter(|x| !x.is_null()),
-                        enabled: trigger.get("enabled").and_then(|x| x.as_bool()).unwrap_or(true),
-                        catch_up: trigger.get("catch_up").and_then(|x| x.as_bool()).unwrap_or(false),
+                        enabled: trigger
+                            .get("enabled")
+                            .and_then(|x| x.as_bool())
+                            .unwrap_or(true),
+                        catch_up: trigger
+                            .get("catch_up")
+                            .and_then(|x| x.as_bool())
+                            .unwrap_or(false),
                         last_run: None,
                     })
                 })();
@@ -4534,7 +5021,13 @@ impl Daemon {
                         self.write_state();
                         self.mirror(mirror);
                         if let Some(c) = self.clients.get_mut(&from) {
-                            send_frame(c, &Frame::TriggerPutOk { req_id: req_id.clone(), trigger_id: id });
+                            send_frame(
+                                c,
+                                &Frame::TriggerPutOk {
+                                    req_id: req_id.clone(),
+                                    trigger_id: id,
+                                },
+                            );
                         }
                     }
                     Err(e) => {
@@ -4558,7 +5051,12 @@ impl Daemon {
                     self.mirror(crate::relay::RelayOut::DeleteTrigger { id: id.to_string() });
                 }
                 if let Some(c) = self.clients.get_mut(&from) {
-                    send_frame(c, &Frame::TriggerDeleteOk { req_id: req_id.clone() });
+                    send_frame(
+                        c,
+                        &Frame::TriggerDeleteOk {
+                            req_id: req_id.clone(),
+                        },
+                    );
                 }
             }
             Frame::TriggerRun { req_id, trigger } => {
@@ -4575,7 +5073,8 @@ impl Daemon {
                             pane: Uuid::nil(),
                         });
                         if let Some(t) = self.triggers.triggers.get_mut(&t.id) {
-                            t.last_run = Some((job_id.clone(), triggers::Scheduler::now(), "queued".into()));
+                            t.last_run =
+                                Some((job_id.clone(), triggers::Scheduler::now(), "queued".into()));
                         }
                         self.write_state();
                         let fired = Frame::TriggerFired {
@@ -4717,8 +5216,7 @@ impl Daemon {
                         );
                         let url = format!(
                             "{}/functions/v1/webhook-relay/w/{}",
-                            rcfg.supabase_url.replace(".supabase.co", ".supabase.co"),
-                            new_id
+                            rcfg.supabase_url, new_id
                         );
                         if let Some(c) = self.clients.get_mut(&from) {
                             send_frame(
@@ -4767,7 +5265,12 @@ impl Daemon {
                             id: webhook.clone(),
                         });
                         if let Some(c) = self.clients.get_mut(&from) {
-                            send_frame(c, &Frame::WebhookDeleteOk { req_id: req_id.clone() });
+                            send_frame(
+                                c,
+                                &Frame::WebhookDeleteOk {
+                                    req_id: req_id.clone(),
+                                },
+                            );
                         }
                     }
                     Err(e) => {
@@ -4785,60 +5288,54 @@ impl Daemon {
             }
 
             // ----- workflows (Phase C): mule proxy -----
-            Frame::MuleAgents { req_id } => {
-                match &self.mule_tx {
-                    Some(tx) => {
-                        let _ = tx.send(mule::MuleJob::Agents { req_id: req_id.clone() });
-                    }
-                    None => Self::mule_unconfigured(self, from, req_id),
+            Frame::MuleAgents { req_id } => match &self.mule_tx {
+                Some(tx) => {
+                    let _ = tx.send(mule::MuleJob::Agents {
+                        req_id: req_id.clone(),
+                    });
                 }
-            }
-            Frame::WorkflowList { req_id } => {
-                match &self.mule_tx {
-                    Some(tx) => {
-                        let _ = tx.send(mule::MuleJob::List { req_id: req_id.clone() });
-                    }
-                    None => Self::mule_unconfigured(self, from, req_id),
+                None => Self::mule_unconfigured(self, from, req_id),
+            },
+            Frame::WorkflowList { req_id } => match &self.mule_tx {
+                Some(tx) => {
+                    let _ = tx.send(mule::MuleJob::List {
+                        req_id: req_id.clone(),
+                    });
                 }
-            }
-            Frame::WorkflowGet { req_id, workflow } => {
-                match &self.mule_tx {
-                    Some(tx) => {
-                        let _ = tx.send(mule::MuleJob::Get {
-                            req_id: req_id.clone(),
-                            workflow_id: workflow.clone(),
-                        });
-                    }
-                    None => Self::mule_unconfigured(self, from, req_id),
+                None => Self::mule_unconfigured(self, from, req_id),
+            },
+            Frame::WorkflowGet { req_id, workflow } => match &self.mule_tx {
+                Some(tx) => {
+                    let _ = tx.send(mule::MuleJob::Get {
+                        req_id: req_id.clone(),
+                        workflow_id: workflow.clone(),
+                    });
                 }
-            }
+                None => Self::mule_unconfigured(self, from, req_id),
+            },
             Frame::WorkflowPut {
                 req_id,
                 workflow_id,
                 draft,
-            } => {
-                match &self.mule_tx {
-                    Some(tx) => {
-                        let _ = tx.send(mule::MuleJob::Put {
-                            req_id: req_id.clone(),
-                            workflow_id: workflow_id.clone(),
-                            draft: draft.clone(),
-                        });
-                    }
-                    None => Self::mule_unconfigured(self, from, req_id),
+            } => match &self.mule_tx {
+                Some(tx) => {
+                    let _ = tx.send(mule::MuleJob::Put {
+                        req_id: req_id.clone(),
+                        workflow_id: workflow_id.clone(),
+                        draft: draft.clone(),
+                    });
                 }
-            }
-            Frame::WorkflowDelete { req_id, workflow } => {
-                match &self.mule_tx {
-                    Some(tx) => {
-                        let _ = tx.send(mule::MuleJob::Delete {
-                            req_id: req_id.clone(),
-                            workflow_id: workflow.clone(),
-                        });
-                    }
-                    None => Self::mule_unconfigured(self, from, req_id),
+                None => Self::mule_unconfigured(self, from, req_id),
+            },
+            Frame::WorkflowDelete { req_id, workflow } => match &self.mule_tx {
+                Some(tx) => {
+                    let _ = tx.send(mule::MuleJob::Delete {
+                        req_id: req_id.clone(),
+                        workflow_id: workflow.clone(),
+                    });
                 }
-            }
+                None => Self::mule_unconfigured(self, from, req_id),
+            },
             Frame::WorkflowRun {
                 req_id,
                 workflow,
@@ -4864,7 +5361,9 @@ impl Daemon {
                     active: Uuid::nil(),
                     size: (80, 24),
                     windows: vec![Window::new(
-                        Layout::Leaf { pane: pid.to_string() },
+                        Layout::Leaf {
+                            pane: pid.to_string(),
+                        },
                         "0".into(),
                     )],
                     win: 0,
@@ -4881,7 +5380,7 @@ impl Daemon {
                         context: None,
                         cwd: None,
                         busy: false,
-                    }
+                    },
                 );
                 sess.active = pid;
                 self.sessions.insert(sid, sess);
@@ -4907,7 +5406,9 @@ impl Daemon {
                 kind,
                 status,
             } if session.is_empty()
-                && (kind == "agent" || kind == "model" || kind == "workflow"
+                && (kind == "agent"
+                    || kind == "model"
+                    || kind == "workflow"
                     || kind == "context") =>
             {
                 let pid = Uuid::parse_str(pane.as_deref().unwrap_or("")).ok();
@@ -4919,35 +5420,30 @@ impl Daemon {
                 if let Some((sid, pid)) = found {
                     // model frames double as the pane cache update so
                     // re-snapshots carry the current model
-                    if kind == "model" {
-                        if let Some(st) = status {
-                            if let Some(s) = self.sessions.get_mut(&sid) {
-                                if let Some(cp) = s.chats.get_mut(&pid) {
-                                    cp.model = Some(st.clone());
-                                }
-                            }
-                        }
+                    if kind == "model"
+                        && let Some(st) = status
+                        && let Some(s) = self.sessions.get_mut(&sid)
+                        && let Some(cp) = s.chats.get_mut(&pid)
+                    {
+                        cp.model = Some(st.clone());
                     }
                     // context readouts cache like model: re-snapshots carry
                     // the last known usage so attaching clients see it
-                    if kind == "context" {
-                        if let Some(st) = status {
-                            if let Some(s) = self.sessions.get_mut(&sid) {
-                                if let Some(cp) = s.chats.get_mut(&pid) {
-                                    cp.context = Some(st.clone());
-                                }
-                            }
-                        }
+                    if kind == "context"
+                        && let Some(st) = status
+                        && let Some(s) = self.sessions.get_mut(&sid)
+                        && let Some(cp) = s.chats.get_mut(&pid)
+                    {
+                        cp.context = Some(st.clone());
                     }
                     // working/idle drives the session-list busy badge: cache
                     // it per pane so HelloOk answers between broadcasts
                     // are correct too
-                    if kind == "agent" {
-                        if let Some(s) = self.sessions.get_mut(&sid) {
-                            if let Some(cp) = s.chats.get_mut(&pid) {
-                                cp.busy = status.as_deref() == Some("working");
-                            }
-                        }
+                    if kind == "agent"
+                        && let Some(s) = self.sessions.get_mut(&sid)
+                        && let Some(cp) = s.chats.get_mut(&pid)
+                    {
+                        cp.busy = status.as_deref() == Some("working");
                     }
                     // Phase D: event triggers see every agent turn end
                     if kind == "agent" && status.as_deref() == Some("idle") {
@@ -4968,27 +5464,26 @@ impl Daemon {
                         }
                     }
                     // Phase D: workflow completion events feed triggers
-                    if kind == "workflow" {
-                        if let Some(st) = status.as_deref() {
-                            if st == "completed" || st == "failed" {
-                                let (tframes, tmirrors) = self.triggers.fire_event(
-                                    "workflow_completed",
-                                    &serde_json::json!({
-                                        "workflow_id": pane.as_deref().unwrap_or(""),
-                                        "pane": pane.as_deref().unwrap_or(""),
-                                        "status": st,
-                                    }),
-                                );
-                                for m in tmirrors {
-                                    self.mirror(m);
-                                }
-                                for f in tframes {
-                                    let fds: Vec<RawFd> = self.clients.keys().copied().collect();
-                                    for fd in fds {
-                                        if let Some(c) = self.clients.get_mut(&fd) {
-                                            send_frame(c, &f);
-                                        }
-                                    }
+                    if kind == "workflow"
+                        && let Some(st) = status.as_deref()
+                        && (st == "completed" || st == "failed")
+                    {
+                        let (tframes, tmirrors) = self.triggers.fire_event(
+                            "workflow_completed",
+                            &serde_json::json!({
+                                "workflow_id": pane.as_deref().unwrap_or(""),
+                                "pane": pane.as_deref().unwrap_or(""),
+                                "status": st,
+                            }),
+                        );
+                        for m in tmirrors {
+                            self.mirror(m);
+                        }
+                        for f in tframes {
+                            let fds: Vec<RawFd> = self.clients.keys().copied().collect();
+                            for fd in fds {
+                                if let Some(c) = self.clients.get_mut(&fd) {
+                                    send_frame(c, &f);
                                 }
                             }
                         }
@@ -5068,18 +5563,16 @@ impl Daemon {
                         *pane = pid.to_string();
                     }
                     // apply to the local cache + broadcast
-                    if let Some(s) = self.sessions.get_mut(&sid) {
-                        if let Some(cp) = s.chats.get_mut(&pid) {
-                            if let Frame::Chat { msgs, reset, .. } = &filled {
-                                if *reset {
-                                    cp.chat = msgs.clone();
-                                } else {
-                                    for m in msgs {
-                                        if cp.chat.last().map(|l| l.seq).is_none_or(|ls| m.seq > ls)
-                                        {
-                                            cp.chat.push(m.clone());
-                                        }
-                                    }
+                    if let Some(s) = self.sessions.get_mut(&sid)
+                        && let Some(cp) = s.chats.get_mut(&pid)
+                        && let Frame::Chat { msgs, reset, .. } = &filled
+                    {
+                        if *reset {
+                            cp.chat = msgs.clone();
+                        } else {
+                            for m in msgs {
+                                if cp.chat.last().map(|l| l.seq).is_none_or(|ls| m.seq > ls) {
+                                    cp.chat.push(m.clone());
                                 }
                             }
                         }
@@ -5099,7 +5592,14 @@ impl Daemon {
                 return;
             }
             // client -> daemon: paged chat history (mobile/web scrollback)
-            Frame::ChatHistory { session, pane, req_id, limit, before, .. } => {
+            Frame::ChatHistory {
+                session,
+                pane,
+                req_id,
+                limit,
+                before,
+                ..
+            } => {
                 let pid = match Uuid::parse_str(pane) {
                     Ok(p) => p,
                     Err(_) => return,
@@ -5112,13 +5612,10 @@ impl Daemon {
                         let rows: Vec<&ChatMsg> = cp
                             .chat
                             .iter()
-                            .filter(|m| before.map_or(true, |b| m.seq < b))
+                            .filter(|m| before.is_none_or(|b| m.seq < b))
                             .collect();
                         let start = rows.len().saturating_sub(lim);
-                        (
-                            rows[start..].iter().cloned().cloned().collect(),
-                            start > 0,
-                        )
+                        (rows[start..].iter().cloned().cloned().collect(), start > 0)
                     });
                 if let Some(c) = self.clients.get_mut(&from) {
                     match page {
@@ -5147,16 +5644,16 @@ impl Daemon {
             // chat pane. Stamp the pane's model in the cache, then
             // broadcast (clients match on req_id).
             Frame::ModelListOk { pane, current, .. } => {
-                if let Some(pid) = Uuid::parse_str(pane).ok() {
-                    let found = self.sessions.iter().find_map(|(sid, s)| {
-                        s.chats.contains_key(&pid).then_some((*sid, pid))
-                    });
-                    if let (Some((sid, pid)), Some(cur)) = (found, current) {
-                        if let Some(s) = self.sessions.get_mut(&sid) {
-                            if let Some(cp) = s.chats.get_mut(&pid) {
-                                cp.model = Some(cur.name.clone());
-                            }
-                        }
+                if let Ok(pid) = Uuid::parse_str(pane) {
+                    let found = self
+                        .sessions
+                        .iter()
+                        .find_map(|(sid, s)| s.chats.contains_key(&pid).then_some((*sid, pid)));
+                    if let (Some((sid, pid)), Some(cur)) = (found, current)
+                        && let Some(s) = self.sessions.get_mut(&sid)
+                        && let Some(cp) = s.chats.get_mut(&pid)
+                    {
+                        cp.model = Some(cur.name.clone());
                     }
                 }
                 let recipients: Vec<RawFd> = self.clients.keys().copied().collect();
@@ -5169,7 +5666,9 @@ impl Daemon {
             }
             // forge worker -> clients: a request error carrying a req_id
             // (e.g. a failed forge model switch); clients match on req_id
-            Frame::Error { req_id: Some(_), .. } => {
+            Frame::Error {
+                req_id: Some(_), ..
+            } => {
                 let recipients: Vec<RawFd> = self.clients.keys().copied().collect();
                 for rfd in recipients {
                     if let Some(c) = self.clients.get_mut(&rfd) {
@@ -5210,7 +5709,9 @@ impl Daemon {
             | Frame::TriggerDeleteOk { .. }
             | Frame::WebhookListOk { .. }
             | Frame::WebhookPutOk { .. }
-            | Frame::WebhookDeleteOk { .. } => {
+            | Frame::WebhookDeleteOk { .. }
+            | Frame::AgentListOk { .. }
+            | Frame::AgentBusyOk { .. } => {
                 let recipients: Vec<RawFd> = self.clients.keys().copied().collect();
                 for rfd in recipients {
                     if let Some(c) = self.clients.get_mut(&rfd) {
@@ -5345,24 +5846,23 @@ impl Daemon {
                     Some(b) => b,
                     None => return,
                 };
-                if let Some(s) = self.sessions.get_mut(&sid) {
-                    if let Some(p) = s.panes.get_mut(&pid) {
-                        if !p.dead {
-                            let n = bytes.len();
-                            let mut written = 0usize;
-                            unsafe {
-                                while written < n {
-                                    let r = libc::write(
-                                        p.master,
-                                        bytes.as_ptr().add(written) as *const _,
-                                        n - written,
-                                    );
-                                    if r <= 0 {
-                                        break;
-                                    }
-                                    written += r as usize;
-                                }
+                if let Some(s) = self.sessions.get_mut(&sid)
+                    && let Some(p) = s.panes.get_mut(&pid)
+                    && !p.dead
+                {
+                    let n = bytes.len();
+                    let mut written = 0usize;
+                    unsafe {
+                        while written < n {
+                            let r = libc::write(
+                                p.master,
+                                bytes.as_ptr().add(written) as *const _,
+                                n - written,
+                            );
+                            if r <= 0 {
+                                break;
                             }
+                            written += r as usize;
                         }
                     }
                 }
@@ -5555,7 +6055,7 @@ impl Daemon {
                                     context: None,
                                     cwd: cwd.clone(),
                                     busy: false,
-                                }
+                                },
                             );
                             s.windows[0].layout = Layout::Leaf {
                                 pane: pid.to_string(),
@@ -5588,19 +6088,20 @@ impl Daemon {
                                             return;
                                         }
                                         // Resume an existing pi session file if provided.
-                                        if let Some(sf) = &pi_session_file {
-                                            if let Some(agent) = self.pi_agents.get(&pid) {
-                                                if let Err(e) = agent.switch_session(sf) {
-                                                    eprintln!("ranchd: pi switch_session failed: {e}");
-                                                } else {
-                                                    eprintln!("ranchd: resumed pi session from {sf}");
-                                                    // show the resumed history, same as restore
-                                                    // (session `s` isn't in self.sessions yet)
-                                                    if let Ok(msgs) = pilocal::LocalPi::read_session_messages(sf) {
-                                                        if let Some(cp) = s.chats.get_mut(&pid) {
-                                                            cp.chat = msgs;
-                                                        }
-                                                    }
+                                        if let Some(sf) = &pi_session_file
+                                            && let Some(agent) = self.pi_agents.get(&pid)
+                                        {
+                                            if let Err(e) = agent.switch_session(sf) {
+                                                eprintln!("ranchd: pi switch_session failed: {e}");
+                                            } else {
+                                                eprintln!("ranchd: resumed pi session from {sf}");
+                                                // show the resumed history, same as restore
+                                                // (session `s` isn't in self.sessions yet)
+                                                if let Ok(msgs) =
+                                                    pilocal::LocalPi::read_session_messages(sf)
+                                                    && let Some(cp) = s.chats.get_mut(&pid)
+                                                {
+                                                    cp.chat = msgs;
                                                 }
                                             }
                                         }
@@ -5621,13 +6122,13 @@ impl Daemon {
                             }
                             // start the SSE watch on forge-backed panes
                             // (local pi panes stream from the child)
-                            if kind == "forge" {
-                                if let Some(tx) = &self.forge_tx {
-                                    let _ = tx.send(forge::ForgeJob::Watch {
-                                        pane: pid,
-                                        forge_sid,
-                                    });
-                                }
+                            if kind == "forge"
+                                && let Some(tx) = &self.forge_tx
+                            {
+                                let _ = tx.send(forge::ForgeJob::Watch {
+                                    pane: pid,
+                                    forge_sid,
+                                });
                             }
                             let ack = Frame::SessionsAck {
                                 req_id: req_id.clone(),
@@ -5720,10 +6221,10 @@ impl Daemon {
                         }
                         // stop the chat panes' backing agents
                         for pid in s.chats.keys() {
-                            if let Some(lp) = self.pi_agents.remove(pid) {
-                                if let Some(pid) = lp.kill() {
-                                    self.orphans.push(pid);
-                                }
+                            if let Some(lp) = self.pi_agents.remove(pid)
+                                && let Some(pid) = lp.kill()
+                            {
+                                self.orphans.push(pid);
                             }
                             if let Some(tx) = &self.forge_tx {
                                 let _ = tx.send(forge::ForgeJob::Unwatch { pane: *pid });
@@ -5741,7 +6242,7 @@ impl Daemon {
                         kind: "exited".into(),
                         status: Some("session killed".into()),
                     };
-                    let recipients: Vec<RawFd> = self.clients.iter().map(|(f, _)| *f).collect();
+                    let recipients: Vec<RawFd> = self.clients.keys().copied().collect();
                     for rfd in recipients {
                         if let Some(c) = self.clients.get_mut(&rfd) {
                             if c.attach == Some(sid) {
@@ -5850,7 +6351,7 @@ impl Daemon {
                                     context: None,
                                     cwd: None,
                                     busy: false,
-                                }
+                                },
                             );
                             s.win_mut()
                                 .split_leaf(&target.to_string(), &pid.to_string(), dir);
@@ -5903,7 +6404,7 @@ impl Daemon {
                                 context: None,
                                 cwd: None,
                                 busy: false,
-                            }
+                            },
                         );
                         s.win_mut()
                             .split_leaf(&target.to_string(), &pid.to_string(), dir);
@@ -6178,10 +6679,10 @@ impl Daemon {
                     }
                     // chat pane kill: stop its backing agent
                     if s.chats.remove(&pid).is_some() {
-                        if let Some(lp) = self.pi_agents.remove(&pid) {
-                            if let Some(pid) = lp.kill() {
-                                self.orphans.push(pid);
-                            }
+                        if let Some(lp) = self.pi_agents.remove(&pid)
+                            && let Some(pid) = lp.kill()
+                        {
+                            self.orphans.push(pid);
                         }
                         if let Some(tx) = &self.forge_tx {
                             let _ = tx.send(forge::ForgeJob::Unwatch { pane: pid });
@@ -6208,8 +6709,7 @@ impl Daemon {
                             kind: "exited".into(),
                             status: Some("session ended".into()),
                         };
-                        let recipients: Vec<RawFd> =
-                            self.clients.iter().map(|(f, _)| *f).collect();
+                        let recipients: Vec<RawFd> = self.clients.keys().copied().collect();
                         for rfd in recipients {
                             if let Some(c) = self.clients.get_mut(&rfd) {
                                 if c.attach == Some(sid) {
@@ -6264,7 +6764,10 @@ pub fn run_daemon_with_args(args: Vec<String>) {
     // (when invoked as `ranch daemon`, the subcommand sits at args[1] and
     // the real flags start at args[2] — normalize so --inherit is args[1])
     let args: Vec<String> = if args.len() >= 2 && args[1] == "daemon" {
-        [args[0].clone()].into_iter().chain(args.into_iter().skip(2)).collect()
+        [args[0].clone()]
+            .into_iter()
+            .chain(args.into_iter().skip(2))
+            .collect()
     } else {
         args
     };
@@ -6440,28 +6943,28 @@ fn run(
         }
 
         // --- accept new clients ---
-        if fds[0].revents & POLLIN != 0 {
-            if let Ok((stream, _addr)) = daemon.listener.accept() {
-                let fd = stream.as_raw_fd();
-                eprintln!("ranchd: client {fd} connected");
-                daemon.clients.insert(
-                    fd,
-                    Client {
-                        stream: Some(stream),
-                        relay_out: None,
-                        backlog: std::collections::VecDeque::new(),
-                        relay_in_progress: false,
-                        relay_in: None,
-                        sink: None,
-                        decoder: Decoder::new(),
-                        name: format!("cli-{fd}"),
-                        attach: None,
-                        chat_limit: None,
-                        scrollback_mode: false,
-                        file_watches: BTreeMap::new(),
-                    },
-                );
-            }
+        if fds[0].revents & POLLIN != 0
+            && let Ok((stream, _addr)) = daemon.listener.accept()
+        {
+            let fd = stream.as_raw_fd();
+            eprintln!("ranchd: client {fd} connected");
+            daemon.clients.insert(
+                fd,
+                Client {
+                    stream: Some(stream),
+                    relay_out: None,
+                    backlog: std::collections::VecDeque::new(),
+                    relay_in_progress: false,
+                    relay_in: None,
+                    sink: None,
+                    decoder: Decoder::new(),
+                    name: format!("cli-{fd}"),
+                    attach: None,
+                    chat_limit: None,
+                    scrollback_mode: false,
+                    file_watches: BTreeMap::new(),
+                },
+            );
         }
 
         // --- client I/O + frame collection ---
@@ -6597,7 +7100,14 @@ fn run(
                 callback: true,
                 callback_fired: false,
             };
-            daemon.deliver_agent_done(caller, &rec, uuid::Uuid::nil(), uuid::Uuid::nil(), "denied", None);
+            daemon.deliver_agent_done(
+                caller,
+                &rec,
+                uuid::Uuid::nil(),
+                uuid::Uuid::nil(),
+                "denied",
+                None,
+            );
         }
         // agent ask-user questions: prune resolved/expired entries
         for id in daemon.asks.prune() {
@@ -6632,10 +7142,7 @@ fn run(
                     c.file_watches.remove(&p);
                 }
                 for (path, mtime) in notes {
-                    send_frame(
-                        c,
-                        &Frame::FileChanged { path, mtime },
-                    );
+                    send_frame(c, &Frame::FileChanged { path, mtime });
                 }
             }
         }
@@ -6647,21 +7154,20 @@ fn run(
                     continue;
                 }
                 let idx = fds.iter().position(|f| f.fd == p.master);
-                if let Some(i) = idx {
-                    if fds[i].revents & (POLLIN | POLLHUP | POLLERR) != 0 {
-                        let mut buf = [0u8; 65536];
-                        loop {
-                            let r = unsafe {
-                                libc::read(p.master, buf.as_mut_ptr() as *mut _, buf.len())
-                            };
-                            if r <= 0 {
-                                break;
-                            }
-                            p.vt.write(&buf[..r as usize]);
-                            p.dirty = true;
-                            if r < buf.len() as isize {
-                                break;
-                            }
+                if let Some(i) = idx
+                    && fds[i].revents & (POLLIN | POLLHUP | POLLERR) != 0
+                {
+                    let mut buf = [0u8; 65536];
+                    loop {
+                        let r =
+                            unsafe { libc::read(p.master, buf.as_mut_ptr() as *mut _, buf.len()) };
+                        if r <= 0 {
+                            break;
+                        }
+                        p.vt.write(&buf[..r as usize]);
+                        p.dirty = true;
+                        if r < buf.len() as isize {
+                            break;
                         }
                     }
                 }
@@ -6684,7 +7190,10 @@ fn run(
                         } else {
                             format!("signal {}", (status & 0x7f) + 1)
                         };
-                        eprintln!("ranchd: pane {pid} ({}:{}) child exited ({})", s.name, s.id, detail);
+                        eprintln!(
+                            "ranchd: pane {pid} ({}:{}) child exited ({})",
+                            s.name, s.id, detail
+                        );
                         died.push((*sid, *pid));
                     }
                 }
@@ -6788,7 +7297,7 @@ fn run(
                     kind: "exited".into(),
                     status: Some("session ended".into()),
                 };
-                let recipients: Vec<RawFd> = daemon.clients.iter().map(|(f, _)| *f).collect();
+                let recipients: Vec<RawFd> = daemon.clients.keys().copied().collect();
                 for rfd in recipients {
                     if let Some(c) = daemon.clients.get_mut(&rfd) {
                         if c.attach == Some(sid) {
@@ -6878,8 +7387,7 @@ mod tests {
     #[test]
     fn relay_backlog_protects_in_progress_line() {
         use std::io::Read;
-        let ((daemon_r, _daemon_w), (relay_r, relay_w)) =
-            crate::relay::make_pipes().unwrap();
+        let ((_daemon_r, _daemon_w), (relay_r, relay_w)) = crate::relay::make_pipes().unwrap();
         let mut relay_w = relay_w;
         let mut backlog: VecDeque<Vec<u8>> = VecDeque::new();
         let mut in_progress = false;
@@ -6943,7 +7451,6 @@ mod tests {
             }
         }
         drop(relay_w);
-        drop(daemon_r);
         let all = reader.join().unwrap().unwrap();
         let mut expected = b1;
         expected.extend_from_slice(&b2);

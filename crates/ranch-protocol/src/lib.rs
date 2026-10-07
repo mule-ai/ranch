@@ -623,13 +623,13 @@ pub enum Frame {
     /// `mode` "split" = new pane in `caller_session`; "session" = new
     /// named session. `callback = true` registers a completion waiter
     /// (AgentDone on the spawned pane's working->idle transition).
-        AgentSpawn {
+    AgentSpawn {
         req_id: String,
         /// the pane requesting the spawn (ownership anchor; may be nil
         /// for human-initiated spawns)
         caller_pane: String,
         caller_session: String,
-        kind: String,               // "pi" | "forge"
+        kind: String, // "pi" | "forge"
         #[serde(default, skip_serializing_if = "Option::is_none")]
         profile_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -639,19 +639,19 @@ pub enum Frame {
         #[serde(default)]
         prompt: String,
         #[serde(default = "default_mode")]
-        mode: String,               // "split" | "session"
+        mode: String, // "split" | "session"
         #[serde(default)]
         callback: bool,
     },
     /// Daemon -> client: ack a successful spawn.
-        AgentSpawnOk {
+    AgentSpawnOk {
         req_id: String,
         spawn_id: String,
         session: String,
         pane: String,
     },
     /// Daemon -> clients (policy=ask): a spawn awaits approval.
-        AgentSpawnRequest {
+    AgentSpawnRequest {
         spawn_id: String,
         caller_pane: String,
         kind: String,
@@ -659,11 +659,14 @@ pub enum Frame {
         preview: String,
     },
     /// Client -> daemon: resolve a pending AgentSpawnRequest.
-        AgentSpawnApprove { spawn_id: String, allow: bool },
+    AgentSpawnApprove {
+        spawn_id: String,
+        allow: bool,
+    },
     /// Agent (or client) -> daemon: send a message to a spawned pane's
     /// agent. delivery: "steer" (pi RPC steer / forge message) or
     /// "queue" (pi follow_up / forge message).
-        AgentSend {
+    AgentSend {
         req_id: String,
         /// requesting pane (ownership anchor; nil = human)
         #[serde(default)]
@@ -675,14 +678,14 @@ pub enum Frame {
         delivery: String,
     },
     /// Agent (or client) -> daemon: cheap status read of a spawned pane.
-        AgentStatus {
+    AgentStatus {
         req_id: String,
         #[serde(default)]
         caller_pane: String,
         pane: String,
     },
     /// Daemon -> client: status reply.
-        AgentStatusOk {
+    AgentStatusOk {
         req_id: String,
         pane: String,
         /// "working" | "idle" | "unknown"
@@ -690,7 +693,7 @@ pub enum Frame {
         model: Option<String>,
     },
     /// Agent (or client) -> daemon: read recent conversation rows.
-        AgentRead {
+    AgentRead {
         req_id: String,
         #[serde(default)]
         caller_pane: String,
@@ -701,13 +704,13 @@ pub enum Frame {
         limit: u32,
     },
     /// Daemon -> client: conversation rows for AgentRead.
-        AgentReadOk {
+    AgentReadOk {
         req_id: String,
         pane: String,
         msgs: Vec<ChatMsg>,
     },
     /// Agent (or client) -> daemon: close a spawned pane (spawn-scoped).
-        AgentClose {
+    AgentClose {
         req_id: String,
         #[serde(default)]
         caller_pane: String,
@@ -716,7 +719,7 @@ pub enum Frame {
     },
     /// Daemon -> clients: ack (or callback) — a spawned pane finished
     /// (working->idle), was closed, was denied, or timed out.
-        AgentDone {
+    AgentDone {
         spawn_id: String,
         session: String,
         pane: String,
@@ -732,7 +735,7 @@ pub enum Frame {
     /// multiple-choice options (0..n); `suggested` is the agent's
     /// preferred index into `choices`; `multi` = select-many; `free_text`
     /// = also allow a blank user-typed answer.
-        AgentAsk {
+    AgentAsk {
         req_id: String,
         /// requesting pane (ownership anchor; nil = human)
         #[serde(default)]
@@ -751,14 +754,14 @@ pub enum Frame {
         free_text: bool,
     },
     /// Daemon -> agent (control API reply): the question is pending.
-        AgentAskOk {
+    AgentAskOk {
         req_id: String,
         ask_id: String,
     },
     /// Daemon -> all clients (broadcast): a question awaits an answer.
     /// Clients render a prompt (TUI status bar, web/mobile card) and
     /// may push a local notification.
-        AgentAskRequest {
+    AgentAskRequest {
         ask_id: String,
         session: String,
         pane: String,
@@ -774,7 +777,7 @@ pub enum Frame {
     },
     /// Client -> daemon: answer a pending AgentAskRequest. First
     /// answer wins; idempotent (later answers ignored).
-        AgentAskAnswer {
+    AgentAskAnswer {
         ask_id: String,
         /// selected choice indices (empty when only free text)
         #[serde(default)]
@@ -784,7 +787,7 @@ pub enum Frame {
         text: String,
     },
     /// Agent -> daemon (poll): has my question been answered yet?
-        AgentAskStatus {
+    AgentAskStatus {
         req_id: String,
         #[serde(default)]
         caller_pane: String,
@@ -792,7 +795,7 @@ pub enum Frame {
     },
     /// Daemon -> agent: status reply. `answered` false until a client
     /// (or TTL expiry) resolves the ask.
-        AgentAskStatusOk {
+    AgentAskStatusOk {
         req_id: String,
         ask_id: String,
         #[serde(default)]
@@ -807,7 +810,9 @@ pub enum Frame {
     // ----- agent builder (Phase B): forge profile CRUD proxy -----
     /// Client -> daemon: the pi model catalog (for profile forms).
     /// Pane-less variant of `ModelList` (which needs a chat pane).
-    ModelCatalog { req_id: String },
+    ModelCatalog {
+        req_id: String,
+    },
     /// Daemon -> client: catalog entries (secrets stripped). Empty
     /// `models` when forge is unreachable — clients keep a free-text
     /// fallback so a custom model id still works.
@@ -816,14 +821,19 @@ pub enum Frame {
         models: Vec<ModelChoice>,
     },
     /// Client -> daemon: list forge agent profiles.
-    ProfileList { req_id: String },
+    ProfileList {
+        req_id: String,
+    },
     /// Daemon -> client: profile summaries (secrets never included).
     ProfileListOk {
         req_id: String,
         profiles: Vec<ProfileSummary>,
     },
     /// Client -> daemon: fetch one profile (secret redacted by forge).
-    ProfileGet { req_id: String, profile: String },
+    ProfileGet {
+        req_id: String,
+        profile: String,
+    },
     /// Daemon -> client: the profile.
     ProfileGetOk {
         req_id: String,
@@ -838,16 +848,28 @@ pub enum Frame {
         draft: ProfileDraft,
     },
     /// Daemon -> client: the saved profile's id.
-    ProfilePutOk { req_id: String, profile_id: String },
+    ProfilePutOk {
+        req_id: String,
+        profile_id: String,
+    },
     /// Client -> daemon: delete a profile.
-    ProfileDelete { req_id: String, profile: String },
+    ProfileDelete {
+        req_id: String,
+        profile: String,
+    },
     /// Daemon -> client: delete ack.
-    ProfileDeleteOk { req_id: String },
+    ProfileDeleteOk {
+        req_id: String,
+    },
     // ----- workflows (Phase C): mule proxy -----
     /// Client -> daemon: list mule workflows.
-    WorkflowList { req_id: String },
+    WorkflowList {
+        req_id: String,
+    },
     /// Client -> daemon: mule agents (for workflow-step pickers).
-    MuleAgents { req_id: String },
+    MuleAgents {
+        req_id: String,
+    },
     /// Daemon -> client: agent summaries (id + name).
     MuleAgentsOk {
         req_id: String,
@@ -859,7 +881,10 @@ pub enum Frame {
         workflows: Vec<WorkflowSummary>,
     },
     /// Client -> daemon: fetch one workflow (with steps).
-    WorkflowGet { req_id: String, workflow: String },
+    WorkflowGet {
+        req_id: String,
+        workflow: String,
+    },
     /// Daemon -> client: the workflow + steps.
     WorkflowGetOk {
         req_id: String,
@@ -876,11 +901,19 @@ pub enum Frame {
         draft: WorkflowDraft,
     },
     /// Daemon -> client: the saved workflow's id.
-    WorkflowPutOk { req_id: String, workflow_id: String },
+    WorkflowPutOk {
+        req_id: String,
+        workflow_id: String,
+    },
     /// Client -> daemon: delete a workflow.
-    WorkflowDelete { req_id: String, workflow: String },
+    WorkflowDelete {
+        req_id: String,
+        workflow: String,
+    },
     /// Daemon -> client: delete ack.
-    WorkflowDeleteOk { req_id: String },
+    WorkflowDeleteOk {
+        req_id: String,
+    },
     /// Client -> daemon: run a workflow into a new pane.
     WorkflowRun {
         req_id: String,
@@ -895,9 +928,85 @@ pub enum Frame {
         session: String,
         pane: String,
     },
+    // ----- agent registry (Herd H1): forge `agents` rows ----- //
+    /// Client -> daemon: list the agents registered in forge (the
+    /// "herd"). Secrets/credentials never cross the wire.
+    AgentList {
+        req_id: String,
+    },
+    /// Daemon -> client: the agent registry.
+    AgentListOk {
+        req_id: String,
+        agents: Vec<AgentInfo>,
+    },
+    /// Client -> daemon: open a conversation with an agent and attach a
+    /// pane to it. `mode`: "continue" = the agent's most-active
+    /// conversation (a fresh one is created when it has none);
+    /// "new" = a fresh conversation; "fork" = a sibling forked from
+    /// `fork_from` (or the most-active conversation when absent).
+    /// When `text` is present the daemon sends it as the first message
+    /// of the attached conversation.
+    AgentTalk {
+        req_id: String,
+        /// agent id (uuid string)
+        agent: String,
+        /// "continue" | "new" | "fork"
+        mode: String,
+        /// first message, sent immediately on the new/attached pane
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+        /// conversation title (new/fork; continue keeps its title)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        /// fork point for mode="fork" (a conversation of the same agent)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fork_from: Option<String>,
+    },
+    /// Daemon -> client: the conversation pane is ready.
+    /// `session`/`pane` are the new ranch session + chat pane.
+    AgentTalkOk {
+        req_id: String,
+        session: String,
+        pane: String,
+    },
+    /// Client -> daemon: is this agent busy right now, and which
+    /// conversation is it in? (Named AgentBusy: `AgentStatus` is taken
+    /// by the Phase A pane-level frame.)
+    AgentBusy {
+        req_id: String,
+        agent: String,
+    },
+    /// Daemon -> client: the busy flag + the agent's most-active
+    /// conversation (None when the agent has no conversations).
+    AgentBusyOk {
+        req_id: String,
+        busy: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        current_conversation: Option<String>,
+    },
+    /// Client -> daemon: pull an agent's recent activity (H5's
+    /// Activity View data). H1 ships the frame only — the daemon
+    /// always answers an empty list until H5 lands the source.
+    AgentActivity {
+        req_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent: Option<String>,
+        /// activity kinds to include (H5 taxonomy; empty = all)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kinds: Option<Vec<String>>,
+    },
+    /// Daemon -> client: activity items, most recent first
+    /// (H1: always empty; H5 fills it).
+    AgentActivityOk {
+        req_id: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        items: Vec<ActivityItem>,
+    },
     // ----- triggers (Phase D) -----
     /// Client -> daemon: list trigger definitions + last runs.
-    TriggerList { req_id: String },
+    TriggerList {
+        req_id: String,
+    },
     /// Daemon -> client: trigger list.
     TriggerListOk {
         req_id: String,
@@ -913,18 +1022,34 @@ pub enum Frame {
         trigger: serde_json::Value,
     },
     /// Daemon -> client: the saved trigger's id.
-    TriggerPutOk { req_id: String, trigger_id: String },
+    TriggerPutOk {
+        req_id: String,
+        trigger_id: String,
+    },
     /// Client -> daemon: delete a trigger.
-    TriggerDelete { req_id: String, trigger: String },
+    TriggerDelete {
+        req_id: String,
+        trigger: String,
+    },
     /// Daemon -> client: delete ack.
-    TriggerDeleteOk { req_id: String },
+    TriggerDeleteOk {
+        req_id: String,
+    },
     /// Client -> daemon: fire a trigger immediately (manual run).
-    TriggerRun { req_id: String, trigger: String },
+    TriggerRun {
+        req_id: String,
+        trigger: String,
+    },
     /// Daemon -> clients: a trigger fired (dashboard badge / toast).
-    TriggerFired { trigger: String, job: String },
+    TriggerFired {
+        trigger: String,
+        job: String,
+    },
     // ----- webhooks (Phase E) -----
     /// Client -> daemon: list webhooks (secrets never returned).
-    WebhookList { req_id: String },
+    WebhookList {
+        req_id: String,
+    },
     /// Daemon -> client: webhook list.
     WebhookListOk {
         req_id: String,
@@ -951,9 +1076,14 @@ pub enum Frame {
         secret: Option<String>,
     },
     /// Client -> daemon: delete a webhook.
-    WebhookDelete { req_id: String, webhook: String },
+    WebhookDelete {
+        req_id: String,
+        webhook: String,
+    },
     /// Daemon -> client: delete ack.
-    WebhookDeleteOk { req_id: String },
+    WebhookDeleteOk {
+        req_id: String,
+    },
     /// Edge function -> daemon (via the relay): a verified external
     /// event. The daemon matches it against webhook triggers and fires
     /// workflows. This frame can only arrive from the relay pipe.
@@ -980,6 +1110,47 @@ fn default_read_limit() -> u32 {
 }
 fn default_true() -> bool {
     true
+}
+
+/// One row of the agent registry (Herd H1). An "agent" is a
+/// first-class forge `agents` row — distinct from a profile (the
+/// model/tool config an agent runs on) and a session (a conversation
+/// the agent has had).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AgentInfo {
+    /// agent id (uuid string)
+    pub id: String,
+    /// registry name (unique per owner in forge)
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar_url: Option<String>,
+    /// ranch machine id this agent "lives on" (None = unbound).
+    /// Ranch refuses to open a pane when this is another machine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home_machine: Option<String>,
+    /// most-recent activity across the agent's conversations
+    /// (ISO-8601). H1 fills None (TODO(H5): derive).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_active: Option<String>,
+    /// how many conversations the agent has (H1: None; TODO(H5)).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_count: Option<u64>,
+}
+
+/// One row of the Activity View (H5). H1 ships the frame only.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ActivityItem {
+    /// stable item id (H5 taxonomy)
+    pub id: String,
+    /// "message" | "task" | "approval" | "research" | ... (H5)
+    pub kind: String,
+    /// the agent the item is about (None = machine-wide)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// one-line summary
+    pub text: String,
+    /// ISO-8601 timestamp
+    pub ts: String,
 }
 
 /// One row of a forge agent conversation (M8). Mirrors a forge
@@ -1333,7 +1504,7 @@ pub fn leaf_order(l: &Layout) -> Vec<String> {
 const B64: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 pub fn b64_encode(data: &[u8]) -> String {
-    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
         let b0 = chunk[0] as u32;
         let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
@@ -1364,7 +1535,7 @@ pub fn b64_decode(s: &str) -> Option<Vec<u8>> {
     if s.is_empty() {
         return Some(Vec::new());
     }
-    if s.len() % 4 != 0 {
+    if !s.len().is_multiple_of(4) {
         return None;
     }
     let mut out = Vec::with_capacity(s.len() / 4 * 3);
@@ -1451,6 +1622,12 @@ pub struct Decoder {
     pending: HashMap<String, (u32, Vec<Option<String>>)>,
 }
 
+impl Default for Decoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Decoder {
     pub fn new() -> Self {
         Self {
@@ -1475,10 +1652,10 @@ impl Decoder {
             if line.is_empty() {
                 continue;
             }
-            if let Ok(f) = serde_json::from_str::<Frame>(line) {
-                if let Some(frame) = self.maybe_complete(&f) {
-                    frames.push(frame);
-                }
+            if let Ok(f) = serde_json::from_str::<Frame>(line)
+                && let Some(frame) = self.maybe_complete(&f)
+            {
+                frames.push(frame);
             }
         }
         frames
@@ -2059,13 +2236,144 @@ mod tests {
     }
 
     #[test]
+    fn agent_registry_frames_roundtrip() {
+        let frames = vec![
+            Frame::AgentList {
+                req_id: "r1".into(),
+            },
+            Frame::AgentListOk {
+                req_id: "r1".into(),
+                agents: vec![AgentInfo {
+                    id: "aa".into(),
+                    name: "iris".into(),
+                    avatar_url: None,
+                    home_machine: Some("omarchy".into()),
+                    last_active: None,
+                    conversation_count: Some(3),
+                }],
+            },
+            Frame::AgentTalk {
+                req_id: "r2".into(),
+                agent: "aa".into(),
+                mode: "continue".into(),
+                text: Some("hi".into()),
+                title: None,
+                fork_from: None,
+            },
+            Frame::AgentTalk {
+                req_id: "r3".into(),
+                agent: "aa".into(),
+                mode: "fork".into(),
+                text: None,
+                title: Some("branch".into()),
+                fork_from: Some("cc".into()),
+            },
+            Frame::AgentTalkOk {
+                req_id: "r2".into(),
+                session: "ss".into(),
+                pane: "pp".into(),
+            },
+            Frame::AgentBusy {
+                req_id: "r4".into(),
+                agent: "aa".into(),
+            },
+            Frame::AgentBusyOk {
+                req_id: "r4".into(),
+                busy: true,
+                current_conversation: Some("cc".into()),
+            },
+            Frame::AgentBusyOk {
+                req_id: "r5".into(),
+                busy: false,
+                current_conversation: None,
+            },
+            Frame::AgentActivity {
+                req_id: "r6".into(),
+                agent: None,
+                kinds: None,
+            },
+            Frame::AgentActivityOk {
+                req_id: "r6".into(),
+                items: vec![ActivityItem {
+                    id: "i1".into(),
+                    kind: "task".into(),
+                    agent: Some("aa".into()),
+                    text: "done".into(),
+                    ts: "2026-10-07T00:00:00Z".into(),
+                }],
+            },
+        ];
+        for f in frames {
+            let lines = encode_frame(&f, "c1");
+            let mut payload = String::new();
+            for l in &lines {
+                payload.push_str(l);
+                payload.push('\n');
+            }
+            let mut d = Decoder::new();
+            let got = d.feed(payload.as_bytes());
+            assert_eq!(got, vec![f]);
+        }
+    }
+
+    #[test]
+    fn agent_registry_minimal_json() {
+        // missing optional fields deserialize to None; wire field names
+        // are stable (docs/PROTOCOL.md §8.6)
+        let f: Frame =
+            serde_json::from_str(r#"{"t":"AgentTalk","req_id":"r","agent":"a","mode":"new"}"#)
+                .unwrap();
+        match f {
+            Frame::AgentTalk {
+                text,
+                title,
+                fork_from,
+                ..
+            } => {
+                assert!(text.is_none());
+                assert!(title.is_none());
+                assert!(fork_from.is_none());
+            }
+            _ => panic!("wrong variant"),
+        }
+        let f: Frame = serde_json::from_str(
+            r#"{"t":"AgentListOk","req_id":"r","agents":[{"id":"a","name":"iris"}]}"#,
+        )
+        .unwrap();
+        match f {
+            Frame::AgentListOk { agents, .. } => {
+                let a = &agents[0];
+                assert_eq!(a.name, "iris");
+                assert!(a.avatar_url.is_none());
+                assert!(a.home_machine.is_none());
+                assert!(a.last_active.is_none());
+                assert!(a.conversation_count.is_none());
+            }
+            _ => panic!("wrong variant"),
+        }
+        let s: String = serde_json::to_string(&Frame::AgentActivityOk {
+            req_id: "r".into(),
+            items: vec![],
+        })
+        .unwrap();
+        assert!(!s.contains("items"), "empty items list must be omitted");
+    }
+
+    #[test]
     fn agent_spawn_defaults() {
         // minimal JSON: mode/delivery/limit default; missing optional
         // fields deserialize to None/false
         let json = r#"{"t":"AgentSpawn","req_id":"r1","caller_pane":"p","caller_session":"s","kind":"pi","prompt":"hi"}"#;
         let f: Frame = serde_json::from_str(json).unwrap();
         match f {
-            Frame::AgentSpawn { mode, callback, name, cwd, profile_id, .. } => {
+            Frame::AgentSpawn {
+                mode,
+                callback,
+                name,
+                cwd,
+                profile_id,
+                ..
+            } => {
                 assert_eq!(mode, "split");
                 assert!(!callback);
                 assert!(name.is_none());

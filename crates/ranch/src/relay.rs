@@ -25,7 +25,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
-use crate::daemon::{clog, civil_from_unix};
+use crate::daemon::{civil_from_unix, clog};
 use ranch_protocol::{Decoder, Frame};
 
 // ---------- config ----------
@@ -138,7 +138,10 @@ pub fn rest_get(cfg: &RelayConfig, jwt: &str, url: &str) -> Result<Value, String
         .map_err(|e| format!("rest get: {e}"))?;
     let mut text = String::new();
     use std::io::Read as _;
-    res.body_mut().as_reader().read_to_string(&mut text).map_err(|e| format!("rest read: {e}"))?;
+    res.body_mut()
+        .as_reader()
+        .read_to_string(&mut text)
+        .map_err(|e| format!("rest read: {e}"))?;
     serde_json::from_str(&text).map_err(|e| format!("rest decode: {e}"))
 }
 
@@ -147,11 +150,20 @@ pub fn rest_post(cfg: &RelayConfig, jwt: &str, url: &str, body: &Value) -> Resul
         .post(url)
         .header("apikey", &cfg.anon_key)
         .header("Prefer", "return=representation");
-    let r = if jwt.is_empty() { r } else { r.header("Authorization", &format!("Bearer {jwt}")) };
-    let mut res = r.send_json(body.clone()).map_err(|e| format!("rest post: {e}"))?;
+    let r = if jwt.is_empty() {
+        r
+    } else {
+        r.header("Authorization", &format!("Bearer {jwt}"))
+    };
+    let mut res = r
+        .send_json(body.clone())
+        .map_err(|e| format!("rest post: {e}"))?;
     let mut text = String::new();
     use std::io::Read as _;
-    res.body_mut().as_reader().read_to_string(&mut text).map_err(|e| format!("rest read: {e}"))?;
+    res.body_mut()
+        .as_reader()
+        .read_to_string(&mut text)
+        .map_err(|e| format!("rest read: {e}"))?;
     if text.trim().is_empty() {
         return Ok(Value::Null);
     }
@@ -167,10 +179,14 @@ pub fn rest_delete(cfg: &RelayConfig, jwt: &str, url: &str) -> Result<(), String
 
 // ---------- thread plumbing ----------
 
+/// One end pair: (raw read fd kept open by the owner, write-end File
+/// whose drop closes the write side).
+type PipePair = (RawFd, std::fs::File);
+
 /// Create both pipes (O_CLOEXEC) used to talk to the relay thread.
 /// Returns ((main-loop read end, main-loop write end), (thread read end, thread write end)).
-pub fn make_pipes() -> Result<((RawFd, std::fs::File), (RawFd, std::fs::File)), String> {
-    fn pipe() -> Result<(RawFd, std::fs::File), String> {
+pub fn make_pipes() -> Result<(PipePair, PipePair), String> {
+    fn pipe() -> Result<PipePair, String> {
         let mut fds = [0 as libc::c_int; 2];
         if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
             return Err(format!("pipe2: {}", std::io::Error::last_os_error()));
@@ -367,7 +383,14 @@ fn mirror_upsert(cfg: &RelayConfig, jwt: &str, op: &RelayOut) {
                 "name": name, "kind": kind, "last_active_at": now_iso(),
             }),
         ),
-        RelayOut::UpsertTrigger { id, name, workflow_id, kind, enabled, spec } => (
+        RelayOut::UpsertTrigger {
+            id,
+            name,
+            workflow_id,
+            kind,
+            enabled,
+            spec,
+        } => (
             format!("{}/rest/v1/triggers?on_conflict=id", cfg.supabase_url),
             serde_json::json!({
                 "id": id, "machine_id": cfg.machine_id,
@@ -388,7 +411,12 @@ fn mirror_upsert(cfg: &RelayConfig, jwt: &str, op: &RelayOut) {
             }
             return;
         }
-        RelayOut::UpsertWebhook { id, name, sources, enabled } => (
+        RelayOut::UpsertWebhook {
+            id,
+            name,
+            sources,
+            enabled,
+        } => (
             format!("{}/rest/v1/webhooks?on_conflict=id", cfg.supabase_url),
             serde_json::json!({
                 "id": id, "machine_id": cfg.machine_id,
@@ -749,32 +777,29 @@ fn handle_ws_text(
         }
         "broadcast" => {
             // remote client frame: payload = {event:"frame", payload:<frame>}
-            if msg_topic == topic {
-                if let Some(frame) = payload.get("payload") {
-                    if let Some(t) = frame.get("t").and_then(|v| v.as_str()) {
-                        clog(&format!("relay: <- {t}"));
+            if msg_topic == topic
+                && let Some(frame) = payload.get("payload")
+            {
+                if let Some(t) = frame.get("t").and_then(|v| v.as_str()) {
+                    clog(&format!("relay: <- {t}"));
+                }
+                // run the frame through the chunk reassembler: whole
+                // frames pass through untouched, Chunk frames are held
+                // until the batch is complete (PROTOCOL §5).
+                let was_chunk = frame.get("t").and_then(|v| v.as_str()) == Some("Chunk");
+                let mut line = serde_json::to_string(frame).unwrap_or_default();
+                line.push('\n');
+                for complete in decoder.feed(line.as_bytes()) {
+                    if was_chunk && let Some(t) = complete_frame_type(&complete) {
+                        clog(&format!("relay: <- {t} (reassembled from chunks)"));
                     }
-                    // run the frame through the chunk reassembler: whole
-                    // frames pass through untouched, Chunk frames are held
-                    // until the batch is complete (PROTOCOL §5).
-                    let was_chunk =
-                        frame.get("t").and_then(|v| v.as_str()) == Some("Chunk");
-                    let mut line = serde_json::to_string(frame).unwrap_or_default();
-                    line.push('\n');
-                    for complete in decoder.feed(line.as_bytes()) {
-                        if was_chunk {
-                            if let Some(t) = complete_frame_type(&complete) {
-                                clog(&format!("relay: <- {t} (reassembled from chunks)"));
-                            }
-                        }
-                        let out = serde_json::to_string(&complete).unwrap_or_default();
-                        to_daemon_w
-                            .write_all(out.as_bytes())
-                            .map_err(|e| format!("pipe write: {e}"))?;
-                        to_daemon_w
-                            .write_all(b"\n")
-                            .map_err(|e| format!("pipe write: {e}"))?;
-                    }
+                    let out = serde_json::to_string(&complete).unwrap_or_default();
+                    to_daemon_w
+                        .write_all(out.as_bytes())
+                        .map_err(|e| format!("pipe write: {e}"))?;
+                    to_daemon_w
+                        .write_all(b"\n")
+                        .map_err(|e| format!("pipe write: {e}"))?;
                 }
             }
         }

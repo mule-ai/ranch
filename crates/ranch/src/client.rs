@@ -79,10 +79,7 @@ fn die(msg: &str) -> ! {
 }
 
 /// Encode a frame (chunking if needed) and write all lines to the stream.
-fn send_frame<W: std::io::Write>(
-    stream: &mut W,
-    frame: &Frame,
-) -> Result<(), std::io::Error> {
+fn send_frame<W: std::io::Write>(stream: &mut W, frame: &Frame) -> Result<(), std::io::Error> {
     let lines = ranch_protocol::encode_frame(frame, &Uuid::new_v4().to_string());
     let mut bytes = Vec::new();
     for line in &lines {
@@ -117,8 +114,8 @@ fn extract_attach_paths(raw: &str) -> (String, Vec<String>) {
                 }
                 let path: String = chars[start..end].iter().collect();
                 // expand ~ to $HOME
-                let expanded = if path.starts_with('~') {
-                    home_dir_string() + &path[1..]
+                let expanded = if let Some(stripped) = path.strip_prefix('~') {
+                    home_dir_string() + stripped
                 } else {
                     path
                 };
@@ -173,8 +170,16 @@ fn one_shot<F: FnOnce(&str) -> Frame>(
 
     let mut decoder = Decoder::new();
     let mut buf = [0u8; 65536];
+    // A response must arrive or the daemon is broken/out of date —
+    // never sit on a silent socket forever (e.g. a daemon binary from
+    // before this frame family exists drops the request unlogged).
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(30)));
     loop {
-        let n = stream.read(&mut buf).unwrap_or(0);
+        let n = match stream.read(&mut buf) {
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+            Err(_) => die("daemon closed the connection"),
+        };
         if n == 0 {
             die("daemon closed the connection");
         }
@@ -191,11 +196,176 @@ fn one_shot<F: FnOnce(&str) -> Frame>(
 }
 
 fn frame_matches(f: &Frame, tag: &str) -> bool {
-    match (f, tag) {
-        (Frame::SessionsAck { .. }, "ack") => true,
-        (Frame::Error { .. }, "ack") => true,
-        (Frame::Meta { .. }, "meta") => true,
-        _ => false,
+    matches!(
+        (f, tag),
+        (Frame::SessionsAck { .. }, "ack")
+            | (
+                Frame::Error { .. },
+                "ack" | "agentlist" | "agenttalk" | "agentbusy"
+            )
+            | (Frame::Meta { .. }, "meta")
+            | (Frame::AgentListOk { .. }, "agentlist")
+            | (Frame::AgentTalkOk { .. }, "agenttalk")
+            | (Frame::AgentBusyOk { .. }, "agentbusy")
+    )
+}
+
+// ---------- agent registry (Herd H1.3) ----------
+
+/// List the agents registered in forge (AgentList → AgentListOk).
+fn agent_list() -> Result<Vec<ranch_protocol::AgentInfo>, String> {
+    let f = one_shot(
+        |req_id| Frame::AgentList {
+            req_id: req_id.to_string(),
+        },
+        "agentlist",
+        |_f| {},
+    );
+    match f {
+        Frame::AgentListOk { agents, .. } => Ok(agents),
+        Frame::Error { message, .. } => Err(message),
+        _ => unreachable!("frame_matches"),
+    }
+}
+
+/// Open/continue a conversation with an agent; returns the new session.
+fn agent_talk(
+    agent: &str,
+    mode: &str,
+    text: Option<String>,
+    title: Option<String>,
+) -> Result<String, String> {
+    let f = one_shot(
+        |req_id| Frame::AgentTalk {
+            req_id: req_id.to_string(),
+            agent: agent.to_string(),
+            mode: mode.to_string(),
+            text,
+            title,
+            fork_from: None,
+        },
+        "agenttalk",
+        |_f| {},
+    );
+    match f {
+        Frame::AgentTalkOk { session, .. } => Ok(session),
+        Frame::Error { message, .. } => Err(message),
+        _ => unreachable!("frame_matches"),
+    }
+}
+
+fn print_agents_hint(agents: &[ranch_protocol::AgentInfo], note: &str) {
+    eprintln!("ranch: {note}");
+    if agents.is_empty() {
+        eprintln!("  (no agents registered in forge — create one in forge first)");
+    } else {
+        eprintln!("  agents:");
+        for a in agents {
+            let home = a
+                .home_machine
+                .as_deref()
+                .map(|h| format!("  @ {h}"))
+                .unwrap_or_default();
+            eprintln!("    {:<24}{}", a.name, home);
+        }
+    }
+}
+
+/// `ranch agent [name] [message...]` (Herd H1.3):
+/// - no args → the dashboard, Agents section selected
+/// - `--new [--dir DIR] [name]` → the LEGACY path: create a fresh forge
+///   agent session (this is what bare `ranch agent [name] [dir]` did
+///   before the registry landed)
+/// - `name [message...]` → talk to the agent by name (case-insensitive):
+///   AgentTalk continue + first message, then attach the pane
+fn cmd_agent(args: &[String]) {
+    // flags first
+    let mut new = false;
+    let mut dir: Option<String> = None;
+    let mut rest: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--new" => new = true,
+            "--dir" => {
+                i += 1;
+                let Some(d) = args.get(i) else {
+                    die("usage: ranch agent --new [--dir DIR] [name]")
+                };
+                dir = Some(d.clone());
+            }
+            _ => rest.push(args[i].clone()),
+        }
+        i += 1;
+    }
+    if new {
+        // legacy: fresh forge agent session (old `ranch agent [name] [dir]`)
+        let name = rest.first().cloned();
+        let cwd = match dir {
+            Some(d) => Some(d),
+            None => std::env::current_dir()
+                .ok()
+                .map(|p| p.to_string_lossy().into_owned()),
+        };
+        cmd_new(name, Some("forge".into()), cwd);
+        return;
+    }
+    let Some(name) = rest.first() else {
+        // no args: the dashboard with the Agents section selected
+        if !libc_isatty() {
+            die("usage: ranch agent [name] [message...] | ranch agent --new [--dir DIR] [name]");
+        }
+        while let Some(ref_) = cmd_dashboard(true) {
+            attach_loop(Target::Local(ref_)); // detach returns here
+        }
+        return;
+    };
+    let text = if rest.len() > 1 {
+        Some(rest[1..].join(" "))
+    } else {
+        None
+    };
+    let agents = match agent_list() {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("ranch: {e}");
+            std::process::exit(1);
+        }
+    };
+    // resolve by name, case-insensitive: exact first, then substring
+    let exact: Vec<&ranch_protocol::AgentInfo> = agents
+        .iter()
+        .filter(|a| a.name.eq_ignore_ascii_case(name))
+        .collect();
+    let matches = if !exact.is_empty() {
+        exact
+    } else {
+        agents
+            .iter()
+            .filter(|a| a.name.to_lowercase().contains(&name.to_lowercase()))
+            .collect()
+    };
+    let Some(agent) = matches.first() else {
+        print_agents_hint(&agents, &format!("no agent named {name:?}"));
+        std::process::exit(1);
+    };
+    if matches.len() > 1 {
+        let m: Vec<ranch_protocol::AgentInfo> = matches.iter().map(|a| (*a).clone()).collect();
+        print_agents_hint(&m, &format!("agent name {name:?} is ambiguous"));
+        std::process::exit(1);
+    }
+    match agent_talk(&agent.id, "continue", text, None) {
+        Ok(session) => {
+            if libc_isatty() {
+                attach_loop(Target::Local(session));
+            } else {
+                println!("session {session}");
+            }
+        }
+        Err(e) => {
+            eprintln!("ranch: {e}");
+            std::process::exit(1);
+        }
     }
 }
 
@@ -263,9 +433,10 @@ fn cmd_new(name: Option<String>, kind: Option<String>, cwd: Option<String>) {
             pi_session_file: None,
         },
         "ack",
-        |f| match f {
-            Frame::Error { message, .. } => eprintln!("error: {message}"),
-            _ => {}
+        |f| {
+            if let Frame::Error { message, .. } = f {
+                eprintln!("error: {message}")
+            }
         },
     );
     // interactive use: drop straight into the new session; scripts
@@ -315,10 +486,14 @@ fn cmd_resume(query: Option<String>) {
         };
         for f in decoder.feed(&buf[..n]) {
             match f {
-                Frame::ForgeListOk { req_id, sessions, .. } if req_id == rid_f.as_str() => {
+                Frame::ForgeListOk {
+                    req_id, sessions, ..
+                } if req_id == rid_f.as_str() => {
                     forge_sessions = Some(sessions);
                 }
-                Frame::PiListOk { req_id, sessions, .. } if req_id == rid_p.as_str() => {
+                Frame::PiListOk {
+                    req_id, sessions, ..
+                } if req_id == rid_p.as_str() => {
                     pi_sessions = Some(sessions);
                 }
                 _ => {}
@@ -379,16 +554,35 @@ fn cmd_resume(query: Option<String>) {
         });
     }
     if candidates.is_empty() {
-        die(&format!("no session matches {:?}", query.unwrap_or_default()));
+        die(&format!(
+            "no session matches {:?}",
+            query.unwrap_or_default()
+        ));
     }
     // single hit + query: resume directly; otherwise show a menu
     let pick = if candidates.len() == 1 && query.is_some() {
         0
     } else {
         for (i, c) in candidates.iter().enumerate() {
-            let tag = match c.kind { ResumeKind::Forge => "forge", ResumeKind::Pi => "pi" };
-            let ended = if c.ended.is_some() { " (ended)" } else if !c.active { " (idle)" } else { "" };
-            println!(">{:>3}. [{:<5}] {}{} [{}]", i + 1, tag, c.title, ended, &c.id[..8.min(c.id.len())]);
+            let tag = match c.kind {
+                ResumeKind::Forge => "forge",
+                ResumeKind::Pi => "pi",
+            };
+            let ended = if c.ended.is_some() {
+                " (ended)"
+            } else if !c.active {
+                " (idle)"
+            } else {
+                ""
+            };
+            println!(
+                ">{:>3}. [{:<5}] {}{} [{}]",
+                i + 1,
+                tag,
+                c.title,
+                ended,
+                &c.id[..8.min(c.id.len())]
+            );
         }
         print!("resume #> ");
         use std::io::Write as _;
@@ -413,9 +607,10 @@ fn cmd_resume(query: Option<String>) {
                 pi_session_file: None,
             },
             "ack",
-            |f| match f {
-                Frame::Error { message, .. } => eprintln!("error: {message}"),
-                _ => {}
+            |f| {
+                if let Frame::Error { message, .. } = f {
+                    eprintln!("error: {message}")
+                }
             },
         ),
         ResumeKind::Pi => one_shot(
@@ -429,9 +624,10 @@ fn cmd_resume(query: Option<String>) {
                 pi_session_file: sel.session_file.clone(),
             },
             "ack",
-            |f| match f {
-                Frame::Error { message, .. } => eprintln!("error: {message}"),
-                _ => {}
+            |f| {
+                if let Frame::Error { message, .. } = f {
+                    eprintln!("error: {message}")
+                }
             },
         ),
     };
@@ -466,7 +662,9 @@ fn cmd_ls() {
                 if let Some(v) = &version {
                     let own = crate::daemon::build_version();
                     if *v != own {
-                        eprintln!("⚠ daemon version {v} != client {own} — consider `ranch upgrade`");
+                        eprintln!(
+                            "⚠ daemon version {v} != client {own} — consider `ranch upgrade`"
+                        );
                     }
                 }
                 if sessions.is_empty() {
@@ -551,14 +749,12 @@ fn cmd_upgrade() {
 }
 
 fn hello_check() -> bool {
-    match std::panic::catch_unwind(|| {
+    std::panic::catch_unwind(|| {
         let mut stream = connect();
         hello(&mut stream, "cli");
         true
-    }) {
-        Ok(v) => v,
-        Err(_) => false,
-    }
+    })
+    .unwrap_or_default()
 }
 
 fn cmd_rename(ref_: &str, new_name: &str) {
@@ -817,7 +1013,7 @@ fn refresh_sessions(stream: &mut UnixStream) {
 /// Interactive session manager — plain `ranch` with a TTY. Lists sessions,
 /// create, kill, rename, and attach. Returns the session ref to attach to,
 /// or None to exit.
-fn cmd_dashboard() -> Option<String> {
+fn cmd_dashboard(agents_first: bool) -> Option<String> {
     crossterm::terminal::enable_raw_mode().ok();
     execute!(std::io::stdout(), EnterAlternateScreen).ok();
     let restore = || {
@@ -834,6 +1030,11 @@ fn cmd_dashboard() -> Option<String> {
     let mut buf = [0u8; 65536];
     let mut sessions: Vec<ranch_protocol::SessionMeta> = vec![];
     let mut sel: usize = 0;
+    // agent registry (Herd H1.3): the Agents section of the dashboard
+    let mut agents: Vec<ranch_protocol::AgentInfo> = vec![];
+    let mut agent_sel: usize = 0;
+    // which section the cursor is in: false = sessions, true = agents
+    let mut in_agents: bool = agents_first;
     let mut status = String::new();
     // version banner: the daemon may be older/newer than this binary —
     // hot upgrade realigns them; the header always shows the live version
@@ -847,6 +1048,14 @@ fn cmd_dashboard() -> Option<String> {
     // sessions can change from other clients (phone, another terminal);
     // re-hello on an interval so the list stays fresh
     let mut last_refresh = std::time::Instant::now();
+    // initial agent-registry fetch (AgentList → AgentListOk; an Error
+    // frame — e.g. forge not configured — shows in the status bar)
+    let _ = send_frame(
+        &mut stream,
+        &Frame::AgentList {
+            req_id: Uuid::new_v4().to_string(),
+        },
+    );
 
     loop {
         // drain socket
@@ -875,6 +1084,18 @@ fn cmd_dashboard() -> Option<String> {
                                 drop(term);
                                 return Some(session);
                             }
+                            Frame::AgentListOk { agents: as_, .. } => {
+                                agents = as_;
+                                if agent_sel >= agents.len() {
+                                    agent_sel = agents.len().saturating_sub(1);
+                                }
+                            }
+                            Frame::AgentTalkOk { session, .. } => {
+                                // "talk" finished — attach the pane
+                                restore();
+                                drop(term);
+                                return Some(session);
+                            }
                             Frame::Error { message, .. } => {
                                 status = format!("error: {message}");
                             }
@@ -893,6 +1114,13 @@ fn cmd_dashboard() -> Option<String> {
         // Hello returns the current list — same path as post-kill refresh)
         if last_refresh.elapsed() >= std::time::Duration::from_secs(1) {
             refresh_sessions(&mut stream);
+            // keep the agent registry fresh the same way
+            let _ = send_frame(
+                &mut stream,
+                &Frame::AgentList {
+                    req_id: Uuid::new_v4().to_string(),
+                },
+            );
             last_refresh = std::time::Instant::now();
         }
 
@@ -902,6 +1130,9 @@ fn cmd_dashboard() -> Option<String> {
         let status_ref = &status;
         let input_ref = input;
         let input_text_ref = &input_text;
+        let agents_ref = &agents;
+        let agent_sel_ref = agent_sel;
+        let in_agents_ref = in_agents;
         let _ = term.draw(|f: &mut RFrame| {
             let area = f.area();
             let mut lines: Vec<Line> = Vec::new();
@@ -953,8 +1184,46 @@ fn cmd_dashboard() -> Option<String> {
                 )));
             }
             lines.push(Line::raw(""));
+            // ----- agents section (Herd H1.3): forge agent registry -----
+            let agents_hdr = if in_agents_ref { "▶" } else { "  " };
+            lines.push(Line::from(Span::styled(
+                format!("{agents_hdr} agents"),
+                if in_agents_ref {
+                    Style::default().add_modifier(Modifier::REVERSED)
+                } else {
+                    Style::default().add_modifier(Modifier::DIM)
+                },
+            )));
+            if agents_ref.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "   (none — agents live in forge; errors above if forge is unreachable)"
+                        .to_string(),
+                    Style::default().add_modifier(Modifier::DIM),
+                )));
+            }
+            for (i, a) in agents_ref.iter().enumerate() {
+                let cur = in_agents_ref && i == agent_sel_ref;
+                let style = if cur {
+                    Style::default().add_modifier(Modifier::REVERSED)
+                } else {
+                    Style::default()
+                };
+                let marker = if cur { ">" } else { " " };
+                // ● = avatar set, ○ = default; home machine shown when set
+                let avatar = if a.avatar_url.is_some() { "●" } else { "○" };
+                let home = a
+                    .home_machine
+                    .as_deref()
+                    .map(|h| format!(" @{h}"))
+                    .unwrap_or_default();
+                lines.push(Line::from(Span::styled(
+                    format!("{marker} {avatar} {:<24}{home}", a.name),
+                    style,
+                )));
+            }
+            lines.push(Line::raw(""));
             lines.push(Line::raw(
-                " enter: attach   c: new   n: new (named)   a: new agent   p: new pi   x: kill   r: rename   q: quit",
+                " enter: attach/talk   c: new   n: new (named)   a: new agent   p: new pi   x: kill   r: rename   tab: agents   q: quit",
             ));
             if !status_ref.is_empty() {
                 lines.push(Line::from(Span::styled(
@@ -1055,15 +1324,15 @@ fn cmd_dashboard() -> Option<String> {
                                 // SessionsAck handler attaches
                             }
                             _ => {
-                                if let Some(s) = sessions.get(sel) {
-                                    if !text.is_empty() {
-                                        let f = Frame::SessionsRename {
-                                            session: s.id.clone(),
-                                            name: text,
-                                        };
-                                        send_frame(&mut stream, &f).ok();
-                                        refresh_sessions(&mut stream);
-                                    }
+                                if let Some(s) = sessions.get(sel)
+                                    && !text.is_empty()
+                                {
+                                    let f = Frame::SessionsRename {
+                                        session: s.id.clone(),
+                                        name: text,
+                                    };
+                                    send_frame(&mut stream, &f).ok();
+                                    refresh_sessions(&mut stream);
                                 }
                                 input = None;
                                 input_text.clear();
@@ -1087,12 +1356,18 @@ fn cmd_dashboard() -> Option<String> {
                 KeyCode::Up | KeyCode::Char('k')
                     if !matches!(key.modifiers, KeyModifiers::CONTROL) =>
                 {
-                    if sel > 0 {
-                        sel -= 1;
+                    if in_agents {
+                        agent_sel = agent_sel.saturating_sub(1);
+                    } else {
+                        sel = sel.saturating_sub(1);
                     }
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
-                    if sel + 1 < sessions.len() {
+                    if in_agents {
+                        if agent_sel + 1 < agents.len() {
+                            agent_sel += 1;
+                        }
+                    } else if sel + 1 < sessions.len() {
                         sel += 1;
                     }
                 }
@@ -1161,10 +1436,33 @@ fn cmd_dashboard() -> Option<String> {
                     }
                 }
                 KeyCode::Enter => {
-                    if let Some(s) = sessions.get(sel) {
+                    if in_agents {
+                        // talk: AgentTalk continue on the selected agent —
+                        // AgentTalkOk handler attaches the pane
+                        if let Some(a) = agents.get(agent_sel) {
+                            let f = Frame::AgentTalk {
+                                req_id: Uuid::new_v4().to_string(),
+                                agent: a.id.clone(),
+                                mode: "continue".into(),
+                                text: None,
+                                title: None,
+                                fork_from: None,
+                            };
+                            send_frame(&mut stream, &f).ok();
+                        } else {
+                            status = "no agent selected".into();
+                        }
+                    } else if let Some(s) = sessions.get(sel) {
                         restore();
                         drop(term);
                         return Some(s.id.clone());
+                    }
+                }
+                KeyCode::Tab => {
+                    // switch sections: sessions <-> agents
+                    in_agents = !in_agents;
+                    if in_agents && agent_sel >= agents.len() {
+                        agent_sel = agents.len().saturating_sub(1);
                     }
                 }
                 _ => {}
@@ -1331,8 +1629,8 @@ impl CloudLink {
                     if v.get("topic").and_then(|t| t.as_str()) == Some(topic.as_str())
                         && ev == "phx_reply"
                     {
-                        let ok = v.pointer("/payload/status").and_then(|s| s.as_str())
-                            == Some("ok");
+                        let ok =
+                            v.pointer("/payload/status").and_then(|s| s.as_str()) == Some("ok");
                         if ok {
                             joined = true;
                             break;
@@ -1356,9 +1654,7 @@ impl CloudLink {
                     ws.send(Message::Pong(p)).ok();
                 }
                 Ok(_) => {}
-                Err(tungstenite::Error::Io(e))
-                    if e.kind() == std::io::ErrorKind::WouldBlock =>
-                {
+                Err(tungstenite::Error::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     std::thread::sleep(std::time::Duration::from_millis(100));
                 }
                 Err(e) => return Err(format!("ws read: {e}")),
@@ -1373,7 +1669,9 @@ impl CloudLink {
                 t.set_nonblocking(true).map_err(|e| e.to_string())?;
             }
             tungstenite::stream::MaybeTlsStream::Rustls(s) => {
-                s.get_ref().set_nonblocking(true).map_err(|e| e.to_string())?;
+                s.get_ref()
+                    .set_nonblocking(true)
+                    .map_err(|e| e.to_string())?;
             }
             _ => return Err("unsupported tls backend".into()),
         }
@@ -1419,9 +1717,7 @@ impl std::io::Read for CloudLink {
                                 "payload": {},
                                 "ref": v.get("ref").cloned().unwrap_or_default(),
                             });
-                            self.ws
-                                .send(Message::Text(reply.to_string().into()))
-                                .ok();
+                            self.ws.send(Message::Text(reply.to_string().into())).ok();
                         }
                         _ => {}
                     }
@@ -1458,11 +1754,9 @@ impl std::io::Write for CloudLink {
             if line.is_empty() {
                 continue;
             }
-            let frame: ranch_protocol::Frame =
-                serde_json::from_slice(line).map_err(|e| std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("frame: {e}"),
-                ))?;
+            let frame: ranch_protocol::Frame = serde_json::from_slice(line).map_err(|e| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, format!("frame: {e}"))
+            })?;
             let msg = serde_json::json!({
                 "topic": self.topic,
                 "event": "broadcast",
@@ -1471,10 +1765,12 @@ impl std::io::Write for CloudLink {
             });
             self.ws
                 .send(tungstenite::Message::Text(msg.to_string().into()))
-                .map_err(|e| std::io::Error::new(
-                    std::io::ErrorKind::ConnectionAborted,
-                    format!("ws send: {e}"),
-                ))?;
+                .map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::ConnectionAborted,
+                        format!("ws send: {e}"),
+                    )
+                })?;
         }
         Ok(buf.len())
     }
@@ -1709,8 +2005,7 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
     // per-pane client state for split rendering
     // per-pane child cwd (from PaneSnap.cwd) — file browser start dir,
     // agent split anchoring hints
-    let mut pane_cwds: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
+    let mut pane_cwds: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     // per-pane chat scroll distance from the bottom (0 = pinned to
     // newest; PageUp/PageDown scroll the conversation in place)
     let mut chat_scroll: std::collections::HashMap<String, usize> =
@@ -1953,7 +2248,9 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                 Ok(n) => {
                     for f in decoder.feed(&buf[..n]) {
                         match f {
-                            Frame::HelloOk { sessions, version, .. } => {
+                            Frame::HelloOk {
+                                sessions, version, ..
+                            } => {
                                 *session_list.borrow_mut() =
                                     sessions.iter().map(|s| s.id.clone()).collect();
                                 sessions_meta.clone_from(&sessions);
@@ -2072,10 +2369,10 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                                 reset,
                                 ..
                             } => {
-                                if csess == session_id {
-                                    if let Some(pv) = pane_views.get_mut(&cpane) {
-                                        pv.apply_chat(&msgs, reset);
-                                    }
+                                if csess == session_id
+                                    && let Some(pv) = pane_views.get_mut(&cpane)
+                                {
+                                    pv.apply_chat(&msgs, reset);
                                 }
                             }
                             Frame::Meta {
@@ -2096,8 +2393,8 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                                     // and drop the pending-set marker
                                     if let Some(status) = mstat {
                                         model_set_pending.borrow_mut().take();
-                                        if let Some(pv) = pane_views
-                                            .get_mut(mpane.as_deref().unwrap_or(""))
+                                        if let Some(pv) =
+                                            pane_views.get_mut(mpane.as_deref().unwrap_or(""))
                                         {
                                             pv.apply_model(&status);
                                         }
@@ -2107,8 +2404,8 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                                     // pane; "compacted …" also confirms our
                                     // :compact request
                                     if let Some(status) = mstat {
-                                        if let Some(pv) = pane_views
-                                            .get_mut(mpane.as_deref().unwrap_or(""))
+                                        if let Some(pv) =
+                                            pane_views.get_mut(mpane.as_deref().unwrap_or(""))
                                         {
                                             pv.apply_context(&status);
                                         }
@@ -2148,10 +2445,10 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                                             }
                                         }
                                     }
-                                } else if mkind != "agent" {
-                                    if let Some(st) = mstat {
-                                        eprintln!("ranch: {st}");
-                                    }
+                                } else if mkind != "agent"
+                                    && let Some(st) = mstat
+                                {
+                                    eprintln!("ranch: {st}");
                                 }
                             }
                             // agent asked the user a question: hold it for the
@@ -2291,10 +2588,8 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                             }
                             Frame::ProfileGetOk { req_id, profile } => {
                                 // prefill the guided form for editing
-                                let matches_req = prof_get_pending
-                                    .borrow()
-                                    .as_deref()
-                                    == Some(req_id.as_str());
+                                let matches_req =
+                                    prof_get_pending.borrow().as_deref() == Some(req_id.as_str());
                                 if matches_req {
                                     prof_get_pending.borrow_mut().take();
                                     *prof_edit.borrow_mut() = Some(ProfEdit {
@@ -2319,7 +2614,8 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                                     });
                                     prompt_input.clear();
                                     if let Some(e) = prof_edit.borrow().as_ref() {
-                                        prompt_input = e.fields[e.step.min(PROF_FIELDS.len() - 1)].clone();
+                                        prompt_input =
+                                            e.fields[e.step.min(PROF_FIELDS.len() - 1)].clone();
                                     }
                                     prompt.set(Some(Prompt::ProfileField));
                                 }
@@ -2327,10 +2623,8 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                             Frame::ProfilePutOk { req_id, profile_id } => {
                                 let _ = req_id;
                                 let _ = profile_id;
-                                err_flash.set(Some((
-                                    std::time::Instant::now(),
-                                    "profile saved".into(),
-                                )));
+                                err_flash
+                                    .set(Some((std::time::Instant::now(), "profile saved".into())));
                                 // refresh the list if the modal is open
                                 if agents_open.get() {
                                     let rid = Uuid::new_v4().to_string();
@@ -2349,15 +2643,9 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                                     send_frame(&mut stream, &f).ok();
                                 }
                             }
-                            Frame::Scrollback {
-                                id,
-                                lines,
-                                ..
-                            } => {
-                                let matches = scroll_pending
-                                    .borrow()
-                                    .as_deref()
-                                    == Some(id.as_str());
+                            Frame::Scrollback { id, lines, .. } => {
+                                let matches =
+                                    scroll_pending.borrow().as_deref() == Some(id.as_str());
                                 if matches {
                                     scroll_pending.borrow_mut().take();
                                     *scroll_lines.borrow_mut() = lines;
@@ -2486,7 +2774,11 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                                 send_frame(&mut stream, &f).ok();
                             }
                             Frame::ModelListOk {
-                                req_id, pane, current, models, ..
+                                req_id,
+                                pane,
+                                current,
+                                models,
+                                ..
                             } => {
                                 let matches_req =
                                     model_pending.borrow().as_deref() == Some(req_id.as_str());
@@ -2498,13 +2790,15 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                                     model_open.set(true);
                                 }
                                 // keep the pane's model label fresh either way
-                                if let Some(c) = current {
-                                    if let Some(pv) = pane_views.get_mut(&pane) {
-                                        pv.apply_model(&c.name);
-                                    }
+                                if let Some(c) = current
+                                    && let Some(pv) = pane_views.get_mut(&pane)
+                                {
+                                    pv.apply_model(&c.name);
                                 }
                             }
-                            Frame::Error { req_id, message, .. } => {
+                            Frame::Error {
+                                req_id, message, ..
+                            } => {
                                 // request-scoped errors from the daemon's
                                 // worker threads carry a req_id; only
                                 // flash the ones we asked for (model list /
@@ -2527,10 +2821,8 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                                     model_set_pending.borrow_mut().take();
                                     model_pending.borrow_mut().take();
                                     compact_pending.borrow_mut().take();
-                                    err_flash.set(Some((
-                                        std::time::Instant::now(),
-                                        message.clone(),
-                                    )));
+                                    err_flash
+                                        .set(Some((std::time::Instant::now(), message.clone())));
                                 }
                             }
                             _ => {}
@@ -2563,10 +2855,10 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
         let flash_ref = &err_flash;
         // expire old flashes (4s); Cell<Option<(Instant, String)>> is
         // non-Copy so expiry works by take + conditional restore
-        if let Some((t, m)) = flash_ref.take() {
-            if t.elapsed() <= std::time::Duration::from_secs(4) {
-                flash_ref.set(Some((t, m)));
-            }
+        if let Some((t, m)) = flash_ref.take()
+            && t.elapsed() <= std::time::Duration::from_secs(4)
+        {
+            flash_ref.set(Some((t, m)));
         }
         let sess_id_ref = &session_id;
         let views_ref = &pane_views;
@@ -2623,8 +2915,8 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
             let multi_pane = rects.len() > 1;
             let draw_pane = |f: &mut RFrame, pane_id: &str, r: Rect, focused: bool| {
                 let pv = views_ref.get(pane_id);
-                if let Some(pv) = pv {
-                    if pv.is_chat() {
+                if let Some(pv) = pv
+                    && pv.is_chat() {
                         // messenger rendering: bg-filled bubbles (user
                         // right/green, agent left/dark), tool chips, a
                         // working spinner, and a rounded input box
@@ -2893,7 +3185,6 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                         f.render_widget(ratatui::widgets::Paragraph::new(rows), r);
                         return;
                     }
-                }
                 let (lines_src, cx, cy, vis): (&Vec<String>, u16, u16, bool) = match pv {
                     Some(pv) => {
                         let (x, y, v) = pv.cursor.unwrap_or((0, 0, false));
@@ -3190,7 +3481,7 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                                         ResumeKind::Pi => if item.external { "pi*  " } else { "pi   " },
                                     };
                                     let display = if item.title.is_empty() {
-                                        format!("{}", &item.id[..8.min(item.id.len())])
+                                        item.id[..8.min(item.id.len())].to_string()
                                     } else {
                                         item.title.clone()
                                     };
@@ -3715,845 +4006,684 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
         });
 
         // events
-        if poll(Duration::from_millis(20)).unwrap_or(false) {
-            if let Ok(event) = read_event() {
-                match event {
-                    CEvent::Resize(c, r) => {
-                        let sb = if sidebar_on.get() { SIDEBAR_W } else { 0 };
-                        let f = Frame::Resize {
-                            id: Uuid::new_v4().to_string(),
-                            client: "attach".into(),
-                            session: session_id.clone(),
-                            cols: c.saturating_sub(sb),
-                            rows: r,
-                        };
-                        send_frame(&mut stream, &f).ok();
+        if poll(Duration::from_millis(20)).unwrap_or(false)
+            && let Ok(event) = read_event()
+        {
+            match event {
+                CEvent::Resize(c, r) => {
+                    let sb = if sidebar_on.get() { SIDEBAR_W } else { 0 };
+                    let f = Frame::Resize {
+                        id: Uuid::new_v4().to_string(),
+                        client: "attach".into(),
+                        session: session_id.clone(),
+                        cols: c.saturating_sub(sb),
+                        rows: r,
+                    };
+                    send_frame(&mut stream, &f).ok();
+                }
+                CEvent::Key(key) => {
+                    if key.kind != KeyEventKind::Press {
+                        continue;
                     }
-                    CEvent::Key(key) => {
-                        if key.kind != KeyEventKind::Press {
-                            continue;
+                    // :resume modal: forge session picker + type-to-filter.
+                    // j/k/arrows navigate the FILTERED list; printable
+                    // chars (except j/k) extend the filter; Backspace
+                    // shortens it; Esc clears the filter, then closes.
+                    if resume_open.get() {
+                        let filter = resume_filter.borrow().clone();
+                        let indices = resume_filtered_indices(&resume_items.borrow(), &filter);
+                        match key.code {
+                            KeyCode::Esc => {
+                                if filter.is_empty() {
+                                    resume_open.set(false);
+                                    resume_filter.borrow_mut().clear();
+                                } else {
+                                    resume_filter.borrow_mut().clear();
+                                    resume_sel.set(0);
+                                }
+                            }
+                            KeyCode::Backspace => {
+                                resume_filter.borrow_mut().pop();
+                                let n = resume_filtered_indices(
+                                    &resume_items.borrow(),
+                                    &resume_filter.borrow(),
+                                )
+                                .len();
+                                if resume_sel.get() >= n {
+                                    resume_sel.set(n.saturating_sub(1));
+                                }
+                            }
+                            KeyCode::Char(c) if c.is_ascii() && c != 'j' && c != 'k' => {
+                                resume_filter.borrow_mut().push(c);
+                                let n = resume_filtered_indices(
+                                    &resume_items.borrow(),
+                                    &resume_filter.borrow(),
+                                )
+                                .len();
+                                if resume_sel.get() >= n {
+                                    resume_sel.set(n.saturating_sub(1));
+                                }
+                            }
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                let sel = resume_sel.get();
+                                if sel > 0 {
+                                    resume_sel.set(sel - 1);
+                                }
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                let sel = resume_sel.get();
+                                if sel + 1 < indices.len() {
+                                    resume_sel.set(sel + 1);
+                                }
+                            }
+                            KeyCode::Enter => {
+                                let picked = indices
+                                    .get(resume_sel.get())
+                                    .copied()
+                                    .and_then(|orig| resume_items.borrow().get(orig).cloned());
+                                if let Some(entry) = picked {
+                                    resume_open.set(false);
+                                    let f = match entry.kind {
+                                        ResumeKind::Forge => Frame::SessionsCreate {
+                                            req_id: Uuid::new_v4().to_string(),
+                                            name: None,
+                                            kind: Some("forge".into()),
+                                            cwd: None,
+                                            profile_id: None,
+                                            forge_session: Some(entry.id.clone()),
+                                            pi_session_file: None,
+                                        },
+                                        ResumeKind::Pi => Frame::SessionsCreate {
+                                            req_id: Uuid::new_v4().to_string(),
+                                            name: None,
+                                            kind: Some("pi".into()),
+                                            cwd: None,
+                                            profile_id: None,
+                                            forge_session: None,
+                                            pi_session_file: entry.session_file,
+                                        },
+                                    };
+                                    send_frame(&mut stream, &f).ok();
+                                    // SessionsAck attaches
+                                }
+                            }
+                            _ => {}
                         }
-                        // :resume modal: forge session picker + type-to-filter.
-                        // j/k/arrows navigate the FILTERED list; printable
-                        // chars (except j/k) extend the filter; Backspace
-                        // shortens it; Esc clears the filter, then closes.
-                        if resume_open.get() {
-                            let filter = resume_filter.borrow().clone();
-                            let indices =
-                                resume_filtered_indices(&resume_items.borrow(), &filter);
+                        continue;
+                    }
+                    // :files modal: browser / viewer / editor (Phase F)
+                    if files_open.get() {
+                        let mode = files_mode.get();
+                        if mode == 2 {
+                            // EDIT: line-buffer editing on the whole text
                             match key.code {
                                 KeyCode::Esc => {
-                                    if filter.is_empty() {
-                                        resume_open.set(false);
-                                        resume_filter.borrow_mut().clear();
-                                    } else {
-                                        resume_filter.borrow_mut().clear();
-                                        resume_sel.set(0);
-                                    }
+                                    // cancel: reload from disk
+                                    files_editing.set(false);
+                                    files_mode.set(1);
+                                    let p = files_view_path.borrow().clone();
+                                    let rid = Uuid::new_v4().to_string();
+                                    *files_pending.borrow_mut() = Some(rid.clone());
+                                    let f = Frame::FileRead {
+                                        id: Uuid::new_v4().to_string(),
+                                        client: "attach".into(),
+                                        req_id: rid,
+                                        path: p,
+                                    };
+                                    send_frame(&mut stream, &f).ok();
+                                }
+                                KeyCode::Char('s')
+                                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                {
+                                    // save with mtime conflict check
+                                    let p = files_view_path.borrow().clone();
+                                    let content = files_view_text.borrow().clone();
+                                    let rid = Uuid::new_v4().to_string();
+                                    *files_save_pending.borrow_mut() = Some(rid.clone());
+                                    let f = Frame::FileWrite {
+                                        id: Uuid::new_v4().to_string(),
+                                        client: "attach".into(),
+                                        req_id: rid,
+                                        path: p,
+                                        content,
+                                        mtime: Some(files_view_mtime.get()),
+                                    };
+                                    send_frame(&mut stream, &f).ok();
                                 }
                                 KeyCode::Backspace => {
-                                    resume_filter.borrow_mut().pop();
-                                    let n = resume_filtered_indices(
-                                        &resume_items.borrow(),
-                                        &resume_filter.borrow(),
-                                    )
-                                    .len();
-                                    if resume_sel.get() >= n {
-                                        resume_sel.set(n.saturating_sub(1));
-                                    }
-                                }
-                                KeyCode::Char(c) if c.is_ascii() && c != 'j' && c != 'k' => {
-                                    resume_filter.borrow_mut().push(c);
-                                    let n = resume_filtered_indices(
-                                        &resume_items.borrow(),
-                                        &resume_filter.borrow(),
-                                    )
-                                    .len();
-                                    if resume_sel.get() >= n {
-                                        resume_sel.set(n.saturating_sub(1));
-                                    }
-                                }
-                                KeyCode::Up | KeyCode::Char('k') => {
-                                    let sel = resume_sel.get();
-                                    if sel > 0 {
-                                        resume_sel.set(sel - 1);
-                                    }
-                                }
-                                KeyCode::Down | KeyCode::Char('j') => {
-                                    let sel = resume_sel.get();
-                                    if sel + 1 < indices.len() {
-                                        resume_sel.set(sel + 1);
-                                    }
+                                    files_view_text.borrow_mut().pop();
                                 }
                                 KeyCode::Enter => {
-                                    let picked = indices
-                                        .get(resume_sel.get())
-                                        .copied()
-                                        .and_then(|orig| resume_items.borrow().get(orig).cloned());
-                                    if let Some(entry) = picked {
-                                        resume_open.set(false);
-                                        let f = match entry.kind {
-                                            ResumeKind::Forge => Frame::SessionsCreate {
-                                                req_id: Uuid::new_v4().to_string(),
-                                                name: None,
-                                                kind: Some("forge".into()),
-                                                cwd: None,
-                                                profile_id: None,
-                                                forge_session: Some(entry.id.clone()),
-                                                pi_session_file: None,
-                                            },
-                                            ResumeKind::Pi => Frame::SessionsCreate {
-                                                req_id: Uuid::new_v4().to_string(),
-                                                name: None,
-                                                kind: Some("pi".into()),
-                                                cwd: None,
-                                                profile_id: None,
-                                                forge_session: None,
-                                                pi_session_file: entry.session_file,
-                                            },
-                                        };
-                                        send_frame(&mut stream, &f).ok();
-                                        // SessionsAck attaches
-                                    }
+                                    files_view_text.borrow_mut().push('\n');
+                                }
+                                KeyCode::Tab => {
+                                    files_view_text.borrow_mut().push_str("    ");
+                                }
+                                KeyCode::Char(c) => {
+                                    files_view_text.borrow_mut().push(c);
                                 }
                                 _ => {}
                             }
                             continue;
                         }
-                        // :files modal: browser / viewer / editor (Phase F)
-                        if files_open.get() {
-                            let mode = files_mode.get();
-                            if mode == 2 {
-                                // EDIT: line-buffer editing on the whole text
-                                match key.code {
-                                    KeyCode::Esc => {
-                                        // cancel: reload from disk
-                                        files_editing.set(false);
-                                        files_mode.set(1);
-                                        let p = files_view_path.borrow().clone();
-                                        let rid = Uuid::new_v4().to_string();
-                                        *files_pending.borrow_mut() = Some(rid.clone());
-                                        let f = Frame::FileRead {
-                                            id: Uuid::new_v4().to_string(),
-                                            client: "attach".into(),
-                                            req_id: rid,
-                                            path: p,
-                                        };
-                                        send_frame(&mut stream, &f).ok();
-                                    }
-                                    KeyCode::Char('s')
-                                        if key.modifiers.contains(KeyModifiers::CONTROL) =>
-                                    {
-                                        // save with mtime conflict check
-                                        let p = files_view_path.borrow().clone();
-                                        let content = files_view_text.borrow().clone();
-                                        let rid = Uuid::new_v4().to_string();
-                                        *files_save_pending.borrow_mut() = Some(rid.clone());
-                                        let f = Frame::FileWrite {
-                                            id: Uuid::new_v4().to_string(),
-                                            client: "attach".into(),
-                                            req_id: rid,
-                                            path: p,
-                                            content,
-                                            mtime: Some(files_view_mtime.get()),
-                                        };
-                                        send_frame(&mut stream, &f).ok();
-                                    }
-                                    KeyCode::Backspace => {
-                                        files_view_text.borrow_mut().pop();
-                                    }
-                                    KeyCode::Enter => {
-                                        files_view_text.borrow_mut().push('\n');
-                                    }
-                                    KeyCode::Tab => {
-                                        files_view_text.borrow_mut().push_str("    ");
-                                    }
-                                    KeyCode::Char(c) => {
-                                        files_view_text.borrow_mut().push(c);
-                                    }
-                                    _ => {}
-                                }
-                                continue;
-                            }
-                            if mode == 1 {
-                                // VIEW
-                                match key.code {
-                                    KeyCode::Esc | KeyCode::Char('q') => {
-                                        files_mode.set(0);
-                                    }
-                                    KeyCode::Char('e') | KeyCode::Enter => {
-                                        files_mode.set(2);
-                                        files_editing.set(true);
-                                    }
-                                    _ => {}
-                                }
-                                continue;
-                            }
-                            // BROWSE
+                        if mode == 1 {
+                            // VIEW
                             match key.code {
                                 KeyCode::Esc | KeyCode::Char('q') => {
-                                    files_open.set(false);
+                                    files_mode.set(0);
                                 }
-                                KeyCode::Up | KeyCode::Char('k') => {
-                                    let sel = files_sel.get();
-                                    if sel > 0 {
-                                        files_sel.set(sel - 1);
-                                    }
+                                KeyCode::Char('e') | KeyCode::Enter => {
+                                    files_mode.set(2);
+                                    files_editing.set(true);
                                 }
-                                KeyCode::Down | KeyCode::Char('j') => {
-                                    let n = files_dirs.borrow().len()
-                                        + files_files.borrow().len()
-                                        + usize::from(files_parent.borrow().is_some());
-                                    if files_sel.get() + 1 < n {
-                                        files_sel.set(files_sel.get() + 1);
-                                    }
+                                _ => {}
+                            }
+                            continue;
+                        }
+                        // BROWSE
+                        match key.code {
+                            KeyCode::Esc | KeyCode::Char('q') => {
+                                files_open.set(false);
+                            }
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                let sel = files_sel.get();
+                                if sel > 0 {
+                                    files_sel.set(sel - 1);
                                 }
-                                KeyCode::Char('h') => {
-                                    // toggle hidden entries + re-list this dir
-                                    files_hidden.set(!files_hidden.get());
-                                    let dir = files_dir.borrow().clone();
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                let n = files_dirs.borrow().len()
+                                    + files_files.borrow().len()
+                                    + usize::from(files_parent.borrow().is_some());
+                                if files_sel.get() + 1 < n {
+                                    files_sel.set(files_sel.get() + 1);
+                                }
+                            }
+                            KeyCode::Char('h') => {
+                                // toggle hidden entries + re-list this dir
+                                files_hidden.set(!files_hidden.get());
+                                let dir = files_dir.borrow().clone();
+                                let rid = Uuid::new_v4().to_string();
+                                *files_pending.borrow_mut() = Some(rid.clone());
+                                let f = Frame::DirList {
+                                    id: Uuid::new_v4().to_string(),
+                                    client: "attach".into(),
+                                    req_id: rid,
+                                    path: Some(dir),
+                                    hidden: files_hidden.get(),
+                                };
+                                send_frame(&mut stream, &f).ok();
+                                files_sel.set(0);
+                            }
+                            KeyCode::Enter => {
+                                let parent = files_parent.borrow().is_some();
+                                let nd = files_dirs.borrow().len();
+                                let sel = files_sel.get();
+                                let idx = sel;
+                                if parent && idx == 0 {
+                                    // up
+                                    let p = files_parent.borrow().clone().unwrap_or_default();
                                     let rid = Uuid::new_v4().to_string();
                                     *files_pending.borrow_mut() = Some(rid.clone());
                                     let f = Frame::DirList {
                                         id: Uuid::new_v4().to_string(),
                                         client: "attach".into(),
                                         req_id: rid,
-                                        path: Some(dir),
+                                        path: Some(p),
                                         hidden: files_hidden.get(),
                                     };
                                     send_frame(&mut stream, &f).ok();
-                                    files_sel.set(0);
+                                } else if idx < usize::from(parent) + nd {
+                                    // into subdir
+                                    let d = files_dirs.borrow()[idx - usize::from(parent)].clone();
+                                    let base = files_dir.borrow().clone();
+                                    let next = format!("{}/{}", base.trim_end_matches('/'), d);
+                                    let rid = Uuid::new_v4().to_string();
+                                    *files_pending.borrow_mut() = Some(rid.clone());
+                                    let f = Frame::DirList {
+                                        id: Uuid::new_v4().to_string(),
+                                        client: "attach".into(),
+                                        req_id: rid,
+                                        path: Some(next),
+                                        hidden: files_hidden.get(),
+                                    };
+                                    send_frame(&mut stream, &f).ok();
+                                } else {
+                                    // open file: FileRead into the viewer
+                                    let fi = files_files.borrow()[idx - usize::from(parent) - nd]
+                                        .clone();
+                                    let base = files_dir.borrow().clone();
+                                    let full = format!("{}/{}", base.trim_end_matches('/'), fi);
+                                    let rid = Uuid::new_v4().to_string();
+                                    *files_pending.borrow_mut() = Some(rid.clone());
+                                    let f = Frame::FileRead {
+                                        id: Uuid::new_v4().to_string(),
+                                        client: "attach".into(),
+                                        req_id: rid,
+                                        path: full,
+                                    };
+                                    send_frame(&mut stream, &f).ok();
                                 }
-                                KeyCode::Enter => {
-                                    let parent = files_parent.borrow().is_some();
-                                    let nd = files_dirs.borrow().len();
-                                    let sel = files_sel.get();
-                                    let idx = sel;
-                                    if parent && idx == 0 {
-                                        // up
-                                        let p = files_parent.borrow().clone().unwrap_or_default();
-                                        let rid = Uuid::new_v4().to_string();
-                                        *files_pending.borrow_mut() = Some(rid.clone());
-                                        let f = Frame::DirList {
-                                            id: Uuid::new_v4().to_string(),
-                                            client: "attach".into(),
-                                            req_id: rid,
-                                            path: Some(p),
-                                            hidden: files_hidden.get(),
-                                        };
-                                        send_frame(&mut stream, &f).ok();
-                                    } else if idx < usize::from(parent) + nd {
-                                        // into subdir
-                                        let d = files_dirs.borrow()[idx - usize::from(parent)]
-                                            .clone();
-                                        let base = files_dir.borrow().clone();
-                                        let next = format!(
-                                            "{}/{}",
-                                            base.trim_end_matches('/'),
-                                            d
-                                        );
-                                        let rid = Uuid::new_v4().to_string();
-                                        *files_pending.borrow_mut() = Some(rid.clone());
-                                        let f = Frame::DirList {
-                                            id: Uuid::new_v4().to_string(),
-                                            client: "attach".into(),
-                                            req_id: rid,
-                                            path: Some(next),
-                                            hidden: files_hidden.get(),
-                                        };
-                                        send_frame(&mut stream, &f).ok();
-                                    } else {
-                                        // open file: FileRead into the viewer
-                                        let fi = files_files.borrow()
-                                            [idx - usize::from(parent) - nd]
-                                            .clone();
-                                        let base = files_dir.borrow().clone();
-                                        let full = format!(
-                                            "{}/{}",
-                                            base.trim_end_matches('/'),
-                                            fi
-                                        );
-                                        let rid = Uuid::new_v4().to_string();
-                                        *files_pending.borrow_mut() = Some(rid.clone());
-                                        let f = Frame::FileRead {
-                                            id: Uuid::new_v4().to_string(),
-                                            client: "attach".into(),
-                                            req_id: rid,
-                                            path: full,
-                                        };
-                                        send_frame(&mut stream, &f).ok();
-                                    }
-                                }
-                                _ => {}
                             }
-                            continue;
+                            _ => {}
                         }
-                        // :triggers modal: trigger list (Phase D)
-                        if trig_open.get() {
-                            match key.code {
-                                KeyCode::Esc | KeyCode::Char('q') => {
-                                    trig_open.set(false);
-                                }
-                                KeyCode::Up | KeyCode::Char('k') => {
-                                    let sel = trig_sel.get();
-                                    if sel > 0 {
-                                        trig_sel.set(sel - 1);
-                                    }
-                                }
-                                KeyCode::Down | KeyCode::Char('j') => {
-                                    let sel = trig_sel.get();
-                                    if sel + 1 < trig_items.borrow().len() {
-                                        trig_sel.set(sel + 1);
-                                    }
-                                }
-                                KeyCode::Char('d') => {
-                                    // toggle enable/disable
-                                    let picked = trig_items.borrow().get(trig_sel.get()).cloned();
-                                    if let Some(mut tv) = picked {
-                                        let id = tv.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string();
-                                        let enabled = tv.get("enabled").and_then(|x| x.as_bool()).unwrap_or(true);
-                                        if let Some(obj) = tv.as_object_mut() {
-                                            obj.insert("enabled".into(), serde_json::Value::Bool(!enabled));
-                                        }
-                                        if !id.is_empty() {
-                                            let f = Frame::TriggerPut {
-                                                req_id: Uuid::new_v4().to_string(),
-                                                trigger_id: Some(id),
-                                                trigger: tv,
-                                            };
-                                            send_frame(&mut stream, &f).ok();
-                                            trig_open.set(false);
-                                        }
-                                    }
-                                }
-                                KeyCode::Enter => {
-                                    let picked = trig_items.borrow().get(trig_sel.get()).cloned();
-                                    if let Some(tv) = picked {
-                                        let id = tv.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string();
-                                        if !id.is_empty() {
-                                            trig_open.set(false);
-                                            let f = Frame::TriggerRun {
-                                                req_id: Uuid::new_v4().to_string(),
-                                                trigger: id,
-                                            };
-                                            send_frame(&mut stream, &f).ok();
-                                        }
-                                    }
-                                }
-                                _ => {}
+                        continue;
+                    }
+                    // :triggers modal: trigger list (Phase D)
+                    if trig_open.get() {
+                        match key.code {
+                            KeyCode::Esc | KeyCode::Char('q') => {
+                                trig_open.set(false);
                             }
-                            continue;
-                        }
-                        // :workflows modal: mule workflow picker (Phase C)
-                        if wf_open.get() {
-                            match key.code {
-                                KeyCode::Esc | KeyCode::Char('q') => {
-                                    wf_open.set(false);
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                let sel = trig_sel.get();
+                                if sel > 0 {
+                                    trig_sel.set(sel - 1);
                                 }
-                                KeyCode::Up | KeyCode::Char('k') => {
-                                    let sel = wf_sel.get();
-                                    if sel > 0 {
-                                        wf_sel.set(sel - 1);
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                let sel = trig_sel.get();
+                                if sel + 1 < trig_items.borrow().len() {
+                                    trig_sel.set(sel + 1);
+                                }
+                            }
+                            KeyCode::Char('d') => {
+                                // toggle enable/disable
+                                let picked = trig_items.borrow().get(trig_sel.get()).cloned();
+                                if let Some(mut tv) = picked {
+                                    let id = tv
+                                        .get("id")
+                                        .and_then(|x| x.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
+                                    let enabled =
+                                        tv.get("enabled").and_then(|x| x.as_bool()).unwrap_or(true);
+                                    if let Some(obj) = tv.as_object_mut() {
+                                        obj.insert(
+                                            "enabled".into(),
+                                            serde_json::Value::Bool(!enabled),
+                                        );
                                     }
-                                }
-                                KeyCode::Down | KeyCode::Char('j') => {
-                                    let sel = wf_sel.get();
-                                    if sel + 1 < wf_items.borrow().len() {
-                                        wf_sel.set(sel + 1);
-                                    }
-                                }
-                                KeyCode::Enter => {
-                                    let picked = wf_items
-                                        .borrow()
-                                        .get(wf_sel.get())
-                                        .cloned();
-                                    if let Some(w) = picked {
-                                        wf_open.set(false);
-                                        let f = Frame::WorkflowRun {
+                                    if !id.is_empty() {
+                                        let f = Frame::TriggerPut {
                                             req_id: Uuid::new_v4().to_string(),
-                                            workflow: w.id,
-                                            input: None,
+                                            trigger_id: Some(id),
+                                            trigger: tv,
                                         };
                                         send_frame(&mut stream, &f).ok();
-                                        // WorkflowRunOk attaches
+                                        trig_open.set(false);
                                     }
                                 }
-                                _ => {}
                             }
-                            continue;
-                        }
-                        // prefix-c modal: new pane kind picker
-                        if newpane_open.get() {
-                            const KINDS: &[&str] = &[
-                                "shell — plain terminal split",
-                                "agent · forge — forge-backed agent chat",
-                                "agent · pi — local pi agent chat",
-                                "editor — $EDITOR in a split",
-                            ];
-                            match key.code {
-                                KeyCode::Esc | KeyCode::Char('q') => {
-                                    newpane_open.set(false);
-                                }
-                                KeyCode::Up | KeyCode::Char('k') => {
-                                    let sel = newpane_sel.get();
-                                    if sel > 0 {
-                                        newpane_sel.set(sel - 1);
+                            KeyCode::Enter => {
+                                let picked = trig_items.borrow().get(trig_sel.get()).cloned();
+                                if let Some(tv) = picked {
+                                    let id = tv
+                                        .get("id")
+                                        .and_then(|x| x.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
+                                    if !id.is_empty() {
+                                        trig_open.set(false);
+                                        let f = Frame::TriggerRun {
+                                            req_id: Uuid::new_v4().to_string(),
+                                            trigger: id,
+                                        };
+                                        send_frame(&mut stream, &f).ok();
                                     }
                                 }
-                                KeyCode::Down | KeyCode::Char('j') => {
-                                    let sel = newpane_sel.get();
-                                    if sel + 1 < KINDS.len() {
-                                        newpane_sel.set(sel + 1);
-                                    }
-                                }
-                                KeyCode::Enter => {
-                                    let sel = newpane_sel.get();
-                                    newpane_open.set(false);
-                                    match sel {
-                                        0 => {
-                                            // shell split (right)
-                                            let f = Frame::PaneSplit {
-                                                req_id: Uuid::new_v4().to_string(),
-                                                session: session_id.clone(),
-                                                pane: active_pane.clone(),
-                                                dir: 1,
-                                                kind: None,
-                                            };
-                                            send_frame(&mut stream, &f).ok();
-                                        }
-                                        1 => {
-                                            // forge agent split
-                                            let f = Frame::PaneSplit {
-                                                req_id: Uuid::new_v4().to_string(),
-                                                session: session_id.clone(),
-                                                pane: active_pane.clone(),
-                                                dir: 1,
-                                                kind: Some("forge".into()),
-                                            };
-                                            send_frame(&mut stream, &f).ok();
-                                        }
-                                        2 => {
-                                            // local pi agent split (anchored
-                                            // to the focused pane's cwd)
-                                            let f = Frame::PaneSplit {
-                                                req_id: Uuid::new_v4().to_string(),
-                                                session: session_id.clone(),
-                                                pane: active_pane.clone(),
-                                                dir: 1,
-                                                kind: Some("pi".into()),
-                                            };
-                                            send_frame(&mut stream, &f).ok();
-                                        }
-                                        _ => {
-                                            // editor split: prompt for a file
-                                            // (blank = new buffer), then the
-                                            // snapshot handler types $EDITOR in
-                                            prompt_input.clear();
-                                            prompt.set(Some(Prompt::EditorFile));
-                                        }
-                                    }
-                                }
-                                _ => {}
                             }
-                            continue;
+                            _ => {}
                         }
-                        // scrollback viewer: scroll + close
-                        if scroll_open.get() {
-                            let lines = scroll_lines.borrow().len();
-                            let vis = (rows as usize).saturating_sub(4);
-                            match key.code {
-                                KeyCode::Esc | KeyCode::Char('q') => {
-                                    scroll_open.set(false);
+                        continue;
+                    }
+                    // :workflows modal: mule workflow picker (Phase C)
+                    if wf_open.get() {
+                        match key.code {
+                            KeyCode::Esc | KeyCode::Char('q') => {
+                                wf_open.set(false);
+                            }
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                let sel = wf_sel.get();
+                                if sel > 0 {
+                                    wf_sel.set(sel - 1);
                                 }
-                                KeyCode::Up | KeyCode::Char('k') => {
-                                    let d = scroll_delta.get();
-                                    if d < lines {
-                                        scroll_delta.set(d + 1);
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                let sel = wf_sel.get();
+                                if sel + 1 < wf_items.borrow().len() {
+                                    wf_sel.set(sel + 1);
+                                }
+                            }
+                            KeyCode::Enter => {
+                                let picked = wf_items.borrow().get(wf_sel.get()).cloned();
+                                if let Some(w) = picked {
+                                    wf_open.set(false);
+                                    let f = Frame::WorkflowRun {
+                                        req_id: Uuid::new_v4().to_string(),
+                                        workflow: w.id,
+                                        input: None,
+                                    };
+                                    send_frame(&mut stream, &f).ok();
+                                    // WorkflowRunOk attaches
+                                }
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+                    // prefix-c modal: new pane kind picker
+                    if newpane_open.get() {
+                        const KINDS: &[&str] = &[
+                            "shell — plain terminal split",
+                            "agent · forge — forge-backed agent chat",
+                            "agent · pi — local pi agent chat",
+                            "editor — $EDITOR in a split",
+                        ];
+                        match key.code {
+                            KeyCode::Esc | KeyCode::Char('q') => {
+                                newpane_open.set(false);
+                            }
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                let sel = newpane_sel.get();
+                                if sel > 0 {
+                                    newpane_sel.set(sel - 1);
+                                }
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                let sel = newpane_sel.get();
+                                if sel + 1 < KINDS.len() {
+                                    newpane_sel.set(sel + 1);
+                                }
+                            }
+                            KeyCode::Enter => {
+                                let sel = newpane_sel.get();
+                                newpane_open.set(false);
+                                match sel {
+                                    0 => {
+                                        // shell split (right)
+                                        let f = Frame::PaneSplit {
+                                            req_id: Uuid::new_v4().to_string(),
+                                            session: session_id.clone(),
+                                            pane: active_pane.clone(),
+                                            dir: 1,
+                                            kind: None,
+                                        };
+                                        send_frame(&mut stream, &f).ok();
+                                    }
+                                    1 => {
+                                        // forge agent split
+                                        let f = Frame::PaneSplit {
+                                            req_id: Uuid::new_v4().to_string(),
+                                            session: session_id.clone(),
+                                            pane: active_pane.clone(),
+                                            dir: 1,
+                                            kind: Some("forge".into()),
+                                        };
+                                        send_frame(&mut stream, &f).ok();
+                                    }
+                                    2 => {
+                                        // local pi agent split (anchored
+                                        // to the focused pane's cwd)
+                                        let f = Frame::PaneSplit {
+                                            req_id: Uuid::new_v4().to_string(),
+                                            session: session_id.clone(),
+                                            pane: active_pane.clone(),
+                                            dir: 1,
+                                            kind: Some("pi".into()),
+                                        };
+                                        send_frame(&mut stream, &f).ok();
+                                    }
+                                    _ => {
+                                        // editor split: prompt for a file
+                                        // (blank = new buffer), then the
+                                        // snapshot handler types $EDITOR in
+                                        prompt_input.clear();
+                                        prompt.set(Some(Prompt::EditorFile));
                                     }
                                 }
-                                KeyCode::Down | KeyCode::Char('j') => {
-                                    let d = scroll_delta.get();
-                                    scroll_delta.set(d.saturating_sub(1));
-                                }
-                                KeyCode::PageUp => {
-                                    let d = scroll_delta.get();
-                                    scroll_delta.set((d + vis).min(lines));
-                                }
-                                KeyCode::PageDown => {
-                                    let d = scroll_delta.get();
-                                    scroll_delta.set(d.saturating_sub(vis));
-                                }
-                                KeyCode::Home | KeyCode::Char('g') => {
-                                    scroll_delta.set(lines);
-                                }
-                                KeyCode::End | KeyCode::Char('G') => {
-                                    scroll_delta.set(0);
-                                }
-                                _ => {}
                             }
-                            continue;
+                            _ => {}
                         }
-                        // :help modal: scroll + close
-                        if help_open.get() {
-                            match key.code {
-                                KeyCode::Esc | KeyCode::Char('q') => {
-                                    help_open.set(false);
-                                }
-                                KeyCode::Up | KeyCode::Char('k') => {
-                                    let off = help_off.get();
-                                    if off > 0 {
-                                        help_off.set(off - 1);
-                                    }
-                                }
-                                KeyCode::Down | KeyCode::Char('j') => {
-                                    help_off.set(help_off.get() + 1);
-                                }
-                                _ => {}
+                        continue;
+                    }
+                    // scrollback viewer: scroll + close
+                    if scroll_open.get() {
+                        let lines = scroll_lines.borrow().len();
+                        let vis = (rows as usize).saturating_sub(4);
+                        match key.code {
+                            KeyCode::Esc | KeyCode::Char('q') => {
+                                scroll_open.set(false);
                             }
-                            continue;
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                let d = scroll_delta.get();
+                                if d < lines {
+                                    scroll_delta.set(d + 1);
+                                }
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                let d = scroll_delta.get();
+                                scroll_delta.set(d.saturating_sub(1));
+                            }
+                            KeyCode::PageUp => {
+                                let d = scroll_delta.get();
+                                scroll_delta.set((d + vis).min(lines));
+                            }
+                            KeyCode::PageDown => {
+                                let d = scroll_delta.get();
+                                scroll_delta.set(d.saturating_sub(vis));
+                            }
+                            KeyCode::Home | KeyCode::Char('g') => {
+                                scroll_delta.set(lines);
+                            }
+                            KeyCode::End | KeyCode::Char('G') => {
+                                scroll_delta.set(0);
+                            }
+                            _ => {}
                         }
-                        // :agents modal: agent-profile picker + CRUD
-                        if agents_open.get() {
-                            match key.code {
-                                KeyCode::Esc | KeyCode::Char('q') => {
+                        continue;
+                    }
+                    // :help modal: scroll + close
+                    if help_open.get() {
+                        match key.code {
+                            KeyCode::Esc | KeyCode::Char('q') => {
+                                help_open.set(false);
+                            }
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                let off = help_off.get();
+                                if off > 0 {
+                                    help_off.set(off - 1);
+                                }
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                help_off.set(help_off.get() + 1);
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+                    // :agents modal: agent-profile picker + CRUD
+                    if agents_open.get() {
+                        match key.code {
+                            KeyCode::Esc | KeyCode::Char('q') => {
+                                agents_open.set(false);
+                                prof_del_confirm.set(false);
+                            }
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                let sel = agents_sel.get();
+                                if sel > 0 {
+                                    agents_sel.set(sel - 1);
+                                }
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                let sel = agents_sel.get();
+                                if sel + 1 < agents_items.borrow().len() {
+                                    agents_sel.set(sel + 1);
+                                }
+                            }
+                            // a → new profile (guided form)
+                            KeyCode::Char('a') => {
+                                agents_open.set(false);
+                                *prof_edit.borrow_mut() = Some(ProfEdit {
+                                    id: None,
+                                    fields: vec![String::new(); PROF_FIELDS.len()],
+                                    step: 0,
+                                    tools: vec![
+                                        "bash".into(),
+                                        "read".into(),
+                                        "write".into(),
+                                        "edit".into(),
+                                    ],
+                                    git_url: None,
+                                    git_ref: None,
+                                    nix_shell: None,
+                                });
+                                prompt_input.clear();
+                                prompt.set(Some(Prompt::ProfileField));
+                            }
+                            // e → edit the selected profile
+                            // (ProfileGet prefill arrives async)
+                            KeyCode::Char('e') => {
+                                let picked = agents_items.borrow().get(agents_sel.get()).cloned();
+                                if let Some(p) = picked {
+                                    let rid = Uuid::new_v4().to_string();
+                                    *prof_get_pending.borrow_mut() = Some(rid.clone());
+                                    let f = Frame::ProfileGet {
+                                        req_id: rid,
+                                        profile: p.id,
+                                    };
+                                    send_frame(&mut stream, &f).ok();
                                     agents_open.set(false);
-                                    prof_del_confirm.set(false);
                                 }
-                                KeyCode::Up | KeyCode::Char('k') => {
-                                    let sel = agents_sel.get();
-                                    if sel > 0 {
-                                        agents_sel.set(sel - 1);
-                                    }
-                                }
-                                KeyCode::Down | KeyCode::Char('j') => {
-                                    let sel = agents_sel.get();
-                                    if sel + 1 < agents_items.borrow().len() {
-                                        agents_sel.set(sel + 1);
-                                    }
-                                }
-                                // a → new profile (guided form)
-                                KeyCode::Char('a') => {
-                                    agents_open.set(false);
-                                    *prof_edit.borrow_mut() = Some(ProfEdit {
-                                        id: None,
-                                        fields: vec![String::new(); PROF_FIELDS.len()],
-                                        step: 0,
-                                        tools: vec![
-                                            "bash".into(),
-                                            "read".into(),
-                                            "write".into(),
-                                            "edit".into(),
-                                        ],
-                                        git_url: None,
-                                        git_ref: None,
-                                        nix_shell: None,
-                                    });
-                                    prompt_input.clear();
-                                    prompt.set(Some(Prompt::ProfileField));
-                                }
-                                // e → edit the selected profile
-                                // (ProfileGet prefill arrives async)
-                                KeyCode::Char('e') => {
-                                    let picked = agents_items
-                                        .borrow()
-                                        .get(agents_sel.get())
-                                        .cloned();
-                                    if let Some(p) = picked {
-                                        let rid = Uuid::new_v4().to_string();
-                                        *prof_get_pending.borrow_mut() = Some(rid.clone());
-                                        let f = Frame::ProfileGet {
-                                            req_id: rid,
+                            }
+                            // x → delete the selected profile
+                            // (two-press confirm)
+                            KeyCode::Char('x') => {
+                                let picked = agents_items.borrow().get(agents_sel.get()).cloned();
+                                if let Some(p) = picked {
+                                    if prof_del_confirm.get() {
+                                        let f = Frame::ProfileDelete {
+                                            req_id: Uuid::new_v4().to_string(),
                                             profile: p.id,
                                         };
                                         send_frame(&mut stream, &f).ok();
-                                        agents_open.set(false);
+                                        prof_del_confirm.set(false);
+                                        err_flash.set(Some((
+                                            std::time::Instant::now(),
+                                            format!("deleted profile {}", p.name),
+                                        )));
+                                    } else {
+                                        prof_del_confirm.set(true);
+                                        err_flash.set(Some((
+                                            std::time::Instant::now(),
+                                            format!("press x again to delete {}", p.name),
+                                        )));
                                     }
                                 }
-                                // x → delete the selected profile
-                                // (two-press confirm)
-                                KeyCode::Char('x') => {
-                                    let picked = agents_items
-                                        .borrow()
-                                        .get(agents_sel.get())
-                                        .cloned();
-                                    if let Some(p) = picked {
-                                        if prof_del_confirm.get() {
-                                            let f = Frame::ProfileDelete {
-                                                req_id: Uuid::new_v4().to_string(),
-                                                profile: p.id,
-                                            };
-                                            send_frame(&mut stream, &f).ok();
-                                            prof_del_confirm.set(false);
-                                            err_flash.set(Some((
-                                                std::time::Instant::now(),
-                                                format!("deleted profile {}", p.name),
-                                            )));
-                                        } else {
-                                            prof_del_confirm.set(true);
-                                            err_flash.set(Some((
-                                                std::time::Instant::now(),
-                                                format!(
-                                                    "press x again to delete {}",
-                                                    p.name
-                                                ),
-                                            )));
-                                        }
-                                    }
-                                }
-                                KeyCode::Enter => {
-                                    let picked = agents_items
-                                        .borrow()
-                                        .get(agents_sel.get())
-                                        .cloned();
-                                    if let Some(p) = picked {
-                                        agents_open.set(false);
-                                        let f = Frame::SessionsCreate {
-                                            req_id: Uuid::new_v4().to_string(),
-                                            name: Some(p.name),
-                                            kind: Some("forge".into()),
-                                            cwd: None,
-                                            profile_id: Some(p.id),
-                                            forge_session: None,
-                                            pi_session_file: None,
-                                        };
-                                        send_frame(&mut stream, &f).ok();
-                                        // SessionsAck attaches
-                                    }
-                                }
-                                _ => {}
                             }
-                            continue;
+                            KeyCode::Enter => {
+                                let picked = agents_items.borrow().get(agents_sel.get()).cloned();
+                                if let Some(p) = picked {
+                                    agents_open.set(false);
+                                    let f = Frame::SessionsCreate {
+                                        req_id: Uuid::new_v4().to_string(),
+                                        name: Some(p.name),
+                                        kind: Some("forge".into()),
+                                        cwd: None,
+                                        profile_id: Some(p.id),
+                                        forge_session: None,
+                                        pi_session_file: None,
+                                    };
+                                    send_frame(&mut stream, &f).ok();
+                                    // SessionsAck attaches
+                                }
+                            }
+                            _ => {}
                         }
-                        // :model modal: agent-model picker
-                        if model_open.get() {
-                            match key.code {
-                                KeyCode::Esc | KeyCode::Char('q') => {
+                        continue;
+                    }
+                    // :model modal: agent-model picker
+                    if model_open.get() {
+                        match key.code {
+                            KeyCode::Esc | KeyCode::Char('q') => {
+                                model_open.set(false);
+                            }
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                let sel = model_sel.get();
+                                if sel > 0 {
+                                    model_sel.set(sel - 1);
+                                }
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                let sel = model_sel.get();
+                                if sel + 1 < model_items.borrow().len() {
+                                    model_sel.set(sel + 1);
+                                }
+                            }
+                            KeyCode::Enter => {
+                                let picked = model_items.borrow().get(model_sel.get()).cloned();
+                                if let Some(mc) = picked {
                                     model_open.set(false);
-                                }
-                                KeyCode::Up | KeyCode::Char('k') => {
-                                    let sel = model_sel.get();
-                                    if sel > 0 {
-                                        model_sel.set(sel - 1);
-                                    }
-                                }
-                                KeyCode::Down | KeyCode::Char('j') => {
-                                    let sel = model_sel.get();
-                                    if sel + 1 < model_items.borrow().len() {
-                                        model_sel.set(sel + 1);
-                                    }
-                                }
-                                KeyCode::Enter => {
-                                    let picked = model_items
-                                        .borrow()
-                                        .get(model_sel.get())
-                                        .cloned();
-                                    if let Some(mc) = picked {
-                                        model_open.set(false);
-                                        let rid = Uuid::new_v4().to_string();
-                                        *model_set_pending.borrow_mut() = Some(rid.clone());
-                                        let f = Frame::ModelSet {
-                                            id: Uuid::new_v4().to_string(),
-                                            client: "attach".into(),
-                                            session: session_id.clone(),
-                                            pane: active_pane.clone(),
-                                            provider: mc.provider,
-                                            model: mc.id,
-                                            req_id: rid,
-                                        };
-                                        send_frame(&mut stream, &f).ok();
-                                    }
-                                }
-                                _ => {}
-                            }
-                            continue;
-                        }
-                        // sidebar (machines/sessions): navigation +
-                        // attach while focused. Esc/q unfocuses but
-                        // KEEPS the sidebar visible (prefix-s collapses).
-                        if picker.get() {
-                            let cloud_ref = cloud
-                                .lock()
-                                .map(|g| g.clone())
-                                .unwrap_or_default();
-                            let rows = sidebar_rows(&sessions_meta, &cloud_ref, &session_id, local_label);
-                            let n_targets = rows.len();
-                            match key.code {
-                                KeyCode::Char('q') | KeyCode::Esc => {
-                                    picker.set(false);
-                                }
-                                KeyCode::Up | KeyCode::Char('k') => {
-                                    let sel = picker_sel.get();
-                                    if sel > 0 {
-                                        picker_sel.set(sel - 1);
-                                    }
-                                }
-                                KeyCode::Down | KeyCode::Char('j') => {
-                                    let sel = picker_sel.get();
-                                    if sel + 1 < n_targets {
-                                        picker_sel.set(sel + 1);
-                                    }
-                                }
-                                KeyCode::Enter => {
-                                    let sel = picker_sel.get().min(n_targets.saturating_sub(1));
-                                    if let Some(row) = rows.get(sel) {
-                                        match &row.target {
-                                            Some(SbTarget::Local(target)) => {
-                                                picker.set(false);
-                                                let rf = Frame::Resize {
-                                                    id: Uuid::new_v4().to_string(),
-                                                    client: "attach".into(),
-                                                    session: session_id.clone(),
-                                                    cols: screen.cols,
-                                                    rows: screen.rows,
-                                                };
-                                                send_frame(&mut stream, &rf).ok();
-                                                let af = Frame::Attach {
-                                                    id: Uuid::new_v4().to_string(),
-                                                    client: "attach".into(),
-                                                    session: target.clone(),
-                                                    pane: None,
-                                                    chat_limit: None,
-                                                };
-                                                send_frame(&mut stream, &af).ok();
-                                                screen.reset_blank();
-                                                sent_resize.set(false);
-                                            }
-                                            Some(SbTarget::Cloud {
-                                                machine_id,
-                                                machine_name,
-                                                session_id: target,
-                                            }) => {
-                                                // jump to a remote machine:
-                                                // tear this attach down and
-                                                // reconnect over realtime
-                                                cloud_jump = Some(AttachNext::Cloud {
-                                                    machine_id: machine_id.clone(),
-                                                    machine_name: machine_name.clone(),
-                                                    session: target.clone(),
-                                                });
-                                                let df = Frame::Detach {
-                                                    id: Uuid::new_v4().to_string(),
-                                                    client: "attach".into(),
-                                                };
-                                                send_frame(&mut stream, &df).ok();
-                                                break;
-                                            }
-                                            None => {}
-                                        }
-                                    }
-                                }
-                                _ => {}
-                            }
-                            continue;
-                        }
-                        // tmux-style prefix handling: Ctrl-B opens the
-                        // command state; the next key is a command (or a
-                        // second Ctrl-B passes the prefix through).
-                        if !prefix_mode.get() {
-                            if key.code == KeyCode::Char('b')
-                                && key.modifiers.contains(KeyModifiers::CONTROL)
-                            {
-                                prefix_mode.set(true);
-                                continue;
-                            }
-                        } else {
-                            prefix_mode.set(false);
-                            match key.code {
-                                // Ctrl-B Ctrl-B → literal Ctrl-B to the PTY
-                                KeyCode::Char('b')
-                                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
-                                {
-                                    let f = Frame::Input {
+                                    let rid = Uuid::new_v4().to_string();
+                                    *model_set_pending.borrow_mut() = Some(rid.clone());
+                                    let f = Frame::ModelSet {
                                         id: Uuid::new_v4().to_string(),
                                         client: "attach".into(),
                                         session: session_id.clone(),
                                         pane: active_pane.clone(),
-                                        data: ranch_protocol::b64_encode(b"\x02"),
+                                        provider: mc.provider,
+                                        model: mc.id,
+                                        req_id: rid,
                                     };
                                     send_frame(&mut stream, &f).ok();
-                                    continue;
                                 }
-                                // c → new-pane modal (shell / agent /
-                                // editor); C → new window (tmux shift)
-                                KeyCode::Char('c') => {
-                                    newpane_open.set(true);
-                                    newpane_sel.set(0);
-                                    continue;
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+                    // sidebar (machines/sessions): navigation +
+                    // attach while focused. Esc/q unfocuses but
+                    // KEEPS the sidebar visible (prefix-s collapses).
+                    if picker.get() {
+                        let cloud_ref = cloud.lock().map(|g| g.clone()).unwrap_or_default();
+                        let rows =
+                            sidebar_rows(&sessions_meta, &cloud_ref, &session_id, local_label);
+                        let n_targets = rows.len();
+                        match key.code {
+                            KeyCode::Char('q') | KeyCode::Esc => {
+                                picker.set(false);
+                            }
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                let sel = picker_sel.get();
+                                if sel > 0 {
+                                    picker_sel.set(sel - 1);
                                 }
-                                KeyCode::Char('C') => {
-                                    let f = Frame::WindowNew {
-                                        req_id: Uuid::new_v4().to_string(),
-                                        session: session_id.clone(),
-                                        name: None,
-                                    };
-                                    send_frame(&mut stream, &f).ok();
-                                    continue;
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                let sel = picker_sel.get();
+                                if sel + 1 < n_targets {
+                                    picker_sel.set(sel + 1);
                                 }
-                                // n / p → next / previous session across the
-                                // sidebar list (this machine first, then
-                                // cloud machines). N / P → next / previous
-                                // window (tmux shift binding).
-                                KeyCode::Char('N') | KeyCode::Char('P') => {
-                                    let f = Frame::WindowNext {
-                                        session: session_id.clone(),
-                                        delta: if key.code == KeyCode::Char('N') {
-                                            1
-                                        } else {
-                                            -1
-                                        },
-                                    };
-                                    send_frame(&mut stream, &f).ok();
-                                    continue;
-                                }
-                                KeyCode::Char('n') | KeyCode::Char('p') => {
-                                    let cloud_ref = cloud
-                                        .lock()
-                                        .map(|g| g.clone())
-                                        .unwrap_or_default();
-                                    let rows = sidebar_rows(
-                                        &sessions_meta,
-                                        &cloud_ref,
-                                        &session_id,
-                                        local_label,
-                                    );
-                                    let cur = rows
-                                        .iter()
-                                        .position(|r| r.current);
-                                    let n = rows.len();
-                                    if n == 0 {
-                                        continue;
-                                    }
-                                    // step ±1 from the current row, wrap
-                                    // around, land on the next row with a
-                                    // jumpable target
-                                    let dir: i64 = if key.code == KeyCode::Char('n') {
-                                        1
-                                    } else {
-                                        -1
-                                    };
-                                    let start = cur.map(|c| c as i64).unwrap_or(if dir > 0 {
-                                        -1
-                                    } else {
-                                        0
-                                    });
-                                    let mut picked = None;
-                                    for step in 1..=(n as i64) {
-                                        let i = ((start + dir * step).rem_euclid(n as i64))
-                                            as usize;
-                                        if rows[i].target.is_some() && Some(i) != cur {
-                                            picked = Some(i);
-                                            break;
-                                        }
-                                    }
-                                    let Some(i) = picked else {
-                                        continue;
-                                    };
-                                    match rows[i].target.clone() {
-                                        Some(SbTarget::Local(id)) => {
+                            }
+                            KeyCode::Enter => {
+                                let sel = picker_sel.get().min(n_targets.saturating_sub(1));
+                                if let Some(row) = rows.get(sel) {
+                                    match &row.target {
+                                        Some(SbTarget::Local(target)) => {
+                                            picker.set(false);
+                                            let rf = Frame::Resize {
+                                                id: Uuid::new_v4().to_string(),
+                                                client: "attach".into(),
+                                                session: session_id.clone(),
+                                                cols: screen.cols,
+                                                rows: screen.rows,
+                                            };
+                                            send_frame(&mut stream, &rf).ok();
                                             let af = Frame::Attach {
                                                 id: Uuid::new_v4().to_string(),
                                                 client: "attach".into(),
-                                                session: id,
+                                                session: target.clone(),
                                                 pane: None,
                                                 chat_limit: None,
                                             };
@@ -4566,10 +4696,13 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                                             machine_name,
                                             session_id: target,
                                         }) => {
+                                            // jump to a remote machine:
+                                            // tear this attach down and
+                                            // reconnect over realtime
                                             cloud_jump = Some(AttachNext::Cloud {
-                                                machine_id,
-                                                machine_name,
-                                                session: target,
+                                                machine_id: machine_id.clone(),
+                                                machine_name: machine_name.clone(),
+                                                session: target.clone(),
                                             });
                                             let df = Frame::Detach {
                                                 id: Uuid::new_v4().to_string(),
@@ -4580,213 +4713,333 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                                         }
                                         None => {}
                                     }
-                                    continue;
                                 }
-                                // 0-9 → select window by index
-                                KeyCode::Char(c @ '0'..='9') => {
-                                    let i = (c as u8 - b'0') as usize;
-                                    if let Some(w) = windows.get(i) {
-                                        let f = Frame::WindowSelect {
-                                            session: session_id.clone(),
-                                            window: w.id.clone(),
-                                        };
-                                        send_frame(&mut stream, &f).ok();
-                                    }
-                                    continue;
-                                }
-                                // d → detach
-                                KeyCode::Char('d') => break,
-                                // y → copy last agent response to clipboard
-                                KeyCode::Char('y') => {
-                                    let text = pane_views
-                                        .get(&active_pane)
-                                        .and_then(|pv| {
-                                            if !pv.is_chat() {
-                                                return None;
-                                            }
-                                            pv.chat
-                                                .iter()
-                                                .filter(|m| m.role != "user" && m.role != "tool")
-                                                .last()
-                                                .map(|m| m.text.clone())
-                                        });
-                                    match text {
-                                        Some(t) if !t.is_empty() => {
-                                            let mut ok = false;
-                                            for (cmd, args) in [
-                                                ("wl-copy", vec!["-p"]),
-                                                ("xclip", vec!["-selection", "clipboard"]),
-                                                ("xsel", vec!["--clipboard", "--input"]),
-                                            ] {
-                                                if let Ok(mut child) = std::process::Command::new(cmd)
-                                                    .args(&args)
-                                                    .stdin(std::process::Stdio::piped())
-                                                    .stderr(std::process::Stdio::null())
-                                                    .spawn()
-                                                {
-                                                    use std::io::Write;
-                                                    let w = child.stdin.as_mut().unwrap();
-                                                    if w.write_all(t.as_bytes()).is_ok()
-                                                        && child.wait().is_ok()
-                                                    {
-                                                        ok = true;
-                                                        break;
-                                                    }
-                                                }
-                                            }
-                                            err_flash.set(Some((
-                                                std::time::Instant::now(),
-                                                if ok {
-                                                    "copied last agent response to clipboard".into()
-                                                } else {
-                                                    "clipboard copy failed".into()
-                                                },
-                                            )));
-                                        }
-                                        _ => {
-                                            err_flash.set(Some((
-                                                std::time::Instant::now(),
-                                                "no agent response to copy".into(),
-                                            )));
-                                        }
-                                    }
-                                    continue;
-                                },
-                                // o / l → next pane in session
-                                KeyCode::Char('o') | KeyCode::Char('l') => {
-                                    if panes.len() > 1 {
-                                        let idx = panes
-                                            .iter()
-                                            .position(|p| p == &active_pane)
-                                            .map_or(0, |i| (i + 1) % panes.len());
-                                        let next = panes[idx].clone();
-                                        let f = Frame::SessionsSelect {
-                                            session: session_id.clone(),
-                                            pane: next,
-                                        };
-                                        send_frame(&mut stream, &f).ok();
-                                    }
-                                    continue;
-                                }
-                                // & / k → kill current window (the session
-                                // dies with its last window; whole sessions
-                                // are killed from the sidebar / manager)
-                                KeyCode::Char('&') | KeyCode::Char('k') => {
-                                    if !cur_window.is_empty() {
-                                        let f = Frame::WindowKill {
-                                            session: session_id.clone(),
-                                            window: cur_window.clone(),
-                                        };
-                                        send_frame(&mut stream, &f).ok();
-                                        screen.reset_blank();
-                                    }
-                                    continue;
-                                }
-                                // , → rename the current window (prompt line)
-                                KeyCode::Char(',') => {
-                                    prompt.set(Some(Prompt::RenameWindow));
-                                    prompt_input.clear();
-                                    continue;
-                                }
-                                // % / " → split pane
-                                KeyCode::Char('%') | KeyCode::Char('"') => {
-                                    let f = Frame::PaneSplit {
-                                        req_id: Uuid::new_v4().to_string(),
-                                        session: session_id.clone(),
-                                        pane: active_pane.clone(),
-                                        dir: if key.code == KeyCode::Char('%') { 1 } else { 0 },
-                                        kind: None,
-                                    };
-                                    send_frame(&mut stream, &f).ok();
-                                    continue;
-                                }
-                                // s → toggle the docked session sidebar
-                                KeyCode::Char('s') => {
-                                    // collapse → expand+focus → focus again
-                                    // collapses (sidebar is visible by
-                                    // default; esc just unfocuses)
-                                    if picker.get() {
-                                        sidebar_on.set(false);
-                                        picker.set(false);
-                                    } else if sidebar_on.get() {
-                                        picker.set(true);
-                                        spawn_cloud_refresh(cloud.clone());
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+                    // tmux-style prefix handling: Ctrl-B opens the
+                    // command state; the next key is a command (or a
+                    // second Ctrl-B passes the prefix through).
+                    if !prefix_mode.get() {
+                        if key.code == KeyCode::Char('b')
+                            && key.modifiers.contains(KeyModifiers::CONTROL)
+                        {
+                            prefix_mode.set(true);
+                            continue;
+                        }
+                    } else {
+                        prefix_mode.set(false);
+                        match key.code {
+                            // Ctrl-B Ctrl-B → literal Ctrl-B to the PTY
+                            KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                let f = Frame::Input {
+                                    id: Uuid::new_v4().to_string(),
+                                    client: "attach".into(),
+                                    session: session_id.clone(),
+                                    pane: active_pane.clone(),
+                                    data: ranch_protocol::b64_encode(b"\x02"),
+                                };
+                                send_frame(&mut stream, &f).ok();
+                                continue;
+                            }
+                            // c → new-pane modal (shell / agent /
+                            // editor); C → new window (tmux shift)
+                            KeyCode::Char('c') => {
+                                newpane_open.set(true);
+                                newpane_sel.set(0);
+                                continue;
+                            }
+                            KeyCode::Char('C') => {
+                                let f = Frame::WindowNew {
+                                    req_id: Uuid::new_v4().to_string(),
+                                    session: session_id.clone(),
+                                    name: None,
+                                };
+                                send_frame(&mut stream, &f).ok();
+                                continue;
+                            }
+                            // n / p → next / previous session across the
+                            // sidebar list (this machine first, then
+                            // cloud machines). N / P → next / previous
+                            // window (tmux shift binding).
+                            KeyCode::Char('N') | KeyCode::Char('P') => {
+                                let f = Frame::WindowNext {
+                                    session: session_id.clone(),
+                                    delta: if key.code == KeyCode::Char('N') {
+                                        1
                                     } else {
-                                        sidebar_on.set(true);
-                                        picker.set(true);
-                                        spawn_cloud_refresh(cloud.clone());
-                                    }
-                                    picker_sel.set(0);
-                                    let sb = if sidebar_on.get() { SIDEBAR_W } else { 0 };
-                                    let rf = Frame::Resize {
-                                        id: Uuid::new_v4().to_string(),
-                                        client: "attach".into(),
-                                        session: session_id.clone(),
-                                        cols: screen.cols.saturating_sub(sb),
-                                        rows: screen.rows,
-                                    };
-                                    send_frame(&mut stream, &rf).ok();
+                                        -1
+                                    },
+                                };
+                                send_frame(&mut stream, &f).ok();
+                                continue;
+                            }
+                            KeyCode::Char('n') | KeyCode::Char('p') => {
+                                let cloud_ref = cloud.lock().map(|g| g.clone()).unwrap_or_default();
+                                let rows = sidebar_rows(
+                                    &sessions_meta,
+                                    &cloud_ref,
+                                    &session_id,
+                                    local_label,
+                                );
+                                let cur = rows.iter().position(|r| r.current);
+                                let n = rows.len();
+                                if n == 0 {
                                     continue;
                                 }
-                                // Ctrl+arrows → resize the focused pane's split
-                                KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right
-                                    if key.modifiers.contains(KeyModifiers::CONTROL)
-                                        && !active_pane.is_empty() =>
-                                {
-                                    let (dir, delta) = match key.code {
-                                        KeyCode::Left => (1u8, -2i16),
-                                        KeyCode::Right => (1, 2),
-                                        KeyCode::Up => (0, -2),
-                                        _ => (0, 2),
-                                    };
-                                    let f = Frame::PaneResize {
+                                // step ±1 from the current row, wrap
+                                // around, land on the next row with a
+                                // jumpable target
+                                let dir: i64 = if key.code == KeyCode::Char('n') {
+                                    1
+                                } else {
+                                    -1
+                                };
+                                let start =
+                                    cur.map(|c| c as i64)
+                                        .unwrap_or(if dir > 0 { -1 } else { 0 });
+                                let mut picked = None;
+                                for step in 1..=(n as i64) {
+                                    let i = ((start + dir * step).rem_euclid(n as i64)) as usize;
+                                    if rows[i].target.is_some() && Some(i) != cur {
+                                        picked = Some(i);
+                                        break;
+                                    }
+                                }
+                                let Some(i) = picked else {
+                                    continue;
+                                };
+                                match rows[i].target.clone() {
+                                    Some(SbTarget::Local(id)) => {
+                                        let af = Frame::Attach {
+                                            id: Uuid::new_v4().to_string(),
+                                            client: "attach".into(),
+                                            session: id,
+                                            pane: None,
+                                            chat_limit: None,
+                                        };
+                                        send_frame(&mut stream, &af).ok();
+                                        screen.reset_blank();
+                                        sent_resize.set(false);
+                                    }
+                                    Some(SbTarget::Cloud {
+                                        machine_id,
+                                        machine_name,
+                                        session_id: target,
+                                    }) => {
+                                        cloud_jump = Some(AttachNext::Cloud {
+                                            machine_id,
+                                            machine_name,
+                                            session: target,
+                                        });
+                                        let df = Frame::Detach {
+                                            id: Uuid::new_v4().to_string(),
+                                            client: "attach".into(),
+                                        };
+                                        send_frame(&mut stream, &df).ok();
+                                        break;
+                                    }
+                                    None => {}
+                                }
+                                continue;
+                            }
+                            // 0-9 → select window by index
+                            KeyCode::Char(c @ '0'..='9') => {
+                                let i = (c as u8 - b'0') as usize;
+                                if let Some(w) = windows.get(i) {
+                                    let f = Frame::WindowSelect {
                                         session: session_id.clone(),
-                                        pane: active_pane.clone(),
-                                        dir,
-                                        delta,
+                                        window: w.id.clone(),
                                     };
                                     send_frame(&mut stream, &f).ok();
-                                    continue;
                                 }
-                                // arrows → move focus between panes (tmux-style)
-                                KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right
-                                    if !active_pane.is_empty() =>
-                                {
-                                    let dir = match key.code {
-                                        KeyCode::Up => 0u8,
-                                        KeyCode::Down => 1,
-                                        KeyCode::Left => 2,
-                                        _ => 3,
-                                    };
-                                    if let Some(ly) = &layout {
-                                        let mut rects: Vec<(String, ratatui::layout::Rect)> =
-                                            vec![];
-                                        fn walk2(
-                                            l: &ranch_protocol::Layout,
-                                            x: u16,
-                                            y: u16,
-                                            w: u16,
-                                            h: u16,
-                                            out: &mut Vec<(String, ratatui::layout::Rect)>,
-                                        ) {
-                                            match l {
-                                                ranch_protocol::Layout::Leaf { pane } => {
-                                                    out.push((
-                                                        pane.clone(),
-                                                        ratatui::layout::Rect::new(
-                                                            x,
-                                                            y,
-                                                            w.max(1),
-                                                            h.max(1),
-                                                        ),
-                                                    ))
+                                continue;
+                            }
+                            // d → detach
+                            KeyCode::Char('d') => break,
+                            // y → copy last agent response to clipboard
+                            KeyCode::Char('y') => {
+                                let text = pane_views.get(&active_pane).and_then(|pv| {
+                                    if !pv.is_chat() {
+                                        return None;
+                                    }
+                                    pv.chat
+                                        .iter()
+                                        .rfind(|m| m.role != "user" && m.role != "tool")
+                                        .map(|m| m.text.clone())
+                                });
+                                match text {
+                                    Some(t) if !t.is_empty() => {
+                                        let mut ok = false;
+                                        for (cmd, args) in [
+                                            ("wl-copy", vec!["-p"]),
+                                            ("xclip", vec!["-selection", "clipboard"]),
+                                            ("xsel", vec!["--clipboard", "--input"]),
+                                        ] {
+                                            if let Ok(mut child) = std::process::Command::new(cmd)
+                                                .args(&args)
+                                                .stdin(std::process::Stdio::piped())
+                                                .stderr(std::process::Stdio::null())
+                                                .spawn()
+                                            {
+                                                use std::io::Write;
+                                                let w = child.stdin.as_mut().unwrap();
+                                                if w.write_all(t.as_bytes()).is_ok()
+                                                    && child.wait().is_ok()
+                                                {
+                                                    ok = true;
+                                                    break;
                                                 }
-                                                ranch_protocol::Layout::Split {
-                                                    dir,
-                                                    a,
-                                                    b,
-                                                    pct,
-                                                } => match dir {
+                                            }
+                                        }
+                                        err_flash.set(Some((
+                                            std::time::Instant::now(),
+                                            if ok {
+                                                "copied last agent response to clipboard".into()
+                                            } else {
+                                                "clipboard copy failed".into()
+                                            },
+                                        )));
+                                    }
+                                    _ => {
+                                        err_flash.set(Some((
+                                            std::time::Instant::now(),
+                                            "no agent response to copy".into(),
+                                        )));
+                                    }
+                                }
+                                continue;
+                            }
+                            // o / l → next pane in session
+                            KeyCode::Char('o') | KeyCode::Char('l') => {
+                                if panes.len() > 1 {
+                                    let idx = panes
+                                        .iter()
+                                        .position(|p| p == &active_pane)
+                                        .map_or(0, |i| (i + 1) % panes.len());
+                                    let next = panes[idx].clone();
+                                    let f = Frame::SessionsSelect {
+                                        session: session_id.clone(),
+                                        pane: next,
+                                    };
+                                    send_frame(&mut stream, &f).ok();
+                                }
+                                continue;
+                            }
+                            // & / k → kill current window (the session
+                            // dies with its last window; whole sessions
+                            // are killed from the sidebar / manager)
+                            KeyCode::Char('&') | KeyCode::Char('k') => {
+                                if !cur_window.is_empty() {
+                                    let f = Frame::WindowKill {
+                                        session: session_id.clone(),
+                                        window: cur_window.clone(),
+                                    };
+                                    send_frame(&mut stream, &f).ok();
+                                    screen.reset_blank();
+                                }
+                                continue;
+                            }
+                            // , → rename the current window (prompt line)
+                            KeyCode::Char(',') => {
+                                prompt.set(Some(Prompt::RenameWindow));
+                                prompt_input.clear();
+                                continue;
+                            }
+                            // % / " → split pane
+                            KeyCode::Char('%') | KeyCode::Char('"') => {
+                                let f = Frame::PaneSplit {
+                                    req_id: Uuid::new_v4().to_string(),
+                                    session: session_id.clone(),
+                                    pane: active_pane.clone(),
+                                    dir: if key.code == KeyCode::Char('%') { 1 } else { 0 },
+                                    kind: None,
+                                };
+                                send_frame(&mut stream, &f).ok();
+                                continue;
+                            }
+                            // s → toggle the docked session sidebar
+                            KeyCode::Char('s') => {
+                                // collapse → expand+focus → focus again
+                                // collapses (sidebar is visible by
+                                // default; esc just unfocuses)
+                                if picker.get() {
+                                    sidebar_on.set(false);
+                                    picker.set(false);
+                                } else if sidebar_on.get() {
+                                    picker.set(true);
+                                    spawn_cloud_refresh(cloud.clone());
+                                } else {
+                                    sidebar_on.set(true);
+                                    picker.set(true);
+                                    spawn_cloud_refresh(cloud.clone());
+                                }
+                                picker_sel.set(0);
+                                let sb = if sidebar_on.get() { SIDEBAR_W } else { 0 };
+                                let rf = Frame::Resize {
+                                    id: Uuid::new_v4().to_string(),
+                                    client: "attach".into(),
+                                    session: session_id.clone(),
+                                    cols: screen.cols.saturating_sub(sb),
+                                    rows: screen.rows,
+                                };
+                                send_frame(&mut stream, &rf).ok();
+                                continue;
+                            }
+                            // Ctrl+arrows → resize the focused pane's split
+                            KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right
+                                if key.modifiers.contains(KeyModifiers::CONTROL)
+                                    && !active_pane.is_empty() =>
+                            {
+                                let (dir, delta) = match key.code {
+                                    KeyCode::Left => (1u8, -2i16),
+                                    KeyCode::Right => (1, 2),
+                                    KeyCode::Up => (0, -2),
+                                    _ => (0, 2),
+                                };
+                                let f = Frame::PaneResize {
+                                    session: session_id.clone(),
+                                    pane: active_pane.clone(),
+                                    dir,
+                                    delta,
+                                };
+                                send_frame(&mut stream, &f).ok();
+                                continue;
+                            }
+                            // arrows → move focus between panes (tmux-style)
+                            KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right
+                                if !active_pane.is_empty() =>
+                            {
+                                let dir = match key.code {
+                                    KeyCode::Up => 0u8,
+                                    KeyCode::Down => 1,
+                                    KeyCode::Left => 2,
+                                    _ => 3,
+                                };
+                                if let Some(ly) = &layout {
+                                    let mut rects: Vec<(String, ratatui::layout::Rect)> = vec![];
+                                    fn walk2(
+                                        l: &ranch_protocol::Layout,
+                                        x: u16,
+                                        y: u16,
+                                        w: u16,
+                                        h: u16,
+                                        out: &mut Vec<(String, ratatui::layout::Rect)>,
+                                    ) {
+                                        match l {
+                                            ranch_protocol::Layout::Leaf { pane } => out.push((
+                                                pane.clone(),
+                                                ratatui::layout::Rect::new(
+                                                    x,
+                                                    y,
+                                                    w.max(1),
+                                                    h.max(1),
+                                                ),
+                                            )),
+                                            ranch_protocol::Layout::Split { dir, a, b, pct } => {
+                                                match dir {
                                                     1 => {
                                                         let lw = ((w as u32 * *pct as u32 / 100)
                                                             as u16)
@@ -4801,811 +5054,812 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                                                         walk2(a, x, y, w, th, out);
                                                         walk2(b, x, y + th, w, h - th, out);
                                                     }
-                                                },
+                                                }
                                             }
                                         }
-                                        walk2(ly, 0, 0, cols, rows.saturating_sub(1), &mut rects);
-                                        if let Some(next) = neighbor_pane(&rects, &active_pane, dir)
-                                        {
-                                            let f = Frame::SessionsSelect {
-                                                session: session_id.clone(),
-                                                pane: next,
-                                            };
-                                            send_frame(&mut stream, &f).ok();
-                                        }
                                     }
-                                    continue;
-                                }
-                                // E → open the focused file (files browser/
-                                // viewer) in $EDITOR in a shell split
-                                KeyCode::Char('E') => {
-                                    let path = if files_open.get() && files_mode.get() >= 1 {
-                                        Some(files_view_path.borrow().clone())
-                                    } else if files_open.get() && files_mode.get() == 0 {
-                                        // resolve the browser selection to a file
-                                        let parent = files_parent.borrow().is_some();
-                                        let nd = files_dirs.borrow().len();
-                                        let sel = files_sel.get();
-                                        let fi = sel.checked_sub(usize::from(parent) + nd)
-                                            .and_then(|i| files_files.borrow().get(i).cloned());
-                                        fi.map(|f| {
-                                            format!(
-                                                "{}/{}",
-                                                files_dir.borrow().trim_end_matches('/'),
-                                                f
-                                            )
-                                        })
-                                    } else {
-                                        None
-                                    };
-                                    if let Some(file) = path {
-                                        files_open.set(false);
-                                        // remember the current leaf order; when
-                                        // the Snapshot shows the new pane, we
-                                        // type the editor command into it
-                                        if let Some(ly) = &layout {
-                                            *pre_split_leaves.borrow_mut() =
-                                                ranch_protocol::leaf_order(ly);
-                                        }
-                                        *pending_editor_file.borrow_mut() = Some(file);
-                                        let f = Frame::PaneSplit {
-                                            req_id: Uuid::new_v4().to_string(),
+                                    walk2(ly, 0, 0, cols, rows.saturating_sub(1), &mut rects);
+                                    if let Some(next) = neighbor_pane(&rects, &active_pane, dir) {
+                                        let f = Frame::SessionsSelect {
                                             session: session_id.clone(),
-                                            pane: active_pane.clone(),
-                                            dir: 0,
-                                            kind: None,
+                                            pane: next,
                                         };
                                         send_frame(&mut stream, &f).ok();
                                     }
-                                    continue;
                                 }
-                                // a → agent split: chat pane bound to a new
-                                // forge session, focused immediately
-                                KeyCode::Char('a') => {
-                                    let f = Frame::PaneSplit {
-                                        req_id: Uuid::new_v4().to_string(),
-                                        session: session_id.clone(),
-                                        pane: active_pane.clone(),
-                                        dir: 1,
-                                        kind: Some("forge".into()),
-                                    };
-                                    send_frame(&mut stream, &f).ok();
-                                    continue;
-                                }
-                                // A → local pi agent split (pi --mode rpc
-                                // child on THIS machine, same chat UX)
-                                KeyCode::Char('A') => {
-                                    let f = Frame::PaneSplit {
-                                        req_id: Uuid::new_v4().to_string(),
-                                        session: session_id.clone(),
-                                        pane: active_pane.clone(),
-                                        dir: 1,
-                                        kind: Some("pi".into()),
-                                    };
-                                    send_frame(&mut stream, &f).ok();
-                                    continue;
-                                }
-                                // { / } → swap focused pane with previous / next
-                                // pane in layout order (tmux swap-pane semantics)
-                                KeyCode::Char('{') | KeyCode::Char('}') => {
+                                continue;
+                            }
+                            // E → open the focused file (files browser/
+                            // viewer) in $EDITOR in a shell split
+                            KeyCode::Char('E') => {
+                                let path = if files_open.get() && files_mode.get() >= 1 {
+                                    Some(files_view_path.borrow().clone())
+                                } else if files_open.get() && files_mode.get() == 0 {
+                                    // resolve the browser selection to a file
+                                    let parent = files_parent.borrow().is_some();
+                                    let nd = files_dirs.borrow().len();
+                                    let sel = files_sel.get();
+                                    let fi = sel
+                                        .checked_sub(usize::from(parent) + nd)
+                                        .and_then(|i| files_files.borrow().get(i).cloned());
+                                    fi.map(|f| {
+                                        format!(
+                                            "{}/{}",
+                                            files_dir.borrow().trim_end_matches('/'),
+                                            f
+                                        )
+                                    })
+                                } else {
+                                    None
+                                };
+                                if let Some(file) = path {
+                                    files_open.set(false);
+                                    // remember the current leaf order; when
+                                    // the Snapshot shows the new pane, we
+                                    // type the editor command into it
                                     if let Some(ly) = &layout {
-                                        let order = ranch_protocol::leaf_order(ly);
-                                        if order.len() > 1 {
-                                            if let Some(cur) =
-                                                order.iter().position(|p| *p == active_pane)
-                                            {
-                                                let other = if key.code == KeyCode::Char('{') {
-                                                    order[(cur + order.len() - 1) % order.len()]
-                                                        .clone()
-                                                } else {
-                                                    order[(cur + 1) % order.len()].clone()
-                                                };
-                                                let f = Frame::PaneSwap {
+                                        *pre_split_leaves.borrow_mut() =
+                                            ranch_protocol::leaf_order(ly);
+                                    }
+                                    *pending_editor_file.borrow_mut() = Some(file);
+                                    let f = Frame::PaneSplit {
+                                        req_id: Uuid::new_v4().to_string(),
+                                        session: session_id.clone(),
+                                        pane: active_pane.clone(),
+                                        dir: 0,
+                                        kind: None,
+                                    };
+                                    send_frame(&mut stream, &f).ok();
+                                }
+                                continue;
+                            }
+                            // a → agent split: chat pane bound to a new
+                            // forge session, focused immediately
+                            KeyCode::Char('a') => {
+                                let f = Frame::PaneSplit {
+                                    req_id: Uuid::new_v4().to_string(),
+                                    session: session_id.clone(),
+                                    pane: active_pane.clone(),
+                                    dir: 1,
+                                    kind: Some("forge".into()),
+                                };
+                                send_frame(&mut stream, &f).ok();
+                                continue;
+                            }
+                            // A → local pi agent split (pi --mode rpc
+                            // child on THIS machine, same chat UX)
+                            KeyCode::Char('A') => {
+                                let f = Frame::PaneSplit {
+                                    req_id: Uuid::new_v4().to_string(),
+                                    session: session_id.clone(),
+                                    pane: active_pane.clone(),
+                                    dir: 1,
+                                    kind: Some("pi".into()),
+                                };
+                                send_frame(&mut stream, &f).ok();
+                                continue;
+                            }
+                            // { / } → swap focused pane with previous / next
+                            // pane in layout order (tmux swap-pane semantics)
+                            KeyCode::Char('{') | KeyCode::Char('}') => {
+                                if let Some(ly) = &layout {
+                                    let order = ranch_protocol::leaf_order(ly);
+                                    if order.len() > 1
+                                        && let Some(cur) =
+                                            order.iter().position(|p| *p == active_pane)
+                                    {
+                                        let other = if key.code == KeyCode::Char('{') {
+                                            order[(cur + order.len() - 1) % order.len()].clone()
+                                        } else {
+                                            order[(cur + 1) % order.len()].clone()
+                                        };
+                                        let f = Frame::PaneSwap {
+                                            session: session_id.clone(),
+                                            a: active_pane.clone(),
+                                            b: other,
+                                        };
+                                        send_frame(&mut stream, &f).ok();
+                                    }
+                                }
+                                continue;
+                            }
+                            // x → kill current pane
+                            KeyCode::Char('x') => {
+                                let f = Frame::PaneKill {
+                                    session: session_id.clone(),
+                                    pane: active_pane.clone(),
+                                };
+                                send_frame(&mut stream, &f).ok();
+                                continue;
+                            }
+                            // [ → scrollback viewer for the focused pane
+                            KeyCode::Char('[') => {
+                                let is_chat =
+                                    pane_views.get(&active_pane).is_some_and(|pv| pv.is_chat());
+                                if is_chat {
+                                    err_flash.set(Some((
+                                        std::time::Instant::now(),
+                                        "chat panes scroll in place: PageUp / PageDown".into(),
+                                    )));
+                                } else {
+                                    let rid = Uuid::new_v4().to_string();
+                                    *scroll_pending.borrow_mut() = Some(rid.clone());
+                                    let f = Frame::ScrollbackReq {
+                                        id: rid,
+                                        client: "attach".into(),
+                                        session: session_id.clone(),
+                                        pane: active_pane.clone(),
+                                        offset: 0,
+                                        limit: 2000,
+                                    };
+                                    send_frame(&mut stream, &f).ok();
+                                }
+                                continue;
+                            }
+                            // q → show pane numbers briefly (MVP: status flash)
+                            KeyCode::Char('q') => continue,
+                            // : → command prompt (rename etc.)
+                            KeyCode::Char(':') => {
+                                prompt.set(Some(Prompt::Command));
+                                prompt_input.clear();
+                                continue;
+                            }
+                            // prefix + any other key: pass the prefix
+                            // through to the PTY as Ctrl-B
+                            _ => {
+                                let f = Frame::Input {
+                                    id: Uuid::new_v4().to_string(),
+                                    client: "attach".into(),
+                                    session: session_id.clone(),
+                                    pane: active_pane.clone(),
+                                    data: ranch_protocol::b64_encode(b"\x02"),
+                                };
+                                send_frame(&mut stream, &f).ok();
+                                // fall through to also send this key
+                            }
+                        }
+                    }
+                    // rename/command prompt captures printable keys
+                    if prompt.get().is_some() {
+                        match key.code {
+                            KeyCode::Esc => {
+                                prompt.set(None);
+                                prompt_input.clear();
+                            }
+                            KeyCode::Enter => {
+                                if let Some(kind) = prompt.take() {
+                                    match kind {
+                                        Prompt::RenameWindow => {
+                                            if !prompt_input.is_empty() && !cur_window.is_empty() {
+                                                let f = Frame::WindowRename {
                                                     session: session_id.clone(),
-                                                    a: active_pane.clone(),
-                                                    b: other,
+                                                    window: cur_window.clone(),
+                                                    name: prompt_input.clone(),
                                                 };
                                                 send_frame(&mut stream, &f).ok();
                                             }
                                         }
-                                    }
-                                    continue;
-                                }
-                                // x → kill current pane
-                                KeyCode::Char('x') => {
-                                    let f = Frame::PaneKill {
-                                        session: session_id.clone(),
-                                        pane: active_pane.clone(),
-                                    };
-                                    send_frame(&mut stream, &f).ok();
-                                    continue;
-                                }
-                                // [ → scrollback viewer for the focused pane
-                                KeyCode::Char('[') => {
-                                    let is_chat = pane_views
-                                        .get(&active_pane)
-                                        .is_some_and(|pv| pv.is_chat());
-                                    if is_chat {
-                                        err_flash.set(Some((
-                                            std::time::Instant::now(),
-                                            "chat panes scroll in place: PageUp / PageDown".into(),
-                                        )));
-                                    } else {
-                                        let rid = Uuid::new_v4().to_string();
-                                        *scroll_pending.borrow_mut() = Some(rid.clone());
-                                        let f = Frame::ScrollbackReq {
-                                            id: rid,
-                                            client: "attach".into(),
-                                            session: session_id.clone(),
-                                            pane: active_pane.clone(),
-                                            offset: 0,
-                                            limit: 2000,
-                                        };
-                                        send_frame(&mut stream, &f).ok();
-                                    }
-                                    continue;
-                                }
-                                // q → show pane numbers briefly (MVP: status flash)
-                                KeyCode::Char('q') => continue,
-                                // : → command prompt (rename etc.)
-                                KeyCode::Char(':') => {
-                                    prompt.set(Some(Prompt::Command));
-                                    prompt_input.clear();
-                                    continue;
-                                }
-                                // prefix + any other key: pass the prefix
-                                // through to the PTY as Ctrl-B
-                                _ => {
-                                    let f = Frame::Input {
-                                        id: Uuid::new_v4().to_string(),
-                                        client: "attach".into(),
-                                        session: session_id.clone(),
-                                        pane: active_pane.clone(),
-                                        data: ranch_protocol::b64_encode(b"\x02"),
-                                    };
-                                    send_frame(&mut stream, &f).ok();
-                                    // fall through to also send this key
-                                }
-                            }
-                        }
-                        // rename/command prompt captures printable keys
-                        if prompt.get().is_some() {
-                            match key.code {
-                                KeyCode::Esc => {
-                                    prompt.set(None);
-                                    prompt_input.clear();
-                                }
-                                KeyCode::Enter => {
-                                    if let Some(kind) = prompt.take() {
-                                        match kind {
-                                            Prompt::RenameWindow => {
-                                                if !prompt_input.is_empty()
-                                                    && !cur_window.is_empty()
-                                                {
-                                                    let f = Frame::WindowRename {
-                                                        session: session_id.clone(),
-                                                        window: cur_window.clone(),
-                                                        name: prompt_input.clone(),
-                                                    };
-                                                    send_frame(&mut stream, &f).ok();
-                                                }
+                                        Prompt::Command => {
+                                            // minimal: :agent <name>, :pi [dir],
+                                            // :resume, :kill, :detach
+                                            if prompt_input.trim() == "files"
+                                                || prompt_input.trim().starts_with("files ")
+                                            {
+                                                let arg = prompt_input
+                                                    .trim()
+                                                    .strip_prefix("files")
+                                                    .unwrap_or("")
+                                                    .trim()
+                                                    .to_string();
+                                                prompt_input.clear();
+                                                prompt.set(None);
+                                                let start = if arg.is_empty() {
+                                                    pane_cwds
+                                                        .get(&active_pane)
+                                                        .cloned()
+                                                        .unwrap_or_else(|| {
+                                                            std::env::var("HOME")
+                                                                .unwrap_or_default()
+                                                        })
+                                                } else {
+                                                    arg
+                                                };
+                                                *files_dir.borrow_mut() = start.clone();
+                                                let rid = Uuid::new_v4().to_string();
+                                                *files_pending.borrow_mut() = Some(rid.clone());
+                                                let f = Frame::DirList {
+                                                    id: Uuid::new_v4().to_string(),
+                                                    client: "attach".into(),
+                                                    req_id: rid,
+                                                    path: Some(start),
+                                                    hidden: files_hidden.get(),
+                                                };
+                                                send_frame(&mut stream, &f).ok();
+                                                files_sel.set(0);
+                                                files_mode.set(0);
+                                                files_open.set(true);
+                                                continue;
                                             }
-                                            Prompt::Command => {
-                                                // minimal: :agent <name>, :pi [dir],
-                                                // :resume, :kill, :detach
-                                                if prompt_input.trim() == "files"
-                                                    || prompt_input.trim().starts_with("files ")
-                                                {
-                                                    let arg = prompt_input
-                                                        .trim()
-                                                        .strip_prefix("files")
-                                                        .unwrap_or("")
-                                                        .trim()
-                                                        .to_string();
-                                                    prompt_input.clear();
-                                                    prompt.set(None);
-                                                    let start = if arg.is_empty() {
-                                                        pane_cwds
-                                                            .get(&active_pane)
-                                                            .cloned()
-                                                            .unwrap_or_else(|| {
-                                                                std::env::var("HOME")
-                                                                    .unwrap_or_default()
-                                                            })
-                                                    } else {
-                                                        arg
-                                                    };
-                                                    *files_dir.borrow_mut() = start.clone();
-                                                    let rid = Uuid::new_v4().to_string();
-                                                    *files_pending.borrow_mut() = Some(rid.clone());
-                                                    let f = Frame::DirList {
-                                                        id: Uuid::new_v4().to_string(),
-                                                        client: "attach".into(),
-                                                        req_id: rid,
-                                                        path: Some(start),
-                                                        hidden: files_hidden.get(),
-                                                    };
-                                                    send_frame(&mut stream, &f).ok();
-                                                    files_sel.set(0);
-                                                    files_mode.set(0);
-                                                    files_open.set(true);
-                                                    continue;
-                                                }
-                                                if prompt_input.trim() == "triggers" {
-                                                    prompt_input.clear();
-                                                    prompt.set(None);
-                                                    let rid = Uuid::new_v4().to_string();
-                                                    *trig_pending.borrow_mut() = Some(rid.clone());
-                                                    let f = Frame::TriggerList { req_id: rid };
-                                                    send_frame(&mut stream, &f).ok();
-                                                    continue;
-                                                }
-                                                if prompt_input.trim() == "workflows" {
-                                                    prompt_input.clear();
-                                                    prompt.set(None);
-                                                    let rid = Uuid::new_v4().to_string();
-                                                    *wf_pending.borrow_mut() = Some(rid.clone());
-                                                    let f = Frame::WorkflowList { req_id: rid };
-                                                    send_frame(&mut stream, &f).ok();
-                                                    continue;
-                                                }
-                                                if prompt_input.trim() == "agents" {
-                                                    prompt_input.clear();
-                                                    prompt.set(None);
-                                                    let rid = Uuid::new_v4().to_string();
-                                                    *agents_pending.borrow_mut() = Some(rid.clone());
-                                                    let f = Frame::ProfileList { req_id: rid };
-                                                    send_frame(&mut stream, &f).ok();
-                                                    continue;
-                                                }
-                                                if prompt_input.trim() == "resume" {
-                                                    let rid = Uuid::new_v4().to_string();
-                                                    let prid = Uuid::new_v4().to_string();
-                                                    *resume_pending.borrow_mut() =
-                                                        Some(rid.clone());
-                                                    *pi_resume_pending.borrow_mut() =
-                                                        Some(prid.clone());
-                                                    resume_items.borrow_mut().clear();
-                                                    resume_filter.borrow_mut().clear();
-                                                    resume_sel.set(0);
-                                                    let f = Frame::ForgeList {
-                                                        id: Uuid::new_v4().to_string(),
-                                                        client: "attach".into(),
-                                                        req_id: rid,
+                                            if prompt_input.trim() == "triggers" {
+                                                prompt_input.clear();
+                                                prompt.set(None);
+                                                let rid = Uuid::new_v4().to_string();
+                                                *trig_pending.borrow_mut() = Some(rid.clone());
+                                                let f = Frame::TriggerList { req_id: rid };
+                                                send_frame(&mut stream, &f).ok();
+                                                continue;
+                                            }
+                                            if prompt_input.trim() == "workflows" {
+                                                prompt_input.clear();
+                                                prompt.set(None);
+                                                let rid = Uuid::new_v4().to_string();
+                                                *wf_pending.borrow_mut() = Some(rid.clone());
+                                                let f = Frame::WorkflowList { req_id: rid };
+                                                send_frame(&mut stream, &f).ok();
+                                                continue;
+                                            }
+                                            if prompt_input.trim() == "agents" {
+                                                prompt_input.clear();
+                                                prompt.set(None);
+                                                let rid = Uuid::new_v4().to_string();
+                                                *agents_pending.borrow_mut() = Some(rid.clone());
+                                                let f = Frame::ProfileList { req_id: rid };
+                                                send_frame(&mut stream, &f).ok();
+                                                continue;
+                                            }
+                                            if prompt_input.trim() == "resume" {
+                                                let rid = Uuid::new_v4().to_string();
+                                                let prid = Uuid::new_v4().to_string();
+                                                *resume_pending.borrow_mut() = Some(rid.clone());
+                                                *pi_resume_pending.borrow_mut() =
+                                                    Some(prid.clone());
+                                                resume_items.borrow_mut().clear();
+                                                resume_filter.borrow_mut().clear();
+                                                resume_sel.set(0);
+                                                let f = Frame::ForgeList {
+                                                    id: Uuid::new_v4().to_string(),
+                                                    client: "attach".into(),
+                                                    req_id: rid,
+                                                };
+                                                send_frame(&mut stream, &f).ok();
+                                                let f2 = Frame::PiList {
+                                                    id: Uuid::new_v4().to_string(),
+                                                    client: "attach".into(),
+                                                    req_id: prid,
+                                                };
+                                                send_frame(&mut stream, &f2).ok();
+                                                prompt_input.clear();
+                                                continue;
+                                            }
+                                            if prompt_input.trim() == "pi"
+                                                || prompt_input.trim().starts_with("pi ")
+                                            {
+                                                // no dir arg: the split anchors
+                                                // to the focused pane's cwd.
+                                                // With a dir arg, create a NEW
+                                                // pi session rooted there (like
+                                                // the web's dir picker).
+                                                let dir = prompt_input
+                                                    .trim()
+                                                    .strip_prefix("pi")
+                                                    .unwrap_or("")
+                                                    .trim()
+                                                    .to_string();
+                                                if dir.is_empty() {
+                                                    let f = Frame::PaneSplit {
+                                                        req_id: Uuid::new_v4().to_string(),
+                                                        session: session_id.clone(),
+                                                        pane: active_pane.clone(),
+                                                        dir: 1,
+                                                        kind: Some("pi".into()),
                                                     };
                                                     send_frame(&mut stream, &f).ok();
-                                                    let f2 = Frame::PiList {
-                                                        id: Uuid::new_v4().to_string(),
-                                                        client: "attach".into(),
-                                                        req_id: prid,
-                                                    };
-                                                    send_frame(&mut stream, &f2).ok();
-                                                    prompt_input.clear();
-                                                    continue;
-                                                }
-                                                if prompt_input.trim() == "pi"
-                                                    || prompt_input.trim().starts_with("pi ")
-                                                {
-                                                    // no dir arg: the split anchors
-                                                    // to the focused pane's cwd.
-                                                    // With a dir arg, create a NEW
-                                                    // pi session rooted there (like
-                                                    // the web's dir picker).
-                                                    let dir = prompt_input
-                                                        .trim()
-                                                        .strip_prefix("pi")
-                                                        .unwrap_or("")
-                                                        .trim()
-                                                        .to_string();
-                                                    if dir.is_empty() {
-                                                        let f = Frame::PaneSplit {
-                                                            req_id: Uuid::new_v4().to_string(),
-                                                            session: session_id.clone(),
-                                                            pane: active_pane.clone(),
-                                                            dir: 1,
-                                                            kind: Some("pi".into()),
-                                                        };
-                                                        send_frame(&mut stream, &f).ok();
-                                                    } else {
-                                                        let f = Frame::SessionsCreate {
-                                                            req_id: Uuid::new_v4().to_string(),
-                                                            name: None,
-                                                            kind: Some("pi".into()),
-                                                            cwd: Some(dir),
-                                                            profile_id: None,
-                                                            forge_session: None,
-                                                            pi_session_file: None,
-                                                        };
-                                                        send_frame(&mut stream, &f).ok();
-                                                        // SessionsAck attaches
-                                                    }
-                                                    prompt_input.clear();
-                                                    continue;
-                                                }
-                                                // :model — open the model picker for the
-                                                // focused agent (chat) pane
-                                                if prompt_input.trim() == "model" {
-                                                    let is_chat = pane_views
-                                                        .get(&active_pane)
-                                                        .is_some_and(|pv| pv.is_chat());
-                                                    if is_chat {
-                                                        let rid = Uuid::new_v4().to_string();
-                                                        *model_pending.borrow_mut() =
-                                                            Some(rid.clone());
-                                                        let f = Frame::ModelList {
-                                                            id: Uuid::new_v4().to_string(),
-                                                            client: "attach".into(),
-                                                            pane: active_pane.clone(),
-                                                            req_id: rid,
-                                                        };
-                                                        send_frame(&mut stream, &f).ok();
-                                                    } else {
-                                                        err_flash.set(Some((
-                                                            std::time::Instant::now(),
-                                                            "model: not an agent (chat) pane".into(),
-                                                        )));
-                                                    }
-                                                    prompt_input.clear();
-                                                    continue;
-                                                }
-                                                // :answer — reply to a pending agent question.
-                                                // Bare `:answer` sends the suggested choice (or empty
-                                                // text); `:answer 1,3` sends choice indices; anything
-                                                // else is sent as free text.
-                                                if let Some(rest) =
-                                                    prompt_input.trim().strip_prefix("answer")
-                                                {
-                                                    let arg = rest.trim().to_string();
-                                                    match pending_ask.borrow().clone() {
-                                                        Some(ask) => {
-                                                            let (sel, text) =
-                                                                if ask.choices.is_empty()
-                                                                {
-                                                                    (Vec::new(), arg)
-                                                                } else {
-                                                                    let nums: Vec<usize> = arg
-                                                                        .split([',', ' '])
-                                                                        .filter(|s| !s.is_empty())
-                                                                        .filter_map(|s| s.parse::<usize>().ok())
-                                                                        .map(|v| v.saturating_sub(1))
-                                                                        .filter(|&v| v < ask.choices.len())
-                                                                        .collect();
-                                                                    if nums.is_empty() {
-                                                                        // bare :answer → suggested
-                                                                        // choice when given, else free text
-                                                                        match ask.suggested {
-                                                                            Some(i) => (vec![i], String::new()),
-                                                                            None => (Vec::new(), arg),
-                                                                        }
-                                                                    } else if ask.multi {
-                                                                        (nums, String::new())
-                                                                    } else {
-                                                                        (
-                                                                            nums.into_iter()
-                                                                                .take(1)
-                                                                                .collect(),
-                                                                            String::new(),
-                                                                        )
-                                                                    }
-                                                                };
-                                                            let f = Frame::AgentAskAnswer {
-                                                                ask_id: ask.ask_id,
-                                                                choices: sel,
-                                                                text,
-                                                            };
-                                                            send_frame(&mut stream, &f).ok();
-                                                            pending_ask.borrow_mut().take();
-                                                            err_flash.set(Some((
-                                                                std::time::Instant::now(),
-                                                                "answer sent".into(),
-                                                            )));
-                                                        }
-                                                        None => {
-                                                            err_flash.set(Some((
-                                                                std::time::Instant::now(),
-                                                                "no pending question".into(),
-                                                            )));
-                                                        }
-                                                    }
-                                                    prompt_input.clear();
-                                                    continue;
-                                                }
-                                                // :compact — manually compact the focused agent
-                                                // (chat) pane's context now
-                                                if prompt_input.trim() == "compact" {
-                                                    let is_chat = pane_views
-                                                        .get(&active_pane)
-                                                        .is_some_and(|pv| pv.is_chat());
-                                                    if is_chat {
-                                                        let rid = Uuid::new_v4().to_string();
-                                                        *compact_pending.borrow_mut() =
-                                                            Some(rid.clone());
-                                                        let f = Frame::ChatCompact {
-                                                            id: Uuid::new_v4().to_string(),
-                                                            client: "attach".into(),
-                                                            session: session_id.clone(),
-                                                            pane: active_pane.clone(),
-                                                            req_id: rid,
-                                                        };
-                                                        send_frame(&mut stream, &f).ok();
-                                                        err_flash.set(Some((
-                                                            std::time::Instant::now(),
-                                                            "compacting…".into(),
-                                                        )));
-                                                    } else {
-                                                        err_flash.set(Some((
-                                                            std::time::Instant::now(),
-                                                            "compact: not an agent (chat) pane".into(),
-                                                        )));
-                                                    }
-                                                    prompt_input.clear();
-                                                    continue;
-                                                }
-                                                // :stop — immediately interrupt the focused
-                                                // agent (chat) pane's in-flight turn
-                                                if prompt_input.trim() == "stop" {
-                                                    let is_chat = pane_views
-                                                        .get(&active_pane)
-                                                        .is_some_and(|pv| pv.is_chat());
-                                                    if is_chat {
-                                                        let f = Frame::Interrupt {
-                                                            id: Uuid::new_v4().to_string(),
-                                                            client: "attach".into(),
-                                                            session: session_id.clone(),
-                                                            pane: active_pane.clone(),
-                                                        };
-                                                        send_frame(&mut stream, &f).ok();
-                                                        err_flash.set(Some((
-                                                            std::time::Instant::now(),
-                                                            "interrupting…".into(),
-                                                        )));
-                                                    } else {
-                                                        err_flash.set(Some((
-                                                            std::time::Instant::now(),
-                                                            "stop: not an agent (chat) pane".into(),
-                                                        )));
-                                                    }
-                                                    prompt_input.clear();
-                                                    continue;
-                                                }
-                                                if let Some(rest) =
-                                                    prompt_input.trim().strip_prefix("agent")
-                                                {
-                                                    let name = rest.trim().to_string();
+                                                } else {
                                                     let f = Frame::SessionsCreate {
                                                         req_id: Uuid::new_v4().to_string(),
-                                                        name: if name.is_empty() {
-                                                            None
-                                                        } else {
-                                                            Some(name)
-                                                        },
-                                                        kind: Some("forge".into()),
-                                                        cwd: None,
+                                                        name: None,
+                                                        kind: Some("pi".into()),
+                                                        cwd: Some(dir),
                                                         profile_id: None,
                                                         forge_session: None,
                                                         pi_session_file: None,
                                                     };
                                                     send_frame(&mut stream, &f).ok();
-                                                    prompt_input.clear();
-                                                    continue;
+                                                    // SessionsAck attaches
                                                 }
-                                                // :upgrade — hot-upgrade the daemon
-                                                // (same as the web "upgrade daemon"
-                                                // button / `ranch upgrade`)
-                                                if prompt_input.trim() == "upgrade" {
-                                                    let f = Frame::Upgrade {};
-                                                    send_frame(&mut stream, &f).ok();
-                                                    err_flash.set(Some((
-                                                        std::time::Instant::now(),
-                                                        "hot-upgrading daemon…".into(),
-                                                    )));
-                                                    prompt_input.clear();
-                                                    continue;
-                                                }
-                                                // :pi-monitor on/off — toggle external pi session monitoring
-                                                if prompt_input.trim() == "pi-monitor on" || prompt_input.trim() == "pi-monitor off" {
-                                                    let enabled = prompt_input.trim() == "pi-monitor on";
+                                                prompt_input.clear();
+                                                continue;
+                                            }
+                                            // :model — open the model picker for the
+                                            // focused agent (chat) pane
+                                            if prompt_input.trim() == "model" {
+                                                let is_chat = pane_views
+                                                    .get(&active_pane)
+                                                    .is_some_and(|pv| pv.is_chat());
+                                                if is_chat {
                                                     let rid = Uuid::new_v4().to_string();
-                                                    let f = Frame::PiMonitor { enabled, req_id: rid };
+                                                    *model_pending.borrow_mut() = Some(rid.clone());
+                                                    let f = Frame::ModelList {
+                                                        id: Uuid::new_v4().to_string(),
+                                                        client: "attach".into(),
+                                                        pane: active_pane.clone(),
+                                                        req_id: rid,
+                                                    };
+                                                    send_frame(&mut stream, &f).ok();
+                                                } else {
+                                                    err_flash.set(Some((
+                                                        std::time::Instant::now(),
+                                                        "model: not an agent (chat) pane".into(),
+                                                    )));
+                                                }
+                                                prompt_input.clear();
+                                                continue;
+                                            }
+                                            // :answer — reply to a pending agent question.
+                                            // Bare `:answer` sends the suggested choice (or empty
+                                            // text); `:answer 1,3` sends choice indices; anything
+                                            // else is sent as free text.
+                                            if let Some(rest) =
+                                                prompt_input.trim().strip_prefix("answer")
+                                            {
+                                                let arg = rest.trim().to_string();
+                                                match pending_ask.borrow().clone() {
+                                                    Some(ask) => {
+                                                        let (sel, text) = if ask.choices.is_empty()
+                                                        {
+                                                            (Vec::new(), arg)
+                                                        } else {
+                                                            let nums: Vec<usize> = arg
+                                                                .split([',', ' '])
+                                                                .filter(|s| !s.is_empty())
+                                                                .filter_map(|s| {
+                                                                    s.parse::<usize>().ok()
+                                                                })
+                                                                .map(|v| v.saturating_sub(1))
+                                                                .filter(|&v| v < ask.choices.len())
+                                                                .collect();
+                                                            if nums.is_empty() {
+                                                                // bare :answer → suggested
+                                                                // choice when given, else free text
+                                                                match ask.suggested {
+                                                                    Some(i) => {
+                                                                        (vec![i], String::new())
+                                                                    }
+                                                                    None => (Vec::new(), arg),
+                                                                }
+                                                            } else if ask.multi {
+                                                                (nums, String::new())
+                                                            } else {
+                                                                (
+                                                                    nums.into_iter()
+                                                                        .take(1)
+                                                                        .collect(),
+                                                                    String::new(),
+                                                                )
+                                                            }
+                                                        };
+                                                        let f = Frame::AgentAskAnswer {
+                                                            ask_id: ask.ask_id,
+                                                            choices: sel,
+                                                            text,
+                                                        };
+                                                        send_frame(&mut stream, &f).ok();
+                                                        pending_ask.borrow_mut().take();
+                                                        err_flash.set(Some((
+                                                            std::time::Instant::now(),
+                                                            "answer sent".into(),
+                                                        )));
+                                                    }
+                                                    None => {
+                                                        err_flash.set(Some((
+                                                            std::time::Instant::now(),
+                                                            "no pending question".into(),
+                                                        )));
+                                                    }
+                                                }
+                                                prompt_input.clear();
+                                                continue;
+                                            }
+                                            // :compact — manually compact the focused agent
+                                            // (chat) pane's context now
+                                            if prompt_input.trim() == "compact" {
+                                                let is_chat = pane_views
+                                                    .get(&active_pane)
+                                                    .is_some_and(|pv| pv.is_chat());
+                                                if is_chat {
+                                                    let rid = Uuid::new_v4().to_string();
+                                                    *compact_pending.borrow_mut() =
+                                                        Some(rid.clone());
+                                                    let f = Frame::ChatCompact {
+                                                        id: Uuid::new_v4().to_string(),
+                                                        client: "attach".into(),
+                                                        session: session_id.clone(),
+                                                        pane: active_pane.clone(),
+                                                        req_id: rid,
+                                                    };
                                                     send_frame(&mut stream, &f).ok();
                                                     err_flash.set(Some((
                                                         std::time::Instant::now(),
-                                                        format!("external pi monitoring: {}", if enabled { "ON" } else { "OFF" }),
+                                                        "compacting…".into(),
                                                     )));
-                                                    prompt_input.clear();
-                                                    continue;
+                                                } else {
+                                                    err_flash.set(Some((
+                                                        std::time::Instant::now(),
+                                                        "compact: not an agent (chat) pane".into(),
+                                                    )));
                                                 }
-                                                // :help — command reference
-                                                if prompt_input.trim() == "help"
-                                                    || prompt_input.trim() == "h"
-                                                {
-                                                    prompt_input.clear();
-                                                    prompt.set(None);
-                                                    help_open.set(true);
-                                                    help_off.set(0);
-                                                    continue;
-                                                }
-                                                // :kill-pane — kill the focused pane
-                                                if prompt_input.trim() == "kill-pane"
-                                                    || prompt_input.trim() == "killp"
-                                                {
-                                                    let f = Frame::PaneKill {
+                                                prompt_input.clear();
+                                                continue;
+                                            }
+                                            // :stop — immediately interrupt the focused
+                                            // agent (chat) pane's in-flight turn
+                                            if prompt_input.trim() == "stop" {
+                                                let is_chat = pane_views
+                                                    .get(&active_pane)
+                                                    .is_some_and(|pv| pv.is_chat());
+                                                if is_chat {
+                                                    let f = Frame::Interrupt {
+                                                        id: Uuid::new_v4().to_string(),
+                                                        client: "attach".into(),
                                                         session: session_id.clone(),
                                                         pane: active_pane.clone(),
                                                     };
                                                     send_frame(&mut stream, &f).ok();
+                                                    err_flash.set(Some((
+                                                        std::time::Instant::now(),
+                                                        "interrupting…".into(),
+                                                    )));
+                                                } else {
+                                                    err_flash.set(Some((
+                                                        std::time::Instant::now(),
+                                                        "stop: not an agent (chat) pane".into(),
+                                                    )));
+                                                }
+                                                prompt_input.clear();
+                                                continue;
+                                            }
+                                            if let Some(rest) =
+                                                prompt_input.trim().strip_prefix("agent")
+                                            {
+                                                let name = rest.trim().to_string();
+                                                let f = Frame::SessionsCreate {
+                                                    req_id: Uuid::new_v4().to_string(),
+                                                    name: if name.is_empty() {
+                                                        None
+                                                    } else {
+                                                        Some(name)
+                                                    },
+                                                    kind: Some("forge".into()),
+                                                    cwd: None,
+                                                    profile_id: None,
+                                                    forge_session: None,
+                                                    pi_session_file: None,
+                                                };
+                                                send_frame(&mut stream, &f).ok();
+                                                prompt_input.clear();
+                                                continue;
+                                            }
+                                            // :upgrade — hot-upgrade the daemon
+                                            // (same as the web "upgrade daemon"
+                                            // button / `ranch upgrade`)
+                                            if prompt_input.trim() == "upgrade" {
+                                                let f = Frame::Upgrade {};
+                                                send_frame(&mut stream, &f).ok();
+                                                err_flash.set(Some((
+                                                    std::time::Instant::now(),
+                                                    "hot-upgrading daemon…".into(),
+                                                )));
+                                                prompt_input.clear();
+                                                continue;
+                                            }
+                                            // :pi-monitor on/off — toggle external pi session monitoring
+                                            if prompt_input.trim() == "pi-monitor on"
+                                                || prompt_input.trim() == "pi-monitor off"
+                                            {
+                                                let enabled =
+                                                    prompt_input.trim() == "pi-monitor on";
+                                                let rid = Uuid::new_v4().to_string();
+                                                let f = Frame::PiMonitor {
+                                                    enabled,
+                                                    req_id: rid,
+                                                };
+                                                send_frame(&mut stream, &f).ok();
+                                                err_flash.set(Some((
+                                                    std::time::Instant::now(),
+                                                    format!(
+                                                        "external pi monitoring: {}",
+                                                        if enabled { "ON" } else { "OFF" }
+                                                    ),
+                                                )));
+                                                prompt_input.clear();
+                                                continue;
+                                            }
+                                            // :help — command reference
+                                            if prompt_input.trim() == "help"
+                                                || prompt_input.trim() == "h"
+                                            {
+                                                prompt_input.clear();
+                                                prompt.set(None);
+                                                help_open.set(true);
+                                                help_off.set(0);
+                                                continue;
+                                            }
+                                            // :kill-pane — kill the focused pane
+                                            if prompt_input.trim() == "kill-pane"
+                                                || prompt_input.trim() == "killp"
+                                            {
+                                                let f = Frame::PaneKill {
+                                                    session: session_id.clone(),
+                                                    pane: active_pane.clone(),
+                                                };
+                                                send_frame(&mut stream, &f).ok();
+                                                prompt_input.clear();
+                                                continue;
+                                            }
+                                            // :rename <name> — rename the session
+                                            if let Some(rest) =
+                                                prompt_input.trim().strip_prefix("rename")
+                                            {
+                                                let name = rest.trim().to_string();
+                                                if !name.is_empty() {
+                                                    let f = Frame::SessionsRename {
+                                                        session: session_id.clone(),
+                                                        name,
+                                                    };
+                                                    send_frame(&mut stream, &f).ok();
+                                                    err_flash.set(Some((
+                                                        std::time::Instant::now(),
+                                                        "session renamed".into(),
+                                                    )));
                                                     prompt_input.clear();
                                                     continue;
                                                 }
-                                                // :rename <name> — rename the session
-                                                if let Some(rest) =
-                                                    prompt_input.trim().strip_prefix("rename")
-                                                {
-                                                    let name = rest.trim().to_string();
-                                                    if !name.is_empty() {
-                                                        let f = Frame::SessionsRename {
-                                                            session: session_id.clone(),
-                                                            name,
-                                                        };
-                                                        send_frame(&mut stream, &f).ok();
-                                                        err_flash.set(Some((
-                                                            std::time::Instant::now(),
-                                                            "session renamed".into(),
-                                                        )));
-                                                        prompt_input.clear();
-                                                        continue;
-                                                    }
-                                                }
-                                                // :scrollback — history ring of the
-                                                // focused pane
-                                                if prompt_input.trim() == "scrollback" {
-                                                    prompt_input.clear();
-                                                    prompt.set(None);
-                                                    let is_chat = pane_views
-                                                        .get(&active_pane)
-                                                        .is_some_and(|pv| pv.is_chat());
-                                                    if is_chat {
-                                                        err_flash.set(Some((
+                                            }
+                                            // :scrollback — history ring of the
+                                            // focused pane
+                                            if prompt_input.trim() == "scrollback" {
+                                                prompt_input.clear();
+                                                prompt.set(None);
+                                                let is_chat = pane_views
+                                                    .get(&active_pane)
+                                                    .is_some_and(|pv| pv.is_chat());
+                                                if is_chat {
+                                                    err_flash.set(Some((
                                                             std::time::Instant::now(),
                                                             "chat panes scroll in place: PageUp / PageDown".into(),
                                                         )));
+                                                } else {
+                                                    let rid = Uuid::new_v4().to_string();
+                                                    *scroll_pending.borrow_mut() =
+                                                        Some(rid.clone());
+                                                    let f = Frame::ScrollbackReq {
+                                                        id: rid,
+                                                        client: "attach".into(),
+                                                        session: session_id.clone(),
+                                                        pane: active_pane.clone(),
+                                                        offset: 0,
+                                                        limit: 2000,
+                                                    };
+                                                    send_frame(&mut stream, &f).ok();
+                                                }
+                                                continue;
+                                            }
+                                            match prompt_input.trim() {
+                                                "kill" | "kill-session" => {
+                                                    let f = Frame::SessionsKill {
+                                                        session: session_id.clone(),
+                                                    };
+                                                    send_frame(&mut stream, &f).ok();
+                                                    screen.reset_blank();
+                                                }
+                                                "detach" | "d" => {
+                                                    prompt_input.clear();
+                                                    break;
+                                                }
+                                                _ => {}
+                                            }
+                                        }
+                                        Prompt::EditorFile => {
+                                            // editor split: file to open
+                                            // (blank = new buffer)
+                                            let file = prompt_input.trim().to_string();
+                                            prompt_input.clear();
+                                            let f = Frame::PaneSplit {
+                                                req_id: Uuid::new_v4().to_string(),
+                                                session: session_id.clone(),
+                                                pane: active_pane.clone(),
+                                                dir: 1,
+                                                kind: None,
+                                            };
+                                            send_frame(&mut stream, &f).ok();
+                                            *pending_editor_file.borrow_mut() = Some(file);
+                                        }
+                                        Prompt::ProfileField => {
+                                            // guided profile form: store the
+                                            // value, advance; on the last
+                                            // field send ProfilePut
+                                            let val = prompt_input.clone();
+                                            prompt_input.clear();
+                                            let finished = {
+                                                let mut ed = prof_edit.borrow_mut();
+                                                match ed.as_mut() {
+                                                    Some(e) if e.step < PROF_FIELDS.len() => {
+                                                        // blank on an edit keeps
+                                                        // the stored value
+                                                        if !val.is_empty() || e.id.is_none() {
+                                                            e.fields[e.step] = val;
+                                                        }
+                                                        e.step += 1;
+                                                        e.step >= PROF_FIELDS.len()
+                                                    }
+                                                    _ => true,
+                                                }
+                                            };
+                                            if finished {
+                                                if let Some(e) = prof_edit.borrow_mut().take() {
+                                                    let opt = |s: &String| {
+                                                        let t = s.trim();
+                                                        if t.is_empty() {
+                                                            None
+                                                        } else {
+                                                            Some(t.to_string())
+                                                        }
+                                                    };
+                                                    if e.fields[0].trim().is_empty()
+                                                        || e.fields[2].trim().is_empty()
+                                                        || e.fields[3].trim().is_empty()
+                                                    {
+                                                        err_flash.set(Some((
+                                                            std::time::Instant::now(),
+                                                            "profile needs name, provider, model"
+                                                                .into(),
+                                                        )));
                                                     } else {
                                                         let rid = Uuid::new_v4().to_string();
-                                                        *scroll_pending.borrow_mut() =
-                                                            Some(rid.clone());
-                                                        let f = Frame::ScrollbackReq {
-                                                            id: rid,
-                                                            client: "attach".into(),
-                                                            session: session_id.clone(),
-                                                            pane: active_pane.clone(),
-                                                            offset: 0,
-                                                            limit: 2000,
+                                                        let f = Frame::ProfilePut {
+                                                            req_id: rid.clone(),
+                                                            profile_id: e.id.clone(),
+                                                            draft: ranch_protocol::ProfileDraft {
+                                                                name: e.fields[0]
+                                                                    .trim()
+                                                                    .to_string(),
+                                                                description: opt(&e.fields[1]),
+                                                                provider: e.fields[2]
+                                                                    .trim()
+                                                                    .to_string(),
+                                                                model: e.fields[3]
+                                                                    .trim()
+                                                                    .to_string(),
+                                                                base_url: opt(&e.fields[4]),
+                                                                api_key: opt(&e.fields[5]),
+                                                                working_dir: opt(&e.fields[6]),
+                                                                git_url: e.git_url.clone(),
+                                                                git_ref: e.git_ref.clone(),
+                                                                nix_shell: e.nix_shell.clone(),
+                                                                system_prompt: opt(&e.fields[7]),
+                                                                tools: e.tools.clone(),
+                                                            },
                                                         };
                                                         send_frame(&mut stream, &f).ok();
+                                                        err_flash.set(Some((
+                                                            std::time::Instant::now(),
+                                                            "saving profile…".into(),
+                                                        )));
                                                     }
-                                                    continue;
                                                 }
-                                                match prompt_input.trim() {
-                                                    "kill" | "kill-session" => {
-                                                        let f = Frame::SessionsKill {
-                                                            session: session_id.clone(),
-                                                        };
-                                                        send_frame(&mut stream, &f).ok();
-                                                        screen.reset_blank();
-                                                    }
-                                                    "detach" | "d" => {
-                                                        prompt_input.clear();
-                                                        break;
-                                                    }
-                                                    _ => {}
-                                                }
-                                            }
-                                            Prompt::EditorFile => {
-                                                // editor split: file to open
-                                                // (blank = new buffer)
-                                                let file = prompt_input.trim().to_string();
-                                                prompt_input.clear();
-                                                let f = Frame::PaneSplit {
-                                                    req_id: Uuid::new_v4().to_string(),
-                                                    session: session_id.clone(),
-                                                    pane: active_pane.clone(),
-                                                    dir: 1,
-                                                    kind: None,
-                                                };
-                                                send_frame(&mut stream, &f).ok();
-                                                *pending_editor_file.borrow_mut() =
-                                                    Some(file);
-                                            }
-                                            Prompt::ProfileField => {
-                                                // guided profile form: store the
-                                                // value, advance; on the last
-                                                // field send ProfilePut
-                                                let val = prompt_input.clone();
-                                                prompt_input.clear();
-                                                let finished = {
-                                                    let mut ed = prof_edit.borrow_mut();
-                                                    match ed.as_mut() {
-                                                        Some(e) if e.step < PROF_FIELDS.len() => {
-                                                            // blank on an edit keeps
-                                                            // the stored value
-                                                            if !val.is_empty()
-                                                                || e.id.is_none()
-                                                            {
-                                                                e.fields[e.step] = val;
-                                                            }
-                                                            e.step += 1;
-                                                            e.step >= PROF_FIELDS.len()
-                                                        }
-                                                        _ => true,
-                                                    }
-                                                };
-                                                if finished {
-                                                    if let Some(e) =
-                                                        prof_edit.borrow_mut().take()
-                                                    {
-                                                        let opt = |s: &String| {
-                                                            let t = s.trim();
-                                                            if t.is_empty() {
-                                                                None
-                                                            } else {
-                                                                Some(t.to_string())
-                                                            }
-                                                        };
-                                                        if e.fields[0].trim().is_empty()
-                                                            || e.fields[2].trim().is_empty()
-                                                            || e.fields[3].trim().is_empty()
-                                                        {
-                                                            err_flash.set(Some((
-                                                                std::time::Instant::now(),
-                                                                "profile needs name, provider, model".into(),
-                                                            )));
-                                                        } else {
-                                                            let rid =
-                                                                Uuid::new_v4().to_string();
-                                                            let f = Frame::ProfilePut {
-                                                                req_id: rid.clone(),
-                                                                profile_id: e.id.clone(),
-                                                                draft:
-                                                                    ranch_protocol::ProfileDraft {
-                                                                    name: e.fields[0].trim().to_string(),
-                                                                    description: opt(&e.fields[1]),
-                                                                    provider: e.fields[2].trim().to_string(),
-                                                                    model: e.fields[3].trim().to_string(),
-                                                                    base_url: opt(&e.fields[4]),
-                                                                    api_key: opt(&e.fields[5]),
-                                                                    working_dir: opt(&e.fields[6]),
-                                                                    git_url: e.git_url.clone(),
-                                                                    git_ref: e.git_ref.clone(),
-                                                                    nix_shell: e.nix_shell.clone(),
-                                                                    system_prompt: opt(&e.fields[7]),
-                                                                    tools: e.tools.clone(),
-                                                                },
-                                                            };
-                                                            send_frame(&mut stream, &f).ok();
-                                                            err_flash.set(Some((
-                                                                std::time::Instant::now(),
-                                                                "saving profile…".into(),
-                                                            )));
-                                                        }
-                                                    }
-                                                    prompt.set(None);
-                                                } else {
-                                                    // prefill the next field's
-                                                    // current value (edit mode)
-                                                    if let Some(v) = prof_edit
-                                                        .borrow()
-                                                        .as_ref()
-                                                        .filter(|e| e.step < PROF_FIELDS.len())
-                                                        .map(|e| e.fields[e.step].clone())
-                                                    {
-                                                        prompt_input = v;
-                                                    }
+                                                prompt.set(None);
+                                            } else {
+                                                // prefill the next field's
+                                                // current value (edit mode)
+                                                if let Some(v) = prof_edit
+                                                    .borrow()
+                                                    .as_ref()
+                                                    .filter(|e| e.step < PROF_FIELDS.len())
+                                                    .map(|e| e.fields[e.step].clone())
+                                                {
+                                                    prompt_input = v;
                                                 }
                                             }
                                         }
                                     }
-                                    prompt_input.clear();
                                 }
-                                KeyCode::Backspace => {
-                                    prompt_input.pop();
-                                }
-                                KeyCode::Char(c) => prompt_input.push(c),
-                                _ => {}
+                                prompt_input.clear();
                             }
-                            continue;
+                            KeyCode::Backspace => {
+                                prompt_input.pop();
+                            }
+                            KeyCode::Char(c) => prompt_input.push(c),
+                            _ => {}
                         }
-                        // forge-chat capture: the focused chat pane takes
-                        // printable keys into its draft line; Enter sends
-                        if pane_views
-                            .get(&active_pane)
-                            .map(|pv| pv.is_chat())
-                            .unwrap_or(false)
-                        {
-                            match key.code {
-                                // Shift+Enter (or Ctrl+J) inserts a newline
-                                // into the draft; plain Enter sends
-                                KeyCode::Enter
-                                    if key.modifiers.contains(KeyModifiers::SHIFT) =>
-                                {
-                                    chat_input.push('\n');
-                                }
-                                KeyCode::PageUp => {
-                                    // scroll the conversation back in place
-                                    let e = chat_scroll
-                                        .entry(active_pane.clone())
-                                        .or_insert(0);
-                                    *e = e.saturating_add(10);
-                                }
-                                KeyCode::PageDown => {
-                                    let e = chat_scroll
-                                        .entry(active_pane.clone())
-                                        .or_insert(0);
-                                    *e = e.saturating_sub(10);
-                                }
-                                KeyCode::End | KeyCode::Char('G') => {
-                                    chat_scroll.insert(active_pane.clone(), 0);
-                                }
-                                KeyCode::Enter => {
-                                    let raw = chat_input.trim().to_string();
-                                    if raw == "/compact" {
-                                        // same as the :compact command /
-                                        // web's composer shortcut
-                                        let rid = Uuid::new_v4().to_string();
-                                        *compact_pending.borrow_mut() = Some(rid.clone());
-                                        let f = Frame::ChatCompact {
-                                            id: Uuid::new_v4().to_string(),
-                                            client: "attach".into(),
-                                            session: session_id.clone(),
-                                            pane: active_pane.clone(),
-                                            req_id: rid,
-                                        };
-                                        send_frame(&mut stream, &f).ok();
-                                        err_flash.set(Some((
-                                            std::time::Instant::now(),
-                                            "compacting…".into(),
-                                        )));
-                                    } else if raw == "/stop" {
-                                        // same as the :stop command /
-                                        // web's stop button
-                                        let f = Frame::Interrupt {
-                                            id: Uuid::new_v4().to_string(),
-                                            client: "attach".into(),
-                                            session: session_id.clone(),
-                                            pane: active_pane.clone(),
-                                        };
-                                        send_frame(&mut stream, &f).ok();
-                                        err_flash.set(Some((
-                                            std::time::Instant::now(),
-                                            "interrupting…".into(),
-                                        )));
-                                    } else if raw.starts_with("/open") {
-                                        // /open [path] — open an image from
-                                        // this conversation in the system
-                                        // viewer (no path = the most recent
-                                        // image reference in the chat)
-                                        let arg = raw["/open".len()..].trim();
-                                        let path = if arg.is_empty() {
-                                            pane_views.get(&active_pane).and_then(|pv| {
-                                                pv.chat.iter().rev().filter_map(|m| {
+                        continue;
+                    }
+                    // forge-chat capture: the focused chat pane takes
+                    // printable keys into its draft line; Enter sends
+                    if pane_views
+                        .get(&active_pane)
+                        .map(|pv| pv.is_chat())
+                        .unwrap_or(false)
+                    {
+                        match key.code {
+                            // Shift+Enter (or Ctrl+J) inserts a newline
+                            // into the draft; plain Enter sends
+                            KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                                chat_input.push('\n');
+                            }
+                            KeyCode::PageUp => {
+                                // scroll the conversation back in place
+                                let e = chat_scroll.entry(active_pane.clone()).or_insert(0);
+                                *e = e.saturating_add(10);
+                            }
+                            KeyCode::PageDown => {
+                                let e = chat_scroll.entry(active_pane.clone()).or_insert(0);
+                                *e = e.saturating_sub(10);
+                            }
+                            KeyCode::End | KeyCode::Char('G') => {
+                                chat_scroll.insert(active_pane.clone(), 0);
+                            }
+                            KeyCode::Enter => {
+                                let raw = chat_input.trim().to_string();
+                                if raw == "/compact" {
+                                    // same as the :compact command /
+                                    // web's composer shortcut
+                                    let rid = Uuid::new_v4().to_string();
+                                    *compact_pending.borrow_mut() = Some(rid.clone());
+                                    let f = Frame::ChatCompact {
+                                        id: Uuid::new_v4().to_string(),
+                                        client: "attach".into(),
+                                        session: session_id.clone(),
+                                        pane: active_pane.clone(),
+                                        req_id: rid,
+                                    };
+                                    send_frame(&mut stream, &f).ok();
+                                    err_flash.set(Some((
+                                        std::time::Instant::now(),
+                                        "compacting…".into(),
+                                    )));
+                                } else if raw == "/stop" {
+                                    // same as the :stop command /
+                                    // web's stop button
+                                    let f = Frame::Interrupt {
+                                        id: Uuid::new_v4().to_string(),
+                                        client: "attach".into(),
+                                        session: session_id.clone(),
+                                        pane: active_pane.clone(),
+                                    };
+                                    send_frame(&mut stream, &f).ok();
+                                    err_flash.set(Some((
+                                        std::time::Instant::now(),
+                                        "interrupting…".into(),
+                                    )));
+                                } else if let Some(arg) = raw.strip_prefix("/open") {
+                                    // /open [path] — open an image from
+                                    // this conversation in the system
+                                    // viewer (no path = the most recent
+                                    // image reference in the chat)
+                                    let arg = arg.trim();
+                                    let path = if arg.is_empty() {
+                                        pane_views.get(&active_pane).and_then(|pv| {
+                                            pv.chat
+                                                .iter()
+                                                .rev()
+                                                .filter_map(|m| {
                                                     m.image_refs
                                                         .as_ref()
                                                         .and_then(|v| v.last())
                                                         .cloned()
-                                                        .or_else(||
+                                                        .or_else(|| {
                                                             m.attachments
                                                                 .as_ref()
                                                                 .and_then(|v| v.last())
-                                                                .cloned(),
-                                                        )
+                                                                .cloned()
+                                                        })
                                                 })
-                                                .find(|p| {
-                                                    crate::daemon::media::file_is_image(p)
-                                                })
-                                            })
-                                        } else {
-                                            Some(arg.to_string())
-                                        };
-                                        match path {
+                                                .find(|p| crate::daemon::media::file_is_image(p))
+                                        })
+                                    } else {
+                                        Some(arg.to_string())
+                                    };
+                                    match path {
                                             Some(p)
                                                 if cloud_machine.is_none() =>
                                             {
@@ -5641,67 +5895,61 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                                                 "no image in this conversation yet".into(),
                                             ))),
                                         }
-                                    } else if !raw.is_empty() {
-                                        // Extract @/path/to/file references as
-                                        // attachments; the remaining text is
-                                        // sent as the display message.
-                                        let (clean, attachments) =
-                                            extract_attach_paths(&raw);
-                                        let text = if clean.is_empty() {
-                                            "(see attached files)".to_string()
-                                        } else {
-                                            clean
-                                        };
-                                        let f = Frame::ChatSend {
-                                            id: Uuid::new_v4().to_string(),
-                                            client: "attach".into(),
-                                            session: session_id.clone(),
-                                            pane: active_pane.clone(),
-                                            text,
-                                            attachments,
-                                        };
-                                        send_frame(&mut stream, &f).ok();
-                                    }
-                                    chat_input.clear();
-                                    // sending repins the view to the reply
-                                    chat_scroll.insert(active_pane.clone(), 0);
+                                } else if !raw.is_empty() {
+                                    // Extract @/path/to/file references as
+                                    // attachments; the remaining text is
+                                    // sent as the display message.
+                                    let (clean, attachments) = extract_attach_paths(&raw);
+                                    let text = if clean.is_empty() {
+                                        "(see attached files)".to_string()
+                                    } else {
+                                        clean
+                                    };
+                                    let f = Frame::ChatSend {
+                                        id: Uuid::new_v4().to_string(),
+                                        client: "attach".into(),
+                                        session: session_id.clone(),
+                                        pane: active_pane.clone(),
+                                        text,
+                                        attachments,
+                                    };
+                                    send_frame(&mut stream, &f).ok();
                                 }
-                                KeyCode::Backspace => {
-                                    chat_input.pop();
-                                }
-                                // Ctrl+J: newline fallback for terminals
-                                // that can't distinguish Shift+Enter
-                                KeyCode::Char('j')
-                                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
-                                {
-                                    chat_input.push('\n');
-                                }
-                                KeyCode::Char('c')
-                                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
-                                {
-                                    chat_input.clear();
-                                }
-                                KeyCode::Esc => {
-                                    chat_input.clear();
-                                }
-                                KeyCode::Char(c) => chat_input.push(c),
-                                _ => {}
+                                chat_input.clear();
+                                // sending repins the view to the reply
+                                chat_scroll.insert(active_pane.clone(), 0);
                             }
-                            continue;
+                            KeyCode::Backspace => {
+                                chat_input.pop();
+                            }
+                            // Ctrl+J: newline fallback for terminals
+                            // that can't distinguish Shift+Enter
+                            KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                chat_input.push('\n');
+                            }
+                            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                chat_input.clear();
+                            }
+                            KeyCode::Esc => {
+                                chat_input.clear();
+                            }
+                            KeyCode::Char(c) => chat_input.push(c),
+                            _ => {}
                         }
-                        if let Some(bytes) = key_to_bytes(&key) {
-                            let f = Frame::Input {
-                                id: Uuid::new_v4().to_string(),
-                                client: "attach".into(),
-                                session: session_id.clone(),
-                                pane: active_pane.clone(),
-                                data: ranch_protocol::b64_encode(&bytes),
-                            };
-                            send_frame(&mut stream, &f).ok();
-                        }
+                        continue;
                     }
-                    _ => {}
+                    if let Some(bytes) = key_to_bytes(&key) {
+                        let f = Frame::Input {
+                            id: Uuid::new_v4().to_string(),
+                            client: "attach".into(),
+                            session: session_id.clone(),
+                            pane: active_pane.clone(),
+                            data: ranch_protocol::b64_encode(&bytes),
+                        };
+                        send_frame(&mut stream, &f).ok();
+                    }
                 }
+                _ => {}
             }
         }
     }
@@ -5767,15 +6015,14 @@ impl CloudCfg {
                 anon_key: k,
             };
         }
-        if let Ok(text) = std::fs::read_to_string(Self::path()) {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                if let (Some(u), Some(k)) = (v["supabase_url"].as_str(), v["anon_key"].as_str()) {
-                    return CloudCfg {
-                        supabase_url: u.to_string(),
-                        anon_key: k.to_string(),
-                    };
-                }
-            }
+        if let Ok(text) = std::fs::read_to_string(Self::path())
+            && let Ok(v) = serde_json::from_str::<serde_json::Value>(&text)
+            && let (Some(u), Some(k)) = (v["supabase_url"].as_str(), v["anon_key"].as_str())
+        {
+            return CloudCfg {
+                supabase_url: u.to_string(),
+                anon_key: k.to_string(),
+            };
         }
         Self::default_cfg()
     }
@@ -5884,7 +6131,10 @@ fn http_json(
 /// b64url decode for JWT payload inspection.
 /// FileReadOk correlation: reads destined for the viewer share the
 /// files_pending slot (saves use files_save_pending separately).
-fn files_view_pending_read(req_id: &str, files_pending: &std::rc::Rc<std::cell::RefCell<Option<String>>>) -> bool {
+fn files_view_pending_read(
+    req_id: &str,
+    files_pending: &std::rc::Rc<std::cell::RefCell<Option<String>>>,
+) -> bool {
     files_pending.borrow().as_deref() == Some(req_id)
 }
 
@@ -6302,7 +6552,7 @@ fn pkce_challenge(verifier: &str) -> String {
 
 fn b64url_encode(data: &[u8]) -> String {
     const B: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for ch in data.chunks(3) {
         let b0 = ch[0] as u32;
         let b1 = ch.get(1).copied().unwrap_or(0) as u32;
@@ -6339,11 +6589,11 @@ fn urlencode(s: &str) -> String {
 
 fn open_browser(url: &str) {
     println!("sign-in URL (browser should open; copy this if not):\n  {url}");
-    if let Ok(b) = std::env::var("BROWSER") {
-        if !b.is_empty() {
-            let _ = std::process::Command::new(b).arg(url).status();
-            return;
-        }
+    if let Ok(b) = std::env::var("BROWSER")
+        && !b.is_empty()
+    {
+        let _ = std::process::Command::new(b).arg(url).status();
+        return;
     }
     let _ = std::process::Command::new("xdg-open")
         .arg(url)
@@ -6519,18 +6769,18 @@ pub fn main_client() {
     if args.is_empty() {
         // TTY → interactive session manager; otherwise print usage.
         if libc_isatty() {
-            loop {
-                match cmd_dashboard() {
-                    Some(ref_) => attach_loop(Target::Local(ref_)), // detach returns here
-                    None => break,
-                }
+            while let Some(ref_) = cmd_dashboard(false) {
+                attach_loop(Target::Local(ref_)); // detach returns here
             }
             return;
         }
         eprintln!(
-            "usage: ranch <new|agent|ls|attach|kill|rename|split|switch|register|login|machines|cloud> [args]"
+            "usage: ranch <new|agent|pi|resume|ls|attach|kill|rename|split|switch|register|login|machines|cloud> [args]"
         );
-        eprintln!("  agent [name] [dir]   new agent session (runs pi in dir)");
+        eprintln!(
+            "  agent [name] [msg…]   talk to a forge agent (Herd) — no args = dashboard Agents section"
+        );
+        eprintln!("  agent --new [name]    legacy: fresh forge agent session in cwd");
         eprintln!("  (run plain `ranch` in a terminal for the interactive session manager)");
         eprintln!("  socket: {}", socket_path().display());
         std::process::exit(2);
@@ -6562,22 +6812,11 @@ pub fn main_client() {
         }
         // ranch resume [query] — resume a forge session in an agent pane
         "resume" => cmd_resume(args.get(1).cloned()),
-        // ranch agent [name] [dir] — first-class agent session (runs pi)
-        "agent" => {
-            // default dir: the shell's cwd — `cd project && ranch agent`
-            // anchors the agent to the project
-            let cwd = args.get(2).cloned().map(Ok).unwrap_or_else(|| {
-                std::env::current_dir().map(|p| p.to_string_lossy().into_owned())
-            });
-            let cwd = match cwd {
-                Ok(c) => Some(c),
-                Err(e) => {
-                    eprintln!("warning: could not resolve cwd ({e}); agent uses forge default");
-                    None
-                }
-            };
-            cmd_new(args.get(1).cloned(), Some("forge".into()), cwd)
-        }
+        // ranch agent [name] [message…] — agent registry (Herd H1.3):
+        // no args = dashboard Agents section; name = talk to the agent
+        // (AgentTalk continue + first message); --new = legacy fresh
+        // forge agent session (the old `ranch agent [name] [dir]` form)
+        "agent" => cmd_agent(&args[1..]),
         "ls" | "list" => cmd_ls(),
         "--version" | "version" => {
             println!("ranch {}", crate::daemon::build_version());
@@ -6620,7 +6859,10 @@ mod tests {
 
     #[test]
     fn wrap_respects_explicit_newlines() {
-        assert_eq!(wrap_text("line one\nline two", 40), vec!["line one", "line two"]);
+        assert_eq!(
+            wrap_text("line one\nline two", 40),
+            vec!["line one", "line two"]
+        );
         // trailing newline → trailing blank row
         assert_eq!(wrap_text("hi\n", 40), vec!["hi", ""]);
         // blank line preserved
@@ -6631,13 +6873,16 @@ mod tests {
     fn wrap_hard_breaks_oversized_words() {
         assert_eq!(wrap_text("abcdefghij", 4), vec!["abcd", "efgh", "ij"]);
         // mixed: short word then oversized URL
-        assert_eq!(wrap_text("see https://example.com/aaaaaaaaaaa end", 10).len() > 2, true);
+        assert!(wrap_text("see https://example.com/aaaaaaaaaaa end", 10).len() > 2);
     }
 
     #[test]
     fn wrap_empty_and_narrow() {
         assert_eq!(wrap_text("", 10), vec![String::new()]);
         // degenerate width: every char gets its own row
-        assert_eq!(wrap_text("hi there", 1), vec!["h", "i", "t", "h", "e", "r", "e"]);
+        assert_eq!(
+            wrap_text("hi there", 1),
+            vec!["h", "i", "t", "h", "e", "r", "e"]
+        );
     }
 }

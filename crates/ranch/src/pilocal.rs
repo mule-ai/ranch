@@ -57,7 +57,12 @@ fn iso_utc_ms(ms: i64) -> String {
     let yy = if m <= 2 { y + 1 } else { y };
     format!(
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-        yy, m, d, sod / 3600, (sod % 3600) / 60, sod % 60
+        yy,
+        m,
+        d,
+        sod / 3600,
+        (sod % 3600) / 60,
+        sod % 60
     )
 }
 
@@ -150,7 +155,9 @@ pub fn no_tools_configured() -> bool {
         Ok(h) => h,
         Err(_) => return false,
     };
-    let text = match std::fs::read_to_string(std::path::PathBuf::from(home).join(".config/ranch/daemon.toml")) {
+    let text = match std::fs::read_to_string(
+        std::path::PathBuf::from(home).join(".config/ranch/daemon.toml"),
+    ) {
         Ok(t) => t,
         Err(_) => return false,
     };
@@ -182,8 +189,7 @@ impl LocalPi {
             }
         }
         if let Ok(home) = std::env::var("HOME") {
-            let p =
-                std::path::PathBuf::from(home).join(".local/share/ranch/ranch-pi-ext");
+            let p = std::path::PathBuf::from(home).join(".local/share/ranch/ranch-pi-ext");
             if p.join("index.js").exists() {
                 return Some(p);
             }
@@ -218,33 +224,31 @@ impl LocalPi {
     /// Returns a path string to hand to `Command::new`.
     fn pi_bin() -> String {
         // 1. daemon.toml `pi_bin = "..."`
-        if let Ok(home) = std::env::var("HOME") {
-            if let Ok(text) =
-                std::fs::read_to_string(
-                    std::path::PathBuf::from(&home).join(".config/ranch/daemon.toml"),
-                )
-            {
-                for line in text.lines() {
-                    let line = line.trim();
-                    let rest = match line.strip_prefix("pi_bin") {
-                        Some(r) => r.trim_start(),
-                        None => continue,
-                    };
-                    if rest.is_empty() || !rest.starts_with('=') {
-                        continue; // e.g. `pi_binary`
-                    }
-                    let v = rest[1..].trim().trim_matches('"').to_string();
-                    if !v.is_empty() {
-                        return v;
-                    }
+        if let Ok(home) = std::env::var("HOME")
+            && let Ok(text) = std::fs::read_to_string(
+                std::path::PathBuf::from(&home).join(".config/ranch/daemon.toml"),
+            )
+        {
+            for line in text.lines() {
+                let line = line.trim();
+                let rest = match line.strip_prefix("pi_bin") {
+                    Some(r) => r.trim_start(),
+                    None => continue,
+                };
+                if rest.is_empty() || !rest.starts_with('=') {
+                    continue; // e.g. `pi_binary`
+                }
+                let v = rest[1..].trim().trim_matches('"').to_string();
+                if !v.is_empty() {
+                    return v;
                 }
             }
         }
         // 2. env override
-        if let Ok(p) = std::env::var("RANCH_PI_BIN") {
-            if !p.is_empty() {
-                return p;
-            }
+        if let Ok(p) = std::env::var("RANCH_PI_BIN")
+            && !p.is_empty()
+        {
+            return p;
         }
         // 3 + 4. well-known mise locations
         if let Ok(home) = std::env::var("HOME") {
@@ -286,14 +290,13 @@ impl LocalPi {
             std::env::var("RANCH_CONTROL_TOKEN").ok(),
             std::env::var("RANCH_CONTROL_PORT").ok(),
         );
-        if let (Some(_tok), Some(_port)) = &control {
-            if let Some(ext) = Self::ranch_ext_path() {
-                // -e resolves against the CHILD's cwd — canonicalize so
-                // the extension loads regardless of spawn dir
-                let ext = std::fs::canonicalize(&ext)
-                    .unwrap_or(ext);
-                child.arg("-e").arg(&ext);
-            }
+        if let (Some(_tok), Some(_port)) = &control
+            && let Some(ext) = Self::ranch_ext_path()
+        {
+            // -e resolves against the CHILD's cwd — canonicalize so
+            // the extension loads regardless of spawn dir
+            let ext = std::fs::canonicalize(&ext).unwrap_or(ext);
+            child.arg("-e").arg(&ext);
         }
         if let (Some(tok), Some(port)) = &control {
             child.env("RANCH_CONTROL_TOKEN", tok);
@@ -362,10 +365,10 @@ impl LocalPi {
 
     /// pid of the rpc child (inherited or spawned) for /proc lookups.
     pub fn child_pid(&self) -> Option<libc::pid_t> {
-        if let Ok(g) = self.child.lock() {
-            if let Some(c) = g.as_ref() {
-                return Some(c.id() as libc::pid_t);
-            }
+        if let Ok(g) = self.child.lock()
+            && let Some(c) = g.as_ref()
+        {
+            return Some(c.id() as libc::pid_t);
         }
         if let Ok(g) = self.inherited_pid.lock() {
             return *g;
@@ -454,24 +457,23 @@ impl LocalPi {
         let compact_retries = self.compact_retries.clone();
         let compact_retry = self.compact_retry.clone();
         let stdin = self.stdin.clone();
+        let state = PiReaderState {
+            session_file,
+            stop,
+            model,
+            model_list_req,
+            model_set_req,
+            compact_req,
+            pin_unconfirmed,
+            last_prompt,
+            prompt_seq,
+            compact_retries,
+            compact_retry,
+            stdin,
+            pipe,
+        };
         std::thread::spawn(move || {
-            run_pi_reader(
-                dup,
-                t_pane,
-                session_file,
-                stop,
-                model,
-                model_list_req,
-                model_set_req,
-                compact_req,
-                pin_unconfirmed,
-                last_prompt,
-                prompt_seq,
-                compact_retries,
-                compact_retry,
-                stdin,
-                pipe,
-            );
+            run_pi_reader(dup, t_pane, state);
         });
     }
 
@@ -570,206 +572,206 @@ impl LocalPi {
             .map(str::to_string)
     }
 
+    /// Read a pi session JSONL file from disk and parse it into chat messages.
+    ///
+    /// `switch_session` tells pi to use a session file for future writes but
+    /// does NOT load historical messages into its in-memory state, so
+    /// `get_messages` returns empty on a freshly-spawned process.  This
+    /// function bypasses the RPC entirely and reads the file directly.
+    pub fn read_session_messages(path: &str) -> Result<Vec<ChatMsg>, String> {
+        use std::io::BufRead;
 
-/// Read a pi session JSONL file from disk and parse it into chat messages.
-///
-/// `switch_session` tells pi to use a session file for future writes but
-/// does NOT load historical messages into its in-memory state, so
-/// `get_messages` returns empty on a freshly-spawned process.  This
-/// function bypasses the RPC entirely and reads the file directly.
-pub fn read_session_messages(path: &str) -> Result<Vec<ChatMsg>, String> {
-    use std::io::BufRead;
+        let file = std::fs::File::open(path)
+            .map_err(|e| format!("cannot open session file {path}: {e}"))?;
+        let reader = std::io::BufReader::new(file);
 
-    let file = std::fs::File::open(path)
-        .map_err(|e| format!("cannot open session file {path}: {e}"))?;
-    let reader = std::io::BufReader::new(file);
+        let mut msgs: Vec<ChatMsg> = Vec::new();
+        // toolCall id -> row index, so a toolResult row attaches its output
+        // to the matching tool row instead of piling on at the end
+        let mut tool_rows: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
 
-    let mut msgs: Vec<ChatMsg> = Vec::new();
-    // toolCall id -> row index, so a toolResult row attaches its output
-    // to the matching tool row instead of piling on at the end
-    let mut tool_rows: std::collections::BTreeMap<String, usize> =
-        std::collections::BTreeMap::new();
-
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => continue,
-        };
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let v: serde_json::Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-
-        // Only process lines that are conversation messages
-        if v.get("type").and_then(|t| t.as_str()) != Some("message") {
-            continue;
-        }
-
-        let msg = match v.get("message") {
-            Some(m) => m,
-            None => continue,
-        };
-
-        let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
-        let c = msg.get("content");
-        let ts = msg
-            .get("timestamp")
-            .or_else(|| v.get("timestamp"))
-            .and_then(|t| t.as_str())
-            .map(|s| {
-                // "2026-09-02T13:29:33.190Z" -> "2026-09-02T13:29:33Z"
-                if s.len() >= 19 {
-                    format!("{}Z", &s[..19])
-                } else {
-                    s.to_string()
-                }
-            });
-
-        let push = |msgs: &mut Vec<ChatMsg>,
-                    role: &str,
-                    text: String,
-                    tool_name: Option<String>,
-                    tool_output: Option<String>,
-                    tool_args: Option<String>,
-                    created_at: Option<String>,
-                    next_seq: &AtomicU64| {
-            msgs.push(ChatMsg {
-                seq: next_seq.fetch_add(1, Ordering::Relaxed) as i64,
-                role: role.to_string(),
-                text,
-                tool_name,
-                tool_call_id: None,
-                tool_output,
-                tool_args,
-                duration_ms: None,
-                created_at,
-                attachments: None,
-                image_refs: None,
-            });
-        };
-
-        match role {
-            "user" => {
-                let t = match c {
-                    Some(serde_json::Value::String(s)) => s.clone(),
-                    Some(serde_json::Value::Array(arr)) => arr
-                        .iter()
-                        .filter(|x| {
-                            x.get("type").and_then(|t| t.as_str())
-                                == Some("text")
-                        })
-                        .filter_map(|x| x.get("text").and_then(|t| t.as_str()))
-                        .collect::<Vec<_>>()
-                        .join(""),
-                    _ => String::new(),
-                };
-                let t = t.trim().to_string();
-                if !t.is_empty() {
-                    push(
-                        &mut msgs, "user", t, None, None, None, ts.clone(), &SEQ,
-                    );
-                }
+        for line in reader.lines() {
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => continue,
+            };
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
             }
-            "assistant" => {
-                if let Some(serde_json::Value::Array(arr)) = c {
-                    for blk in arr {
-                        match blk.get("type").and_then(|t| t.as_str()) {
-                            Some("text") => {
-                                if let Some(text) =
-                                    blk.get("text").and_then(|t| t.as_str())
-                                {
-                                    let t = text.trim();
-                                    if !t.is_empty() {
-                                        push(
-                                            &mut msgs, "assistant",
-                                            t.to_string(), None, None, None,
-                                            ts.clone(), &SEQ,
-                                        );
+            let v: serde_json::Value = match serde_json::from_str(line) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            // Only process lines that are conversation messages
+            if v.get("type").and_then(|t| t.as_str()) != Some("message") {
+                continue;
+            }
+
+            let msg = match v.get("message") {
+                Some(m) => m,
+                None => continue,
+            };
+
+            let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+            let c = msg.get("content");
+            let ts = msg
+                .get("timestamp")
+                .or_else(|| v.get("timestamp"))
+                .and_then(|t| t.as_str())
+                .map(|s| {
+                    // "2026-09-02T13:29:33.190Z" -> "2026-09-02T13:29:33Z"
+                    if s.len() >= 19 {
+                        format!("{}Z", &s[..19])
+                    } else {
+                        s.to_string()
+                    }
+                });
+
+            let push = |msgs: &mut Vec<ChatMsg>,
+                        role: &str,
+                        text: String,
+                        tool_name: Option<String>,
+                        tool_output: Option<String>,
+                        tool_args: Option<String>,
+                        created_at: Option<String>,
+                        next_seq: &AtomicU64| {
+                msgs.push(ChatMsg {
+                    seq: next_seq.fetch_add(1, Ordering::Relaxed) as i64,
+                    role: role.to_string(),
+                    text,
+                    tool_name,
+                    tool_call_id: None,
+                    tool_output,
+                    tool_args,
+                    duration_ms: None,
+                    created_at,
+                    attachments: None,
+                    image_refs: None,
+                });
+            };
+
+            match role {
+                "user" => {
+                    let t = match c {
+                        Some(serde_json::Value::String(s)) => s.clone(),
+                        Some(serde_json::Value::Array(arr)) => arr
+                            .iter()
+                            .filter(|x| x.get("type").and_then(|t| t.as_str()) == Some("text"))
+                            .filter_map(|x| x.get("text").and_then(|t| t.as_str()))
+                            .collect::<Vec<_>>()
+                            .join(""),
+                        _ => String::new(),
+                    };
+                    let t = t.trim().to_string();
+                    if !t.is_empty() {
+                        push(&mut msgs, "user", t, None, None, None, ts.clone(), &SEQ);
+                    }
+                }
+                "assistant" => {
+                    if let Some(serde_json::Value::Array(arr)) = c {
+                        for blk in arr {
+                            match blk.get("type").and_then(|t| t.as_str()) {
+                                Some("text") => {
+                                    if let Some(text) = blk.get("text").and_then(|t| t.as_str()) {
+                                        let t = text.trim();
+                                        if !t.is_empty() {
+                                            push(
+                                                &mut msgs,
+                                                "assistant",
+                                                t.to_string(),
+                                                None,
+                                                None,
+                                                None,
+                                                ts.clone(),
+                                                &SEQ,
+                                            );
+                                        }
                                     }
                                 }
-                            }
-                            Some("toolCall") => {
-                                let name = blk
-                                    .get("name")
-                                    .and_then(|n| n.as_str())
-                                    .unwrap_or("tool")
-                                    .to_string();
-                                let call_id = blk
-                                    .get("id")
-                                    .and_then(|i| i.as_str())
-                                    .map(String::from);
-                                // the call's arguments (path / command / …)
-                                // — clients show them, and image paths in
-                                // them become viewable image refs
-                                let args = blk
-                                    .get("arguments")
-                                    .map(|a| a.to_string());
-                                let idx = msgs.len();
-                                push(
-                                    &mut msgs, "tool", String::new(),
-                                    Some(name), None, args, ts.clone(), &SEQ,
-                                );
-                                if let Some(id) = call_id {
-                                    tool_rows.insert(id, idx);
+                                Some("toolCall") => {
+                                    let name = blk
+                                        .get("name")
+                                        .and_then(|n| n.as_str())
+                                        .unwrap_or("tool")
+                                        .to_string();
+                                    let call_id =
+                                        blk.get("id").and_then(|i| i.as_str()).map(String::from);
+                                    // the call's arguments (path / command / …)
+                                    // — clients show them, and image paths in
+                                    // them become viewable image refs
+                                    let args = blk.get("arguments").map(|a| a.to_string());
+                                    let idx = msgs.len();
+                                    push(
+                                        &mut msgs,
+                                        "tool",
+                                        String::new(),
+                                        Some(name),
+                                        None,
+                                        args,
+                                        ts.clone(),
+                                        &SEQ,
+                                    );
+                                    if let Some(id) = call_id {
+                                        tool_rows.insert(id, idx);
+                                    }
                                 }
+                                _ => {}
                             }
-                            _ => {}
                         }
                     }
                 }
-            }
-            "toolResult" => {
-                let out = match c {
-                    Some(serde_json::Value::Array(arr)) => arr
-                        .iter()
-                        .filter(|x| {
-                            x.get("type").and_then(|t| t.as_str())
-                                == Some("text")
-                        })
-                        .filter_map(|x| x.get("text").and_then(|t| t.as_str()))
-                        .collect::<Vec<_>>()
-                        .join(""),
-                    _ => String::new(),
-                };
-                let call_id = msg
-                    .get("toolCallId")
-                    .or_else(|| msg.get("tool_call_id"))
-                    .and_then(|i| i.as_str())
-                    .map(String::from);
-                let idx = call_id.as_ref().and_then(|cid| {
-                    tool_rows.get(cid).copied()
-                });
-                if let Some(idx) = idx {
-                    if msgs[idx].tool_output.is_none() {
-                        msgs[idx].tool_output = Some(out);
+                "toolResult" => {
+                    let out = match c {
+                        Some(serde_json::Value::Array(arr)) => arr
+                            .iter()
+                            .filter(|x| x.get("type").and_then(|t| t.as_str()) == Some("text"))
+                            .filter_map(|x| x.get("text").and_then(|t| t.as_str()))
+                            .collect::<Vec<_>>()
+                            .join(""),
+                        _ => String::new(),
+                    };
+                    let call_id = msg
+                        .get("toolCallId")
+                        .or_else(|| msg.get("tool_call_id"))
+                        .and_then(|i| i.as_str())
+                        .map(String::from);
+                    let idx = call_id.as_ref().and_then(|cid| tool_rows.get(cid).copied());
+                    if let Some(idx) = idx {
+                        if msgs[idx].tool_output.is_none() {
+                            msgs[idx].tool_output = Some(out);
+                        }
+                    } else {
+                        let name = msg
+                            .get("toolName")
+                            .or_else(|| msg.get("tool_name"))
+                            .and_then(|n| n.as_str())
+                            .unwrap_or("tool")
+                            .to_string();
+                        push(
+                            &mut msgs,
+                            "tool",
+                            String::new(),
+                            Some(name),
+                            Some(out),
+                            None,
+                            ts.clone(),
+                            &SEQ,
+                        );
                     }
-                } else {
-                    let name = msg
-                        .get("toolName")
-                        .or_else(|| msg.get("tool_name"))
-                        .and_then(|n| n.as_str())
-                        .unwrap_or("tool")
-                        .to_string();
-                    push(
-                        &mut msgs, "tool", String::new(),
-                        Some(name), Some(out), None, ts.clone(), &SEQ,
-                    );
                 }
+                _ => {}
             }
-            _ => {}
         }
+
+        // tool rows whose args reference an image get image_refs set (and the
+        // paths registered so clients can FileGet them after restarts)
+        crate::daemon::media::flag_image_refs(&mut msgs);
+
+        Ok(msgs)
     }
-
-    // tool rows whose args reference an image get image_refs set (and the
-    // paths registered so clients can FileGet them after restarts)
-    crate::daemon::media::flag_image_refs(&mut msgs);
-
-    Ok(msgs)
-}
 
     /// Send a user prompt: write the RPC prompt to pi's stdin first,
     /// then record the user row + flip the working indicator (so a
@@ -796,9 +798,7 @@ pub fn read_session_messages(path: &str) -> Result<Vec<ChatMsg>, String> {
         if let Ok(mut g) = self.last_prompt.lock() {
             *g = Some(agent_text.to_string());
         }
-        let send = || -> Result<(), String> {
-            write_prompt_line(&self.stdin, agent_text, images)
-        };
+        let send = || -> Result<(), String> { write_prompt_line(&self.stdin, agent_text, images) };
         if let Err(e) = send() {
             // a failed write emits the error row + clears the indicator
             // instead — otherwise the message vanishes silently on every
@@ -813,7 +813,11 @@ pub fn read_session_messages(path: &str) -> Result<Vec<ChatMsg>, String> {
             );
             return Err(e);
         }
-        let att = if attachments.is_empty() { None } else { Some(attachments.to_vec()) };
+        let att = if attachments.is_empty() {
+            None
+        } else {
+            Some(attachments.to_vec())
+        };
         // attached images get image_refs on the user row so every client
         // can render them (and the paths are registered for FileGet)
         let mut image_refs: Vec<String> = attachments
@@ -826,7 +830,11 @@ pub fn read_session_messages(path: &str) -> Result<Vec<ChatMsg>, String> {
                 image_refs.push(i.path.clone());
             }
         }
-        let refs = if image_refs.is_empty() { None } else { Some(image_refs) };
+        let refs = if image_refs.is_empty() {
+            None
+        } else {
+            Some(image_refs)
+        };
         emit_user_row(pipe, self.pane, display_text, att, refs, now_iso());
         write_status(pipe, self.pane, "working");
         Ok(())
@@ -851,19 +859,19 @@ pub fn read_session_messages(path: &str) -> Result<Vec<ChatMsg>, String> {
     /// without `wait` leaves a zombie for the daemon's lifetime.
     pub fn kill(&self) -> Option<libc::pid_t> {
         self.stop.store(true, Ordering::Relaxed);
-        if let Ok(mut guard) = self.child.lock() {
-            if let Some(c) = guard.as_mut() {
-                let pid = c.id() as libc::pid_t;
-                let _ = c.kill();
-                *guard = None;
-                return Some(pid);
-            }
+        if let Ok(mut guard) = self.child.lock()
+            && let Some(c) = guard.as_mut()
+        {
+            let pid = c.id() as libc::pid_t;
+            let _ = c.kill();
+            *guard = None;
+            return Some(pid);
         }
-        if let Ok(g) = self.inherited_pid.lock() {
-            if let Some(pid) = *g {
-                unsafe { libc::kill(pid, libc::SIGKILL) };
-                return Some(pid);
-            }
+        if let Ok(g) = self.inherited_pid.lock()
+            && let Some(pid) = *g
+        {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+            return Some(pid);
         }
         None
     }
@@ -880,9 +888,7 @@ fn write_prompt_line(
     agent_text: &str,
     images: &[crate::daemon::media::PiImage],
 ) -> Result<(), String> {
-    let mut g = stdin
-        .lock()
-        .map_err(|_| "pi stdin poisoned".to_string())?;
+    let mut g = stdin.lock().map_err(|_| "pi stdin poisoned".to_string())?;
     let s = g
         .as_mut()
         .ok_or_else(|| "pi stdin already taken".to_string())?;
@@ -941,9 +947,9 @@ fn looks_like_context_error(err: &str) -> bool {
         || lower == "413 status code (no body)"
 }
 
-fn run_pi_reader(
-    stdout: Box<dyn std::io::Read + Send>,
-    t_pane: Uuid,
+/// Shared per-pane state for the pi reader thread — grouped so
+/// `run_pi_reader` stays within clippy's argument limit.
+struct PiReaderState {
     session_file: Arc<Mutex<Option<String>>>,
     stop: Arc<AtomicBool>,
     model: Arc<Mutex<Option<ModelChoice>>>,
@@ -957,16 +963,33 @@ fn run_pi_reader(
     compact_retry: Arc<Mutex<Option<(String, u64)>>>,
     stdin: Arc<Mutex<Option<Box<dyn std::io::Write + Send>>>>,
     pipe: PipeWriter,
-) {
+}
+
+fn run_pi_reader(stdout: Box<dyn std::io::Read + Send>, t_pane: Uuid, s: PiReaderState) {
+    let PiReaderState {
+        session_file,
+        stop,
+        model,
+        model_list_req,
+        model_set_req,
+        compact_req,
+        pin_unconfirmed,
+        last_prompt,
+        prompt_seq,
+        compact_retries,
+        compact_retry,
+        stdin,
+        pipe,
+    } = s;
     /// Fire a read-only RPC from the reader thread (best-effort; used
     /// for context-window refreshes).
     fn rpc(stdin: &Arc<Mutex<Option<Box<dyn std::io::Write + Send>>>>, cmd: &str) {
-        if let Ok(mut g) = stdin.lock() {
-            if let Some(s) = g.as_mut() {
-                let _ = s.write_all(cmd.as_bytes());
-                let _ = s.write_all(b"\n");
-                let _ = s.flush();
-            }
+        if let Ok(mut g) = stdin.lock()
+            && let Some(s) = g.as_mut()
+        {
+            let _ = s.write_all(cmd.as_bytes());
+            let _ = s.write_all(b"\n");
+            let _ = s.flush();
         }
     }
     let reader = BufReader::new(stdout);
@@ -986,36 +1009,40 @@ fn run_pi_reader(
             // this very conversation
             "response" => {
                 if v.get("command").and_then(|c| c.as_str()) == Some("get_state") {
-                    if let Some(sf) = v.pointer("/data/sessionFile").and_then(|s| s.as_str()) {
-                        if let Ok(mut g) = session_file.lock() {
-                            // After a switch_session we pin the target path.
-                            // pi answers RPCs in order, but the spawn-time
-                            // get_state may still be in flight when the switch
-                            // is sent — its late reply carries the FRESH
-                            // auto-created path and must not clobber the pin.
-                            // Accept a different path only once pi has
-                            // confirmed the pinned one at least once (a
-                            // genuine later change, e.g. /new).
-                            let pinned = g.as_ref().filter(|cur| {
-                                pin_unconfirmed.load(Ordering::Relaxed) && cur.as_str() != sf
-                            });
-                            if pinned.is_some() {
-                                eprintln!("ranchd: local pi {t_pane} ignoring stale session file {sf} (pinned to {})", g.as_deref().unwrap_or(""));
-                            } else {
-                                if g.as_deref() == Some(sf) {
-                                    pin_unconfirmed.store(false, Ordering::Relaxed);
-                                }
-                                if g.as_deref() != Some(sf) {
-                                    eprintln!("ranchd: local pi {t_pane} session file: {sf}");
-                                    *g = Some(sf.to_string());
-                                    STATE_DIRTY.store(true, Ordering::Relaxed);
-                                }
+                    if let Some(sf) = v.pointer("/data/sessionFile").and_then(|s| s.as_str())
+                        && let Ok(mut g) = session_file.lock()
+                    {
+                        // After a switch_session we pin the target path.
+                        // pi answers RPCs in order, but the spawn-time
+                        // get_state may still be in flight when the switch
+                        // is sent — its late reply carries the FRESH
+                        // auto-created path and must not clobber the pin.
+                        // Accept a different path only once pi has
+                        // confirmed the pinned one at least once (a
+                        // genuine later change, e.g. /new).
+                        let pinned = g.as_ref().filter(|cur| {
+                            pin_unconfirmed.load(Ordering::Relaxed) && cur.as_str() != sf
+                        });
+                        if pinned.is_some() {
+                            eprintln!(
+                                "ranchd: local pi {t_pane} ignoring stale session file {sf} (pinned to {})",
+                                g.as_deref().unwrap_or("")
+                            );
+                        } else {
+                            if g.as_deref() == Some(sf) {
+                                pin_unconfirmed.store(false, Ordering::Relaxed);
+                            }
+                            if g.as_deref() != Some(sf) {
+                                eprintln!("ranchd: local pi {t_pane} session file: {sf}");
+                                *g = Some(sf.to_string());
+                                STATE_DIRTY.store(true, Ordering::Relaxed);
                             }
                         }
                     }
                     // capture the active model and tell clients what the
                     // pane is running (meta kind="model" display name)
-                    let m = v.pointer("/data/model")
+                    let m = v
+                        .pointer("/data/model")
                         .filter(|m| !m.is_null())
                         .and_then(parse_model);
                     if let Some(m) = &m {
@@ -1024,11 +1051,16 @@ fn run_pi_reader(
                         }
                         write_model_status(&pipe, t_pane, &m.name);
                     }
-                } else if v.get("command").and_then(|c| c.as_str()) == Some("get_available_models") {
+                } else if v.get("command").and_then(|c| c.as_str()) == Some("get_available_models")
+                {
                     // model picker request: echo the catalog back (the
                     // pane's own model was last captured via get_state /
                     // set_model)
-                    let req_id = model_list_req.lock().ok().and_then(|mut g| g.take()).unwrap_or_default();
+                    let req_id = model_list_req
+                        .lock()
+                        .ok()
+                        .and_then(|mut g| g.take())
+                        .unwrap_or_default();
                     let mut models = Vec::new();
                     if let Some(arr) = v.pointer("/data/models").and_then(|m| m.as_array()) {
                         for m in arr {
@@ -1080,7 +1112,7 @@ fn run_pi_reader(
                         let after = v
                             .pointer("/data/estimatedTokensAfter")
                             .and_then(|a| a.as_i64())
-                            .map(|n| format_k_tokens(n))
+                            .map(format_k_tokens)
                             .unwrap_or_default();
                         let note = if after.is_empty() {
                             "compacted".to_string()
@@ -1092,39 +1124,34 @@ fn run_pi_reader(
                         write_status(&pipe, t_pane, "idle");
                         // refresh the live readout (pi re-reported after
                         // the window shrank)
-                        rpc(
-                            &stdin,
-                            r#"{"type": "get_session_stats"}"#,
-                        );
+                        rpc(&stdin, r#"{"type": "get_session_stats"}"#);
                         // auto compact+retry: if THIS compact was
                         // triggered by a context failure, re-send the
                         // failed prompt now that the window has room
                         // again — unless a newer user prompt is already
                         // in flight (the compact still helps it, but
                         // nothing needs re-sending).
-                        if let Some((text, seq)) = compact_retry
-                            .lock()
-                            .ok()
-                            .and_then(|mut g| g.take())
+                        if let Some((text, seq)) =
+                            compact_retry.lock().ok().and_then(|mut g| g.take())
+                            && seq == prompt_seq.load(Ordering::Relaxed)
+                            && !stop.load(Ordering::Relaxed)
                         {
-                            if seq == prompt_seq.load(Ordering::Relaxed)
-                                && !stop.load(Ordering::Relaxed)
-                            {
-                                match write_prompt_line(&stdin, &text, &[]) {
-                                    Ok(()) => {
-                                        write_status(&pipe, t_pane, "working");
-                                    }
-                                    Err(e) => {
-                                        eprintln!("ranchd: local pi {t_pane} auto compact+retry re-send failed: {e}");
-                                        emit_chat(
-                                            &pipe,
-                                            t_pane,
-                                            "assistant",
-                                            &format!("⚠ compact retry failed: {e}"),
-                                            now_iso(),
-                                        );
-                                        write_status(&pipe, t_pane, "idle");
-                                    }
+                            match write_prompt_line(&stdin, &text, &[]) {
+                                Ok(()) => {
+                                    write_status(&pipe, t_pane, "working");
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "ranchd: local pi {t_pane} auto compact+retry re-send failed: {e}"
+                                    );
+                                    emit_chat(
+                                        &pipe,
+                                        t_pane,
+                                        "assistant",
+                                        &format!("⚠ compact retry failed: {e}"),
+                                        now_iso(),
+                                    );
+                                    write_status(&pipe, t_pane, "idle");
                                 }
                             }
                         }
@@ -1135,7 +1162,12 @@ fn run_pi_reader(
                             .unwrap_or("compaction failed")
                             .to_string();
                         eprintln!("ranchd: local pi {t_pane} compact failed: {msg}");
-                        if compact_retry.lock().ok().and_then(|mut g| g.take()).is_some() {
+                        if compact_retry
+                            .lock()
+                            .ok()
+                            .and_then(|mut g| g.take())
+                            .is_some()
+                        {
                             // auto compact+retry died: don't re-enter the
                             // 400 loop for this prompt. Report the failure
                             // factually — a single 400 is NOT proof the
@@ -1184,7 +1216,11 @@ fn run_pi_reader(
                         let pct = cu.get("percent").and_then(|x| x.as_f64());
                         let status = match (tokens, window, pct) {
                             (Some(t), Some(w), Some(p)) => {
-                                format!("ctx {p:.0}% · {}/{}", format_k_tokens(t), format_k_tokens(w))
+                                format!(
+                                    "ctx {p:.0}% · {}/{}",
+                                    format_k_tokens(t),
+                                    format_k_tokens(w)
+                                )
                             }
                             (Some(t), _, _) => format!("ctx ~{} est.", format_k_tokens(t)),
                             _ => String::new(),
@@ -1209,31 +1245,28 @@ fn run_pi_reader(
                             let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("");
                             let c = m.get("content");
                             // pi records the agent's own send time (epoch ms)
-                            let ts = m
-                                .get("timestamp")
-                                .and_then(|t| t.as_i64())
-                                .map(iso_utc_ms);
-                            let push = |msgs: &mut Vec<ChatMsg>,
-                                            role: &str,
-                                            text: String,
-                                            tool_name: Option<String>,
-                                            tool_output: Option<String>,
-                                            tool_args: Option<String>|
-                            {
-                                msgs.push(ChatMsg {
-                                    seq: next_seq(),
-                                    role: role.to_string(),
-                                    text,
-                                    tool_name,
-                                    tool_call_id: None,
-                                    tool_output,
-                                    tool_args,
-                                    duration_ms: None,
-                                    created_at: ts.clone(),
-                                    attachments: None,
-                                    image_refs: None,
-                                });
-                            };
+                            let ts = m.get("timestamp").and_then(|t| t.as_i64()).map(iso_utc_ms);
+                            let push =
+                                |msgs: &mut Vec<ChatMsg>,
+                                 role: &str,
+                                 text: String,
+                                 tool_name: Option<String>,
+                                 tool_output: Option<String>,
+                                 tool_args: Option<String>| {
+                                    msgs.push(ChatMsg {
+                                        seq: next_seq(),
+                                        role: role.to_string(),
+                                        text,
+                                        tool_name,
+                                        tool_call_id: None,
+                                        tool_output,
+                                        tool_args,
+                                        duration_ms: None,
+                                        created_at: ts.clone(),
+                                        attachments: None,
+                                        image_refs: None,
+                                    });
+                                };
                             match role {
                                 "user" => {
                                     let t = match c {
@@ -1285,9 +1318,8 @@ fn run_pi_reader(
                                                         .get("id")
                                                         .and_then(|i| i.as_str())
                                                         .map(String::from);
-                                                    let args = blk
-                                                        .get("arguments")
-                                                        .map(|a| a.to_string());
+                                                    let args =
+                                                        blk.get("arguments").map(|a| a.to_string());
                                                     let idx = msgs.len();
                                                     push(
                                                         &mut msgs,
@@ -1346,7 +1378,14 @@ fn run_pi_reader(
                                             .and_then(|n| n.as_str())
                                             .unwrap_or("tool")
                                             .to_string();
-                                        push(&mut msgs, "tool", String::new(), Some(name), Some(out), None);
+                                        push(
+                                            &mut msgs,
+                                            "tool",
+                                            String::new(),
+                                            Some(name),
+                                            Some(out),
+                                            None,
+                                        );
                                     }
                                 }
                                 _ => {}
@@ -1418,10 +1457,8 @@ fn run_pi_reader(
                             })
                             .unwrap_or_default();
                         let trimmed = text.trim();
-                        let stop_reason = msg
-                            .get("stopReason")
-                            .and_then(|s| s.as_str())
-                            .unwrap_or("");
+                        let stop_reason =
+                            msg.get("stopReason").and_then(|s| s.as_str()).unwrap_or("");
                         if !trimmed.is_empty() {
                             // stamp with the agent's own timestamp when
                             // it carried one, else the arrival moment
@@ -1460,19 +1497,20 @@ fn run_pi_reader(
                                 .map(|g| g.is_some())
                                 .unwrap_or(true);
                             let attempts = compact_retries.load(Ordering::Relaxed);
-                            if last.is_some()
+                            if let Some(text) = &last
                                 && !pending
                                 && attempts < 1
                                 && looks_like_context_error(&err)
                                 && !stop.load(Ordering::Relaxed)
                             {
-                                let text = last.unwrap();
                                 let seq = prompt_seq.load(Ordering::Relaxed);
                                 if let Ok(mut g) = compact_retry.lock() {
                                     *g = Some((text.clone(), seq));
                                 }
                                 compact_retries.fetch_add(1, Ordering::Relaxed);
-                                eprintln!("ranchd: local pi {t_pane} context error ({err}) — auto-compacting + retrying");
+                                eprintln!(
+                                    "ranchd: local pi {t_pane} context error ({err}) — auto-compacting + retrying"
+                                );
                                 emit_chat(
                                     &pipe,
                                     t_pane,
@@ -1581,10 +1619,7 @@ fn run_pi_reader(
                 write_status(&pipe, t_pane, "idle");
                 // the turn may have grown the context — refresh the
                 // readout (reader thread fires the RPC itself)
-                rpc(
-                    &stdin,
-                    r#"{"type": "get_session_stats"}"#,
-                );
+                rpc(&stdin, r#"{"type": "get_session_stats"}"#);
             }
             "error" => {
                 let msg = v
@@ -1677,11 +1712,10 @@ fn emit_tool(
 ) {
     // tool rows whose args point at an image become viewable: set
     // image_refs + register the path so clients can FileGet it
-    let image_refs = args
-        .and_then(|a| {
-            let refs = crate::daemon::media::image_refs_from_tool_args(a);
-            (!refs.is_empty()).then_some(refs)
-        });
+    let image_refs = args.and_then(|a| {
+        let refs = crate::daemon::media::image_refs_from_tool_args(a);
+        (!refs.is_empty()).then_some(refs)
+    });
     if let Some(refs) = &image_refs {
         for r in refs {
             crate::daemon::media::register(r);

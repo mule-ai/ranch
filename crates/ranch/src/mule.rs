@@ -22,8 +22,8 @@ use std::io::{Read, Write};
 use std::sync::mpsc;
 use uuid::Uuid;
 
-use ranch_protocol::{Frame, MuleAgent, WorkflowDraft, WorkflowStep, WorkflowSummary};
 use crate::forge::PipeWriter;
+use ranch_protocol::{Frame, MuleAgent, WorkflowDraft, WorkflowStep, WorkflowSummary};
 
 #[derive(Debug, Clone)]
 pub struct MuleConfig {
@@ -35,10 +35,9 @@ pub struct MuleConfig {
 /// integration is off when `mule_url` is absent).
 pub fn load_mule_config() -> Option<MuleConfig> {
     let home = std::env::var("HOME").ok()?;
-    let text = std::fs::read_to_string(
-        std::path::PathBuf::from(home).join(".config/ranch/daemon.toml"),
-    )
-    .ok()?;
+    let text =
+        std::fs::read_to_string(std::path::PathBuf::from(home).join(".config/ranch/daemon.toml"))
+            .ok()?;
     let get = |key: &str| -> String {
         for line in text.lines() {
             let line = line.trim();
@@ -64,12 +63,26 @@ pub fn load_mule_config() -> Option<MuleConfig> {
 
 /// Jobs the main loop hands to the worker.
 pub enum MuleJob {
-    List { req_id: String },
+    List {
+        req_id: String,
+    },
     /// mule agents (workflow-step pickers)
-    Agents { req_id: String },
-    Get { req_id: String, workflow_id: String },
-    Put { req_id: String, workflow_id: Option<String>, draft: WorkflowDraft },
-    Delete { req_id: String, workflow_id: String },
+    Agents {
+        req_id: String,
+    },
+    Get {
+        req_id: String,
+        workflow_id: String,
+    },
+    Put {
+        req_id: String,
+        workflow_id: Option<String>,
+        draft: WorkflowDraft,
+    },
+    Delete {
+        req_id: String,
+        workflow_id: String,
+    },
     /// Run into a new pane: POST /api/v1/jobs, then tee the WS stream
     /// for that job into the pane.
     Run {
@@ -81,12 +94,19 @@ pub enum MuleJob {
     },
     /// Stop teeing a pane's job stream (pane killed).
     #[allow(dead_code)]
-    Unwatch { pane: Uuid },
+    Unwatch {
+        pane: Uuid,
+    },
 }
 
 // ---------- HTTP helpers (worker thread only) ----------
 
-fn http_json(cfg: &MuleConfig, method: &str, path: &str, body: Option<&serde_json::Value>) -> Result<serde_json::Value, String> {
+fn http_json(
+    cfg: &MuleConfig,
+    method: &str,
+    path: &str,
+    body: Option<&serde_json::Value>,
+) -> Result<serde_json::Value, String> {
     let url = format!("{}{}", cfg.base, path);
     let m = method.to_ascii_uppercase();
     fn with_auth<B>(r: ureq::RequestBuilder<B>, key: &Option<String>) -> ureq::RequestBuilder<B> {
@@ -97,14 +117,19 @@ fn http_json(cfg: &MuleConfig, method: &str, path: &str, body: Option<&serde_jso
     }
     let sent = match (m.as_str(), body) {
         ("GET", _) => with_auth(ureq::get(&url), &cfg.api_key).call(),
-        ("POST", b) => with_auth(ureq::post(&url), &cfg.api_key).send_json(b.cloned().unwrap_or(serde_json::Value::Null)),
-        ("PUT", b) => with_auth(ureq::put(&url), &cfg.api_key).send_json(b.cloned().unwrap_or(serde_json::Value::Null)),
+        ("POST", b) => with_auth(ureq::post(&url), &cfg.api_key)
+            .send_json(b.cloned().unwrap_or(serde_json::Value::Null)),
+        ("PUT", b) => with_auth(ureq::put(&url), &cfg.api_key)
+            .send_json(b.cloned().unwrap_or(serde_json::Value::Null)),
         ("DELETE", _) => with_auth(ureq::delete(&url), &cfg.api_key).call(),
         _ => return Err(format!("mule: unsupported method {method}")),
     };
     let mut res = sent.map_err(|e| format!("mule {method} {path}: {e}"))?;
     let mut text = String::new();
-    res.body_mut().as_reader().read_to_string(&mut text).map_err(|e| format!("mule read {path}: {e}"))?;
+    res.body_mut()
+        .as_reader()
+        .read_to_string(&mut text)
+        .map_err(|e| format!("mule read {path}: {e}"))?;
     if text.trim().is_empty() {
         return Ok(serde_json::Value::Null);
     }
@@ -199,11 +224,18 @@ fn format_event(type_: &str, data: &serde_json::Value, job: &str) -> Vec<String>
             let order = data.get("workflow_step_id").map(|_| "").unwrap_or("");
             let _ = order;
             match status {
-                "RUNNING" => vec![format!("▶ step {} running", data.get("workflow_step_id").and_then(|x| x.as_str()).unwrap_or(""))],
-                "COMPLETED" => vec![format!("✓ step done")],
+                "RUNNING" => vec![format!(
+                    "▶ step {} running",
+                    data.get("workflow_step_id")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                )],
+                "COMPLETED" => vec!["✓ step done".to_string()],
                 "FAILED" => vec![format!(
                     "✗ step failed: {}",
-                    data.get("output_data").map(|o| o.to_string()).unwrap_or_default()
+                    data.get("output_data")
+                        .map(|o| o.to_string())
+                        .unwrap_or_default()
                 )],
                 _ => vec![],
             }
@@ -215,83 +247,83 @@ fn format_event(type_: &str, data: &serde_json::Value, job: &str) -> Vec<String>
 /// The WS reader: connect, filter, write rows. Runs on the worker
 /// thread; reconnects with backoff. Dies with hot upgrade and restarts
 /// (watches map is rebuilt from Run jobs; acceptable — runs are long).
-fn run_ws_reader(cfg: MuleConfig, pipe: PipeWriter, watches: Watches, stop: std::sync::Arc<std::sync::atomic::AtomicBool>) {
-    use tungstenite::connect;
+fn run_ws_reader(
+    cfg: MuleConfig,
+    pipe: PipeWriter,
+    watches: Watches,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
     use tungstenite::Message;
-    let ws_url = format!(
-        "{}{}",
-        cfg.base.replace("http", "ws"),
-        "/ws"
-    );
+    use tungstenite::connect;
+    let ws_url = format!("{}{}", cfg.base.replace("http", "ws"), "/ws");
     let mut backoff = 1u64;
     loop {
         if stop.load(std::sync::atomic::Ordering::Relaxed) {
             return;
         }
         let maybe_ws = connect(&ws_url);
-        match maybe_ws {
-            Ok((mut ws, _resp)) => {
-                backoff = 1;
-                loop {
-                    if stop.load(std::sync::atomic::Ordering::Relaxed) {
-                        return;
-                    }
-                    match std::time::Duration::from_secs(2).as_millis() {
-                        _ => {}
-                    }
-                    // read with a timeout via set_read_timeout on the
-                    // underlying stream is not exposed by tungstenite's
-                    // WebSocket API pre-0.27; use read (blocking) and
-                    // check stop between messages — the stop flag also
-                    // gets checked when no messages arrive via the read
-                    // timeout set on the socket below.
-                    match ws.read() {
-                        Ok(Message::Text(t)) => {
-                            let Ok(v) = serde_json::from_str::<serde_json::Value>(&t) else {
-                                continue;
-                            };
-                            let type_ = v.get("type").and_then(|x| x.as_str()).unwrap_or("");
-                            let data = v.get("data").cloned().unwrap_or(serde_json::Value::Null);
-                            let job_ids: Vec<String> = watches
-                                .lock()
-                                .map(|g| g.values().cloned().collect())
-                                .unwrap_or_default();
-                            for job in job_ids {
-                                for row in format_event(type_, &data, &job) {
-                                    let pane = watches.lock().ok().and_then(|g| {
-                                        g.iter().find_map(|(p, j)| (j == &job).then_some(*p))
-                                    });
-                                    if let Some(pane) = pane {
-                                        write_row(&pipe, pane, &row);
-                                        // status metas for dashboards
-                                        if row.starts_with('✓') || row.starts_with('✗') {
-                                            write_frame(
-                                                &pipe,
-                                                &Frame::Meta {
-                                                    session: String::new(),
-                                                    pane: Some(pane.to_string()),
-                                                    kind: "workflow".into(),
-                                                    status: Some(if row.starts_with('✓') { "completed".into() } else { "failed".into() }),
-                                                },
-                                            );
-                                        }
+        if let Ok((mut ws, _resp)) = maybe_ws {
+            backoff = 1;
+            loop {
+                if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
+                // read with a timeout via set_read_timeout on the
+                // underlying stream is not exposed by tungstenite's
+                // WebSocket API pre-0.27; use read (blocking) and
+                // check stop between messages — the stop flag also
+                // gets checked when no messages arrive via the read
+                // timeout set on the socket below.
+                match ws.read() {
+                    Ok(Message::Text(t)) => {
+                        let Ok(v) = serde_json::from_str::<serde_json::Value>(&t) else {
+                            continue;
+                        };
+                        let type_ = v.get("type").and_then(|x| x.as_str()).unwrap_or("");
+                        let data = v.get("data").cloned().unwrap_or(serde_json::Value::Null);
+                        let job_ids: Vec<String> = watches
+                            .lock()
+                            .map(|g| g.values().cloned().collect())
+                            .unwrap_or_default();
+                        for job in job_ids {
+                            for row in format_event(type_, &data, &job) {
+                                let pane = watches.lock().ok().and_then(|g| {
+                                    g.iter().find_map(|(p, j)| (j == &job).then_some(*p))
+                                });
+                                if let Some(pane) = pane {
+                                    write_row(&pipe, pane, &row);
+                                    // status metas for dashboards
+                                    if row.starts_with('✓') || row.starts_with('✗') {
+                                        write_frame(
+                                            &pipe,
+                                            &Frame::Meta {
+                                                session: String::new(),
+                                                pane: Some(pane.to_string()),
+                                                kind: "workflow".into(),
+                                                status: Some(if row.starts_with('✓') {
+                                                    "completed".into()
+                                                } else {
+                                                    "failed".into()
+                                                }),
+                                            },
+                                        );
                                     }
                                 }
                             }
                         }
-                        Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => {}
-                        Ok(Message::Close(_)) => break,
-                        Ok(_) => {}
-                        Err(tungstenite::Error::Io(e))
-                            if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut =>
-                        {
-                            continue;
-                        }
-                        Err(_) => break,
                     }
+                    Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => {}
+                    Ok(Message::Close(_)) => break,
+                    Ok(_) => {}
+                    Err(tungstenite::Error::Io(e))
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            || e.kind() == std::io::ErrorKind::TimedOut =>
+                    {
+                        continue;
+                    }
+                    Err(_) => break,
                 }
             }
-            Err(_) => {}
         }
         std::thread::sleep(std::time::Duration::from_secs(backoff.min(30)));
         backoff = (backoff * 2).min(30);
@@ -321,62 +353,117 @@ pub fn spawn_worker(cfg: MuleConfig, pipe_w: std::fs::File, rx: mpsc::Receiver<M
         .spawn(move || {
             for job in rx {
                 match job {
-                    MuleJob::List { req_id } => match http_json(&cfg, "GET", "/api/v1/workflows", None) {
-                        Ok(v) => {
-                            // mule returns {workflows: [...]} or a bare array
-                            let arr = v
-                                .get("workflows")
-                                .and_then(|x| x.as_array())
-                                .cloned()
-                                .or_else(|| v.as_array().cloned())
-                                .unwrap_or_default();
-                            let workflows: Vec<WorkflowSummary> = arr
-                                .iter()
-                                .filter_map(|w| {
-                                    Some(WorkflowSummary {
-                                        id: w.get("id")?.as_str()?.to_string(),
-                                        name: w.get("name").and_then(|n| n.as_str()).unwrap_or("").into(),
-                                        description: w.get("description").and_then(|d| d.as_str()).map(String::from),
-                                        is_async: w.get("is_async").and_then(|x| x.as_bool()),
-                                        updated_at: w.get("updated_at").and_then(|d| d.as_str()).map(String::from),
+                    MuleJob::List { req_id } => {
+                        match http_json(&cfg, "GET", "/api/v1/workflows", None) {
+                            Ok(v) => {
+                                // mule returns {workflows: [...]} or a bare array
+                                let arr = v
+                                    .get("workflows")
+                                    .and_then(|x| x.as_array())
+                                    .cloned()
+                                    .or_else(|| v.as_array().cloned())
+                                    .unwrap_or_default();
+                                let workflows: Vec<WorkflowSummary> = arr
+                                    .iter()
+                                    .filter_map(|w| {
+                                        Some(WorkflowSummary {
+                                            id: w.get("id")?.as_str()?.to_string(),
+                                            name: w
+                                                .get("name")
+                                                .and_then(|n| n.as_str())
+                                                .unwrap_or("")
+                                                .into(),
+                                            description: w
+                                                .get("description")
+                                                .and_then(|d| d.as_str())
+                                                .map(String::from),
+                                            is_async: w.get("is_async").and_then(|x| x.as_bool()),
+                                            updated_at: w
+                                                .get("updated_at")
+                                                .and_then(|d| d.as_str())
+                                                .map(String::from),
+                                        })
                                     })
-                                })
-                                .collect();
-                            write_frame(&pipe, &Frame::WorkflowListOk { req_id, workflows });
+                                    .collect();
+                                write_frame(&pipe, &Frame::WorkflowListOk { req_id, workflows });
+                            }
+                            Err(e) => write_frame(
+                                &pipe,
+                                &Frame::Error {
+                                    req_id: Some(req_id),
+                                    message: e,
+                                },
+                            ),
                         }
-                        Err(e) => write_frame(&pipe, &Frame::Error { req_id: Some(req_id), message: e }),
-                    },
-                    MuleJob::Agents { req_id } => match http_json(&cfg, "GET", "/api/v1/agents", None) {
-                        Ok(v) => {
-                            let arr = v
-                                .get("agents")
-                                .and_then(|x| x.as_array())
-                                .cloned()
-                                .or_else(|| v.as_array().cloned())
-                                .unwrap_or_default();
-                            let agents: Vec<MuleAgent> = arr
-                                .iter()
-                                .filter_map(|a| {
-                                    Some(MuleAgent {
-                                        id: a.get("id")?.as_str()?.to_string(),
-                                        name: a.get("name").and_then(|n| n.as_str()).unwrap_or("").into(),
-                                        description: a.get("description").and_then(|d| d.as_str()).map(String::from),
+                    }
+                    MuleJob::Agents { req_id } => {
+                        match http_json(&cfg, "GET", "/api/v1/agents", None) {
+                            Ok(v) => {
+                                let arr = v
+                                    .get("agents")
+                                    .and_then(|x| x.as_array())
+                                    .cloned()
+                                    .or_else(|| v.as_array().cloned())
+                                    .unwrap_or_default();
+                                let agents: Vec<MuleAgent> = arr
+                                    .iter()
+                                    .filter_map(|a| {
+                                        Some(MuleAgent {
+                                            id: a.get("id")?.as_str()?.to_string(),
+                                            name: a
+                                                .get("name")
+                                                .and_then(|n| n.as_str())
+                                                .unwrap_or("")
+                                                .into(),
+                                            description: a
+                                                .get("description")
+                                                .and_then(|d| d.as_str())
+                                                .map(String::from),
+                                        })
                                     })
-                                })
-                                .collect();
-                            write_frame(&pipe, &Frame::MuleAgentsOk { req_id, agents });
+                                    .collect();
+                                write_frame(&pipe, &Frame::MuleAgentsOk { req_id, agents });
+                            }
+                            Err(e) => write_frame(
+                                &pipe,
+                                &Frame::Error {
+                                    req_id: Some(req_id),
+                                    message: e,
+                                },
+                            ),
                         }
-                        Err(e) => write_frame(&pipe, &Frame::Error { req_id: Some(req_id), message: e }),
-                    },
-                    MuleJob::Get { req_id, workflow_id } => {
-                        match http_json(&cfg, "GET", &format!("/api/v1/workflows/{workflow_id}"), None) {
+                    }
+                    MuleJob::Get {
+                        req_id,
+                        workflow_id,
+                    } => {
+                        match http_json(
+                            &cfg,
+                            "GET",
+                            &format!("/api/v1/workflows/{workflow_id}"),
+                            None,
+                        ) {
                             Ok(v) => {
                                 let summary = WorkflowSummary {
-                                    id: v.get("id").and_then(|x| x.as_str()).unwrap_or(&workflow_id).to_string(),
-                                    name: v.get("name").and_then(|x| x.as_str()).unwrap_or("").into(),
-                                    description: v.get("description").and_then(|x| x.as_str()).map(String::from),
+                                    id: v
+                                        .get("id")
+                                        .and_then(|x| x.as_str())
+                                        .unwrap_or(&workflow_id)
+                                        .to_string(),
+                                    name: v
+                                        .get("name")
+                                        .and_then(|x| x.as_str())
+                                        .unwrap_or("")
+                                        .into(),
+                                    description: v
+                                        .get("description")
+                                        .and_then(|x| x.as_str())
+                                        .map(String::from),
                                     is_async: v.get("is_async").and_then(|x| x.as_bool()),
-                                    updated_at: v.get("updated_at").and_then(|x| x.as_str()).map(String::from),
+                                    updated_at: v
+                                        .get("updated_at")
+                                        .and_then(|x| x.as_str())
+                                        .map(String::from),
                                 };
                                 let steps = http_json(
                                     &cfg,
@@ -393,14 +480,33 @@ pub fn spawn_worker(cfg: MuleConfig, pipe_w: std::fs::File, rx: mpsc::Receiver<M
                                 })
                                 .unwrap_or_default()
                                 .iter()
-                                .filter_map(|st| serde_json::from_value::<WorkflowStep>(st.clone()).ok())
+                                .filter_map(|st| {
+                                    serde_json::from_value::<WorkflowStep>(st.clone()).ok()
+                                })
                                 .collect();
-                                write_frame(&pipe, &Frame::WorkflowGetOk { req_id, workflow: summary, steps });
+                                write_frame(
+                                    &pipe,
+                                    &Frame::WorkflowGetOk {
+                                        req_id,
+                                        workflow: summary,
+                                        steps,
+                                    },
+                                );
                             }
-                            Err(e) => write_frame(&pipe, &Frame::Error { req_id: Some(req_id), message: e }),
+                            Err(e) => write_frame(
+                                &pipe,
+                                &Frame::Error {
+                                    req_id: Some(req_id),
+                                    message: e,
+                                },
+                            ),
                         }
                     }
-                    MuleJob::Put { req_id, workflow_id, draft } => {
+                    MuleJob::Put {
+                        req_id,
+                        workflow_id,
+                        draft,
+                    } => {
                         // create or update the workflow, then sync steps
                         let res: Result<String, String> = (|| {
                             let body = serde_json::json!({
@@ -410,12 +516,21 @@ pub fn spawn_worker(cfg: MuleConfig, pipe_w: std::fs::File, rx: mpsc::Receiver<M
                             });
                             let id = match &workflow_id {
                                 Some(id) => {
-                                    http_json(&cfg, "PUT", &format!("/api/v1/workflows/{id}"), Some(&body))?;
+                                    http_json(
+                                        &cfg,
+                                        "PUT",
+                                        &format!("/api/v1/workflows/{id}"),
+                                        Some(&body),
+                                    )?;
                                     id.clone()
                                 }
                                 None => {
-                                    let v = http_json(&cfg, "POST", "/api/v1/workflows", Some(&body))?;
-                                    v.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string()
+                                    let v =
+                                        http_json(&cfg, "POST", "/api/v1/workflows", Some(&body))?;
+                                    v.get("id")
+                                        .and_then(|x| x.as_str())
+                                        .unwrap_or("")
+                                        .to_string()
                                 }
                             };
                             if id.is_empty() {
@@ -433,11 +548,16 @@ pub fn spawn_worker(cfg: MuleConfig, pipe_w: std::fs::File, rx: mpsc::Receiver<M
                             )
                             .ok()
                             .and_then(|sv| {
-                                sv.get("steps").or(Some(&sv)).and_then(|x| x.as_array()).cloned()
+                                sv.get("steps")
+                                    .or(Some(&sv))
+                                    .and_then(|x| x.as_array())
+                                    .cloned()
                             })
                             .unwrap_or_default()
                             .iter()
-                            .filter_map(|st| serde_json::from_value::<WorkflowStep>(st.clone()).ok())
+                            .filter_map(|st| {
+                                serde_json::from_value::<WorkflowStep>(st.clone()).ok()
+                            })
                             .collect();
                             let draft_ids: Vec<String> =
                                 draft.steps.iter().filter_map(|s| s.id.clone()).collect();
@@ -446,7 +566,10 @@ pub fn spawn_worker(cfg: MuleConfig, pipe_w: std::fs::File, rx: mpsc::Receiver<M
                                     let _ = http_json(
                                         &cfg,
                                         "DELETE",
-                                        &format!("/api/v1/workflows/{id}/steps/{}", old.id.clone().unwrap_or_default()),
+                                        &format!(
+                                            "/api/v1/workflows/{id}/steps/{}",
+                                            old.id.clone().unwrap_or_default()
+                                        ),
                                         None,
                                     );
                                 }
@@ -485,17 +608,49 @@ pub fn spawn_worker(cfg: MuleConfig, pipe_w: std::fs::File, rx: mpsc::Receiver<M
                             Ok(id)
                         })();
                         match res {
-                            Ok(id) => write_frame(&pipe, &Frame::WorkflowPutOk { req_id, workflow_id: id }),
-                            Err(e) => write_frame(&pipe, &Frame::Error { req_id: Some(req_id), message: e }),
+                            Ok(id) => write_frame(
+                                &pipe,
+                                &Frame::WorkflowPutOk {
+                                    req_id,
+                                    workflow_id: id,
+                                },
+                            ),
+                            Err(e) => write_frame(
+                                &pipe,
+                                &Frame::Error {
+                                    req_id: Some(req_id),
+                                    message: e,
+                                },
+                            ),
                         }
                     }
-                    MuleJob::Delete { req_id, workflow_id } => {
-                        match http_json(&cfg, "DELETE", &format!("/api/v1/workflows/{workflow_id}"), None) {
+                    MuleJob::Delete {
+                        req_id,
+                        workflow_id,
+                    } => {
+                        match http_json(
+                            &cfg,
+                            "DELETE",
+                            &format!("/api/v1/workflows/{workflow_id}"),
+                            None,
+                        ) {
                             Ok(_) => write_frame(&pipe, &Frame::WorkflowDeleteOk { req_id }),
-                            Err(e) => write_frame(&pipe, &Frame::Error { req_id: Some(req_id), message: e }),
+                            Err(e) => write_frame(
+                                &pipe,
+                                &Frame::Error {
+                                    req_id: Some(req_id),
+                                    message: e,
+                                },
+                            ),
                         }
                     }
-                    MuleJob::Run { req_id, workflow_id, input, session, pane } => {
+                    MuleJob::Run {
+                        req_id,
+                        workflow_id,
+                        input,
+                        session,
+                        pane,
+                    } => {
                         let body = serde_json::json!({
                             "workflow_id": workflow_id,
                             "input_data": input.unwrap_or(serde_json::Value::Null),
@@ -518,7 +673,11 @@ pub fn spawn_worker(cfg: MuleConfig, pipe_w: std::fs::File, rx: mpsc::Receiver<M
                                     continue;
                                 }
                                 watches.lock().unwrap().insert(pane, job_id.clone());
-                                write_row(&pipe, pane, &format!("▶ workflow run started (job {job_id})"));
+                                write_row(
+                                    &pipe,
+                                    pane,
+                                    &format!("▶ workflow run started (job {job_id})"),
+                                );
                                 write_frame(
                                     &pipe,
                                     &Frame::WorkflowRunOk {
@@ -538,7 +697,13 @@ pub fn spawn_worker(cfg: MuleConfig, pipe_w: std::fs::File, rx: mpsc::Receiver<M
                                     },
                                 );
                             }
-                            Err(e) => write_frame(&pipe, &Frame::Error { req_id: Some(req_id), message: e }),
+                            Err(e) => write_frame(
+                                &pipe,
+                                &Frame::Error {
+                                    req_id: Some(req_id),
+                                    message: e,
+                                },
+                            ),
                         }
                     }
                     MuleJob::Unwatch { pane } => {
