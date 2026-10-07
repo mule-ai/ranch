@@ -127,6 +127,19 @@ object Term {
 
     fun upgrade(): JSONObject = JSONObject().put("t", "Upgrade")
 
+    // ---- Herd H1: agent registry (forge agents) ----
+    fun agentList(): JSONObject =
+        JSONObject().put("t", "AgentList").put("id", newId()).put("client", CLIENT)
+            .put("req_id", "al-" + newId())
+
+    fun agentTalk(agent: String, mode: String, reqId: String = "at-" + newId()): JSONObject =
+        JSONObject().put("t", "AgentTalk").put("id", newId()).put("client", CLIENT)
+            .put("req_id", reqId).put("agent", agent).put("mode", mode)
+
+    fun agentBusy(agent: String, reqId: String = "ab-" + newId()): JSONObject =
+        JSONObject().put("t", "AgentBusy").put("id", newId()).put("client", CLIENT)
+            .put("req_id", reqId).put("agent", agent)
+
     // ---- Phase 4: agents / pi manager ----
     fun piList(): JSONObject =
         JSONObject().put("t", "PiList").put("id", newId()).put("client", CLIENT)
@@ -275,6 +288,29 @@ object Term {
         val multi: Boolean,
         val freeText: Boolean,
     )
+
+    /// One row of the forge agent registry (Herd H1). Mirrors
+    /// `ranch_protocol::AgentInfo`.
+    data class AgentInfo(
+        val id: String,
+        val name: String,
+        val avatarUrl: String?,
+        val homeMachine: String?,
+        val lastActive: String?,
+        val conversationCount: Long?,
+    )
+
+    fun parseAgentInfo(o: JSONObject): AgentInfo =
+        AgentInfo(
+            id = o.optString("id"),
+            name = o.optString("name"),
+            avatarUrl = o.optString("avatar_url").takeIf { it.isNotEmpty() },
+            homeMachine = o.optString("home_machine").takeIf { it.isNotEmpty() },
+            lastActive = o.optString("last_active").takeIf { it.isNotEmpty() },
+            conversationCount =
+                if (o.has("conversation_count") && !o.isNull("conversation_count"))
+                    o.optLong("conversation_count") else null,
+        )
 
     data class PiSession(
         val id: String,

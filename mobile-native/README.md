@@ -42,6 +42,16 @@ fire while the phone is in a drawer.
   test buttons, a **live session list** (from `HelloOk` + `SessionsAck` +
   `Meta exited`), a "+ New shell session" button, and a live diagnostics
   readout.
+- **Agents screen** — `AgentsActivity`: the forge agent registry (Herd
+  H1.4). Sends `AgentList` over the same Realtime channel; each
+  `AgentListOk` row shows an avatar placeholder, the agent name, a live
+  busy dot (`AgentBusy`/`AgentBusyOk`), home machine + last active. Tap
+  a row → `AgentTalk{mode:"continue"}` → on `AgentTalkOk` the new
+  session opens in [SessionActivity] (same extras as the home screen
+  session list). `Error` replies (unknown agent, agent lives on another
+  machine, forge down) flash the status line — never crash. The
+  pre-H1.4 **local pi manager** (PiList/PiMonitor/adopt) is kept as a
+  second section under a "Local pi sessions" divider.
 - **Session / terminal screen** — `SessionActivity`: attaches to one
   session and renders its active pane.
   - **PTY panes** → `TerminalView` (custom `View`) paints the SGR-tagged row
