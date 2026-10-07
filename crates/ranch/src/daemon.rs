@@ -1638,6 +1638,29 @@ impl Daemon {
             name: sname,
             kind: skind,
         });
+        // keep the agent registry mirror fresh (Herd H1): a talk proves
+        // the agent exists and is active now
+        self.mirror(relay::RelayOut::UpsertAgent {
+            id: agent.to_string(),
+            name: agent_row
+                .get("name")
+                .and_then(|n| n.as_str())
+                .unwrap_or(agent)
+                .to_string(),
+            avatar_url: agent_row
+                .get("avatar_url")
+                .and_then(|a| a.as_str())
+                .map(String::from),
+            home_machine: agent_row
+                .get("home_machine")
+                .and_then(|h| h.as_str())
+                .map(String::from),
+            visibility: agent_row
+                .get("visibility")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            last_active_at: None, // stamp the sync time in the relay thread
+        });
         if let Some(c) = self.clients.get_mut(&from) {
             send_frame(
                 c,
@@ -5710,8 +5733,31 @@ impl Daemon {
             | Frame::WebhookListOk { .. }
             | Frame::WebhookPutOk { .. }
             | Frame::WebhookDeleteOk { .. }
-            | Frame::AgentListOk { .. }
             | Frame::AgentBusyOk { .. } => {
+                let recipients: Vec<RawFd> = self.clients.keys().copied().collect();
+                for rfd in recipients {
+                    if let Some(c) = self.clients.get_mut(&rfd) {
+                        send_frame(c, frame);
+                    }
+                }
+                return;
+            }
+            // forge worker -> clients: the agent registry (Herd H1).
+            // Mirror the rows to Supabase so a phone on another network
+            // sees the registry even when this machine goes offline, then
+            // broadcast as usual (clients match on req_id). Mirror
+            // failures are fire-and-forget (relay thread logs + drops).
+            Frame::AgentListOk { agents, .. } => {
+                for a in agents {
+                    self.mirror(relay::RelayOut::UpsertAgent {
+                        id: a.id.clone(),
+                        name: a.name.clone(),
+                        avatar_url: a.avatar_url.clone(),
+                        home_machine: a.home_machine.clone(),
+                        visibility: None, // AgentListOk (H1) carries no visibility
+                        last_active_at: a.last_active.clone(),
+                    });
+                }
                 let recipients: Vec<RawFd> = self.clients.keys().copied().collect();
                 for rfd in recipients {
                     if let Some(c) = self.clients.get_mut(&rfd) {

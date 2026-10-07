@@ -103,6 +103,18 @@ pub enum RelayOut {
     },
     /// Remove a webhook mirror row.
     DeleteWebhook { id: String },
+    /// Mirror an agent registry row (Herd H1). Upserted when the daemon
+    /// sees an `AgentListOk` from the forge worker or on `agent_talk`.
+    UpsertAgent {
+        id: String,
+        name: String,
+        avatar_url: Option<String>,
+        home_machine: Option<String>,
+        /// forge visibility ("private" | "public"); None = unknown
+        visibility: Option<String>,
+        /// forge's last-active timestamp; None = stamp the sync time
+        last_active_at: Option<String>,
+    },
 }
 
 // ---------- REST helpers (main loop only; webhook/trigger CRUD) ----------
@@ -374,6 +386,30 @@ fn heartbeat(cfg: &RelayConfig, jwt: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// (url, body) for the agent-registry mirror upsert. Split out of
+/// `mirror_upsert` so the payload shape is unit-testable.
+fn agent_upsert_url_body(cfg: &RelayConfig, op: &RelayOut) -> (String, serde_json::Value) {
+    match op {
+        RelayOut::UpsertAgent {
+            id,
+            name,
+            avatar_url,
+            home_machine,
+            visibility,
+            last_active_at,
+        } => (
+            format!("{}/rest/v1/agents?on_conflict=id", cfg.supabase_url),
+            serde_json::json!({
+                "id": id, "machine_id": cfg.machine_id,
+                "name": name, "avatar_url": avatar_url,
+                "home_machine": home_machine, "visibility": visibility,
+                "last_active_at": last_active_at.clone().unwrap_or_else(now_iso),
+            }),
+        ),
+        _ => unreachable!("agent_upsert_url_body called with a non-agent op"),
+    }
+}
+
 fn mirror_upsert(cfg: &RelayConfig, jwt: &str, op: &RelayOut) {
     let (url, body) = match op {
         RelayOut::UpsertSession { id, name, kind } => (
@@ -383,6 +419,7 @@ fn mirror_upsert(cfg: &RelayConfig, jwt: &str, op: &RelayOut) {
                 "name": name, "kind": kind, "last_active_at": now_iso(),
             }),
         ),
+        RelayOut::UpsertAgent { .. } => agent_upsert_url_body(cfg, op),
         RelayOut::UpsertTrigger {
             id,
             name,
@@ -891,4 +928,50 @@ fn instant_now() -> f64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs_f64()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_mirror_upsert_payload_shape() {
+        let cfg = RelayConfig {
+            machine_id: "machine-1".into(),
+            machine_email: "m@x".into(),
+            machine_key: "k".into(),
+            supabase_url: "https://sb.example".into(),
+            anon_key: "anon".into(),
+        };
+        let op = RelayOut::UpsertAgent {
+            id: "a-uuid".into(),
+            name: "iris".into(),
+            avatar_url: None,
+            home_machine: Some("machine-1".into()),
+            visibility: Some("private".into()),
+            last_active_at: Some("2026-01-02T03:04:05Z".into()),
+        };
+        let (url, body) = agent_upsert_url_body(&cfg, &op);
+
+        assert_eq!(url, "https://sb.example/rest/v1/agents?on_conflict=id");
+        assert_eq!(body["id"], "a-uuid");
+        assert_eq!(body["machine_id"], "machine-1");
+        assert_eq!(body["name"], "iris");
+        assert_eq!(body["avatar_url"], serde_json::Value::Null);
+        assert_eq!(body["home_machine"], "machine-1");
+        assert_eq!(body["visibility"], "private");
+        assert_eq!(body["last_active_at"], "2026-01-02T03:04:05Z");
+
+        // last_active None => stamped with the sync time (ISO-8601 Z)
+        let op2 = RelayOut::UpsertAgent {
+            id: "a-uuid".into(),
+            name: "iris".into(),
+            avatar_url: None,
+            home_machine: None,
+            visibility: None,
+            last_active_at: None,
+        };
+        let (_, body) = agent_upsert_url_body(&cfg, &op2);
+        assert!(body["last_active_at"].as_str().unwrap().ends_with('Z'));
+    }
 }
