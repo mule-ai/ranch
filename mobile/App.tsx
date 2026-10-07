@@ -90,6 +90,8 @@ export default function App() {
   const sessionsRef = useRef<SessionMeta[] | null>(null);
   sessionsRef.current = sessions;
   const kindRef = useRef(newKind);
+  // Herd H1.4: pending AgentTalk req_id -> agent name (attach title)
+  const agentTalkNames = useRef(new Map<string, string>());
   kindRef.current = newKind;
   const resumeReqRef = useRef<string | null>(null);
   const piResumeReqRef = useRef<string | null>(null);
@@ -227,6 +229,16 @@ export default function App() {
             ]);
             setNewName("");
             break;
+          case "AgentTalkOk": {
+            // Herd H1.4: an agent row was tapped → open the chat pane
+            const name = agentTalkNames.current.get(f.req_id) ?? "agent";
+            agentTalkNames.current.delete(f.req_id);
+            const meta: SessionMeta = { id: f.session, name, kind: "forge", active_pane: f.pane, panes: [f.pane] };
+            setSessions((prev) => [...(prev ?? []).filter((x) => x.id !== f.session), meta]);
+            setTab("sessions");
+            setAttached(meta);
+            break;
+          }
           case "ForgeListOk":
             if (f.req_id === resumeReqRef.current) {
               resumeReqRef.current = null;
@@ -592,6 +604,11 @@ export default function App() {
         <AgentsScreen
           relay={relay}
           onExit={() => setTab("sessions")}
+          onTalk={(a) => {
+            const rid = "at-" + nextId();
+            agentTalkNames.current.set(rid, a.name || a.id.slice(0, 8));
+            relay?.send({ t: "AgentTalk", req_id: rid, agent: a.id, mode: "continue" } as Frame);
+          }}
           onLaunch={(p) => {
             setPendingProfile(p);
             setTab("sessions");

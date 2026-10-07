@@ -1,4 +1,7 @@
-// Agents screen (Phase B): browse/create/edit/delete forge agent
+// Agents screen: top section is the H1.4 agent registry (the "herd") —
+// `AgentList` -> `AgentListOk`, each row avatar/name/busy dot/home
+// machine, tap -> `AgentTalk{continue}` -> the app attaches the chat
+// pane. Bottom section (Phase B): browse/create/edit/delete forge agent
 // profiles through the daemon's forge proxy; tap "launch" to open an
 // agent pane running that profile (SessionsCreate kind=forge +
 // profile_id).
@@ -15,16 +18,61 @@ import {
   View,
 } from "react-native";
 import { Relay } from "../lib/relay";
-import { Frame, ModelChoice, ProfileSummary, ProfileDraft, nextId } from "../lib/frames";
+import { Frame, AgentInfo, ModelChoice, ProfileSummary, ProfileDraft, nextId } from "../lib/frames";
 
 const PROVIDERS = ["openai", "anthropic", "proxy-anthropic", "proxy", "google", "gemini", "custom"];
 const KNOWN_TOOLS = ["bash", "read", "write", "edit"];
 
-type Props = { relay: Relay; onLaunch: (p: ProfileSummary) => void; onExit: () => void };
+// deterministic avatar tint (no image loader in the RN app yet — the
+// registry row shows the agent's initial on this color)
+const AVATAR_TINTS = ["#3b82f6", "#8b5cf6", "#ec4899", "#f59e0b", "#10b981", "#06b6d4", "#ef4444", "#84cc16"];
+function avatarColor(seed: string): string {
+  let h = 0;
+  for (let i = 0; i < seed.length; i++) h = (h * 31 + seed.charCodeAt(i)) >>> 0;
+  return AVATAR_TINTS[h % AVATAR_TINTS.length];
+}
 
-export function AgentsScreen({ relay, onLaunch, onExit }: Props) {
+type Props = { relay: Relay; onLaunch: (p: ProfileSummary) => void; onTalk: (a: AgentInfo) => void; onExit: () => void };
+
+export function AgentsScreen({ relay, onLaunch, onTalk, onExit }: Props) {
   const [profiles, setProfiles] = useState<ProfileSummary[] | null>(null);
   const [editing, setEditing] = useState<{ id: string | null; draft: ProfileDraft } | null>(null);
+
+  // Herd H1.4: the forge agent registry + per-agent busy flag
+  const [agents, setAgents] = useState<AgentInfo[] | null>(null);
+  const [busy, setBusy] = useState<Record<string, boolean>>({});
+  const [herdStatus, setHerdStatus] = useState("");
+
+  useEffect(() => {
+    const un = relay.onFrame((f: Frame) => {
+      switch (f.t) {
+        case "AgentListOk":
+          setAgents(f.agents);
+          setHerdStatus("");
+          break;
+        case "AgentBusyOk":
+          // req_id is "ab-<agent id>" (the join key — the frame carries
+          // no agent field)
+          setBusy((prev) => ({ ...prev, [f.req_id.slice(3)]: f.busy }));
+          break;
+        case "Error": {
+          const rid = (f as { req_id?: string | null }).req_id ?? "";
+          if (rid.startsWith("al-") || rid.startsWith("ab-") || rid.startsWith("at-"))
+            setHerdStatus(f.message);
+          break;
+        }
+      }
+    });
+    relay.send({ t: "AgentList", id: nextId(), client: "mobile", req_id: "al-" + nextId() } as Frame);
+    return un;
+  }, [relay]);
+
+  // busy dots: one probe per agent (the herd is small)
+  useEffect(() => {
+    if (!agents) return;
+    for (const a of agents)
+      relay.send({ t: "AgentBusy", id: nextId(), client: "mobile", req_id: "ab-" + a.id, agent: a.id } as Frame);
+  }, [agents, relay]);
 
   // back gesture/button: close the profile form first (mirrors the
   // form's "‹ agents" control), then exit the screen
@@ -76,8 +124,50 @@ export function AgentsScreen({ relay, onLaunch, onExit }: Props) {
 
   return (
     <View style={s.wrap}>
+      <Text style={s.herdTitle}>HERD — FORGE AGENTS</Text>
+      {herdStatus ? <Text style={s.herdErr}>{herdStatus}</Text> : null}
+      {agents === null ? (
+        <ActivityIndicator color="#4ade80" style={{ marginVertical: 8 }} />
+      ) : agents.length === 0 ? (
+        <Text style={s.dim}>No agents registered in forge.</Text>
+      ) : (
+        agents.map((a) => (
+          <Pressable
+            key={a.id}
+            style={s.agentRow}
+            onPress={() => {
+              setHerdStatus(`opening ${a.name}…`);
+              onTalk(a);
+            }}
+          >
+            <View style={[s.avatar, { backgroundColor: avatarColor(a.id + a.name) }]}>
+              <Text style={s.avatarText}>{(a.name || "?").slice(0, 1).toUpperCase()}</Text>
+            </View>
+            <View style={{ flex: 1 }}>
+              <Text style={s.agentName}>
+                {a.name || a.id.slice(0, 8)}
+                {busy[a.id] ? (
+                  <Text style={s.busyOn}> ●</Text>
+                ) : (
+                  <Text style={s.busyOff}> ○</Text>
+                )}
+              </Text>
+              <Text style={s.dim}>
+                {[
+                  a.home_machine ? `on ${a.home_machine}` : null,
+                  a.last_active ? `last ${a.last_active.slice(0, 16)}` : "no conversations yet",
+                ]
+                  .filter(Boolean)
+                  .join(" · ")}
+              </Text>
+            </View>
+            <Text style={s.chipGoText}>talk →</Text>
+          </Pressable>
+        ))
+      )}
+      <Text style={s.herdTitle}>AGENT PROFILES</Text>
       {profiles === null ? (
-        <ActivityIndicator color="#4ade80" style={{ marginTop: 32 }} />
+        <ActivityIndicator color="#4ade80" style={{ marginTop: 8 }} />
       ) : (
         <FlatList
           data={profiles}
@@ -402,6 +492,14 @@ const s = StyleSheet.create({
   row: { paddingVertical: 12, borderBottomWidth: 1, borderBottomColor: "#1f2430", gap: 2 },
   rowTitle: { color: "#f3f4f6", fontSize: 17, fontWeight: "600" },
   dim: { color: "#6b7280", fontSize: 13 },
+  herdTitle: { color: "#4ade80", fontSize: 12, fontWeight: "700", letterSpacing: 1, marginTop: 14, marginBottom: 6 },
+  herdErr: { color: "#f59e0b", fontSize: 13, marginBottom: 6 },
+  agentRow: { flexDirection: "row", alignItems: "center", paddingVertical: 10, paddingHorizontal: 4, borderBottomWidth: 1, borderBottomColor: "#1f2430", gap: 10 },
+  avatar: { width: 36, height: 36, borderRadius: 18, alignItems: "center", justifyContent: "center" },
+  avatarText: { color: "#fff", fontSize: 15, fontWeight: "700" },
+  agentName: { color: "#f3f4f6", fontSize: 16, fontWeight: "600" },
+  busyOn: { color: "#f59e0b", fontSize: 13 },
+  busyOff: { color: "#374151", fontSize: 13 },
   label: { color: "#9ca3af", fontSize: 12, marginTop: 6 },
   input: {
     backgroundColor: "#1a1b23", borderRadius: 8, paddingHorizontal: 12, paddingVertical: 8,

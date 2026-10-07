@@ -112,6 +112,17 @@ export type ProfileDraft = {
 
 // ----- workflows (Phase C): mule proxy -----
 
+/** One row of the forge agent registry (Herd H1). Mirrors `AgentInfo` in
+ *  ranch-protocol. */
+export type AgentInfo = {
+  id: string;
+  name: string;
+  avatar_url?: string | null;
+  home_machine?: string | null;
+  last_active?: string | null;
+  conversation_count?: number | null;
+};
+
 export type MuleAgent = {
   id: string;
   name: string;
@@ -257,6 +268,14 @@ export type Frame =
   // broadcast when the question is answered (any client): choices =
   // selected 0-based indices, text = free-text answer
   | { t: "AgentAskAnswer"; ask_id: string; choices: number[]; text: string }
+  // Herd H1: the agent registry (forge `agents` rows). Secrets never
+  // cross the wire.
+  | { t: "AgentList"; id: string; req_id: string }
+  | { t: "AgentListOk"; id: string; req_id: string; agents: AgentInfo[] }
+  | { t: "AgentTalk"; id: string; req_id: string; agent: string; mode: string; text?: string; title?: string | null; fork_from?: string | null }
+  | { t: "AgentTalkOk"; id: string; req_id: string; session: string; pane: string }
+  | { t: "AgentBusy"; id: string; req_id: string; agent: string }
+  | { t: "AgentBusyOk"; id: string; req_id: string; busy: boolean; current_conversation?: string | null }
   | { t: "ProfileList"; id: string; req_id: string }
   | { t: "ProfileListOk"; id: string; req_id: string; profiles: ProfileSummary[] }
   | { t: "ProfileGet"; id: string; req_id: string; profile: string }
