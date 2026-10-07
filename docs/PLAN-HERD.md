@@ -1653,7 +1653,7 @@ kill-criteria). Nothing open blocks starting H0.
 
 | Phase | Status | Notes |
 |---|---|---|
-| H0 | ◐ in progress | H0.1 ✅ (vendor @ ae92585d = pi-durable 1.0.4, digest notes written), H0.2 ⏳ (durable-pg in progress — subagent flakiness; being driven directly), H0.3 ✅ (decision record at `forge/docs/HERD-DURABLE-DECISION.md`), H0.4 ◐ config written (`lab/ct/forge` pgvector ✅, `lab/ct/mule` machine config ✅ @ port 8091) — **pending human: image build + `lab-alc-reconcile` on mini + secrets + consumer repoint**, H0.5 ✅ code-side (extension pins + ranchd drift warning; image rebuilds ride H0.4's reconcile) |
+| H0 | ◐ in progress | H0.1 ✅ (vendor @ ae92585d = pi-durable 1.0.4, digest notes written), H0.2 ✅ (forge `57d5035b`: `durable-pg` Postgres Storage backend — vendor conformance suite 23/23 green, kill-9 ×2 green, README w/ PG-vs-sqlite benchmarks; note: npm dist ships 20 conformance cases, vendored src has 23 w/ scan `order`), H0.3 ✅ (decision record at `forge/docs/HERD-DURABLE-DECISION.md`), H0.4 ◐ config written (`lab/ct/forge` pgvector ✅, `lab/ct/mule` machine config ✅ @ port 8091) — **pending human: image build + `lab-alc-reconcile` on mini + secrets + consumer repoint**, H0.5 ✅ code-side (extension pins + ranchd drift warning; image rebuilds ride H0.4's reconcile) |
 | H1 | ☐ not started | |
 | H2 | ☐ not started | |
 | H3 | ☐ not started | |
