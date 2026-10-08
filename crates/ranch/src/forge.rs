@@ -404,6 +404,19 @@ fn handle_event(
                 });
                 return;
             }
+            if tool == "memory_review" {
+                // Herd H4.4: forge proposed a pending belief and pushed
+                // the approval card — same AgentAsk round-trip shape as
+                // policy_ask, but with Keep/Forget choices plus free
+                // text (the text IS the Edit answer). The answer
+                // payload rides the result relay; forge applies the
+                // belief transition on the result door.
+                std::thread::spawn(move || {
+                    let result = execute_memory_review_via_ctl(&input, pane);
+                    relay_result_to_forge(&cfg, &id, &result);
+                });
+                return;
+            }
             if id.is_empty() || !tool.starts_with("ranch_") {
                 return;
             }
@@ -568,6 +581,135 @@ fn execute_policy_ask_via_ctl(input: &serde_json::Value, caller_pane: Uuid) -> s
             return serde_json::json!({ "success": false, "error": "policy ask: no answer in time" });
         }
         std::thread::sleep(std::time::Duration::from_millis(2000));
+    }
+}
+
+/// Herd H4.4: drive the ranch approval round-trip for a forge belief
+/// proposal (the `memory_review` card). Same AgentAsk plumbing as the
+/// H3.5 policy lane, but the card offers **Keep / Forget plus free
+/// text** — a free-text answer IS the Edit: the typed text becomes
+/// the belief's new content. Polls `AgentAskStatus` (~2 s cadence)
+/// until answered or the ~55 s deadline, just under forge's 60 s
+/// queue TTL: a slow human means the belief simply STAYS PENDING
+/// (v1 does not re-push the card; it remains visible via
+/// `GET /memory/beliefs?status=pending` and answerable via the
+/// keep/forget routes). The choice mapping is [`memory_review_reply`]
+/// (unit-tested); this function only drives the control API.
+fn execute_memory_review_via_ctl(
+    input: &serde_json::Value,
+    caller_pane: Uuid,
+) -> serde_json::Value {
+    let port = std::env::var("RANCH_CONTROL_PORT").unwrap_or_default();
+    let token = std::env::var("RANCH_CONTROL_TOKEN").unwrap_or_default();
+    if port.is_empty() || token.is_empty() {
+        return serde_json::json!({
+            "success": false,
+            "error": "ranch control API unavailable (no RANCH_CONTROL_PORT)"
+        });
+    }
+    let content = input.get("content").and_then(|x| x.as_str()).unwrap_or("");
+    let rationale = input
+        .get("rationale")
+        .and_then(|x| x.as_str())
+        .unwrap_or("");
+    let question = if rationale.is_empty() {
+        format!("I've learned: **{content}** — keep this memory?")
+    } else {
+        format!("I've learned: **{content}** ({rationale}) — keep this memory?")
+    };
+
+    // 1 — ask: POST /agent/ask → AgentAskOk { ask_id }. Free text next
+    // to the Keep/Forget choices carries the Edit answer.
+    let ask_body = serde_json::json!({
+        "caller_pane": caller_pane.to_string(),
+        "question": question,
+        "choices": ["Keep", "Forget"],
+        "suggested": 0,
+        "free_text": true,
+    });
+    let frames = match ctl_post_frames(&port, &token, caller_pane, "ask", &ask_body) {
+        Ok(f) => f,
+        Err(e) => {
+            return serde_json::json!({ "success": false, "error": format!("memory review: control API error: {e}") });
+        }
+    };
+    let ask_id = frames
+        .iter()
+        .find(|f| f.get("t").and_then(|x| x.as_str()) == Some("AgentAskOk"))
+        .and_then(|f| f.get("ask_id").and_then(|x| x.as_str()))
+        .unwrap_or("")
+        .to_string();
+    if ask_id.is_empty() {
+        return serde_json::json!({ "success": false, "error": "memory review: no AgentAskOk in the control reply" });
+    }
+
+    // 2 — poll: /agent/ask-status every ~2 s until answered or ~55 s.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(55);
+    loop {
+        let frames = match ctl_post_frames(
+            &port,
+            &token,
+            caller_pane,
+            "ask-status",
+            &serde_json::json!({ "caller_pane": caller_pane.to_string(), "ask_id": ask_id }),
+        ) {
+            Ok(f) => f,
+            Err(e) => {
+                return serde_json::json!({ "success": false, "error": format!("memory review: status poll failed: {e}") });
+            }
+        };
+        if let Some(st) = frames
+            .iter()
+            .find(|f| f.get("t").and_then(|x| x.as_str()) == Some("AgentAskStatusOk"))
+        {
+            let state = st
+                .get("state")
+                .and_then(|x| x.as_str())
+                .unwrap_or("unknown");
+            if state == "answered" {
+                let choices: Vec<i64> = st
+                    .get("choices")
+                    .and_then(|c| c.as_array())
+                    .map(|a| a.iter().filter_map(|x| x.as_i64()).collect())
+                    .unwrap_or_default();
+                let text = st.get("text").and_then(|x| x.as_str()).unwrap_or("");
+                return memory_review_reply(&choices, text);
+            }
+            if state == "unknown" {
+                return serde_json::json!({ "success": false, "error": "memory review: no answer in time" });
+            }
+            // "pending" — keep polling
+        }
+        if std::time::Instant::now() >= deadline {
+            return serde_json::json!({ "success": false, "error": "memory review: no answer in time" });
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2000));
+    }
+}
+
+/// Map a memory_review card answer (selected choice indices + free
+/// text) to the result payload forge applies on the belief. Pure,
+/// so the contract is unit-testable:
+///
+/// - free text (non-blank) → `edit`: the text becomes the belief's
+///   new content (takes precedence over any choice — the user typed a
+///   correction, that's the intent);
+/// - choice 0 ("Keep") → `keep`;
+/// - any other selection (choice 1, "Forget") → `forget`;
+/// - nothing selected and nothing typed → a failed relay (the belief
+///   stays pending).
+fn memory_review_reply(choices: &[i64], text: &str) -> serde_json::Value {
+    let text = text.trim();
+    if !text.is_empty() {
+        return serde_json::json!({ "success": true, "output": { "action": "edit", "content": text } });
+    }
+    if choices.is_empty() {
+        return serde_json::json!({ "success": false, "error": "memory review: no answer in time" });
+    }
+    if choices.contains(&0) {
+        serde_json::json!({ "success": true, "output": { "action": "keep" } })
+    } else {
+        serde_json::json!({ "success": true, "output": { "action": "forget" } })
     }
 }
 
@@ -1547,6 +1689,36 @@ mod tests {
     use super::*;
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
+
+    // ---------- memory_review card answer → result payload (H4.4) ----------
+
+    #[test]
+    fn memory_review_reply_maps_choices_to_belief_actions() {
+        // Keep (choice 0)
+        let r = memory_review_reply(&[0], "");
+        assert_eq!(r["success"], true);
+        assert_eq!(r["output"]["action"], "keep");
+        // Forget (choice 1)
+        let r = memory_review_reply(&[1], "");
+        assert_eq!(r["success"], true);
+        assert_eq!(r["output"]["action"], "forget");
+        // Free text IS the Edit — the text becomes the new content,
+        // and it takes precedence over any co-selected choice.
+        let r = memory_review_reply(&[0], "user prefers VERY brief replies");
+        assert_eq!(r["success"], true);
+        assert_eq!(r["output"]["action"], "edit");
+        assert_eq!(r["output"]["content"], "user prefers VERY brief replies");
+        let r = memory_review_reply(&[1], " deploys go on Thursdays ");
+        assert_eq!(r["output"]["action"], "edit");
+        assert_eq!(r["output"]["content"], "deploys go on Thursdays");
+        // Blank text + a choice → the choice wins (no stray edit).
+        assert_eq!(memory_review_reply(&[0], "   ")["output"]["action"], "keep");
+        // Nothing selected, nothing typed → failed relay (the belief
+        // stays pending on the forge side).
+        let r = memory_review_reply(&[], "");
+        assert_eq!(r["success"], false);
+        assert!(r["error"].as_str().unwrap().contains("no answer in time"));
+    }
 
     // ---------- talk_plan (pure mode-resolution logic) ----------
 
