@@ -1600,4 +1600,166 @@ mod tests {
         let s = seen.lock().unwrap().clone();
         assert!(s.ends_with(" {}"), "no title/fork → empty object body: {s}");
     }
+
+    // ---------- forge-sse reconnect dedup (Herd H2.6) ----------
+    //
+    // Post-cutover, harness restarts are frequent and harmless by
+    // design: the worker's SSE connection drops, and the reconnect's
+    // catch-up replay re-sends rows that were already delivered on the
+    // first connection (forge re-sends rows > `since` and the worker
+    // dedupes by the `last_seq` high-water mark). These tests drive
+    // `handle_event` — what the SSE loop calls per frame — across a
+    // simulated drop + replay and assert no row is ever re-emitted as
+    // a `chat` frame.
+
+    /// A WatchState + pipe (a real file) + its path, for one test.
+    fn sse_fixture() -> (Arc<WatchState>, PipeWriter, std::path::PathBuf) {
+        let state = Arc::new(WatchState {
+            pane: Uuid::new_v4(),
+            forge_sid: Uuid::new_v4(),
+            last_seq: AtomicI64::new(0),
+            stop: AtomicBool::new(false),
+            turn_gen: AtomicU64::new(0),
+        });
+        let path = std::env::temp_dir().join(format!("ranch-forge-sse-test-{}", Uuid::new_v4()));
+        let file = std::fs::File::create(&path).expect("create pipe file");
+        let pipe: PipeWriter = Arc::new(Mutex::new(file));
+        (state, pipe, path)
+    }
+
+    fn message_event(seq: i64, role: &str, text: &str) -> String {
+        serde_json::json!({
+            "sequence": seq,
+            "role": role,
+            "content": text,
+            "tool_name": null,
+            "tool_call_id": null,
+            "tool_output": null,
+            "tool_input": null,
+            "duration_ms": null,
+            "created_at": "2026-10-08T00:00:00Z",
+        })
+        .to_string()
+    }
+
+    /// Decode every frame the fixture's pipe received, in order.
+    fn pipe_frames(path: &std::path::Path) -> Vec<Frame> {
+        std::fs::read_to_string(path)
+            .expect("read pipe file")
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_str::<Frame>(l).unwrap_or_else(|e| panic!("decode {l}: {e}")))
+            .collect()
+    }
+
+    #[test]
+    fn sse_reconnect_replay_is_deduped() {
+        let (state, pipe, path) = sse_fixture();
+        let cfg = ForgeConfig {
+            base: "http://127.0.0.1:0".into(),
+            key: "k".into(),
+            profile: None,
+        };
+
+        // Connection 1: the stream delivers rows 1..3.
+        for (seq, role, text) in [
+            (1i64, "user", "legacy hello"),
+            (2, "assistant", "legacy answer"),
+            (3, "user", "next question"),
+        ] {
+            handle_event(
+                &state,
+                &cfg,
+                &pipe,
+                "message",
+                &message_event(seq, role, text),
+            );
+        }
+        assert_eq!(state.last_seq.load(Ordering::Relaxed), 3);
+
+        // --- the harness restarts: the connection drops, and the
+        // reconnect's catch-up REPLAYS rows 1..3 plus fresh rows 4..5
+        // (the fork window is longer than the client's backoff).
+        for (seq, role, text) in [
+            (1i64, "user", "legacy hello"),
+            (2, "assistant", "legacy answer"),
+            (3, "user", "next question"),
+            (4, "user", "reconnect question"),
+            (5, "assistant", "reconnect answer"),
+        ] {
+            handle_event(
+                &state,
+                &cfg,
+                &pipe,
+                "message",
+                &message_event(seq, role, text),
+            );
+        }
+
+        assert_eq!(state.last_seq.load(Ordering::Relaxed), 5);
+        let frames = pipe_frames(&path);
+        let chat_texts: Vec<String> = frames
+            .iter()
+            .filter_map(|f| match f {
+                Frame::Chat { msgs, .. } => {
+                    Some(msgs.iter().map(|m| m.text.clone()).collect::<Vec<_>>())
+                }
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert_eq!(
+            chat_texts,
+            vec![
+                "legacy hello",
+                "legacy answer",
+                "next question",
+                "reconnect question",
+                "reconnect answer"
+            ],
+            "replayed rows must never be re-emitted"
+        );
+
+        // An out-of-order replay of an already-delivered row that
+        // arrives AFTER the high-water mark advanced is dropped too.
+        let n_before = pipe_frames(&path).len();
+        handle_event(
+            &state,
+            &cfg,
+            &pipe,
+            "message",
+            &message_event(2, "assistant", "stale replay"),
+        );
+        assert_eq!(
+            state.last_seq.load(Ordering::Relaxed),
+            5,
+            "a duplicate must not move the high-water mark backward"
+        );
+        assert_eq!(
+            pipe_frames(&path).len(),
+            n_before,
+            "stale row emitted a frame"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn sse_heartbeat_and_lagged_are_noops() {
+        let (state, pipe, path) = sse_fixture();
+        let cfg = ForgeConfig {
+            base: "http://127.0.0.1:0".into(),
+            key: "k".into(),
+            profile: None,
+        };
+        handle_event(&state, &cfg, &pipe, "heartbeat", "");
+        handle_event(&state, &cfg, &pipe, "lagged", "");
+        handle_event(&state, &cfg, &pipe, "", "{}");
+        assert!(
+            pipe_frames(&path).is_empty(),
+            "heartbeat/lagged/unknown events must write no frames"
+        );
+        assert_eq!(state.last_seq.load(Ordering::Relaxed), 0);
+        let _ = std::fs::remove_file(&path);
+    }
 }
