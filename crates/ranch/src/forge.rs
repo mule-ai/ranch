@@ -390,12 +390,23 @@ fn handle_event(
                 .and_then(|x| x.as_str())
                 .unwrap_or("")
                 .to_string();
-            if id.is_empty() || !tool.starts_with("ranch_") {
-                return;
-            }
             let input = v.get("input").cloned().unwrap_or(serde_json::Value::Null);
             let cfg = cfg.clone();
             let pane = state.pane;
+            if tool == "policy_ask" {
+                // Herd H3.5: mule's policy engine returned an `ask`
+                // verdict — the approval round-trip is a ranch
+                // AgentAsk (broadcast to every client), relayed back to
+                // forge as the policy-ask decision.
+                std::thread::spawn(move || {
+                    let result = execute_policy_ask_via_ctl(&input, pane);
+                    relay_result_to_forge(&cfg, &id, &result);
+                });
+                return;
+            }
+            if id.is_empty() || !tool.starts_with("ranch_") {
+                return;
+            }
             std::thread::spawn(move || {
                 let result = execute_ranch_tool_via_ctl(&tool, &input, pane);
                 relay_result_to_forge(&cfg, &id, &result);
@@ -451,6 +462,144 @@ fn execute_ranch_tool_via_ctl(
         Err(e) => {
             serde_json::json!({ "success": false, "error": format!("control call failed: {e}") })
         }
+    }
+}
+
+/// Herd H3.5: drive the ranch approval round-trip for a mule policy
+/// `ask` verdict (the forge-side `POST /sessions/{id}/policy-ask`
+/// long-poll resolves on our result POST). Posts an `AgentAsk` to the
+/// loopback control API — the daemon broadcasts `AgentAskRequest` to
+/// every client, which render it with their EXISTING ask-answer
+/// plumbing (TUI status bar, web/mobile card, mobile notification):
+/// no protocol change, the rule context rides in the `question` text.
+/// Then polls `AgentAskStatus` (~2 s cadence) until answered or the
+/// ~55 s deadline — just under forge's 60 s relay TTL, so a slow human
+/// surfaces as forge's `expired` (the harness fails closed) rather
+/// than as our socket timing out under forge's. Choice 0 ("Allow this
+/// action") maps to success; anything else (or the deadline) to a
+/// failure result, which forge maps to `deny`/`expired`.
+fn execute_policy_ask_via_ctl(input: &serde_json::Value, caller_pane: Uuid) -> serde_json::Value {
+    let port = std::env::var("RANCH_CONTROL_PORT").unwrap_or_default();
+    let token = std::env::var("RANCH_CONTROL_TOKEN").unwrap_or_default();
+    if port.is_empty() || token.is_empty() {
+        return serde_json::json!({
+            "success": false,
+            "error": "ranch control API unavailable (no RANCH_CONTROL_PORT)"
+        });
+    }
+    let rule_id = input.get("rule_id").and_then(|x| x.as_str()).unwrap_or("");
+    let reason = input.get("reason").and_then(|x| x.as_str()).unwrap_or("");
+    let tool = input.get("tool").and_then(|x| x.as_str()).unwrap_or("");
+    let tool_input = input
+        .get("input")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let input_brief = truncate_str(&serde_json::to_string(&tool_input).unwrap_or_default(), 500);
+    let question = format!(
+        "Agent wants to run `{tool}` {input_brief}.\nOperator policy rule '{rule_id}': {reason}\nAllow this action?"
+    );
+
+    // 1 — ask: POST /agent/ask → AgentAskOk { ask_id }.
+    let ask_body = serde_json::json!({
+        "caller_pane": caller_pane.to_string(),
+        "question": question,
+        "choices": ["Allow this action", "Deny"],
+        "free_text": false,
+    });
+    let frames = match ctl_post_frames(&port, &token, caller_pane, "ask", &ask_body) {
+        Ok(f) => f,
+        Err(e) => {
+            return serde_json::json!({ "success": false, "error": format!("policy ask: control API error: {e}") });
+        }
+    };
+    let ask_id = frames
+        .iter()
+        .find(|f| f.get("t").and_then(|x| x.as_str()) == Some("AgentAskOk"))
+        .and_then(|f| f.get("ask_id").and_then(|x| x.as_str()))
+        .unwrap_or("")
+        .to_string();
+    if ask_id.is_empty() {
+        return serde_json::json!({ "success": false, "error": "policy ask: no AgentAskOk in the control reply" });
+    }
+
+    // 2 — poll: /agent/ask-status every ~2 s until answered or ~55 s.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(55);
+    loop {
+        let frames = match ctl_post_frames(
+            &port,
+            &token,
+            caller_pane,
+            "ask-status",
+            &serde_json::json!({ "caller_pane": caller_pane.to_string(), "ask_id": ask_id }),
+        ) {
+            Ok(f) => f,
+            Err(e) => {
+                return serde_json::json!({ "success": false, "error": format!("policy ask: status poll failed: {e}") });
+            }
+        };
+        if let Some(st) = frames
+            .iter()
+            .find(|f| f.get("t").and_then(|x| x.as_str()) == Some("AgentAskStatusOk"))
+        {
+            let state = st
+                .get("state")
+                .and_then(|x| x.as_str())
+                .unwrap_or("unknown");
+            match state {
+                "answered" => {
+                    let choices = st
+                        .get("choices")
+                        .and_then(|c| c.as_array())
+                        .cloned()
+                        .unwrap_or_default();
+                    return if choices.iter().any(|c| c.as_i64() == Some(0)) {
+                        serde_json::json!({ "success": true })
+                    } else {
+                        serde_json::json!({ "success": false, "error": "user denied" })
+                    };
+                }
+                "unknown" => {
+                    return serde_json::json!({ "success": false, "error": "policy ask: no answer in time" });
+                }
+                _ => {} // "pending" — keep polling
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return serde_json::json!({ "success": false, "error": "policy ask: no answer in time" });
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2000));
+    }
+}
+
+/// One loopback control-API POST (`/agent/<route>`): the control API
+/// answers with a JSON array of frames; return it.
+fn ctl_post_frames(
+    port: &str,
+    token: &str,
+    caller_pane: Uuid,
+    route: &str,
+    body: &serde_json::Value,
+) -> Result<Vec<serde_json::Value>, String> {
+    let url = format!("http://127.0.0.1:{port}/agent/{route}");
+    let mut res = ureq::post(&url)
+        .header("Authorization", &format!("Bearer {token}"))
+        .header("X-Ranch-Pane", &caller_pane.to_string())
+        .send_json(body)
+        .map_err(|e| e.to_string())?;
+    let mut text = String::new();
+    res.body_mut()
+        .as_reader()
+        .read_to_string(&mut text)
+        .map_err(|e| e.to_string())?;
+    serde_json::from_str(&text).map_err(|e| e.to_string())
+}
+
+/// Trim a string to `max` chars (on a char boundary), ellipsis-marked.
+fn truncate_str(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        format!("{}…", s.chars().take(max).collect::<String>())
     }
 }
 

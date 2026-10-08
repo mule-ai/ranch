@@ -227,6 +227,19 @@ Why this shape:
   pending callback into the caller's session — as a system row the
   harness hands to pi, or as the resolved tool result when the caller
   used the long-poll `ranch_wait` variant of spawn.
+- **The policy hook rides the same bridge (Herd H3.5).** forge's
+  `before_tool` policy hook (mule `evaluate`) gets an `ask` verdict, so
+  it calls `POST /sessions/{id}/policy-ask` — which inserts the SAME
+  queue row and publishes `ranch_tool_request` with tool `policy_ask`
+  (payload `{rule_id, reason, tool, input}`). ranchd turns that into
+  the ordinary `AgentAsk` round-trip (`AgentAskRequest` broadcast to
+  every client — no protocol change; the rule context rides in the
+  `question` text, choices `Allow this action` / `Deny`), polls
+  `AgentAskStatus` to a ~55 s deadline (just under forge's 60 s relay
+  TTL), and POSTs the decision to `/ranch-tools/{id}/result`: success
+  ⇒ forge answers the harness `decision: "allow"` (the harness
+  best-effort-memos the approval in mule); failure/timeout ⇒
+  `"deny"` / `"expired"` — the harness fails closed either way.
 - **Cross-host by design.** A forge-hosted agent can spawn *local pi*
   panes (they run on ranchd's host, next to the human's shells) or
   *other forge* panes (agents on the forge host). Both are ordinary
