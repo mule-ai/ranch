@@ -29,36 +29,132 @@ use ranch_protocol::{Frame, MuleAgent, WorkflowDraft, WorkflowStep, WorkflowSumm
 pub struct MuleConfig {
     pub base: String,
     pub api_key: Option<String>,
+    /// `[wakes] mule_forward = true` (H3.3): forward local WebhookEvents
+    /// fire-and-forget to mule's `POST /api/v1/wakes/fire` so one
+    /// webhook can drive both local panes and fleet agents.
+    pub wakes_forward: bool,
+    /// `[wakes] wakes_url` — falls back to `mule_url` when absent.
+    pub wakes_url: String,
+    /// `[wakes] wakes_api_key` — falls back to `mule_api_key`.
+    pub wakes_api_key: Option<String>,
 }
 
 /// Extract the mule section from daemon.toml (optional keys —
-/// integration is off when `mule_url` is absent).
+/// integration is off when `mule_url` is absent). Also reads the
+/// optional `[wakes]` table (H3.3): `mule_forward = true`,
+/// `wakes_url`, `wakes_api_key` (both fall back to the top-level
+/// `mule_url` / `mule_api_key`).
 pub fn load_mule_config() -> Option<MuleConfig> {
     let home = std::env::var("HOME").ok()?;
     let text =
         std::fs::read_to_string(std::path::PathBuf::from(home).join(".config/ranch/daemon.toml"))
             .ok()?;
-    let get = |key: &str| -> String {
-        for line in text.lines() {
-            let line = line.trim();
-            if let Some(rest) = line.strip_prefix(key) {
-                let rest = rest.trim_start();
-                if let Some(rest) = rest.strip_prefix('=') {
-                    return rest.trim().trim_matches('"').to_string();
-                }
-            }
+    parse_toml_wakes(&text)
+}
+
+/// Parse the mule + `[wakes]` keys out of a daemon.toml body
+/// (section-aware line scan: keys under `[wakes]` are tracked
+/// separately from the top-level keys).
+fn parse_toml_wakes(text: &str) -> Option<MuleConfig> {
+    let mut top: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    let mut wakes: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    let mut section = String::from("top");
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('[') && line.ends_with(']') {
+            section = line[1..line.len() - 1].trim().to_string();
+            continue;
         }
-        String::new()
-    };
-    let url = get("mule_url");
+        let Some(rest) = line.split_once('=') else {
+            continue;
+        };
+        let key = rest.0.trim();
+        let val = rest.1.trim().trim_matches('#').trim().trim_matches('"');
+        match section.as_str() {
+            "wakes" => {
+                wakes.insert(key.to_string(), val.to_string());
+            }
+            "top" => {
+                top.insert(key.to_string(), val.to_string());
+            }
+            _ => {}
+        }
+    }
+    let url = top.get("mule_url").cloned().unwrap_or_default();
     if url.is_empty() {
         return None;
     }
-    let key = get("mule_api_key");
+    let key = top.get("mule_api_key").cloned().unwrap_or_default();
+    let forward = wakes
+        .get("mule_forward")
+        .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+    let wakes_url = wakes
+        .get("wakes_url")
+        .filter(|v| !v.is_empty())
+        .cloned()
+        .map(|v| v.trim_end_matches('/').to_string())
+        .unwrap_or_else(|| url.trim_end_matches('/').to_string());
+    let wakes_api_key = wakes
+        .get("wakes_api_key")
+        .filter(|v| !v.is_empty())
+        .cloned()
+        .or((!key.is_empty()).then_some(key.clone()));
     Some(MuleConfig {
         base: url.trim_end_matches('/').to_string(),
         api_key: if key.is_empty() { None } else { Some(key) },
+        wakes_forward: forward,
+        wakes_url,
+        wakes_api_key,
     })
+}
+
+// ---------- wake forward (H3.3) ----------
+
+/// The `POST /api/v1/wakes/fire` body for a local webhook event:
+/// ranch's webhook shape {source, event_tag, payload} becomes mule's
+/// wake ingress shape {kind: "webhook", source, event_tag?, payload}.
+pub fn wake_forward_body(
+    source: &str,
+    event: Option<&str>,
+    payload: &serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "kind": "webhook",
+        "source": source,
+        "event_tag": event,
+        "payload": payload,
+    })
+}
+
+/// Fire-and-forget webhook -> mule wake forward (H3.3). No-op unless
+/// `[wakes] mule_forward = true`. Errors are logged and swallowed: a
+/// mule outage must never fail local webhook handling.
+pub fn forward_webhook_to_wakes(
+    cfg: &MuleConfig,
+    source: &str,
+    event: Option<&str>,
+    payload: &serde_json::Value,
+) {
+    if !cfg.wakes_forward {
+        return;
+    }
+    let body = wake_forward_body(source, event, payload);
+    // No per-call timeout, same posture as http_json above: the daemon
+    // already accepts blocking mule calls, and the forward is bounded
+    // to one request (no retries, no reconnects).
+    let mut r = ureq::post(format!("{}/api/v1/wakes/fire", cfg.wakes_url));
+    if let Some(k) = &cfg.wakes_api_key {
+        r = r.header("Authorization", &format!("Bearer {k}"));
+    }
+    match r.send_json(&body) {
+        Ok(_) => eprintln!(
+            "ranchd: mule wakes: forwarded webhook {source}/{} to the fleet wake engine",
+            event.unwrap_or("")
+        ),
+        Err(e) => eprintln!(
+            "ranchd: mule wakes: forward failed (dropped, local webhook handling unaffected): {e}"
+        ),
+    }
 }
 
 /// Jobs the main loop hands to the worker.
@@ -713,4 +809,96 @@ pub fn spawn_worker(cfg: MuleConfig, pipe_w: std::fs::File, rx: mpsc::Receiver<M
             }
         })
         .ok();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// H3.3: the forward payload must be the mule wake-ingress shape,
+    /// built from the ranch webhook fields.
+    #[test]
+    fn wake_forward_body_shape() {
+        let body = wake_forward_body("ranch", Some("push"), &serde_json::json!({"repo": "mule"}));
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "kind": "webhook",
+                "source": "ranch",
+                "event_tag": "push",
+                "payload": { "repo": "mule" },
+            })
+        );
+        // No event tag: the field is null (mule treats it as
+        // "match any tag").
+        let body = wake_forward_body("ranch", None, &serde_json::json!(null));
+        assert_eq!(body["kind"], "webhook");
+        assert_eq!(body["source"], "ranch");
+        assert!(body["event_tag"].is_null());
+        assert!(body["payload"].is_null());
+    }
+
+    /// H3.3: a mule failure is swallowed (log + drop) — the caller
+    /// gets no error and no panic. An unreachable port stands in for a
+    /// dead mule; the call must simply return.
+    #[test]
+    fn forward_swallows_http_errors() {
+        let cfg = MuleConfig {
+            base: "http://127.0.0.1:1".into(),
+            api_key: Some("sk_mule_test".into()),
+            wakes_forward: true,
+            wakes_url: "http://127.0.0.1:1".into(),
+            wakes_api_key: Some("sk_mule_test".into()),
+        };
+        forward_webhook_to_wakes(&cfg, "ranch", Some("push"), &serde_json::json!({"a": 1}));
+        // And it is a no-op (no request at all) when forwarding is off.
+        let off = MuleConfig {
+            base: "http://127.0.0.1:1".into(),
+            api_key: None,
+            wakes_forward: false,
+            wakes_url: "http://127.0.0.1:1".into(),
+            wakes_api_key: None,
+        };
+        forward_webhook_to_wakes(&off, "ranch", None, &serde_json::json!(null));
+    }
+
+    /// H3.3: `[wakes]` table parsing — mule_forward, wakes_url /
+    /// wakes_api_key overrides, and the fallbacks to the top-level
+    /// mule_url / mule_api_key.
+    #[test]
+    fn wakes_config_parsing() {
+        let toml = r#"
+            mule_url = "http://mule.example"
+            mule_api_key = "sk_mule_top"
+
+            [wakes]
+            mule_forward = true
+            wakes_url = "http://mules.example/"
+            wakes_api_key = "sk_mule_wakes"
+        "#;
+        let mut cfg = parse_toml_wakes(toml).expect("config parses");
+        assert!(cfg.wakes_forward);
+        assert_eq!(cfg.wakes_url, "http://mules.example");
+        assert_eq!(cfg.wakes_api_key.as_deref(), Some("sk_mule_wakes"));
+        assert_eq!(cfg.api_key.as_deref(), Some("sk_mule_top"));
+
+        // Without the [wakes] table: forward off, fallbacks to top level.
+        let toml2 = r#"
+            mule_url = "http://mule.example/"
+            mule_api_key = "sk_mule_top"
+        "#;
+        cfg = parse_toml_wakes(toml2).expect("config parses");
+        assert!(!cfg.wakes_forward);
+        assert_eq!(
+            cfg.wakes_url, "http://mule.example",
+            "falls back to mule_url"
+        );
+        assert_eq!(
+            cfg.wakes_api_key.as_deref(),
+            Some("sk_mule_top"),
+            "falls back to mule_api_key"
+        );
+        // No mule_url at all: no config.
+        assert!(parse_toml_wakes("relay = 1").is_none());
+    }
 }

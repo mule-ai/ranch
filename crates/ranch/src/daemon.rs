@@ -578,6 +578,9 @@ struct Daemon {
     spawn_policy: agenttools::SpawnPolicy,
     /// mule worker jobs (None when mule is not configured)
     mule_tx: Option<std::sync::mpsc::Sender<mule::MuleJob>>,
+    /// mule config (for the H3.3 webhook -> mule wake forward; the
+    /// worker itself keeps its own clone)
+    mule_cfg: Option<mule::MuleConfig>,
     /// trigger scheduler (Phase D): owns the trigger registry; fires
     /// workflows via mule_tx
     triggers: triggers::Scheduler,
@@ -2595,6 +2598,7 @@ impl Daemon {
             asks: agenttools::AskRegistry::new(),
             spawn_policy,
             mule_tx: None,
+            mule_cfg: None,
             triggers: triggers::Scheduler::new(None),
             monitor_external_pi: false,
         };
@@ -2663,8 +2667,9 @@ impl Daemon {
                 && let Ok(clone) = pipe_w.lock().unwrap().try_clone()
             {
                 let (tx, rx) = std::sync::mpsc::channel();
-                mule::spawn_worker(mcfg, clone, rx);
+                mule::spawn_worker(mcfg.clone(), clone, rx);
                 daemon.mule_tx = Some(tx);
+                daemon.mule_cfg = Some(mcfg);
                 eprintln!("ranchd: mule: worker started");
             }
         } else {
@@ -5141,6 +5146,17 @@ impl Daemon {
                 // against webhook triggers and fire workflows. The
                 // payload nests under "payload" for trigger templates.
                 let event_type = event.as_deref().unwrap_or("");
+                // H3.3: optional forward to the mule wake engine
+                // (daemon.toml `[wakes] mule_forward = true`) so one
+                // webhook can drive both local panes and fleet agents.
+                // Fire-and-forget on a throwaway thread: a mule failure
+                // (or hang) must never fail or delay local handling.
+                if let Some(mcfg) = self.mule_cfg.clone().filter(|c| c.wakes_forward) {
+                    let (src, ev, pl) = (source.clone(), event.clone(), payload.clone());
+                    std::thread::spawn(move || {
+                        mule::forward_webhook_to_wakes(&mcfg, &src, ev.as_deref(), &pl)
+                    });
+                }
                 let (tframes, tmirrors) = self.triggers.fire_event(
                     "webhook",
                     &serde_json::json!({
