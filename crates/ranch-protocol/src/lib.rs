@@ -2485,10 +2485,9 @@ mod tests {
         // additive: an old-client Meta (kind "activity" with no
         // payload — Meta's shape never changes) still parses; an
         // unknown frame tag is dropped, not fatal, by the decoder
-        let f: Frame = serde_json::from_str(
-            r#"{"t":"Meta","session":"s","kind":"activity","status":"x"}"#,
-        )
-        .unwrap();
+        let f: Frame =
+            serde_json::from_str(r#"{"t":"Meta","session":"s","kind":"activity","status":"x"}"#)
+                .unwrap();
         assert!(matches!(f, Frame::Meta { .. }));
         let mut d = Decoder::new();
         let got = d.feed(b"{\"t\":\"Bogus\",\"x\":1}\n");
