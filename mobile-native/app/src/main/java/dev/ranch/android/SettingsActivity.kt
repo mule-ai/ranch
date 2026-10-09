@@ -10,6 +10,7 @@ import android.os.Looper
 import android.util.TypedValue
 import android.view.Gravity
 import android.widget.Button
+import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.Switch
@@ -99,6 +100,31 @@ class SettingsActivity : Activity() {
         root.addView(sectionHeader("Editor"))
         root.addView(buildFontRow("Font size", "editor_font_px", 14, 10, 28, 1))
         root.addView(buildFontRow("Markdown font size", "markdown_font_px", 16, 12, 30, 1))
+
+        // ---- voice input (H6.2) ----
+        root.addView(sectionHeader("Voice input"))
+        root.addView(buildVoiceModeRow())
+        root.addView(buildConfigField("Forge STT base URL", Voice.PKEY_FORGE_BASE,
+            "e.g. http://your-machine:PORT (the forge API server)"))
+        root.addView(buildConfigField("Forge API key", Voice.PKEY_FORGE_KEY, "forge API key", true))
+        root.addView(TextView(this).apply {
+            text = "forge STT (default): hold the mic in a chat, release to transcribe via " +
+                "forge's /v1/audio/transcriptions proxy (Parakeet). Needs the base URL + key " +
+                "above — the phone talks to forge directly.  " +
+                "recognizer: Android's on-device speech service — works in airplane mode, " +
+                "no config. The transcript lands in the chat box; you still hit send."
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            setTextColor(0xFF6B7280.toInt())
+            setPadding(0, 0, 0, dp(8))
+        })
+        root.addView(Button(this).apply {
+            text = "Microphone permission"
+            setPadding(0, dp(6), 0, dp(6))
+            setOnClickListener {
+                requestPermissions(
+                    arrayOf(android.Manifest.permission.RECORD_AUDIO), 2)
+            }
+        })
 
         // ---- notifications ----
         root.addView(sectionHeader("Notifications"))
@@ -214,6 +240,73 @@ class SettingsActivity : Activity() {
         }
     }
 
+    /** `recognizer | forge-stt` toggle (two highlight buttons; forge-stt is
+     * the default — it's the path the H6.3 voice loop uses too). */
+    private fun buildVoiceModeRow(): LinearLayout {
+        val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val modes = arrayOf(
+            Voice.MODE_RECOGNIZER to "recognizer (on-device)",
+            Voice.MODE_FORGE to "forge STT (default)",
+        )
+        fun style(b: Button, on: Boolean) {
+            b.setTextColor(if (on) 0xFF4ADE80.toInt() else 0xFF9AA0A6.toInt())
+            b.setBackgroundColor(if (on) 0xFF14261E.toInt() else 0xFF1B2126.toInt())
+        }
+        for ((key, label) in modes) {
+            val b = Button(this).apply {
+                text = label
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+                setPadding(dp(8), dp(8), dp(8), dp(8))
+                minWidth = 0; minimumWidth = 0
+                background = android.graphics.drawable.GradientDrawable().apply {
+                    cornerRadius = dp(8).toFloat()
+                }
+                layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
+                    if (row.childCount > 0) leftMargin = dp(6)
+                }
+            }
+            row.addView(b)
+            style(b, app.prefs.get(Voice.PKEY_MODE, Voice.MODE_FORGE) == key)
+            b.setOnClickListener {
+                app.prefs.set(Voice.PKEY_MODE, key)
+                for (c in 0 until row.childCount) style(row.getChildAt(c) as Button, c == row.indexOfChild(b))
+            }
+        }
+        return row
+    }
+
+    /** Label + persisted EditText (saved on blur / keyboard done). The forge
+     *  base URL + key give the phone direct STT access (the recognizer path
+     *  needs neither). */
+    private fun buildConfigField(label: String, key: String, hint: String, password: Boolean = false): LinearLayout {
+        val wrap = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        wrap.addView(TextView(this@SettingsActivity).apply {
+            text = label
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            setTextColor(0xFF9AA0A6.toInt())
+            setPadding(0, dp(6), 0, dp(2))
+        })
+        val et = EditText(this@SettingsActivity).apply {
+            setText(app.prefs.get(key, ""))
+            setHint(hint)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+            setTextColor(0xFFC9CDD3.toInt())
+            setHintTextColor(0xFF5C636B.toInt())
+            if (password) inputType = android.text.InputType.TYPE_CLASS_TEXT or
+                android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD
+            setPadding(0, dp(6), 0, dp(6))
+            background = android.graphics.drawable.GradientDrawable().apply {
+                cornerRadius = dp(8).toFloat()
+                setColor(0xFF1B2126.toInt())
+            }
+        }
+        val save = { et: EditText -> app.prefs.set(key, et.text.toString().trim()) }
+        et.setOnFocusChangeListener { _, hasFocus -> if (!hasFocus) save(et) }
+        et.setOnEditorActionListener { v, _, _ -> save(v as EditText); true }
+        wrap.addView(et)
+        return wrap
+    }
+
     override fun onRequestPermissionsResult(
         requestCode: Int,
         permissions: Array<out String>,
@@ -224,6 +317,10 @@ class SettingsActivity : Activity() {
             diagText.text = if (grantResults.isNotEmpty() &&
                 grantResults[0] == PackageManager.PERMISSION_GRANTED
             ) "notification permission granted ✓" else "notification permission denied"
+        } else if (requestCode == 2) {
+            diagText.text = if (grantResults.isNotEmpty() &&
+                grantResults[0] == PackageManager.PERMISSION_GRANTED
+            ) "microphone permission granted ✓" else "microphone permission denied"
         }
     }
 

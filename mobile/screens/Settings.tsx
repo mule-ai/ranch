@@ -11,6 +11,7 @@ import {
   StyleSheet,
   Switch,
   Text,
+  TextInput,
   View,
 } from "react-native";
 import * as Notifications from "expo-notifications";
@@ -24,6 +25,7 @@ import {
   type NotifSettings,
 } from "../lib/notifications";
 import { getAgentFrameStats } from "../lib/notifyEvents";
+import { loadVoiceConfig, saveVoiceConfig, type VoiceConfig } from "../lib/voice";
 
 // Android back gesture/button = the on-screen back control (same pattern
 // as Triggers/Workflows).
@@ -52,6 +54,10 @@ export function SettingsScreen({ onExit }: Props) {
   const [settings, setSettings] = useState<NotifSettings | null>(null);
   const [perm, setPerm] = useState<{ granted: boolean } | null>(null);
   const [testNote, setTestNote] = useState("");
+  // H6.2 voice input config (forge STT base URL + key; web mic path only)
+  const [voice, setVoice] = useState<VoiceConfig | null>(null);
+  const [voiceDirty, setVoiceDirty] = useState(false);
+  const [voiceSaved, setVoiceSaved] = useState(false);
 
   const refreshPerm = useCallback(async () => {
     try {
@@ -64,6 +70,7 @@ export function SettingsScreen({ onExit }: Props) {
 
   useEffect(() => {
     loadSettings().then(setSettings).catch(() => {});
+    loadVoiceConfig().then(setVoice).catch(() => {});
     refreshPerm();
   }, [refreshPerm]);
 
@@ -180,6 +187,57 @@ export function SettingsScreen({ onExit }: Props) {
           </Text>
         )}
 
+        <Text style={s.sectionTitle}>voice input</Text>
+        <Text style={s.note}>
+          The mic button in a chat's input (web build) is push-to-talk: hold to
+          record, release to transcribe via your forge's
+          /v1/audio/transcriptions proxy (Parakeet). The transcript lands in the
+          composer — you still hit send. The on-device recognizer path used by
+          the native Android app has no web equivalent.
+        </Text>
+        {voice === null ? (
+          <Text style={s.dim}>loading…</Text>
+        ) : (
+          <>
+            <TextInput
+              style={s.voiceField}
+              value={voice.forgeBase}
+              onChangeText={(v) => {
+                setVoice({ ...voice, forgeBase: v });
+                setVoiceDirty(true);
+                setVoiceSaved(false);
+              }}
+              placeholder="forge base URL (e.g. http://your-machine:8080)"
+              placeholderTextColor="#4b5563"
+            />
+            <TextInput
+              style={s.voiceField}
+              value={voice.forgeKey}
+              onChangeText={(v) => {
+                setVoice({ ...voice, forgeKey: v });
+                setVoiceDirty(true);
+                setVoiceSaved(false);
+              }}
+              placeholder="forge API key"
+              placeholderTextColor="#4b5563"
+            />
+            <View style={{ flexDirection: "row", gap: 8, marginBottom: 10 }}>
+              <Pressable
+                style={[s.testBtn, voiceDirty && s.testBtnOn]}
+                onPress={async () => {
+                  await saveVoiceConfig(voice);
+                  setVoiceDirty(false);
+                  setVoiceSaved(true);
+                }}
+                hitSlop={6}
+              >
+                <Text style={s.testBtnText}>save voice config</Text>
+              </Pressable>
+              {voiceSaved && <Text style={s.dim}>saved ✓</Text>}
+            </View>
+          </>
+        )}
+
         <Text style={s.sectionTitle}>diagnostics</Text>
         <DiagBlock />
       </ScrollView>
@@ -243,6 +301,10 @@ const s = StyleSheet.create({
   testBtnOn: { borderColor: "#4ade80", backgroundColor: "rgba(74,222,128,0.12)" },
   testBtnText: { color: "#9ca3af", fontSize: 13, fontWeight: "600" },
   testNote: { color: "#f59e0b", fontSize: 12, marginTop: 6, marginBottom: 4 },
+  voiceField: {
+    backgroundColor: "#1a1b23", borderRadius: 8, paddingHorizontal: 10,
+    paddingVertical: 8, color: "#e5e7eb", fontSize: 13, marginBottom: 8,
+  },
   diagBox: {
     backgroundColor: "#1a1b23", borderRadius: 8, padding: 8, marginTop: 8,
   },

@@ -4,6 +4,7 @@ import {
   Alert,
   BackHandler,
   Keyboard,
+  Platform,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -26,6 +27,12 @@ import {
   initNotifications,
   loadSettings,
 } from "../lib/notifications";
+import {
+  isVoiceSupported,
+  loadVoiceConfig,
+  transcribeViaForge,
+  type VoiceConfig,
+} from "../lib/voice";
 
 // Compute screen rects from the split tree (mirrors the desktop client).
 export type Rect = { pane: string; x: number; y: number; w: number; h: number };
@@ -475,6 +482,86 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
   // req_id of the last ModelSet we sent (error correlation)
   const modelSetReq = useRef<string | null>(null);
   const chatRef = useRef<TextInput | null>(null);
+  // voice input (H6.2, web only): push-to-talk — hold the mic to record
+  // (browser MediaRecorder), release to POST to forge's STT proxy and
+  // append the transcript to the composer. Config (forge base + key) is
+  // read once at mount; the on-device recognizer path has no web form.
+  const voiceSupported = Platform.OS === "web" && isVoiceSupported();
+  const [voiceRec, setVoiceRec] = useState(false);
+  const [voiceNote, setVoiceNote] = useState("");
+  const voiceCfgRef = useRef<VoiceConfig>({ forgeBase: "", forgeKey: "" });
+  const recRef = useRef<{ rec: MediaRecorder; chunks: Blob[]; stream: MediaStream } | null>(null);
+  useEffect(() => {
+    if (!voiceSupported) return;
+    let cancel = false;
+    loadVoiceConfig().then((c) => {
+      if (!cancel) voiceCfgRef.current = c;
+    });
+    return () => {
+      cancel = true;
+      const r = recRef.current;
+      if (r && r.rec.state !== "inactive") {
+        try {
+          r.rec.stop();
+        } catch {
+          // teardown
+        }
+      }
+    };
+  }, [voiceSupported]);
+  const startVoice = () => {
+    if (recRef.current) return;
+    setVoiceNote("recording…");
+    navigator.mediaDevices
+      .getUserMedia({ audio: true })
+      .then((stream) => {
+        const mimes = [
+          "audio/webm;codecs=opus",
+          "audio/webm",
+          "audio/mp4",
+          "audio/ogg",
+        ];
+        const mime = mimes.find((m) => MediaRecorder.isTypeSupported(m));
+        const rec = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
+        const chunks: Blob[] = [];
+        rec.ondataavailable = (e) => {
+          if (e.data.size) chunks.push(e.data);
+        };
+        rec.onstop = () => {
+          stream.getTracks().forEach((t) => t.stop());
+          recRef.current = null;
+          setVoiceRec(false);
+          const blob = new Blob(chunks, { type: mime || "audio/webm" });
+          if (blob.size === 0) {
+            setVoiceNote("");
+            return;
+          }
+          setVoiceNote("transcribing…");
+          transcribeViaForge(blob, voiceCfgRef.current)
+            .then((text) => {
+              setVoiceNote("");
+              if (text) setChatDraft((d) => (d ? d + " " : "") + text + " ");
+              else setVoiceNote("no speech detected");
+            })
+            .catch((e: unknown) =>
+              setVoiceNote(
+                String((e as Error)?.message ?? e).slice(0, 140) || "transcription failed"
+              ),
+            );
+        };
+        rec.start();
+        recRef.current = { rec, chunks, stream };
+        setVoiceRec(true);
+      })
+      .catch((e: unknown) => {
+        setVoiceRec(false);
+        setVoiceNote("mic unavailable: " + String((e as Error)?.message ?? e).slice(0, 100));
+      });
+  };
+  const stopVoice = () => {
+    const r = recRef.current;
+    if (r && r.rec.state !== "inactive") r.rec.stop();
+  };
   const chatScrollRef = useRef<ScrollView | null>(null);
   // sticky-bottom chat: only auto-follow when the user is at the bottom;
   // leave them where they are when they've scrolled up
@@ -798,6 +885,17 @@ export function TerminalScreen({ relay, sessionId, sessionName, onExit }: Props)
                 placeholderTextColor="#4b5563"
                 multiline
               />
+              {voiceSupported ? (
+                <Pressable
+                  style={[styles.micBtn, voiceRec && styles.micBtnRec]}
+                  onPressIn={startVoice}
+                  onPressOut={stopVoice}
+                  hitSlop={6}
+                >
+                  <Text style={styles.micBtnText}>{voiceRec ? "●" : "🎤"}</Text>
+                </Pressable>
+              ) : null}
+              {voiceNote ? <Text style={styles.micNote}>{voiceNote}</Text> : null}
               <Pressable
                 style={styles.chatSend}
                 onPress={() => {
@@ -1580,6 +1678,10 @@ const styles = StyleSheet.create({
   },
   chatSend: { backgroundColor: "#a855f7", borderRadius: 10, paddingHorizontal: 14, paddingVertical: 10, justifyContent: "center" },
   chatSendText: { color: "#fff", fontWeight: "700", fontSize: 13 },
+  micBtn: { paddingHorizontal: 8, paddingVertical: 6, backgroundColor: "#1e1e26", borderRadius: 10 },
+  micBtnRec: { backgroundColor: "#7f1d1d" },
+  micBtnText: { fontSize: 14 },
+  micNote: { color: "#6b7280", fontSize: 11, maxWidth: 160 },
   mono: {
     fontFamily: "JetBrainsMono NF Mono", fontSize: FONT_SIZE,
     lineHeight: LINE_HEIGHT, color: "#d1d5db",

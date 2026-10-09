@@ -126,6 +126,31 @@ fire while the phone is in a drawer.
   - **Agent question card** — `AgentAskRequest` renders an interactive card
     (choices + suggested + free-text + multi) pinned above the input; Send
     posts `AgentAskAnswer`. The phone UI for the `ranch_ask` agent tool.
+  - **Voice input (H6.2)** — a 🎤 button next to send in the chat input row,
+    with two modes (Settings & tools → *Voice input*, Prefs `voice_input`):
+    - **forge-stt (default)** — push-to-talk: ACTION_DOWN records a
+      16 kHz mono m4a/AAC memo (`MediaRecorder`, `DictationRecorder` in
+      `Voice.kt`), ACTION_UP stops it and the bytes go straight to your
+      forge's OpenAI-compatible STT proxy, `POST {forge}/v1/audio/transcriptions`
+      (multipart `file` + `model=parakeet` + `response_format=json`,
+      `X-API-Key` auth; OkHttp, 30 s timeout) → Parakeet → the transcript
+      appends to the composer. This is the path the H6.3 voice loop uses.
+      It needs the **forge base URL + API key in Settings** — the phone talks
+      to forge *directly* on this path (there is no forge channel through
+      the daemon), so it's the config asymmetry: recognizer needs nothing,
+      forge-stt needs those two fields.
+    - **recognizer** — Android's system `SpeechRecognizer`
+      (`RecognizerIntent`, `EXTRA_PREFER_OFFLINE`) → transcript into the
+      composer. No new deps, no config, and it's the **airplane-mode path**
+      (no network at all).
+    - v1 behavior: the transcript lands **in the input box — you still hit
+      send** (no auto-send). While recording the button turns red ⏹ and the
+      status line says so; a level meter is deliberately out of scope.
+    - **Permissions**: `RECORD_AUDIO` is requested at first forge-stt use
+      (runtime flow); if denied, a toast + status flash and the tap falls
+      back to the recognizer once. forge-stt misconfig/5xx (e.g. forge's
+      503 "speech-to-text is disabled" / 502 "Parakeet STT backend
+      unreachable") flash the status line — never a crash (M8.4 rule).
 
 ## Build
 

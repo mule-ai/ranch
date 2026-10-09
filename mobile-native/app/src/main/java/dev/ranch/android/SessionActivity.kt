@@ -3,6 +3,7 @@ package dev.ranch.android
 import android.app.Activity
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
@@ -19,6 +20,7 @@ import android.text.style.ForegroundColorSpan
 import android.text.style.StyleSpan
 import android.util.TypedValue
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.View
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
@@ -34,6 +36,7 @@ import android.widget.PopupWindow
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.TextView.BufferType
+import android.widget.Toast
 import org.json.JSONObject
 
 /**
@@ -195,6 +198,15 @@ class SessionActivity : Activity() {
     private val pendingLocalBitmaps = mutableMapOf<String, Bitmap>() // FilePut req_id -> locally decoded thumb
     private val imgRequesting = mutableSetOf<String>()
     private val PICK_IMAGE_REQ = 42
+    // voice input (H6.2): mic button + dictation state. forge-stt mode
+    // is push-to-talk (ACTION_DOWN starts recording, ACTION_UP transcribes);
+    // recognizer mode starts on the tap-up. Transcripts land in chatEdit —
+    // the user still hits send (v1). Errors flash statusView, never crash.
+    private var micBtn: Button? = null
+    private var dictation: DictationRecorder? = null
+    private var onDeviceRec: OnDeviceRecognizer? = null
+    private var dictating = false
+    private val MIC_PERM_REQ = 43
     private lateinit var modelBar: LinearLayout
     private lateinit var modelChip: TextView
     private lateinit var contextLabel: TextView
@@ -416,7 +428,143 @@ class SessionActivity : Activity() {
         if (app.foregroundSession == sessionId) app.foregroundSession = null
         handler.removeCallbacksAndMessages(null)
         uploadExec.shutdownNow()
+        stopDictation(silent = true)
+        onDeviceRec?.let { it.destroy(); onDeviceRec = null }
         super.onDestroy()
+    }
+
+    // ---- voice input (H6.2) ----
+
+    /// ACTION_DOWN: forge-stt starts recording; recognizer mode waits for
+    /// the tap-up so a quick flick over the mic never eats the tap.
+    private fun micDown() {
+        if (dictating) return
+        if (prefs().get(Voice.PKEY_MODE, Voice.MODE_FORGE) != Voice.MODE_RECOGNIZER) {
+            startDictation()
+        }
+    }
+
+    private fun micUp() {
+        when {
+            dictating -> stopDictation(silent = false)
+            prefs().get(Voice.PKEY_MODE, Voice.MODE_FORGE) == Voice.MODE_RECOGNIZER && onDeviceRec == null ->
+                startOnDeviceRecognition()
+            else -> {}
+        }
+    }
+
+    private fun micCancel() {
+        if (dictating) stopDictation(silent = true)
+    }
+
+    private fun startDictation() {
+        if (!Voice.forgeConfigured(prefs())) {
+            statusView.text = "voice: set the forge base URL + key in Settings (or switch to recognizer mode)"
+            Toast.makeText(this, "forge STT not configured — trying on-device recognizer", Toast.LENGTH_LONG)
+                .show()
+            startOnDeviceRecognition()
+            return
+        }
+        if (!Voice.hasMicPermission(this)) {
+            requestPermissions(arrayOf(android.Manifest.permission.RECORD_AUDIO), MIC_PERM_REQ)
+            statusView.text = "voice: microphone permission needed"
+            return
+        }
+        try {
+            dictation = DictationRecorder(this).also { it.start() }
+            dictating = true
+            micBtn?.apply {
+                text = "\u23F9"  // ⏹
+                setTextColor(0xFFE06C75.toInt())
+            }
+            statusView.text = "\uD83C\uDF99 recording\u2026 release to transcribe"
+        } catch (e: Exception) {
+            dictation = null
+            dictating = false
+            statusView.text = "voice: could not start recording (${e.message})"
+        }
+    }
+
+    /// Release/teardown: stop the recorder, then POST the bytes to forge's
+    /// STT proxy off the main thread. Empty/cancelled recordings just reset
+    /// the button; transport + HTTP failures flash the status line (M8.4:
+    /// flash, don't die).
+    private fun stopDictation(silent: Boolean) {
+        dictating = false
+        micBtn?.apply {
+            text = "🎤"
+            setTextColor(0xFFB8C0C8.toInt())
+        }
+        val rec = dictation
+        dictation = null
+        val bytes = try { rec?.stop() } catch (_: Exception) { null }
+        if (rec != null) {
+            try { java.io.File(filesDir, "dictation.m4a").delete() } catch (_: Exception) {}
+        }
+        if (bytes == null || bytes.size < 2048) {
+            if (!silent) statusView.text = "voice: nothing recorded"
+            return
+        }
+        statusView.text = "transcribing\u2026"
+        val base = prefs().get(Voice.PKEY_FORGE_BASE, "").trim()
+        val key = prefs().get(Voice.PKEY_FORGE_KEY, "").trim()
+        uploadExec.execute {
+            val r = ForgeStt.transcribe(base, key, bytes, "dictation.m4a")
+            handler.post {
+                when {
+                    dictating -> {} // a new recording superseded this one
+                    r.isSuccess -> {
+                        val t = r.getOrThrow()
+                        statusView.text = ""
+                        if (t.isNotEmpty()) chatEdit.append(t + " ")
+                        else statusView.text = "voice: no speech detected"
+                    }
+                    else -> statusView.text = "voice: ${r.exceptionOrNull()?.message ?: "transcription failed"}"
+                }
+            }
+        }
+    }
+
+    private fun startOnDeviceRecognition() {
+        try {
+            onDeviceRec = OnDeviceRecognizer(
+                this,
+                onResult = { text ->
+                    onDeviceRec = null
+                    statusView.text = ""
+                    if (text.isNotBlank()) chatEdit.append(text + " ")
+                },
+                onError = { msg ->
+                    onDeviceRec = null
+                    statusView.text = "voice: $msg"
+                },
+            ).also { it.start() }
+            statusView.text = "\uD83C\uDF99 listening\u2026"
+        } catch (e: Exception) {
+            onDeviceRec = null
+            statusView.text = "voice: on-device recognizer unavailable (${e.message})"
+            Toast.makeText(this, "on-device recognizer unavailable", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray,
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == MIC_PERM_REQ) {
+            val granted = grantResults.isNotEmpty() &&
+                grantResults[0] == PackageManager.PERMISSION_GRANTED
+            if (granted) {
+                statusView.text = ""
+            } else {
+                statusView.text = "voice: microphone permission denied — using on-device recognizer instead"
+                Toast.makeText(this, "mic permission denied — falling back to on-device recognizer",
+                    Toast.LENGTH_LONG).show()
+                startOnDeviceRecognition()
+            }
+        }
     }
 
     // ---- frame dispatch (WS thread -> main) ----
@@ -1529,6 +1677,32 @@ class SessionActivity : Activity() {
             rightMargin = dp(8)
         })
         row.addView(chatEdit, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        // mic button next to send (H6.2): hold = record + transcribe via the
+        // forge STT proxy (default), tap = on-device SpeechRecognizer.
+        val mic = Button(this).apply {
+            text = "🎤"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+            minWidth = 0
+            setPadding(0, 0, 0, 0)
+            includeFontPadding = false
+            background = android.graphics.drawable.GradientDrawable().apply {
+                shape = android.graphics.drawable.GradientDrawable.OVAL
+                setColor(0xFF1C2127.toInt())
+                setStroke(dp(1), 0xFF2A3138.toInt())
+            }
+            setOnTouchListener { _, ev ->
+                when (ev.action) {
+                    MotionEvent.ACTION_DOWN -> { micDown(); true }
+                    MotionEvent.ACTION_UP -> { micUp(); false }
+                    MotionEvent.ACTION_CANCEL -> { micCancel(); false }
+                    else -> false
+                }
+            }
+        }
+        micBtn = mic
+        row.addView(mic, LinearLayout.LayoutParams(dp(36), dp(36)).apply {
+            leftMargin = dp(6); rightMargin = dp(6)
+        })
         row.addView(send, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
             leftMargin = dp(6)
