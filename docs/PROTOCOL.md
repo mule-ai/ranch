@@ -538,7 +538,32 @@ AgentTalk { req_id, agent, mode: "continue"|"new"|"fork",
 AgentBusy { req_id, agent }                     → AgentBusyOk { req_id, busy,
                                                                current_conversation? }
 AgentActivity { req_id, agent?, kinds? }        → AgentActivityOk { req_id, items: [ActivityItem] }
-ActivityItem { id, kind, agent?, text, ts }     // H5's Activity View data; H1: items always []
+ActivityItem { id, kind, agent?, text, ts }     // H5's Activity View data;
+                                                // H5.3 kinds: "ask" | "spawn" |
+                                                // "trigger" | "mule_job" |
+                                                // "forge_task" | "belief_pending" |
+                                                // "research_open" | "wake";
+                                                // text ≤ 200 chars, ts RFC3339
+
+// H5.3 (Activity View push + herd pause):
+ActivityPush { items: [ActivityItem] }          // daemon -> every client: the
+                                                // poller's recomputed FULL set
+                                                // (most recent first; item key
+                                                // = (kind, agent, id)); broadcast
+                                                // only on set change (5 s poll,
+                                                // 2 s debounce). Old clients
+                                                // drop the unknown tag.
+AgentPause { req_id, agent?, paused }           // client -> daemon: pause
+                                                // (paused=true) or resume
+                                                // (paused=false) one agent;
+                                                // agent=null = every known
+                                                // agent (the whole herd)
+  → AgentPauseOk { req_id, results: [AgentPauseResult] }
+AgentPauseResult { agent, name, forge?, mule?, error? }
+    // forge = resulting paused state (null = leg not attempted:
+    // forge unconfigured); mule = wakes flipped (null = leg not
+    // attempted: mule unconfigured); error = first failure detail
+    // naming the leg that failed
 ```
 
 Semantics:
@@ -560,6 +585,29 @@ Semantics:
   X lives on machine Y — open there" }` and creates **no** pane.
 - `Error { req_id, message }` on any failure (unknown agent, unknown
   mode, forge down/unconfigured, conversation create failed).
-- No new frames for H5's activity *push* — it rides
-  `Meta { kind: "activity" }` when H5 lands.
+- `AgentPause` (H5.3 kill switch, `ranch pause|unpause [AGENT]`): the
+  daemon calls forge `POST /agents/:id/pause` / `POST /agents/:id/resume`
+  per target (idempotent) + mule `POST /api/v1/wakes/pause` as a
+  best-effort second leg (no mule config in `daemon.toml` ⇒ that leg is
+  simply not attempted, still OK). No `agent` = every agent the daemon
+  knows (its registry is kept warm by `AgentListOk` + the poller's own
+  `GET /agents`; a fresh daemon does one live list fetch). `Error
+  { req_id }` when no targets resolve. Pausing an agent keeps its
+  pending asks VISIBLE in the Activity View — pause halts new work, not
+  observability (forge's agent reads stay open for a paused agent).
+- **Activity push** (`ActivityPush`, H5.3): the daemon's activity
+  poller (a worker thread with its own pipe pair) recomputes the item
+  set every 5 s — local pending asks / agent-spawned panes / recent
+  trigger fires / machine-launched mule jobs (10-min window) + per
+  agent forge feeds (`GET /agents/:id/tasks` non-terminal, `GET
+  /agents/:id/memory/beliefs?status=pending`, `GET /agents/:id/research?open=1`)
+  + the mule `GET /api/v1/wakes/activity` feed (RFC3339 `since`
+  watermark, 10-min window) — and broadcasts the full new set only when
+  the set changed vs. the last broadcast (items keyed by
+  (kind, agent, id)), after a 2 s debounce that re-checks so churn
+  that settles inside the window never ships. A dedicated frame
+  instead of `Meta { kind: "activity" }`: `Meta` carries only a
+  `status` string — it has no payload slot for structured items.
+  Down/misconfigured forge or mule degrade their feed to empty with a
+  one-time warning; the loop never stalls.
 

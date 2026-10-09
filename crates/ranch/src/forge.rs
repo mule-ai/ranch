@@ -1767,6 +1767,46 @@ pub fn agent_get(cfg: &ForgeConfig, agent: &str) -> Result<serde_json::Value, St
     Ok(a.clone())
 }
 
+/// The owner-visible agent list (H5.3): `GET /agents` →
+/// (id → name). Used by the activity poller + the pause path when the
+/// daemon's cached agent map is empty (fresh boot, no AgentList yet).
+pub fn agent_list_names(
+    cfg: &ForgeConfig,
+) -> Result<std::collections::BTreeMap<String, String>, String> {
+    let v = http_json(cfg, "GET", "/agents", None)?;
+    let arr = v
+        .get("agents")
+        .and_then(|x| x.as_array())
+        .cloned()
+        .or_else(|| v.as_array().cloned())
+        .unwrap_or_default();
+    let mut out = std::collections::BTreeMap::new();
+    for a in arr {
+        if let (Some(id), Some(name)) = (
+            a.get("id").and_then(|x| x.as_str()),
+            a.get("name").and_then(|x| x.as_str()),
+        ) {
+            out.insert(id.to_string(), name.to_string());
+        }
+    }
+    Ok(out)
+}
+
+/// `POST /agents/{agent}/pause` | `/resume` (H5.3 kill switch) →
+/// `{id, paused}`. Idempotent on the forge side; returns the
+/// resulting paused state.
+pub fn agent_set_paused(cfg: &ForgeConfig, agent: &str, paused: bool) -> Result<bool, String> {
+    let path = if paused {
+        format!("/agents/{agent}/pause")
+    } else {
+        format!("/agents/{agent}/resume")
+    };
+    let v = http_json(cfg, "POST", &path, Some(&serde_json::json!({})))?;
+    v.get("paused")
+        .and_then(|x| x.as_bool())
+        .ok_or(format!("forge POST {path}: unexpected response shape"))
+}
+
 /// The agent's most-active conversation (GET /agents/{id}/conversations
 /// ?latest=1 → first row's id; None when the agent has none).
 pub fn agent_latest_conversation(cfg: &ForgeConfig, agent: &str) -> Result<Option<Uuid>, String> {

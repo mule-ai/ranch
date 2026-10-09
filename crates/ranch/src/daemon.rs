@@ -28,11 +28,13 @@ use std::time::Instant;
 
 use libc::{SIGINT, WNOHANG, c_int, pollfd};
 use ranch_protocol::{
-    ChatMsg, Cursor, Decoder, Frame, Layout, PaneSnap, PiSessionInfo, SessionMeta,
+    ActivityItem, ChatMsg, Cursor, Decoder, Frame, Layout, PaneSnap, PiSessionInfo, SessionMeta,
 };
 use ranch_vt::Vt;
 use uuid::Uuid;
 
+#[path = "activity.rs"]
+mod activity;
 #[path = "agenttools.rs"]
 pub(crate) mod agenttools;
 #[path = "control_api.rs"]
@@ -584,6 +586,18 @@ struct Daemon {
     /// trigger scheduler (Phase D): owns the trigger registry; fires
     /// workflows via mule_tx
     triggers: triggers::Scheduler,
+    /// H5.3 Activity View: local items handed to the poller every
+    /// tick (the poller also maintains `agents` from its own
+    /// `GET /agents` + the `AgentListOk` mirror; pause resolution
+    /// reads it)
+    activity_shared: std::sync::Arc<std::sync::Mutex<activity::LocalState>>,
+    /// stop flag for the activity poller (set on daemon shutdown, then
+    /// the thread is joined — it must not outlive the daemon)
+    activity_stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    activity_handle: Option<std::thread::JoinHandle<()>>,
+    /// machine-launched mule jobs (H5.3 "mule_job" items): job id,
+    /// label, unix ts — pruned to a 10-minute window on every tick
+    recent_mule_jobs: std::collections::VecDeque<(String, String, i64)>,
     /// Whether to monitor external pi sessions (started outside ranch)
     /// and include them in PiList responses.
     monitor_external_pi: bool,
@@ -2600,6 +2614,12 @@ impl Daemon {
             mule_tx: None,
             mule_cfg: None,
             triggers: triggers::Scheduler::new(None),
+            activity_shared: std::sync::Arc::new(std::sync::Mutex::new(
+                activity::LocalState::default(),
+            )),
+            activity_stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            activity_handle: None,
+            recent_mule_jobs: std::collections::VecDeque::new(),
             monitor_external_pi: false,
         };
         // register the relay as a client keyed by its read-pipe fd; remote
@@ -2674,6 +2694,52 @@ impl Daemon {
             }
         } else {
             eprintln!("ranchd: mule: disabled (no mule_url in daemon.toml)");
+        }
+        // H5.3 Activity poller: its OWN pipe pair, per the worker
+        // rules — the thread writes ActivityPush frames into the pipe
+        // and the poll loop reads it through the synthetic "activity"
+        // client, broadcasting the frames like any client frame. The
+        // local registries are handed over via the shared LocalState
+        // (refreshed every tick, below).
+        {
+            let activity_cfg = activity::PollerConfig {
+                forge: forge::load_forge_config(),
+                mule: daemon.mule_cfg.clone(),
+            };
+            match relay::make_pipes() {
+                Ok(((a_r, a_w), _unused)) => {
+                    let act_client = Client {
+                        stream: None,
+                        relay_out: None,
+                        backlog: std::collections::VecDeque::new(),
+                        relay_in_progress: false,
+                        relay_in: Some(fd_file(a_r)),
+                        sink: None,
+                        decoder: Decoder::new(),
+                        name: "activity".into(),
+                        attach: None,
+                        chat_limit: None,
+                        scrollback_mode: false,
+                        file_watches: BTreeMap::new(),
+                    };
+                    let stop = daemon.activity_stop.clone();
+                    let shared = daemon.activity_shared.clone();
+                    let h = activity::spawn_poller(
+                        activity_cfg,
+                        std::sync::Arc::new(std::sync::Mutex::new(a_w)),
+                        shared,
+                        stop,
+                    );
+                    if let Some(rfd) = act_client.relay_in.as_ref().map(|f| f.as_raw_fd()) {
+                        daemon.clients.insert(rfd, act_client);
+                        eprintln!("ranchd: activity: poller started (pipe fd {rfd})");
+                        daemon.activity_handle = Some(h);
+                    } else {
+                        eprintln!("ranchd: activity: poller pipe has no fd; poller not started");
+                    }
+                }
+                Err(e) => eprintln!("ranchd: activity: pipe init failed: {e}; poller not started"),
+            }
         }
         // trigger scheduler rides the mule worker (Phase D)
         daemon.triggers = triggers::Scheduler::new(daemon.mule_tx.clone());
@@ -3510,6 +3576,138 @@ impl Daemon {
                     }
                 }
             }
+        }
+    }
+
+    /// H5.3: pause (or resume) one agent, or the whole herd.
+    ///
+    /// Targets resolve against the shared agent map (kept warm by
+    /// `AgentListOk` + the poller's own `GET /agents`; a fresh daemon
+    /// falls back to one live list fetch). The forge leg is
+    /// `POST /agents/:id/pause|resume` and the mule leg is `POST
+    /// /api/v1/wakes/pause` (best-effort: no mule config means the leg
+    /// is skipped, still OK). Pending asks STAY VISIBLE while paused:
+    /// pause halts new work, not observability (forge's reads stay
+    /// open for a paused agent by design).
+    fn handle_agent_pause(&mut self, from: RawFd, req_id: &str, agent: Option<&str>, paused: bool) {
+        let verb = if paused { "pause" } else { "resume" };
+        let mut targets: Vec<(String, String)> = {
+            let st = self
+                .activity_shared
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            match agent {
+                Some(q) if !q.is_empty() => st
+                    .agents
+                    .iter()
+                    .filter(|(id, name)| id.as_str() == q || name.eq_ignore_ascii_case(q))
+                    .map(|(id, name)| (id.clone(), name.clone()))
+                    .collect(),
+                _ => st
+                    .agents
+                    .iter()
+                    .map(|(id, name)| (id.clone(), name.clone()))
+                    .collect(),
+            }
+        };
+        if targets.is_empty() {
+            // fresh daemon (no AgentList yet): one live list fetch
+            if let Some(cfg) = forge::load_forge_config()
+                && let Ok(names) = forge::agent_list_names(&cfg)
+            {
+                targets = names
+                    .iter()
+                    .map(|(id, name)| (id.clone(), name.clone()))
+                    .collect();
+                let mut st = self
+                    .activity_shared
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                for (id, name) in &targets {
+                    st.agents.insert(id.clone(), name.clone());
+                }
+            }
+        }
+        if targets.is_empty() {
+            let message = match agent {
+                Some(q) => format!("unknown agent '{q}' (forge unreachable or no such agent)"),
+                None => format!(
+                    "no agents known to the daemon — cannot {verb} the herd \
+                     (is forge configured? `ranch agent` syncs the registry)"
+                ),
+            };
+            if let Some(c) = self.clients.get_mut(&from) {
+                send_frame(
+                    c,
+                    &Frame::Error {
+                        req_id: Some(req_id.to_string()),
+                        message,
+                    },
+                );
+            }
+            return;
+        }
+        let forge_cfg = forge::load_forge_config();
+        let mule_cfg = self.mule_cfg.clone();
+        let mut results = Vec::new();
+        for (id, name) in &targets {
+            let mut forge_res: Option<bool> = None;
+            let mut mule_res: Option<usize> = None;
+            let mut error: Option<String> = None;
+            if let Some(cfg) = &forge_cfg {
+                match forge::agent_set_paused(cfg, id, paused) {
+                    Ok(p) => forge_res = Some(p),
+                    Err(e) => error = Some(e),
+                }
+            }
+            if let Some(cfg) = &mule_cfg {
+                match activity::mule_wakes_pause(cfg, id, paused) {
+                    Ok(n) => mule_res = Some(n),
+                    Err(e) => match error.take() {
+                        Some(prev) => error = Some(format!("{prev}; {e}")),
+                        None => error = Some(e),
+                    },
+                }
+            }
+            results.push(ranch_protocol::AgentPauseResult {
+                agent: id.clone(),
+                name: name.clone(),
+                forge: forge_res,
+                mule: mule_res,
+                error,
+            });
+        }
+        eprintln!(
+            "ranchd: {verb} herd: {} agent(s) [{}]",
+            results.len(),
+            results
+                .iter()
+                .map(|r| r.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        if let Some(c) = self.clients.get_mut(&from) {
+            send_frame(
+                c,
+                &Frame::AgentPauseOk {
+                    req_id: req_id.to_string(),
+                    results,
+                },
+            );
+        }
+    }
+
+    /// Record a machine-launched (pane-less) mule job for the H5.3
+    /// activity view; the poll-loop tick prunes it to the 10-minute
+    /// window. Bounded at 32 entries.
+    fn push_mule_job(&mut self, job: &str, label: &str) {
+        self.recent_mule_jobs.push_back((
+            job.to_string(),
+            label.to_string(),
+            triggers::Scheduler::now(),
+        ));
+        while self.recent_mule_jobs.len() > 32 {
+            self.recent_mule_jobs.pop_front();
         }
     }
 
@@ -4893,7 +5091,8 @@ impl Daemon {
             Frame::AgentActivity { req_id, .. } => {
                 // TODO(H5): the Activity worker (forge tasks + memory +
                 // mule workflow runs) fills this in — H1 answers empty
-                // so clients can build against the frame today.
+                // so clients can build against the frame today. The
+                // H5.3 push path is `ActivityPush` from the poller.
                 if let Some(c) = self.clients.get_mut(&from) {
                     send_frame(
                         c,
@@ -4903,6 +5102,17 @@ impl Daemon {
                         },
                     );
                 }
+            }
+            // H5.3 herd pause switch: per target agent, forge
+            // POST /agents/:id/pause|resume + mule POST
+            // /api/v1/wakes/pause (blocking sync-localhost HTTP, the
+            // AgentTalk pattern).
+            Frame::AgentPause {
+                req_id,
+                agent,
+                paused,
+            } => {
+                self.handle_agent_pause(from, req_id, agent.as_deref(), *paused);
             }
             Frame::AgentTalk {
                 req_id,
@@ -5100,10 +5310,18 @@ impl Daemon {
                             session: Uuid::nil(),
                             pane: Uuid::nil(),
                         });
+                        let tname = t.name.clone();
                         if let Some(t) = self.triggers.triggers.get_mut(&t.id) {
                             t.last_run =
                                 Some((job_id.clone(), triggers::Scheduler::now(), "queued".into()));
                         }
+                        // H5.3: a manual fire joins the recent-fire ring
+                        // (the scheduler's tick/fire_event paths record there too)
+                        self.triggers
+                            .record_fire(&tname, &job_id, triggers::Scheduler::now());
+                        // H5.3: a machine-launched, pane-less mule job is
+                        // an activity item until it ages out of the window
+                        self.push_mule_job(&job_id, &format!("manual run of trigger '{tname}'"));
                         self.write_state();
                         let fired = Frame::TriggerFired {
                             trigger: id.unwrap().to_string(),
@@ -5764,7 +5982,8 @@ impl Daemon {
             // broadcast as usual (clients match on req_id). Mirror
             // failures are fire-and-forget (relay thread logs + drops).
             Frame::AgentListOk { agents, .. } => {
-                for a in agents {
+                let agents = agents.clone();
+                for a in agents.iter() {
                     self.mirror(relay::RelayOut::UpsertAgent {
                         id: a.id.clone(),
                         name: a.name.clone(),
@@ -5774,10 +5993,36 @@ impl Daemon {
                         last_active_at: a.last_active.clone(),
                     });
                 }
+                // H5.3: keep the activity poller's agent map warm —
+                // `AgentPause` with no target resolves against it
+                {
+                    let mut st = self
+                        .activity_shared
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    for a in &agents {
+                        st.agents.insert(a.id.clone(), a.name.clone());
+                    }
+                }
                 let recipients: Vec<RawFd> = self.clients.keys().copied().collect();
                 for rfd in recipients {
                     if let Some(c) = self.clients.get_mut(&rfd) {
                         send_frame(c, frame);
+                    }
+                }
+                return;
+            }
+            // H5.3: the activity poller pushes through its private pipe
+            // client; broadcast the full item set to every client
+            // (their timelines replace on receipt). A real client
+            // sending ActivityPush is not expected — ignore it.
+            Frame::ActivityPush { .. } => {
+                if self.clients.get(&from).map(|c| c.name.as_str()) == Some("activity") {
+                    let recipients: Vec<RawFd> = self.clients.keys().copied().collect();
+                    for rfd in recipients {
+                        if let Some(c) = self.clients.get_mut(&rfd) {
+                            send_frame(c, frame);
+                        }
                     }
                 }
                 return;
@@ -7152,6 +7397,115 @@ fn run(
                 }
             }
         }
+        // H5.3: hand the activity poller a fresh local item set every
+        // tick — pending asks, agent-spawned panes, recent trigger
+        // fires, recent machine-launched mule jobs. The poller merges
+        // this with the remote feeds it polls itself. `agents` is
+        // deliberately left alone: the poller / AgentListOk own it.
+        {
+            let now = triggers::Scheduler::now();
+            daemon.triggers.evict_fires(now);
+            let fires: Vec<ActivityItem> = daemon
+                .triggers
+                .recent_fires
+                .iter()
+                .map(|f| ActivityItem {
+                    id: format!("trigger/{}/{}", f.name, f.job),
+                    kind: "trigger".into(),
+                    agent: None,
+                    text: activity::truncate_summary(&format!(
+                        "trigger '{}' fired (job {})",
+                        f.name,
+                        &f.job[..8.min(f.job.len())]
+                    )),
+                    ts: agenttools::iso_from_unix(f.at),
+                })
+                .collect();
+            daemon
+                .recent_mule_jobs
+                .retain(|(_, _, at)| now - *at <= activity::RECENT_WINDOW);
+            let mule_jobs: Vec<ActivityItem> = daemon
+                .recent_mule_jobs
+                .iter()
+                .map(|(job, label, at)| ActivityItem {
+                    id: format!("mule_job/{job}"),
+                    kind: "mule_job".into(),
+                    agent: None,
+                    text: activity::truncate_summary(&format!("mule job {job} — {label}")),
+                    ts: agenttools::iso_from_unix(*at),
+                })
+                .collect();
+            // pending asks: no expiry (the user may answer hours later),
+            // so every unanswered ask stays on the timeline
+            let asks: Vec<ActivityItem> = daemon
+                .asks
+                .pending
+                .values()
+                .filter(|r| r.answer.is_none())
+                .map(|r| {
+                    let ts = now
+                        - std::time::Instant::now()
+                            .duration_since(r.created_at)
+                            .as_secs() as i64;
+                    ActivityItem {
+                        id: format!("ask/{}", r.ask_id),
+                        kind: "ask".into(),
+                        agent: None, // local panes carry no agent identity
+                        text: activity::truncate_summary(&r.question),
+                        ts: agenttools::iso_from_unix(ts),
+                    }
+                })
+                .collect();
+            // agent-spawned panes (active) + spawn requests awaiting approval
+            let mut spawns: Vec<ActivityItem> = Vec::new();
+            for pane in daemon.spawns.by_pane.keys() {
+                let short = &pane.to_string()[..8];
+                let label = daemon
+                    .sessions
+                    .values()
+                    .find_map(|s| {
+                        (s.panes.contains_key(pane) || s.chats.contains_key(pane))
+                            .then(|| s.name.clone())
+                    })
+                    .unwrap_or_default();
+                let text = if label.is_empty() {
+                    format!("agent pane {short} active")
+                } else {
+                    format!("agent pane in '{label}' active")
+                };
+                spawns.push(ActivityItem {
+                    id: format!("spawn/{pane}"),
+                    kind: "spawn".into(),
+                    agent: None,
+                    text: activity::truncate_summary(&text),
+                    ts: agenttools::iso_from_unix(now),
+                });
+            }
+            for (spawn_id, (rec, _)) in &daemon.spawns.pending {
+                let ts = now
+                    - std::time::Instant::now()
+                        .duration_since(rec.created_at)
+                        .as_secs() as i64;
+                spawns.push(ActivityItem {
+                    id: format!("spawn/{spawn_id}"),
+                    kind: "spawn".into(),
+                    agent: None,
+                    text: activity::truncate_summary(&format!(
+                        "spawn request {} awaiting approval",
+                        &spawn_id[..8.min(spawn_id.len())]
+                    )),
+                    ts: agenttools::iso_from_unix(ts),
+                });
+            }
+            let mut st = daemon
+                .activity_shared
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            st.asks = asks;
+            st.spawns = spawns;
+            st.fires = fires;
+            st.mule_jobs = mule_jobs;
+        }
         // agent-tool `ask` policy: expire unapproved spawn requests
         for (spawn_id, caller) in daemon.spawns.expire_pending() {
             eprintln!("ranchd: spawn request {spawn_id} expired (no approval)");
@@ -7391,6 +7745,18 @@ fn run(
         // --- shutdown ---
         if RUNNING.load(Ordering::SeqCst) == 0 {
             break;
+        }
+    }
+
+    // H5.3: stop the activity poller and join it — the thread must not
+    // outlive the daemon (its HTTP calls are 10 s-capped, so the join
+    // is bounded). Dropping the pipe write end below also EOFs the
+    // pipe reader, so a wedged poller can never hold the loop open.
+    {
+        let stop = daemon.activity_stop.clone();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(h) = daemon.activity_handle.take() {
+            let _ = h.join();
         }
     }
 

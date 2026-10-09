@@ -15,7 +15,7 @@
 //! lists `a,b`, and ranges `a-b`. Timezones: schedules run in **UTC**
 //! (v1; `tz` is parsed but only UTC is honored — documented in SPEC).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ranch_protocol::Frame;
@@ -252,10 +252,27 @@ pub fn dow_from_unix(secs: i64) -> (i64, u32, u32, u32, u32, u32) {
 }
 
 /// The trigger scheduler: owns the registry + fires workflows.
+/// One recent trigger fire (H5.3 Activity View): who, which mule
+/// job, when (unix seconds).
+#[derive(Debug, Clone)]
+pub struct FireRec {
+    pub name: String,
+    pub job: String,
+    pub at: i64,
+}
+
+/// Ring cap + window for the recent-fire history (H5.3): a trigger
+/// fire stays on the Activity View for 10 minutes.
+pub const RECENT_FIRES_CAP: usize = 32;
+pub const RECENT_FIRES_WINDOW: i64 = 10 * 60;
+
 pub struct Scheduler {
     pub triggers: BTreeMap<Uuid, Trigger>,
     /// last cron fire per trigger (unix minute) — catch-up + dedupe
     last_cron: BTreeMap<Uuid, i64>,
+    /// recent fires (H5.3): bounded ring, in-memory only — a daemon
+    /// restart just restarts the 10-minute window
+    pub recent_fires: VecDeque<FireRec>,
     /// configured: mule worker tx (None = nothing can fire)
     mule_tx: Option<std::sync::mpsc::Sender<crate::daemon::mule::MuleJob>>,
 }
@@ -265,7 +282,33 @@ impl Scheduler {
         Scheduler {
             triggers: BTreeMap::new(),
             last_cron: BTreeMap::new(),
+            recent_fires: VecDeque::new(),
             mule_tx,
+        }
+    }
+
+    /// Record a fire in the bounded ring (H5.3): evicts entries older
+    /// than `RECENT_FIRES_WINDOW` and keeps the ring at its cap.
+    pub fn record_fire(&mut self, name: &str, job: &str, at: i64) {
+        self.recent_fires.push_back(FireRec {
+            name: name.into(),
+            job: job.into(),
+            at,
+        });
+        self.evict_fires(at);
+    }
+
+    /// Drop fire-history entries outside the 10-minute window / cap.
+    pub fn evict_fires(&mut self, now: i64) {
+        while self.recent_fires.len() > RECENT_FIRES_CAP {
+            self.recent_fires.pop_front();
+        }
+        while let Some(front) = self.recent_fires.front() {
+            if now - front.at > RECENT_FIRES_WINDOW {
+                self.recent_fires.pop_front();
+            } else {
+                break;
+            }
         }
     }
 
@@ -354,9 +397,12 @@ impl Scheduler {
                     pane: Uuid::nil(),
                 });
             }
+            let name = trig.name.clone();
             if let Some(t) = self.triggers.get_mut(&id) {
                 t.last_run = Some((job_id.clone(), this_min, "queued".into()));
             }
+            // H5.3: the Activity View's "trigger" items
+            self.record_fire(&name, &job_id, this_min);
             frames.push(Frame::TriggerFired {
                 trigger: id.to_string(),
                 job: job_id.clone(),
@@ -409,9 +455,12 @@ impl Scheduler {
                     pane: Uuid::nil(),
                 });
             }
+            let name = trig.name.clone();
             if let Some(t) = self.triggers.get_mut(&id) {
                 t.last_run = Some((job_id.clone(), Self::now(), "queued".into()));
             }
+            // H5.3: the Activity View's "trigger" items
+            self.record_fire(&name, &job_id, Self::now());
             frames.push(Frame::TriggerFired {
                 trigger: id.to_string(),
                 job: job_id.clone(),
@@ -714,5 +763,23 @@ mod tests {
             TriggerKind::Cron { expr } => assert_eq!(expr, "0 3 * * *"),
             _ => panic!("wrong kind"),
         }
+    }
+
+    #[test]
+    fn fire_ring_is_bounded_and_evicted_by_window() {
+        let mut s = Scheduler::new(None);
+        let now = 1_000_000;
+        for i in 0..40 {
+            s.record_fire(&format!("t{i}"), &format!("job{i}"), now);
+        }
+        // cap: the oldest 40-32 fell off the front
+        assert_eq!(s.recent_fires.len(), RECENT_FIRES_CAP);
+        assert_eq!(s.recent_fires.front().unwrap().name, "t8");
+        // window: a second later everything is still fresh…
+        s.evict_fires(now + 60);
+        assert_eq!(s.recent_fires.len(), RECENT_FIRES_CAP);
+        // …but just past the 10-minute window it's all gone
+        s.evict_fires(now + RECENT_FIRES_WINDOW + 1);
+        assert!(s.recent_fires.is_empty());
     }
 }

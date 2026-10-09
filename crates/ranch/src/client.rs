@@ -201,13 +201,71 @@ fn frame_matches(f: &Frame, tag: &str) -> bool {
         (Frame::SessionsAck { .. }, "ack")
             | (
                 Frame::Error { .. },
-                "ack" | "agentlist" | "agenttalk" | "agentbusy"
+                "ack" | "agentlist" | "agenttalk" | "agentbusy" | "agentpause"
             )
             | (Frame::Meta { .. }, "meta")
             | (Frame::AgentListOk { .. }, "agentlist")
             | (Frame::AgentTalkOk { .. }, "agenttalk")
             | (Frame::AgentBusyOk { .. }, "agentbusy")
+            | (Frame::AgentPauseOk { .. }, "agentpause")
     )
+}
+
+/// H5.3: `ranch pause|unpause [AGENT]` — pause (or unpause) one agent,
+/// or the whole herd when no name is given. The daemon answers with
+/// one result row per agent (forge + mule legs). (`ranch resume` is
+/// the existing forge-session resume command — hence "unpause".)
+fn cmd_pause_resume(paused: bool, agent: Option<String>) {
+    let verb = if paused { "pause" } else { "resume" };
+    one_shot(
+        |req_id| Frame::AgentPause {
+            req_id: req_id.to_string(),
+            agent,
+            paused,
+        },
+        "agentpause",
+        |f| match f {
+            Frame::AgentPauseOk { results, .. } => {
+                let mut any_err = false;
+                for r in results {
+                    let mut bits: Vec<String> = Vec::new();
+                    if let Some(p) = r.forge {
+                        bits.push(if p { "paused".into() } else { "resumed".into() });
+                    }
+                    if let Some(n) = r.mule {
+                        let which = if paused {
+                            "wakes disabled"
+                        } else {
+                            "wakes enabled"
+                        };
+                        bits.push(format!("{n} {which}"));
+                    }
+                    match &r.error {
+                        Some(e) => {
+                            any_err = true;
+                            eprintln!("{} {} — {} ({})", r.name, verb, bits.join(", "), e);
+                        }
+                        None => {
+                            let rest = if bits.is_empty() {
+                                "no legs attempted".to_string()
+                            } else {
+                                bits.join(", ")
+                            };
+                            println!("{} {} — {}", r.name, verb, rest);
+                        }
+                    }
+                }
+                if any_err {
+                    std::process::exit(1);
+                }
+            }
+            Frame::Error { message, .. } => {
+                eprintln!("error: {message}");
+                std::process::exit(1);
+            }
+            _ => {}
+        },
+    );
 }
 
 // ---------- agent registry (Herd H1.3) ----------
@@ -6775,11 +6833,12 @@ pub fn main_client() {
             return;
         }
         eprintln!(
-            "usage: ranch <new|agent|pi|resume|ls|attach|kill|rename|split|switch|register|login|machines|cloud> [args]"
+            "usage: ranch <new|agent|pi|resume|ls|attach|kill|rename|split|switch|pause|unpause|register|login|machines|cloud> [args]"
         );
         eprintln!(
             "  agent [name] [msg…]   talk to a forge agent (Herd) — no args = dashboard Agents section"
         );
+        eprintln!("  pause|unpause [AGENT] H5.3 kill switch — no agent = every known agent");
         eprintln!("  agent --new [name]    legacy: fresh forge agent session in cwd");
         eprintln!("  (run plain `ranch` in a terminal for the interactive session manager)");
         eprintln!("  socket: {}", socket_path().display());
@@ -6841,6 +6900,11 @@ pub fn main_client() {
             (Some(r), Some(p)) => cmd_switch(r, p),
             _ => die("usage: ranch switch <session> <pane>"),
         },
+        // ranch pause|unpause [AGENT] — H5.3 herd kill switch: no agent
+        // = every agent the daemon knows. ("resume" is taken by the
+        // forge-session resume command, so the inverse is "unpause".)
+        "pause" => cmd_pause_resume(true, args.get(1).cloned()),
+        "unpause" => cmd_pause_resume(false, args.get(1).cloned()),
         other => die(&format!("unknown command {other:?}")),
     }
 }

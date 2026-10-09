@@ -1002,6 +1002,38 @@ pub enum Frame {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         items: Vec<ActivityItem>,
     },
+    /// Daemon -> client: push the FULL Activity View item set (H5.3).
+    /// The daemon's activity poller recomputes the set every 5 s (local
+    /// asks/spawns/trigger-fires/mule jobs + per-agent forge feeds +
+    /// the mule wake log) and broadcasts it only when the set changes
+    /// (2 s debounce coalesces rapid churn). Clients replace their
+    /// timeline with `items` (most recent first; an item's identity
+    /// key is (kind, agent, id)). Additive: older clients drop the
+    /// unknown tag; the H1 `AgentActivity` request path stays as-is.
+    ActivityPush {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        items: Vec<ActivityItem>,
+    },
+    /// Client -> daemon: pause (or resume) one agent, or the whole
+    /// herd when `agent` is None (H5.3 global kill switch). The
+    /// daemon calls forge `POST /agents/:id/pause|resume` (idempotent)
+    /// and mule `POST /api/v1/wakes/pause` (best-effort: no mule
+    /// config => that leg is simply not attempted). Pending asks stay
+    /// visible while an agent is paused — pause halts new work, not
+    /// observability.
+    AgentPause {
+        req_id: String,
+        /// agent id or registry name; None = every known agent
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent: Option<String>,
+        /// false = resume
+        paused: bool,
+    },
+    /// Daemon -> client: per-agent pause/resume results.
+    AgentPauseOk {
+        req_id: String,
+        results: Vec<AgentPauseResult>,
+    },
     // ----- triggers (Phase D) -----
     /// Client -> daemon: list trigger definitions + last runs.
     TriggerList {
@@ -1137,7 +1169,17 @@ pub struct AgentInfo {
     pub conversation_count: Option<u64>,
 }
 
-/// One row of the Activity View (H5). H1 ships the frame only.
+/// One row of the Activity View (H5). H1 ships the frame only;
+/// H5.3 fills it from the daemon's activity poller (push via
+/// `ActivityPush`, request via `AgentActivity`/`AgentActivityOk`):
+/// `kind` ∈ "ask" (pending approval), "spawn" (agent-spawned pane /
+/// awaiting approval), "trigger" (recent trigger fire, 10-min
+/// window), "mule_job" (recent machine-launched mule job, 10-min
+/// window), "forge_task" (durable task, non-terminal),
+/// "belief_pending" (pending belief), "research_open" (open research
+/// task), "wake" (mule wake_log entry). `text` is a one-line summary,
+/// truncated to 200 chars; `ts` is RFC 3339 (UTC `Z`) — sources
+/// without a timestamp (e.g. durable tasks) use the poll time.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ActivityItem {
     /// stable item id (H5 taxonomy)
@@ -1151,6 +1193,25 @@ pub struct ActivityItem {
     pub text: String,
     /// ISO-8601 timestamp
     pub ts: String,
+}
+
+/// One agent's pause/resume outcome (H5.3). `forge` = the agent's
+/// resulting paused state (None = not attempted: forge unconfigured);
+/// `mule` = how many of the agent's wakes were flipped (None = not
+/// attempted: mule unconfigured); `error` = failure detail naming the
+/// leg that failed (the other leg may still have succeeded).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AgentPauseResult {
+    /// agent id (uuid string)
+    pub agent: String,
+    /// registry name (the id itself when unknown)
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forge: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mule: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// One row of a forge agent conversation (M8). Mirrors a forge
@@ -2302,6 +2363,36 @@ mod tests {
                     ts: "2026-10-07T00:00:00Z".into(),
                 }],
             },
+            Frame::ActivityPush {
+                items: vec![ActivityItem {
+                    id: "ask/77".into(),
+                    kind: "ask".into(),
+                    agent: None,
+                    text: "approve spawn?".into(),
+                    ts: "2026-10-07T00:01:00Z".into(),
+                }],
+            },
+            Frame::ActivityPush { items: vec![] },
+            Frame::AgentPause {
+                req_id: "r7".into(),
+                agent: Some("iris".into()),
+                paused: true,
+            },
+            Frame::AgentPause {
+                req_id: "r8".into(),
+                agent: None,
+                paused: false,
+            },
+            Frame::AgentPauseOk {
+                req_id: "r7".into(),
+                results: vec![AgentPauseResult {
+                    agent: "a1".into(),
+                    name: "iris".into(),
+                    forge: Some(true),
+                    mule: Some(3),
+                    error: None,
+                }],
+            },
         ];
         for f in frames {
             let lines = encode_frame(&f, "c1");
@@ -2357,6 +2448,51 @@ mod tests {
         })
         .unwrap();
         assert!(!s.contains("items"), "empty items list must be omitted");
+    }
+
+    #[test]
+    fn activity_push_and_agent_pause_minimal_json() {
+        // minimal AgentPause: agent defaults to None (pause the herd)
+        let f: Frame =
+            serde_json::from_str(r#"{"t":"AgentPause","req_id":"r","paused":true}"#).unwrap();
+        match f {
+            Frame::AgentPause { agent, paused, .. } => {
+                assert!(agent.is_none());
+                assert!(paused);
+            }
+            _ => panic!("wrong variant"),
+        }
+        // AgentPauseOk with missing optionals in a result
+        let f: Frame = serde_json::from_str(
+            r#"{"t":"AgentPauseOk","req_id":"r","results":[{"agent":"a","name":"iris"}]}"#,
+        )
+        .unwrap();
+        match f {
+            Frame::AgentPauseOk { results, .. } => {
+                let r = &results[0];
+                assert!(r.forge.is_none());
+                assert!(r.mule.is_none());
+                assert!(r.error.is_none());
+            }
+            _ => panic!("wrong variant"),
+        }
+        // ActivityPush with no items decodes to an empty set
+        let f: Frame = serde_json::from_str(r#"{"t":"ActivityPush"}"#).unwrap();
+        match f {
+            Frame::ActivityPush { items } => assert!(items.is_empty()),
+            _ => panic!("wrong variant"),
+        }
+        // additive: an old-client Meta (kind "activity" with no
+        // payload — Meta's shape never changes) still parses; an
+        // unknown frame tag is dropped, not fatal, by the decoder
+        let f: Frame = serde_json::from_str(
+            r#"{"t":"Meta","session":"s","kind":"activity","status":"x"}"#,
+        )
+        .unwrap();
+        assert!(matches!(f, Frame::Meta { .. }));
+        let mut d = Decoder::new();
+        let got = d.feed(b"{\"t\":\"Bogus\",\"x\":1}\n");
+        assert!(got.is_empty());
     }
 
     #[test]
