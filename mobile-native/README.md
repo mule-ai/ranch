@@ -52,6 +52,28 @@ fire while the phone is in a drawer.
   machine, forge down) flash the status line — never crash. The
   pre-H1.4 **local pi manager** (PiList/PiMonitor/adopt) is kept as a
   second section under a "Local pi sessions" divider.
+- **Activity screen** — `HerdActivity`: the H5.3 Activity View (the
+  herd's live timeline, mirroring the TUI's Activity section). Data is
+  push-only: the daemon's activity poller broadcasts `ActivityPush`
+  {items} on every item-set change and this screen replaces its
+  in-memory timeline (no polling, no persistence in v1). Items group
+  by agent (machine-wide items — the local ask/spawn/trigger/mule_job
+  kinds, `agent: null` — group under "LOCAL"), groups ordered by their
+  most-recent item, each row "glyph text · HH:MM" with the TUI's
+  H5.3 glyph map (🧠 belief, ✅ ask, 🔬 research, ⏰ wake, ▸ forge
+  task, ⇄ mule job, ⚡ trigger, ✚ spawn). Header **Pause herd** /
+  **Resume herd** button sends `AgentPause { agent: null, paused }`
+  (the global kill switch: forge pause + mule wake-pause); long-press
+  on an item offers "Pause agent <name>" / "Resume agent <name>"
+  (machine-local items flash instead). Both toggle off the last
+  CONFIRMED target (`AgentPauseOk` with all legs ok sets/clears the
+  hint; a failed leg leaves it unknown) and toast the per-agent
+  results. Tapping an item deep-links to that agent — the H1.4
+  `AgentTalk{mode:"continue"}` path (name → id from a cached
+  `AgentList`, so the screen sends one on open); machine-local items
+  flash "open it from the sessions list" (v1: no cross-pane focus).
+  Opened from the Settings & tools screen's Tools row (next to
+  Agents).
 - **Session / terminal screen** — `SessionActivity`: attaches to one
   session and renders its active pane.
   - **PTY panes** → `TerminalView` (custom `View`) paints the SGR-tagged row

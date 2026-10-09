@@ -86,6 +86,7 @@ class SettingsActivity : Activity() {
             setOnClickListener { startActivity(Intent(this@SettingsActivity, cls)) }
         })
         toolBtn(tools1, "Agents", AgentsActivity::class.java)
+        toolBtn(tools1, "Activity", HerdActivity::class.java)
         toolBtn(tools1, "Files", EditorActivity::class.java)
         toolBtn(tools2, "Workflows", WorkflowsActivity::class.java)
         toolBtn(tools2, "Triggers", TriggersActivity::class.java)

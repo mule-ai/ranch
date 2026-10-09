@@ -176,6 +176,31 @@ export type WebhookRow = {
   enabled: boolean;
   created_at?: string | null;
 };
+
+// ----- Herd H5.3: Activity View + pause kill switch -----
+
+/** One row of the Activity View — mirrors `ranch_protocol::ActivityItem`.
+ *  `agent` is the registry name; undefined = machine-wide item (the
+ *  local ask/spawn/trigger/mule_job kinds). `ts` is RFC 3339 (UTC Z). */
+export type ActivityItem = {
+  id: string;
+  kind: string; // ask|spawn|trigger|mule_job|forge_task|belief_pending|research_open|wake
+  agent?: string | null;
+  text: string;
+  ts: string;
+};
+
+/** One agent's pause/resume outcome — mirrors `AgentPauseResult`.
+ *  `forge` = resulting paused state, `mule` = wake flips; null = leg not
+ *  attempted. */
+export type AgentPauseResult = {
+  agent: string;
+  name: string;
+  forge?: boolean | null;
+  mule?: number | null;
+  error?: string | null;
+};
+
 export type Layout =
   | { k: "Leaf"; pane: string }
   | { k: "Split"; dir: 0 | 1; pct: number; a: Layout; b: Layout };
@@ -272,6 +297,12 @@ export type Frame =
   // cross the wire.
   | { t: "AgentList"; id: string; req_id: string }
   | { t: "AgentListOk"; id: string; req_id: string; agents: AgentInfo[] }
+  // Herd H5.3: the Activity View (push-only — the daemon's poller
+  // recomputes the full item set and broadcasts it on change) + the
+  // pause kill switch.
+  | { t: "ActivityPush"; items: ActivityItem[] }
+  | { t: "AgentPause"; id: string; req_id: string; agent?: string | null; paused: boolean }
+  | { t: "AgentPauseOk"; req_id: string; results: AgentPauseResult[] }
   | { t: "AgentTalk"; id: string; req_id: string; agent: string; mode: string; text?: string; title?: string | null; fork_from?: string | null }
   | { t: "AgentTalkOk"; id: string; req_id: string; session: string; pane: string }
   | { t: "AgentBusy"; id: string; req_id: string; agent: string }

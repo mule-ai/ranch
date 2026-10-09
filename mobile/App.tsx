@@ -24,6 +24,7 @@ import { MachinesScreen } from "./screens/Machines";
 import { TerminalScreen } from "./screens/Terminal";
 import { EditorScreen } from "./screens/Editor";
 import { AgentsScreen } from "./screens/Agents";
+import { ActivityScreen } from "./screens/Activity";
 import { WorkflowsScreen } from "./screens/Workflows";
 import { TriggersScreen } from "./screens/Triggers";
 import { SettingsScreen } from "./screens/Settings";
@@ -60,9 +61,10 @@ export default function App() {
   // M10: file editor (browse/read/write files on this machine)
   // Phase B: agent builder (profiles) + a profile awaiting launch
   // Bottom tabs while a machine is picked: sessions | files | agents |
-  // automation (the old top-bar action pile — five text buttons
-  // crammed next to the title — is unusable on a phone)
-  const [tab, setTab] = useState<"sessions" | "files" | "agents" | "automation" | "settings">("sessions");
+  // activity (H5.3 Activity View) | automation (the old top-bar action
+  // pile — five text buttons crammed next to the title — is unusable on
+  // a phone)
+  const [tab, setTab] = useState<"sessions" | "files" | "agents" | "activity" | "automation" | "settings">("sessions");
   const [pendingProfile, setPendingProfile] = useState<ProfileSummary | null>(null);
   // hot daemon upgrade in flight (button shows progress, err shows result)
   const [upgrading, setUpgrading] = useState(false);
@@ -615,6 +617,18 @@ export default function App() {
           }}
         />
       )}
+      {tab === "activity" && (
+        <ActivityScreen
+          relay={relay}
+          onTalk={(a) => {
+            // same deep-link path as the agents tab: AgentTalk continue,
+            // attach on AgentTalkOk (handled in the main frame handler)
+            const rid = "at-" + nextId();
+            agentTalkNames.current.set(rid, a.name || a.id.slice(0, 8));
+            relay?.send({ t: "AgentTalk", req_id: rid, agent: a.id, mode: "continue" } as Frame);
+          }}
+        />
+      )}
       {tab === "automation" && <AutomationScreen relay={relay} />}
       {tab === "settings" && <SettingsScreen onExit={() => setTab("sessions")} />}
         {resumeList !== null && (() => {
@@ -755,8 +769,8 @@ function TabBar({
   tab,
   onPick,
 }: {
-  tab: "sessions" | "files" | "agents" | "automation" | "settings";
-  onPick: (t: "sessions" | "files" | "agents" | "automation" | "settings") => void;
+  tab: "sessions" | "files" | "agents" | "activity" | "automation" | "settings";
+  onPick: (t: "sessions" | "files" | "agents" | "activity" | "automation" | "settings") => void;
 }) {
   // sit above the Android gesture-bar/home-pill area, not under it
   const insets = useSafeAreaInsets();
@@ -764,6 +778,7 @@ function TabBar({
     { id: "sessions" as const, label: "sessions", icon: "□" },
     { id: "files" as const, label: "files", icon: "≡" },
     { id: "agents" as const, label: "agents", icon: "◆" },
+    { id: "activity" as const, label: "activity", icon: "◈" },
     { id: "automation" as const, label: "automation", icon: "⏱" },
     { id: "settings" as const, label: "settings", icon: "⚙" },
   ];

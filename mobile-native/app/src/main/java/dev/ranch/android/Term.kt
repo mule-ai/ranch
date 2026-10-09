@@ -140,6 +140,16 @@ object Term {
         JSONObject().put("t", "AgentBusy").put("id", newId()).put("client", CLIENT)
             .put("req_id", reqId).put("agent", agent)
 
+    /** H5.3: pause (or resume) one agent — by id OR registry name — or
+     *  the whole herd when [agent] is null. The daemon fans out to
+     *  forge `/agents/:id/pause|resume` + mule `/wakes/pause` and
+     *  answers `AgentPauseOk` (or `Error` when no agent is known). */
+    fun agentPause(agent: String?, paused: Boolean, reqId: String = "ap-" + newId()): JSONObject =
+        JSONObject().put("t", "AgentPause").put("id", newId()).put("client", CLIENT)
+            .put("req_id", reqId)
+            .apply { if (agent != null) put("agent", agent) }
+            .put("paused", paused)
+
     // ---- Phase 4: agents / pi manager ----
     fun piList(): JSONObject =
         JSONObject().put("t", "PiList").put("id", newId()).put("client", CLIENT)
@@ -310,6 +320,46 @@ object Term {
             conversationCount =
                 if (o.has("conversation_count") && !o.isNull("conversation_count"))
                     o.optLong("conversation_count") else null,
+        )
+
+    /** One row of the Activity View (Herd H5.3) — mirrors
+     *  `ranch_protocol::ActivityItem`. [agent] is the registry name;
+     *  null = machine-wide item (local ask/spawn/trigger/mule_job). */
+    data class ActivityItem(
+        val id: String,
+        val kind: String, // ask|spawn|trigger|mule_job|forge_task|belief_pending|research_open|wake
+        val agent: String?,
+        val text: String,
+        val ts: String, // RFC 3339 (UTC Z)
+    )
+
+    fun parseActivityItem(o: JSONObject): ActivityItem =
+        ActivityItem(
+            id = o.optString("id"),
+            kind = o.optString("kind"),
+            agent = o.optString("agent").takeIf { it.isNotEmpty() },
+            text = o.optString("text"),
+            ts = o.optString("ts"),
+        )
+
+    /** One agent's pause/resume outcome (H5.3) — mirrors
+     *  `ranch_protocol::AgentPauseResult`. [forge] = resulting paused
+     *  state (null = leg not attempted); [mule] = flips (null = same). */
+    data class AgentPauseResult(
+        val agent: String,
+        val name: String,
+        val forge: Boolean?,
+        val mule: Int?,
+        val error: String?,
+    )
+
+    fun parseAgentPauseResult(o: JSONObject): AgentPauseResult =
+        AgentPauseResult(
+            agent = o.optString("agent"),
+            name = o.optString("name"),
+            forge = if (o.has("forge") && !o.isNull("forge")) o.optBoolean("forge") else null,
+            mule = if (o.has("mule") && !o.isNull("mule")) o.optInt("mule") else null,
+            error = o.optString("error").takeIf { it.isNotEmpty() },
         )
 
     data class PiSession(
