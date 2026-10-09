@@ -88,6 +88,7 @@ class SettingsActivity : Activity() {
         toolBtn(tools1, "Agents", AgentsActivity::class.java)
         toolBtn(tools1, "Activity", HerdActivity::class.java)
         toolBtn(tools1, "Files", EditorActivity::class.java)
+        toolBtn(tools2, "Per-agent", NotifyAgentsActivity::class.java)
         toolBtn(tools2, "Workflows", WorkflowsActivity::class.java)
         toolBtn(tools2, "Triggers", TriggersActivity::class.java)
         toolBtn(tools2, "Machines", MachinesActivity::class.java)
@@ -105,6 +106,10 @@ class SettingsActivity : Activity() {
         root.addView(buildSwitch("every_message", "Every agent message (only when turn-end is off)", app.prefs.getBool("every_message", false)))
         root.addView(buildSwitch("ignore_tool_calls", "Ignore tool calls", app.prefs.getBool("ignore_tool_calls", true)))
         root.addView(buildSwitch("questions", "Agent questions", app.prefs.getBool("questions", true)))
+        root.addView(buildSwitch("approval", "Approvals (allow/deny cards)", app.prefs.getBool("approval", true)))
+        root.addView(buildSwitch("research", "Research reports (use/discard)", app.prefs.getBool("research", true)))
+        root.addView(buildSwitch("memory", "Memory reviews (keep/forget)", app.prefs.getBool("memory", true)))
+        root.addView(buildSwitch("task_done", "Background tasks finished", app.prefs.getBool("task_done", true)))
         root.addView(Button(this).apply {
             text = "Notification permission"
             setPadding(0, dp(6), 0, dp(6))

@@ -20,4 +20,9 @@ class Prefs(context: Context) {
     fun setInt(key: String, value: Int) {
         sp.edit().putInt(key, value).apply()
     }
+    /** Raw JSON blob (H6.1: the per-agent notification settings map). */
+    fun getJson(key: String): String = sp.getString(key, "") ?: ""
+    fun setJson(key: String, value: String) {
+        sp.edit().putString(key, value).apply()
+    }
 }

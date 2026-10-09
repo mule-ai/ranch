@@ -86,6 +86,7 @@ class MainActivity : Activity() {
             }
         }
         pendingOpen = pendingFromIntent(intent)
+        pendingAgentFromIntent(intent)
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(0xFF101418.toInt())
@@ -105,6 +106,7 @@ class MainActivity : Activity() {
     override fun onNewIntent(i: Intent) {
         super.onNewIntent(i)
         pendingFromIntent(i)?.let { pendingOpen = it }
+        pendingAgentFromIntent(i)
         handleAuthIntent(i)
         renderState()
     }
@@ -115,20 +117,79 @@ class MainActivity : Activity() {
     // (and that exact pane, for sessions with several chat panes).
     private var pendingOpen: Triple<String, String, String>? = null
 
+    /** H6.1 task-notification buttons: open the agent's conversation
+     *  (mode "continue") or fork it (mode "fork") via AgentTalk. */
+    private var pendingAgent: Pair<String, String>? = null
+    /** When the pending agent first became unresolvable (the registry
+     *  may simply not have loaded yet) — bounded retry, then give up. */
+    private var agentUnresolvedSince: Long? = null
+    private var agentTalkSink: ((JSONObject) -> Unit)? = null
+
     private fun pendingFromIntent(i: Intent?): Triple<String, String, String>? {
         val sid = i?.getStringExtra("open_session") ?: return null
         if (sid.isEmpty()) return null
         return Triple(sid, i.getStringExtra("open_session_name") ?: "", i.getStringExtra("open_pane") ?: "")
     }
 
+    private fun pendingAgentFromIntent(i: Intent?) {
+        val name = i?.getStringExtra("open_agent") ?: return
+        if (name.isEmpty()) return
+        pendingAgent = name to (i.getStringExtra("open_agent_mode") ?: "continue")
+    }
+
     private fun maybeAutoOpen() {
-        val p = pendingOpen ?: return
+        val p = pendingOpen
+        if (p != null) {
+            if (Monitor.running) {
+                pendingOpen = null
+                startActivity(Intent(this, SessionActivity::class.java)
+                    .putExtra("sessionId", p.first)
+                    .putExtra("sessionName", p.second)
+                    .putExtra("openPane", p.third))
+            }
+            return
+        }
+        val a = pendingAgent ?: return
         if (!Monitor.running) return   // retry on the refresh tick once connected
-        pendingOpen = null
-        startActivity(Intent(this, SessionActivity::class.java)
-            .putExtra("sessionId", p.first)
-            .putExtra("sessionName", p.second)
-            .putExtra("openPane", p.third))
+        val agentId = Monitor.agentIdFor(a.first)
+        if (agentId == null) {
+            // the registry (AgentListOk) may still be loading — retry for
+            // up to 15 s, then give up with a toast
+            val since = agentUnresolvedSince ?: System.currentTimeMillis().also { agentUnresolvedSince = it }
+            if (System.currentTimeMillis() - since > 15_000) {
+                pendingAgent = null
+                agentUnresolvedSince = null
+                Toast.makeText(this, "agent \"${a.first}\" not in the registry", Toast.LENGTH_LONG).show()
+            }
+            return
+        }
+        pendingAgent = null
+        agentUnresolvedSince = null
+        val rid = "at-notif-" + System.currentTimeMillis()
+        val agentName = a.first
+        val sink: (JSONObject) -> Unit = { f -> onAgentNotifyFrame(f, rid, agentName) }
+        agentTalkSink = sink
+        Monitor.relay?.addSink(sink)
+        Monitor.relay?.send(Term.agentTalk(agentId, a.second, rid))
+    }
+
+    private fun onAgentNotifyFrame(f: JSONObject, rid: String, agentName: String) {
+        if (f.optString("req_id") != rid) return
+        when (f.optString("t")) {
+            "AgentTalkOk" -> {
+                agentTalkSink?.let { Monitor.relay?.removeSink(it) }
+                agentTalkSink = null
+                startActivity(Intent(this, SessionActivity::class.java)
+                    .putExtra("sessionId", f.optString("session"))
+                    .putExtra("sessionName", agentName)
+                    .putExtra("openPane", f.optString("pane")))
+            }
+            "Error" -> {
+                agentTalkSink?.let { Monitor.relay?.removeSink(it) }
+                agentTalkSink = null
+                Toast.makeText(this, f.optString("message", "error"), Toast.LENGTH_LONG).show()
+            }
+        }
     }
 
     override fun onResume() {
@@ -155,6 +216,8 @@ class MainActivity : Activity() {
     override fun onDestroy() {
         handler.removeCallbacksAndMessages(null)
         exec.shutdownNow()
+        agentTalkSink?.let { Monitor.relay?.removeSink(it) }
+        agentTalkSink = null
         frameSink?.let { frameSinkRelay?.removeSink(it) }
         frameSink = null
         frameSinkRelay = null

@@ -39,6 +39,14 @@ class MonitorService : Service() {
             Monitor.start(app, mid, mname.ifEmpty { mid })
         }
 
+        // H6.1 notification button ("Allow this action" / "Keep" / …):
+        // answer through the Realtime socket. Runs after the restore so
+        // a just-started monitor also gets the answer; when the channel
+        // is not joined yet, sendFrame queues the frame until it is.
+        if (intent?.action == Notify.ACTION_ASK && Monitor.running) {
+            Monitor.handleAskAction(intent.getStringExtra("ask_id") ?: "", intent.getIntExtra("choice", -1))
+        }
+
         return START_STICKY
     }
 

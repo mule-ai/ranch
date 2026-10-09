@@ -74,6 +74,30 @@ fire while the phone is in a drawer.
   flash "open it from the sessions list" (v1: no cross-pane focus).
   Opened from the Settings & tools screen's Tools row (next to
   Agents).
+- **Per-agent notifications** — `NotifyAgentsActivity` (H6.1): the
+  forge registry with a **mute** switch + **high/normal/quiet**
+  priority per agent, persisted as the `agent_notify` JSON pref
+  `{name: {muted, priority}}`. Mute is notification-only — the
+  agent's items still appear in the Activity View. quiet/high pick
+  the low/high-importance notification channels. The shared
+  notification POLICY (kinds, defaults, card-lane choice
+  fingerprints, action labels) lives in `NotifyPolicy.kt`, mirrored
+  from the Expo app's `mobile/lib/notify-policy.ts` (source of
+  truth — keep in sync). Notification buttons (Keep/Forget,
+  Use/Discard, Allow/Deny — the ask's first two choices) route
+  `AgentAskAnswer` through the foreground service's Realtime socket
+  (`MonitorService`); task-done notifications carry **Open** / **Fork**
+  (`AgentTalk{mode:"continue"|"fork"}` — the plan's **Stop** button is
+  deferred: the `TaskAbort` frame does not exist yet, matching
+  H5.3's v1). Agent identity on notifications comes from
+  `AgentTalk`/`AgentTalkOk` pane-binding + the `AgentListOk`
+  registry (Meta/Chat/AgentAskRequest frames carry no agent id);
+  unresolved panes notify under the machine name. Avatars: registry
+  `avatar_url` downloaded to `cacheDir/avatars/` (`Avatars.kt`,
+  plain OkHttp — no new dep) and shown via `setLargeIcon` +
+  `BigPictureStyle` (custom bitmaps are not allowed as small icons
+  on modern Android). Opened from the Settings & tools screen's
+  Tools row (**Per-agent**).
 - **Session / terminal screen** — `SessionActivity`: attaches to one
   session and renders its active pane.
   - **PTY panes** → `TerminalView` (custom `View`) paints the SGR-tagged row

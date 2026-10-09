@@ -1,44 +1,124 @@
 package dev.ranch.android
 
 import android.app.Notification
+import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
-import android.os.Build
 import org.json.JSONObject
 import kotlin.concurrent.Volatile
 
 /**
- * Notification engine — port of the RN `notifyEvents.ts` +
- * `notifications.ts` logic. Fires local notifications for agent events
- * ONLY while the app is in the background; the on-screen UI covers the
- * foreground case. Dedup rules (mirroring the RN client):
+ * Notification engine — H6.1: AGENT-SCOPED notifications with actions.
+ *
+ * Fires local notifications for agent events ONLY while the app is in
+ * the background; the on-screen UI covers the foreground case.
+ *
+ * Kinds (defaults in [NotifyPolicy.KIND_DEFAULTS], the shared policy —
+ * the Expo/TS twin is `mobile/lib/notify-policy.ts`):
+ *   turn_end     pane working -> idle edge (existing; re-tagged with
+ *                the agent name + avatar when the pane is resolvable
+ *                to an agent via AgentTalk/AgentTalkOk)
+ *   errors       `⚠` assistant chat rows (existing)
+ *   questions    ad-hoc AgentAsk with no recognizable card lane
+ *   approval     policy_ask card ("Allow this action" / "Deny")
+ *   research     research_report card ("Use" / "Discard" / "Ask more")
+ *   memory       memory_review card ("Keep" / "Forget")
+ *   task_done    a forge_task activity item left the ActivityPush set
+ *                (its forge state went terminal — the poller only
+ *                lists pending/running tasks, so "gone = done"; a feed
+ *                outage that hides a task is indistinguishable and
+ *                also fires this — documented v1 limitation)
+ *   every_message existing per-message mode (only when turn-end off)
+ *
+ * Actions: actionable kinds carry up to two buttons whose
+ * PendingIntents broadcast to [MonitorService], which answers through
+ * the foreground service's Realtime socket:
+ *   ask lanes  -> AgentAskAnswer { ask_id, choices: [i] }
+ *   task_done  -> "Open" (the agent's conversation) + "Fork"
+ *                 (AgentTalk { mode: "fork" } via MainActivity).
+ *                 The plan's "stop" (TaskAbort frame) is deferred: the
+ *                 frame does not exist yet (H5.3 part 3a deferred it
+ *                 too) — v1 ships without a stop button.
+ *
+ * Per-agent mute/priority: `agent_notify` prefs JSON
+ * ({name: {muted, priority high|normal|quiet}}) — managed in
+ * [NotifyAgentsActivity]. Mute is NOTIFICATION-ONLY: the agent's items
+ * still appear in the Activity View. quiet/high select the
+ * "ranch.quiet" / "ranch.high" channels.
+ *
+ * Avatars: agent registry avatar_url downloaded to
+ * cacheDir/avatars (see [Avatars]), shown via setLargeIcon +
+ * BigPictureStyle (custom bitmaps are not allowed as small icons on
+ * modern Android — the app icon is the small icon).
+ *
+ * Dedup rules (mirroring the RN client):
  *  - turn_end: only on a working -> idle edge for a pane we SAW working
  *  - every_message: only append frames (reset=false) past the pane's
  *    last-seen seq; the first frame for a pane primes the baseline
- *  - questions: once per ask_id, until the AgentAskAnswer broadcast
+ *  - questions/cards: once per ask_id, until the AgentAskAnswer
+ *    broadcast
  */
 class Notify(private val app: App) {
     private val nm =
         app.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
 
-    // ---- settings (defaults mirror mobile/lib/notifications.ts) ----
+    init {
+        // per-priority channels ("ranch" is created at app start)
+        nm.createNotificationChannel(
+            NotificationChannel("ranch.quiet", "ranch (quiet)", NotificationManager.IMPORTANCE_LOW)
+        )
+        nm.createNotificationChannel(
+            NotificationChannel("ranch.high", "ranch (high)", NotificationManager.IMPORTANCE_HIGH)
+        )
+    }
+
+    // ---- global settings (defaults mirror mobile/lib/notify-policy.ts) ----
     var turnEnd: Boolean
-        get() = app.prefs.getBool("turn_end", true)
+        get() = app.prefs.getBool("turn_end", NotifyPolicy.KIND_DEFAULTS[NotifyPolicy.TURN_END]!!)
         set(v) { app.prefs.setBool("turn_end", v) }
     var everyMessage: Boolean
-        get() = app.prefs.getBool("every_message", false)
+        get() = app.prefs.getBool("every_message", NotifyPolicy.KIND_DEFAULTS[NotifyPolicy.EVERY_MESSAGE]!!)
         set(v) { app.prefs.setBool("every_message", v) }
     var ignoreToolCalls: Boolean
         get() = app.prefs.getBool("ignore_tool_calls", true)
         set(v) { app.prefs.setBool("ignore_tool_calls", v) }
     var questions: Boolean
-        get() = app.prefs.getBool("questions", true)
+        get() = app.prefs.getBool("questions", NotifyPolicy.KIND_DEFAULTS[NotifyPolicy.QUESTIONS]!!)
         set(v) { app.prefs.setBool("questions", v) }
     var notifyErrors: Boolean
-        get() = app.prefs.getBool("errors", true)
+        get() = app.prefs.getBool("errors", NotifyPolicy.KIND_DEFAULTS[NotifyPolicy.ERRORS]!!)
         set(v) { app.prefs.setBool("errors", v) }
+    var approval: Boolean
+        get() = app.prefs.getBool("approval", NotifyPolicy.KIND_DEFAULTS[NotifyPolicy.APPROVAL]!!)
+        set(v) { app.prefs.setBool("approval", v) }
+    var research: Boolean
+        get() = app.prefs.getBool("research", NotifyPolicy.KIND_DEFAULTS[NotifyPolicy.RESEARCH]!!)
+        set(v) { app.prefs.setBool("research", v) }
+    var memory: Boolean
+        get() = app.prefs.getBool("memory", NotifyPolicy.KIND_DEFAULTS[NotifyPolicy.MEMORY]!!)
+        set(v) { app.prefs.setBool("memory", v) }
+    var taskDone: Boolean
+        get() = app.prefs.getBool("task_done", NotifyPolicy.KIND_DEFAULTS[NotifyPolicy.TASK_DONE]!!)
+        set(v) { app.prefs.setBool("task_done", v) }
+
+    private fun kindEnabled(kind: String): Boolean = when (kind) {
+        NotifyPolicy.TURN_END -> turnEnd
+        NotifyPolicy.EVERY_MESSAGE -> everyMessage
+        NotifyPolicy.QUESTIONS -> questions
+        NotifyPolicy.ERRORS -> notifyErrors
+        NotifyPolicy.APPROVAL -> approval
+        NotifyPolicy.RESEARCH -> research
+        NotifyPolicy.MEMORY -> memory
+        NotifyPolicy.TASK_DONE -> taskDone
+        else -> false
+    }
+
+    /** Per-agent settings; unknown/absent agents get the defaults. */
+    private fun agentPrefs(name: String?): NotifyPolicy.AgentPrefs =
+        name?.let { Avatars.parseAgentPrefs(app.prefs.getJson("agent_notify"))[it] }
+            ?: NotifyPolicy.AgentPrefs()
 
     // ---- dedup state (single relay thread, no locking needed) ----
     private val busy = HashMap<String, Boolean>()
@@ -52,6 +132,10 @@ class Notify(private val app: App) {
     // turn-end notification carries it so the ping lands on the LAST
     // message (with the actual reply), not the first
     private val turnLast = HashMap<String, String>()
+    // H6.1 task_done: forge_task item ids currently in the ActivityPush
+    // set; an id leaving the set = its forge task went terminal
+    private val seenTasks = HashSet<String>()
+    private var tasksPrimed = false
 
     // ---- diagnostics (in-memory, session scoped) ----
     @Volatile var framesSeen = 0; private set
@@ -60,6 +144,8 @@ class Notify(private val app: App) {
     @Volatile var firedMessage = 0; private set
     @Volatile var firedQuestion = 0; private set
     @Volatile var firedError = 0; private set
+    @Volatile var firedCard = 0; private set
+    @Volatile var firedTask = 0; private set
     @Volatile var skippedActive = 0; private set
     @Volatile var skippedOff = 0; private set
     @Volatile var errors = 0; private set
@@ -71,6 +157,8 @@ class Notify(private val app: App) {
         primed.clear()
         turnLast.clear()
         paneSession.clear()
+        seenTasks.clear()
+        tasksPrimed = false
     }
 
     /** Call for EVERY frame received. Never throws. */
@@ -80,24 +168,9 @@ class Notify(private val app: App) {
             when (t) {
                 "Meta" -> onMeta(f, sessionName)
                 "Chat" -> onChat(f, sessionName)
-                "AgentAskRequest" -> {
-                    framesSeen++
-                    lastFrameAt = System.currentTimeMillis()
-                    rememberSession(f)
-                    val askId = f.optString("ask_id")
-                    if (askId.isNotEmpty() && notifiedAsks.add(askId)) {
-                        val q = f.optString("question").take(110)
-                        val fired = notify(
-                            "questions", sessionName, "agent question: $q", sessionName,
-                            f.optString("pane"), f.optString("session"),
-                        )
-                        if (!fired) notifiedAsks.remove(askId)
-                        // ask re-broadcasts (attach/reconnect) re-arm the
-                        // notification so a question the user never saw can
-                        // still ping later
-                    }
-                }
+                "AgentAskRequest" -> onAsk(f, sessionName)
                 "AgentAskAnswer" -> f.optString("ask_id").takeIf { it.isNotEmpty() }?.let(notifiedAsks::remove)
+                "ActivityPush" -> onActivityPush(f)
                 else -> Unit
             }
         } catch (e: Exception) {
@@ -127,11 +200,12 @@ class Notify(private val app: App) {
             }
             status == "idle" && busy[pane] == true -> {
                 busy[pane] = false
+                val agent = Monitor.agentFor(pane, f.optString("session"))
                 val body = turnLast.remove(pane)
                     ?.replace(Regex("\\s+"), " ")
                     ?.take(160)
                     ?: "agent finished its turn"
-                notify("turn_end", name, body, name, pane)
+                notify(NotifyPolicy.TURN_END, agent ?: name, body, agent, pane)
             }
         }
     }
@@ -141,6 +215,7 @@ class Notify(private val app: App) {
         lastFrameAt = System.currentTimeMillis()
         rememberSession(f)
         val pane = f.optString("pane")
+        val agent = Monitor.agentFor(pane, f.optString("session"))
         val msgs = f.optJSONArray("msgs") ?: return
         if (msgs.length() == 0) return
         var maxSeq = 0L
@@ -176,7 +251,10 @@ class Notify(private val app: App) {
                     // because the error IS the turn-end news
                     busy[pane] = false
                     turnLast.remove(pane)
-                    notify("errors", name, "agent error: " + text.replace(Regex("\\s+"), " ").take(120), name, pane)
+                    notify(
+                        NotifyPolicy.ERRORS, agent ?: name,
+                        "agent error: " + text.replace(Regex("\\s+"), " ").take(120), agent, pane,
+                    )
                 }
                 role == "assistant" && text.trim().isNotEmpty() -> {
                     if (turnEnd) {
@@ -185,80 +263,177 @@ class Notify(private val app: App) {
                         // open the app, and the final reply never notifies
                         turnLast[pane] = text
                     } else {
-                        notify("every_message", name, text.replace(Regex("\\s+"), " ").take(120), name, pane)
+                        notify(
+                            NotifyPolicy.EVERY_MESSAGE, agent ?: name,
+                            text.replace(Regex("\\s+"), " ").take(120), agent, pane,
+                        )
                     }
                 }
                 role == "tool" && !ignoreToolCalls && !turnEnd ->
-                    notify("every_message", name, "tool: " + m.optString("tool_name", "tool"), name, pane)
+                    notify(
+                        NotifyPolicy.EVERY_MESSAGE, agent ?: name,
+                        "tool: " + m.optString("tool_name", "tool"), agent, pane,
+                    )
             }
         }
     }
+
+    /** H6.1: an AgentAskRequest — classify the card lane and post an
+     *  agent-scoped, ACTIONABLE notification (choice buttons). */
+    private fun onAsk(f: JSONObject, name: String) {
+        framesSeen++
+        lastFrameAt = System.currentTimeMillis()
+        rememberSession(f)
+        val askId = f.optString("ask_id")
+        if (askId.isEmpty() || !notifiedAsks.add(askId)) return
+        val choices = mutableListOf<String>()
+        f.optJSONArray("choices")?.let { arr ->
+            for (i in 0 until arr.length()) choices.add(arr.getString(i))
+        }
+        val lane = NotifyPolicy.laneForChoices(choices)
+        val pane = f.optString("pane")
+        val session = f.optString("session")
+        val agent = Monitor.agentFor(pane, session)
+        val q = f.optString("question").replace(Regex("\\s+"), " ").take(110)
+        val body = when (lane) {
+            NotifyPolicy.QUESTIONS -> "agent question: $q"
+            else -> "${lane}: $q"
+        }
+        val actions = NotifyPolicy.actionIndices(choices).map {
+            NotifyAction(NotifyPolicy.actionLabel(choices[it]), askAction(askId, it))
+        }
+        val fired = notify(lane, agent ?: name, body, agent, pane, session, actions)
+        if (!fired) notifiedAsks.remove(askId)
+        // ask re-broadcasts (attach/reconnect) re-arm the notification
+        // so a question the user never saw can still ping later
+    }
+
+    /** H6.1 task_done source: the ActivityPush set diffing. The daemon
+     *  poller only lists NON-TERMINAL forge tasks, so a previously-seen
+     *  forge_task item leaving the set means its state went terminal
+     *  (done/failed/discarded — not distinguishable from the item). */
+    private fun onActivityPush(f: JSONObject) {
+        val items = f.optJSONArray("items") ?: return
+        val now = HashSet<String>()
+        for (i in 0 until items.length()) {
+            val it = items.getJSONObject(i)
+            if (it.optString("kind") != "forge_task") continue
+            val id = it.optString("id")
+            if (id.isNotEmpty() && it.optString("agent").isNotEmpty()) now.add(id)
+        }
+        if (!tasksPrimed) {
+            tasksPrimed = true
+            seenTasks.clear()
+            seenTasks.addAll(now)
+            return
+        }
+        for (key in seenTasks) {
+            if (now.contains(key)) continue
+            // item id shape: "forge_task/<agentName>/<taskId>"
+            val rest = key.removePrefix("forge_task/")
+            val agent = rest.substringBeforeLast('/', "")
+            if (agent.isEmpty()) continue
+            val actions = listOf(
+                NotifyAction("Open", taskOpenIntent(agent, "continue")),
+                NotifyAction("Fork", taskOpenIntent(agent, "fork")),
+            )
+            notify(
+                NotifyPolicy.TASK_DONE, agent, "background task finished", agent, null, null, actions,
+            )
+        }
+        seenTasks.clear()
+        seenTasks.addAll(now)
+    }
+
+    // ---- gating + posting ----
 
     private fun notify(
         kind: String,
         title: String,
         body: String,
-        tag: String,
+        agent: String? = null,
         pane: String? = null,
         session: String? = null,
+        actions: List<NotifyAction> = emptyList(),
     ): Boolean {
         return try {
-        val enabled = when (kind) {
-            "turn_end" -> turnEnd
-            "every_message" -> everyMessage
-            "questions" -> questions
-            "errors" -> notifyErrors
-            else -> false
+            val prefs = agentPrefs(agent)
+            if (!NotifyPolicy.decision(kindEnabled(kind), prefs)) {
+                skippedOff++
+                return false
+            }
+            if (app.isForeground) {
+                // an actionable question/card is actionable no matter where
+                // the user is in the app — suppress only when THAT
+                // conversation is the one on screen (the card is right there)
+                val onScreen = session != null && app.foregroundSession == session
+                if (!(NotifyPolicy.ACTIONABLE.contains(kind) && !onScreen)) {
+                    skippedActive++
+                    return false
+                }
+            }
+            postLocal(title, body, agent, pane, actions, prefs.priority)
+            when (kind) {
+                NotifyPolicy.TURN_END -> firedTurn++
+                NotifyPolicy.EVERY_MESSAGE -> firedMessage++
+                NotifyPolicy.QUESTIONS -> firedQuestion++
+                NotifyPolicy.ERRORS -> firedError++
+                NotifyPolicy.TASK_DONE -> firedTask++
+                else -> firedCard++
+            }
+            true
+        } catch (e: Exception) {
+            errors++
+            false
         }
-        if (!enabled) { skippedOff++; return false }
-        if (app.isForeground) {
-            // a pending question is actionable no matter where the user is
-            // in the app — suppress only when THAT conversation is the one
-            // on screen (the card is right there)
-            val onScreen = session != null && app.foregroundSession == session
-            if (!(kind == "questions" && !onScreen)) { skippedActive++; return false }
-        }
-        postLocal(title, body, tag, pane)
-        when (kind) {
-            "turn_end" -> firedTurn++
-            "every_message" -> firedMessage++
-            "questions" -> firedQuestion++
-            "errors" -> firedError++
-        }
-        true
-    } catch (e: Exception) {
-        errors++
-        false
-    }
     }
 
     /** Bypasses the foreground/settings gates — for the Settings "test" button. */
     fun testNotification(): Pair<Boolean, String> {
         return try {
-        if (!nm.areNotificationsEnabled()) return Pair(false, "notifications disabled on device")
-        postLocal("ranch", "test notification — if you see this, notifications work", "test", null)
-        Pair(true, "sent — pull down the notification shade")
-    } catch (e: Exception) {
-        errors++
-        Pair(false, "failed: ${e.message}")
-    }
+            if (!nm.areNotificationsEnabled()) return Pair(false, "notifications disabled on device")
+            postLocal("ranch", "test notification — if you see this, notifications work", null, null, emptyList(), "normal")
+            Pair(true, "sent — pull down the notification shade")
+        } catch (e: Exception) {
+            errors++
+            Pair(false, "failed: ${e.message}")
+        }
     }
 
-    private fun postLocal(title: String, body: String, tag: String, pane: String?) {
+    private fun channelFor(priority: String): String = when (priority) {
+        "high" -> "ranch.high"
+        "quiet" -> "ranch.quiet"
+        else -> "ranch"
+    }
+
+    /**
+     * One notification per pane (tag = session id, or the legacy tag).
+     * Tapping deep-links into the conversation that fired it; buttons
+     * route through [MonitorService] (see [onAsk]).
+     */
+    private fun postLocal(
+        title: String,
+        body: String,
+        agent: String?,
+        pane: String?,
+        actions: List<NotifyAction>,
+        priority: String,
+    ) {
         // deep link: tapping opens the conversation that fired this —
         // MainActivity consumes the extras once the monitor is up
         val intent = Intent(app, MainActivity::class.java)
         val sid = pane?.let { paneSession[it] }
-        // the session name beats the machine name as title, and each
-        // session gets its own shade entry (no clobbering between agents)
+        // the session name beats the machine name as title; the agent
+        // name beats both (H6.1); each session gets its own shade entry
         val sname = sid?.let { s ->
             Monitor.sessions.firstOrNull { it.id == s }?.name
                 .takeUnless { it.isNullOrEmpty() }
-        } ?: title
-        var notifTag = tag
+        }
+        val finalTitle = agent?.takeUnless { it.isEmpty() } ?: sname ?: title
+        var notifTag = title
         if (!sid.isNullOrEmpty()) {
             intent.putExtra("open_session", sid)
-            intent.putExtra("open_session_name", sname)
+            intent.putExtra("open_session_name", sname ?: finalTitle)
             if (!pane.isNullOrEmpty()) intent.putExtra("open_pane", pane)
             notifTag = sid
         }
@@ -267,18 +442,67 @@ class Notify(private val app: App) {
             app, notifTag.hashCode(), intent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
-        val builder = Notification.Builder(app, "ranch")
+        var builder = Notification.Builder(app, channelFor(priority))
             .setSmallIcon(R.drawable.ic_stat_ranch)
-            .setContentTitle(sname)
+            .setContentTitle(finalTitle)
             .setContentText(body)
             .setAutoCancel(true)
             .setCategory(Notification.CATEGORY_REMINDER)
             .setContentIntent(openIntent)
             .setWhen(System.currentTimeMillis())
             .setDefaults(Notification.DEFAULT_ALL)
-        if (Build.VERSION.SDK_INT >= 26) {
-            builder.setGroup("ranch")
+        if (priority == "high") {
+            @Suppress("DEPRECATION")
+            builder.setPriority(Notification.PRIORITY_HIGH)
+        }
+        // H6.1 avatar: big picture + large icon (custom bitmaps are not
+        // allowed as the small icon on modern Android — the app icon is)
+        val url = agent?.let { Monitor.agentAvatarUrl(it) }
+        if (!url.isNullOrEmpty()) {
+            val bmp = Avatars.bitmapFor(url)
+            if (bmp != null) {
+                builder.setLargeIcon(bmp)
+                builder.setStyle(Notification.BigPictureStyle().bigPicture(bmp))
+            } else {
+                Avatars.ensure(url) // next notification gets it
+            }
+        }
+        for (a in actions) {
+            builder.addAction(0, a.label, a.intent)
         }
         nm.notify(notifTag.hashCode(), builder.build())
     }
+
+    /** Button -> MonitorService -> Realtime `AgentAskAnswer`. */
+    private fun askAction(askId: String, choiceIndex: Int): PendingIntent {
+        val i = Intent(ACTION_ASK)
+            .setPackage(app.packageName)
+            .putExtra("ask_id", askId)
+            .putExtra("choice", choiceIndex)
+        return PendingIntent.getService(
+            app, "ask:$askId:$choiceIndex".hashCode(), i,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+    }
+
+    /** "Open"/"Fork" on a task notification: launch the app; MainActivity
+     *  resolves the agent + sends `AgentTalk` and opens the pane. */
+    private fun taskOpenIntent(agent: String, mode: String): PendingIntent {
+        val i = Intent(app, MainActivity::class.java)
+            .putExtra("open_agent", agent)
+            .putExtra("open_agent_mode", mode)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        return PendingIntent.getActivity(
+            app, "task:$agent:$mode".hashCode(), i,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+    }
+
+    companion object {
+        /** MonitorService intent action for notification buttons. */
+        const val ACTION_ASK = "dev.ranch.android.NOTIFY_ASK"
+    }
 }
+
+/** One notification button: label + the PendingIntent it fires. */
+data class NotifyAction(val label: String, val intent: PendingIntent)

@@ -42,6 +42,10 @@ const TOGGLES: { key: keyof NotifSettings; label: string; desc: string }[] = [
   { key: "every_message", label: "Every agent message", desc: "notify on each new assistant message" },
   { key: "ignore_tool_calls", label: "Ignore tool calls", desc: "when on, tool calls never notify" },
   { key: "questions", label: "Agent questions", desc: "notify when an agent asks a question" },
+  { key: "approval", label: "Approvals", desc: "allow/deny policy cards (actionable on the native app)" },
+  { key: "research", label: "Research reports", desc: "use/discard research report cards (actionable on the native app)" },
+  { key: "memory", label: "Memory reviews", desc: "keep/forget belief cards (actionable on the native app)" },
+  { key: "task_done", label: "Background tasks finished", desc: "a forge task reached a terminal state" },
 ];
 
 export function SettingsScreen({ onExit }: Props) {
@@ -130,6 +134,14 @@ export function SettingsScreen({ onExit }: Props) {
             </View>
           ))
         )}
+
+        <Text style={{ ...s.note, marginTop: 8 }}>
+          Per-agent mute/priority: the native Android app (Settings & tools →
+          Per-agent). Approvals, research and memory cards carry action
+          buttons there (Keep/Forget, Use/Discard, …) that answer through
+          the foreground service — buttons can't be attached to browser/
+          expo local notifications, so this app mirrors the policy only.
+        </Text>
 
         <View style={s.row}>
           <View style={s.rowTextWrap}>

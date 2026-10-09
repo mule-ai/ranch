@@ -38,6 +38,34 @@ object Monitor {
     @Volatile
     var daemonVersion: String = ""
 
+    // ---- H6.1 agent identity (feeds the notification engine) ----
+    // id -> registry name / avatar url, from AgentListOk (any client's
+    // request refreshes this; Monitor.start also warms it)
+    val agentNames = java.util.concurrent.ConcurrentHashMap<String, String>()
+    val agentAvatars = java.util.concurrent.ConcurrentHashMap<String, String>() // id -> url
+    // pane / session -> registry name, from AgentTalk + AgentTalkOk
+    val paneAgent = java.util.concurrent.ConcurrentHashMap<String, String>()
+    val sessionAgent = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+    /** Best-effort agent name for a pane (or its session). */
+    fun agentFor(pane: String?, session: String?): String? =
+        pane?.takeIf { it.isNotEmpty() }?.let { paneAgent[it] }
+            ?: session?.takeIf { it.isNotEmpty() }?.let { sessionAgent[it] }
+
+    fun agentIdFor(name: String): String? =
+        agentNames.entries.firstOrNull { it.value == name }?.key
+
+    fun agentAvatarUrl(name: String): String? =
+        agentIdFor(name)?.let { agentAvatars[it] }
+
+    /** Notification button tapped while the app is backgrounded:
+     *  answer the ask through the (possibly just-started) relay —
+     *  sendFrame queues until the channel is joined. */
+    fun handleAskAction(askId: String, choice: Int) {
+        if (askId.isEmpty() || choice < 0) return
+        relay?.send(Term.agentAskAnswer(askId, listOf(choice), ""))
+    }
+
     fun publishSessions(s: List<Term.SessionMeta>) { sessions = s }
 
     fun start(app: App, machineId: String, machineName: String) {
@@ -47,10 +75,16 @@ object Monitor {
         sessions = emptyList()
         pendingAsks.clear()
         daemonVersion = ""
+        agentNames.clear()
+        agentAvatars.clear()
+        paneAgent.clear()
+        sessionAgent.clear()
         val s = RelaySession(app, machineId)
+        Avatars.init(app)
         session = s
         running = true
         s.start()
+        s.send(Term.agentList()) // warm the registry + avatar prefetch
     }
 
     fun stop() {
@@ -61,6 +95,10 @@ object Monitor {
         sessions = emptyList()
         pendingAsks.clear()
         daemonVersion = ""
+        agentNames.clear()
+        agentAvatars.clear()
+        paneAgent.clear()
+        sessionAgent.clear()
     }
 
     val relay: RelaySession? get() = session
@@ -97,6 +135,9 @@ class RelaySession(
     val notify: Notify = Notify(app)
 
     private val sinks = CopyOnWriteArrayList<(JSONObject) -> Unit>()
+    // H6.1: outbound AgentTalk req_id -> agent id, matched against the
+    // AgentTalkOk reply to learn which pane belongs to which agent
+    private val talkPending = java.util.concurrent.ConcurrentHashMap<String, String>()
 
     private val realtime = Realtime(
         machineId,
@@ -119,7 +160,14 @@ class RelaySession(
     fun removeSink(s: (JSONObject) -> Unit) = sinks.remove(s)
 
     // ---- client -> daemon send helpers (all route through the WS) ----
-    fun send(frame: JSONObject) = realtime.sendFrame(frame)
+    fun send(frame: JSONObject) {
+        if (frame.optString("t") == "AgentTalk") {
+            val rid = frame.optString("req_id")
+            val agent = frame.optString("agent")
+            if (rid.isNotEmpty() && agent.isNotEmpty()) talkPending[rid] = agent
+        }
+        realtime.sendFrame(frame)
+    }
     fun attach(sessionId: String, pane: String? = null) =
         send(Term.attach(sessionId, pane))
     fun detach() = send(Term.detach())
@@ -150,6 +198,34 @@ class RelaySession(
 
     private fun refreshSessions(frame: JSONObject) {
         when (val t = frame.optString("t")) {
+            "AgentListOk" -> {
+                // H6.1: keep the agent registry (names + avatars) fresh
+                // for notification identity; any client's list request
+                // refreshes it. Warm the avatar cache too.
+                val arr = frame.optJSONArray("agents") ?: return
+                for (i in 0 until arr.length()) {
+                    val a = arr.getJSONObject(i)
+                    val id = a.optString("id")
+                    val name = a.optString("name")
+                    if (id.isNotEmpty() && name.isNotEmpty()) Monitor.agentNames[id] = name
+                    val url = a.optString("avatar_url")
+                    if (url.isNotEmpty()) Monitor.agentAvatars[id] = url else
+                        Monitor.agentAvatars.remove(id)
+                }
+                Avatars.prefetch(Monitor.agentAvatars.values.toTypedArray())
+            }
+            "AgentTalkOk" -> {
+                // H6.1: bind the new pane/session to its agent so
+                // notifications can carry agent identity
+                val agentId = frame.optString("req_id").let { talkPending.remove(it) }
+                val pane = frame.optString("pane")
+                val sid = frame.optString("session")
+                if (agentId != null) {
+                    val name = Monitor.agentNames[agentId] ?: agentId
+                    if (pane.isNotEmpty()) Monitor.paneAgent[pane] = name
+                    if (sid.isNotEmpty()) Monitor.sessionAgent[sid] = name
+                }
+            }
             "HelloOk" -> {
                 Monitor.daemonVersion = frame.optString("version", "")
                 Monitor.publishSessions(Term.parseSessionList(frame))

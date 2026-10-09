@@ -28,8 +28,8 @@ import { ActivityScreen } from "./screens/Activity";
 import { WorkflowsScreen } from "./screens/Workflows";
 import { TriggersScreen } from "./screens/Triggers";
 import { SettingsScreen } from "./screens/Settings";
-import { initNotifications, loadSettings } from "./lib/notifications";
-import { onFrameForNotifications, resetNotificationState } from "./lib/notifyEvents";
+import { initNotifications, loadSettings, loadAgentPrefs } from "./lib/notifications";
+import { onFrameForNotifications, resetNotificationState, agentTalkRequested } from "./lib/notifyEvents";
 import { clearSessionChat } from "./lib/chatCache";
 
 type Machine = { id: string; name: string };
@@ -141,6 +141,7 @@ export default function App() {
   useEffect(() => {
     initNotifications().catch(() => {});
     loadSettings().catch(() => {});
+    loadAgentPrefs().catch(() => {}); // H6.1 per-agent mute/priority
   }, []);
 
   // update banner: this APK vs the published release; and the daemon
@@ -609,6 +610,7 @@ export default function App() {
           onTalk={(a) => {
             const rid = "at-" + nextId();
             agentTalkNames.current.set(rid, a.name || a.id.slice(0, 8));
+            agentTalkRequested(rid, a.name || a.id.slice(0, 8)); // H6.1 notif identity
             relay?.send({ t: "AgentTalk", req_id: rid, agent: a.id, mode: "continue" } as Frame);
           }}
           onLaunch={(p) => {
@@ -625,6 +627,7 @@ export default function App() {
             // attach on AgentTalkOk (handled in the main frame handler)
             const rid = "at-" + nextId();
             agentTalkNames.current.set(rid, a.name || a.id.slice(0, 8));
+            agentTalkRequested(rid, a.name || a.id.slice(0, 8)); // H6.1 notif identity
             relay?.send({ t: "AgentTalk", req_id: rid, agent: a.id, mode: "continue" } as Frame);
           }}
         />
