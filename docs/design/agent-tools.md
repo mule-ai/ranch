@@ -245,6 +245,21 @@ Why this shape:
   *other forge* panes (agents on the forge host). Both are ordinary
   panes on the ranchd machine; only the agent harness's location
   differs.
+- **Suggestion cards ride the same bridge (Herd H4.4 / H5.1).** forge
+  belief-proposal cards (`memory_review`) and proactive-research cards
+  (`research_report`, forge's H5.1 read-only research tasks) use the
+  SAME queue row + `ranch_tool_request` SSE event; ranchd's forge
+  worker drives each through the `AgentAsk` round-trip (belief: Keep
+  / Forget + free text where the text IS the edit; research: Use /
+  Discard / Ask more where the free text is the Ask-more follow-up),
+  polling `AgentAskStatus` ~2 s to a ~55 s deadline (under forge's
+  60 s queue TTL — a slow human leaves the row in its last state,
+  still answerable through the read APIs), and POSTs the mapped
+  answer (`{action, content|followup}`) to `/ranch-tools/{id}/result`
+  where forge applies the transition. The answer payload is relayed
+  as the result body's TOP-LEVEL `output` (the card-lane relay
+  flattens the executor's inner `output` down — forge's apply
+  handlers read `output.action`).
 
 Forge changes required (Phase B forge items, additive):
 - **F3a**: pending-request queue + SSE event + result endpoint +

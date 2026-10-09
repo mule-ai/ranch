@@ -413,7 +413,20 @@ fn handle_event(
                 // belief transition on the result door.
                 std::thread::spawn(move || {
                     let result = execute_memory_review_via_ctl(&input, pane);
-                    relay_result_to_forge(&cfg, &id, &result);
+                    relay_card_result_to_forge(&cfg, &id, &result);
+                });
+                return;
+            }
+            if tool == "research_report" {
+                // Herd H5.1: a research task settled and forge pushed
+                // the suggestion card — Use / Discard / Ask more via
+                // the same AgentAsk round-trip; the answer payload
+                // (`{action: use|discard|ask_more, followup}`) rides
+                // the result relay and forge resolves the
+                // agent_research row on the result door.
+                std::thread::spawn(move || {
+                    let result = execute_research_report_via_ctl(&input, pane);
+                    relay_card_result_to_forge(&cfg, &id, &result);
                 });
                 return;
             }
@@ -713,6 +726,138 @@ fn memory_review_reply(choices: &[i64], text: &str) -> serde_json::Value {
     }
 }
 
+/// Herd H5.1: drive the ranch approval round-trip for a settled
+/// research task (the `research_report` card). Same AgentAsk
+/// plumbing as the H4.4 memory lane: Use / Discard / Ask more
+/// choices, with free text carrying the Ask-more follow-up. Polls
+/// `AgentAskStatus` (~2 s cadence) until answered or the ~55 s
+/// deadline — just under forge's 60 s queue TTL, so a slow human
+/// means the row STAYS `done` (still open, answerable later via
+/// `GET /agents/:id/research?open=1`; forge's card handler treats a
+/// failed relay as "no answer"). The choice mapping is
+/// [`research_report_reply`] (unit-tested); this function only
+/// drives the control API.
+fn execute_research_report_via_ctl(
+    input: &serde_json::Value,
+    caller_pane: Uuid,
+) -> serde_json::Value {
+    let port = std::env::var("RANCH_CONTROL_PORT").unwrap_or_default();
+    let token = std::env::var("RANCH_CONTROL_TOKEN").unwrap_or_default();
+    if port.is_empty() || token.is_empty() {
+        return serde_json::json!({
+            "success": false,
+            "error": "ranch control API unavailable (no RANCH_CONTROL_PORT)"
+        });
+    }
+    let question = input.get("question").and_then(|x| x.as_str()).unwrap_or("");
+    let summary = input.get("summary").and_then(|x| x.as_str()).unwrap_or("");
+    let ask = if summary.is_empty() {
+        format!("Research done: **{question}** — use this, discard it, or ask for more?")
+    } else {
+        format!("**{question}**\n\n{summary}\n\nUse this, discard it, or ask for more?")
+    };
+
+    // 1 — ask: POST /agent/ask → AgentAskOk { ask_id }. Free text next
+    // to the Use/Discard/Ask-more choices carries the follow-up.
+    let ask_body = serde_json::json!({
+        "caller_pane": caller_pane.to_string(),
+        "question": ask,
+        "choices": ["Use", "Discard", "Ask more"],
+        "suggested": 0,
+        "free_text": true,
+    });
+    let frames = match ctl_post_frames(&port, &token, caller_pane, "ask", &ask_body) {
+        Ok(f) => f,
+        Err(e) => {
+            return serde_json::json!({ "success": false, "error": format!("research report: control API error: {e}") });
+        }
+    };
+    let ask_id = frames
+        .iter()
+        .find(|f| f.get("t").and_then(|x| x.as_str()) == Some("AgentAskOk"))
+        .and_then(|f| f.get("ask_id").and_then(|x| x.as_str()))
+        .unwrap_or("")
+        .to_string();
+    if ask_id.is_empty() {
+        return serde_json::json!({ "success": false, "error": "research report: no AgentAskOk in the control reply" });
+    }
+
+    // 2 — poll: /agent/ask-status every ~2 s until answered or ~55 s.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(55);
+    loop {
+        let frames = match ctl_post_frames(
+            &port,
+            &token,
+            caller_pane,
+            "ask-status",
+            &serde_json::json!({ "caller_pane": caller_pane.to_string(), "ask_id": ask_id }),
+        ) {
+            Ok(f) => f,
+            Err(e) => {
+                return serde_json::json!({ "success": false, "error": format!("research report: status poll failed: {e}") });
+            }
+        };
+        if let Some(st) = frames
+            .iter()
+            .find(|f| f.get("t").and_then(|x| x.as_str()) == Some("AgentAskStatusOk"))
+        {
+            let state = st
+                .get("state")
+                .and_then(|x| x.as_str())
+                .unwrap_or("unknown");
+            if state == "answered" {
+                let choices: Vec<i64> = st
+                    .get("choices")
+                    .and_then(|c| c.as_array())
+                    .map(|a| a.iter().filter_map(|x| x.as_i64()).collect())
+                    .unwrap_or_default();
+                let text = st.get("text").and_then(|x| x.as_str()).unwrap_or("");
+                return research_report_reply(&choices, text);
+            }
+            if state == "unknown" {
+                return serde_json::json!({ "success": false, "error": "research report: no answer in time" });
+            }
+            // "pending" — keep polling
+        }
+        if std::time::Instant::now() >= deadline {
+            return serde_json::json!({ "success": false, "error": "research report: no answer in time" });
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2000));
+    }
+}
+
+/// Map a research_report card answer (selected choice indices + free
+/// text) to the result payload forge applies on the agent_research
+/// row. Pure, so the contract is unit-testable:
+///
+/// - choice 2 ("Ask more") with non-blank text → `ask_more` +
+///   `followup`: the text is re-injected into the research
+///   conversation and the task runs again;
+/// - free text WITHOUT any choice → `ask_more` (a bare typed reply
+///   means "dig further");
+/// - choice 0 ("Use") → `use` (the finding is adopted — the
+///   row leaves the open listing);
+/// - choice 1 ("Discard") → `discard`;
+/// - "Ask more" with blank text, or nothing at all → a failed relay
+///   (forge's handler treats that as "no answer"; the row stays
+///   `done`, still open).
+fn research_report_reply(choices: &[i64], text: &str) -> serde_json::Value {
+    let text = text.trim();
+    if choices.contains(&2) && !text.is_empty() {
+        return serde_json::json!({ "success": true, "output": { "action": "ask_more", "followup": text } });
+    }
+    if choices.is_empty() && !text.is_empty() {
+        return serde_json::json!({ "success": true, "output": { "action": "ask_more", "followup": text } });
+    }
+    if choices.contains(&0) {
+        return serde_json::json!({ "success": true, "output": { "action": "use" } });
+    }
+    if choices.contains(&1) {
+        return serde_json::json!({ "success": true, "output": { "action": "discard" } });
+    }
+    serde_json::json!({ "success": false, "error": "research report: no answer in time" })
+}
+
 /// One loopback control-API POST (`/agent/<route>`): the control API
 /// answers with a JSON array of frames; return it.
 fn ctl_post_frames(
@@ -755,6 +900,48 @@ fn relay_result_to_forge(cfg: &ForgeConfig, id: &str, reply: &serde_json::Value)
     } else {
         (true, reply.clone(), None)
     };
+    post_result_to_forge(cfg, id, success, output, error);
+}
+
+/// Relay a CARD-lane answer (H4.4 `memory_review`, H5.1
+/// `research_report`): the executor's reply is
+/// `{success, output: <the answer>, error}` and forge's apply handler
+/// reads the answer at the TOP LEVEL of the result body's `output`
+/// (`output.action`), so the relay flattens the inner `output` down —
+/// posting the whole reply would nest it one level too deep and
+/// forge would see no `action`.
+fn relay_card_result_to_forge(cfg: &ForgeConfig, id: &str, reply: &serde_json::Value) {
+    let (success, output, error) = if reply.get("success").and_then(|x| x.as_bool()) == Some(true) {
+        (
+            true,
+            reply
+                .get("output")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+            None,
+        )
+    } else {
+        (
+            false,
+            serde_json::Value::Null,
+            reply
+                .get("error")
+                .and_then(|x| x.as_str())
+                .map(str::to_string),
+        )
+    };
+    post_result_to_forge(cfg, id, success, output, error);
+}
+
+/// POST one `{success, output, error}` body to forge's
+/// `/ranch-tools/:id/result` door.
+fn post_result_to_forge(
+    cfg: &ForgeConfig,
+    id: &str,
+    success: bool,
+    output: serde_json::Value,
+    error: Option<String>,
+) {
     let body = serde_json::json!({ "success": success, "output": output, "error": error });
     let url = format!("{}/ranch-tools/{}/result", cfg.base, id);
     let res = ureq::post(&url)
@@ -1716,6 +1903,39 @@ mod tests {
         // Nothing selected, nothing typed → failed relay (the belief
         // stays pending on the forge side).
         let r = memory_review_reply(&[], "");
+        assert_eq!(r["success"], false);
+        assert!(r["error"].as_str().unwrap().contains("no answer in time"));
+    }
+
+    // ---------- research_report card answer → result payload (H5.1) ----------
+
+    #[test]
+    fn research_report_reply_maps_choices_to_actions() {
+        // Use (choice 0)
+        let r = research_report_reply(&[0], "");
+        assert_eq!(r["success"], true);
+        assert_eq!(r["output"]["action"], "use");
+        // Discard (choice 1)
+        let r = research_report_reply(&[1], "");
+        assert_eq!(r["output"]["action"], "discard");
+        // Ask more (choice 2) + the follow-up text
+        let r = research_report_reply(&[2], " dig deeper into the security model ");
+        assert_eq!(r["success"], true);
+        assert_eq!(r["output"]["action"], "ask_more");
+        assert_eq!(
+            r["output"]["followup"],
+            "dig deeper into the security model"
+        );
+        // Free text WITHOUT any choice is a follow-up ("dig further")
+        let r = research_report_reply(&[], "what about offline mode?");
+        assert_eq!(r["output"]["action"], "ask_more");
+        assert_eq!(r["output"]["followup"], "what about offline mode?");
+        // "Ask more" with blank text is NOT a follow-up → failed relay
+        let r = research_report_reply(&[2], "   ");
+        assert_eq!(r["success"], false);
+        // Nothing selected, nothing typed → failed relay (the row
+        // stays `done` on the forge side, still open).
+        let r = research_report_reply(&[], "");
         assert_eq!(r["success"], false);
         assert!(r["error"].as_str().unwrap().contains("no answer in time"));
     }
