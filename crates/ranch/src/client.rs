@@ -1071,6 +1071,129 @@ fn refresh_sessions(stream: &mut UnixStream) {
 /// Interactive session manager — plain `ranch` with a TTY. Lists sessions,
 /// create, kill, rename, and attach. Returns the session ref to attach to,
 /// or None to exit.
+/// Dashboard sections: the session list, the agent registry (Herd
+/// H1.3) and the Activity View (Herd H5.3). `Tab` cycles them.
+#[derive(Clone, Copy, PartialEq)]
+enum DashSection {
+    Sessions,
+    Agents,
+    Activity,
+}
+
+/// Group Activity View items by agent for the dashboard timeline
+/// (H5.3): one group per agent — items with no agent (the local
+/// ask/spawn/trigger/mule_job kinds) group under "local" — newest-
+/// first within a group; groups ordered by their most-recent item.
+/// Returns (group name, indices into `items`).
+fn activity_groups(items: &[ranch_protocol::ActivityItem]) -> Vec<(String, Vec<usize>)> {
+    let mut order: Vec<usize> = (0..items.len()).collect();
+    // RFC3339-UTC strings sort lexicographically; the stable sort keeps
+    // the poller's own order for equal timestamps
+    order.sort_by(|&a, &b| items[b].ts.cmp(&items[a].ts));
+    let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
+    for i in order {
+        let key = items[i].agent.clone().unwrap_or_else(|| "local".into());
+        match groups.iter_mut().find(|g| g.0 == key) {
+            Some(g) => g.1.push(i),
+            None => groups.push((key, vec![i])),
+        }
+    }
+    groups
+}
+
+/// One glyph per item kind — the H5.3 glyph map. All are single
+/// terminal-safe characters (the emoji ones render wide where the
+/// terminal supports them, narrow otherwise — same convention as the
+/// 🖼 image badges in chat panes).
+///
+/// 🧠 belief_pending · ✅ ask · 🔬 research_open · ⏰ wake ·
+/// ▸ forge_task · ⇄ mule_job · ⚡ trigger · ✚ spawn · · unknown
+fn activity_glyph(kind: &str) -> &'static str {
+    match kind {
+        "belief_pending" => "🧠",
+        "ask" => "✅",
+        "research_open" => "🔬",
+        "wake" => "⏰",
+        "forge_task" => "▸",
+        "mule_job" => "⇄",
+        "trigger" => "⚡",
+        "spawn" => "✚",
+        _ => "·",
+    }
+}
+
+/// "HH:MM" from an RFC3339 timestamp (`ActivityItem.ts`); empty when
+/// the shape doesn't match.
+fn activity_ts_hhmm(ts: &str) -> String {
+    let b = ts.as_bytes();
+    if b.len() >= 16 && b[10] == b'T' {
+        ts[11..16].to_string()
+    } else {
+        String::new()
+    }
+}
+
+/// The pause toggle (H5.3): the key pauses its target unless that
+/// exact target is the one we last confirmed paused (`paused_hint` —
+/// "herd" or an agent's registry name), in which case it resumes it.
+fn activity_pause_value(target: &str, paused_hint: Option<&str>) -> bool {
+    !paused_hint.is_some_and(|h| h == target)
+}
+
+/// One status line for an `AgentPauseOk` (H5.3): per-agent ok/failed
+/// counts + the first failure's detail.
+fn activity_pause_status(results: &[ranch_protocol::AgentPauseResult]) -> String {
+    if results.is_empty() {
+        return "pause: no agents known".into();
+    }
+    let failed = results.iter().filter(|r| r.error.is_some()).count();
+    let mut s = if failed == 0 {
+        format!("{} agent(s) ok", results.len())
+    } else {
+        format!("{} ok, {failed} failed", results.len() - failed)
+    };
+    if let Some(first) = results.iter().find(|r| r.error.is_some()) {
+        s.push_str(&format!(
+            " — {}: {}",
+            first.name,
+            first.error.as_deref().unwrap_or("unknown error")
+        ));
+    }
+    s
+}
+
+/// The Activity View deep-link (H5.3): item → frame. An item that
+/// references an agent (by registry name) opens that agent's most-
+/// active conversation — the same `AgentTalk "continue"` open path as
+/// the H1.3 talk-to-agent (name → id resolved from the cached
+/// registry). Local items (`agent: None`) have no cross-pane focus
+/// target in v1: they flash an explanation instead. (No "stop"/task-
+/// abort action in v1 — the forge abort surface is a follow-up.)
+fn activity_deep_link(
+    item: &ranch_protocol::ActivityItem,
+    agents: &[ranch_protocol::AgentInfo],
+) -> Result<Frame, String> {
+    let Some(name) = &item.agent else {
+        return Err(match item.kind.as_str() {
+            "ask" => "pending approval — answer it with :answer in the session it came from (v1: no cross-pane focus)".into(),
+            _ => "machine-local event — open it from the sessions list (v1: no agent to talk to)".into(),
+        });
+    };
+    match agents.iter().find(|a| a.name == *name) {
+        Some(a) => Ok(Frame::AgentTalk {
+            req_id: Uuid::new_v4().to_string(),
+            agent: a.id.clone(),
+            mode: "continue".into(),
+            text: None,
+            title: None,
+            fork_from: None,
+        }),
+        None => Err(format!(
+            "agent '{name}' not in the registry yet — retry in a moment"
+        )),
+    }
+}
+
 fn cmd_dashboard(agents_first: bool) -> Option<String> {
     crossterm::terminal::enable_raw_mode().ok();
     execute!(std::io::stdout(), EnterAlternateScreen).ok();
@@ -1091,8 +1214,21 @@ fn cmd_dashboard(agents_first: bool) -> Option<String> {
     // agent registry (Herd H1.3): the Agents section of the dashboard
     let mut agents: Vec<ranch_protocol::AgentInfo> = vec![];
     let mut agent_sel: usize = 0;
-    // which section the cursor is in: false = sessions, true = agents
-    let mut in_agents: bool = agents_first;
+    // which section the cursor is in (H5.3 adds the Activity View)
+    let mut section = if agents_first {
+        DashSection::Agents
+    } else {
+        DashSection::Sessions
+    };
+    // Activity View (H5.3): the latest `ActivityPush` item set (the
+    // poller's full set, most recent first) + the highlighted item
+    let mut activity: Vec<ranch_protocol::ActivityItem> = vec![];
+    let mut act_sel: usize = 0;
+    // pause state (H5.3): what we last confirmed — "herd" or an agent
+    // registry name (shown in the Activity header, so the user knows
+    // the key now RESUMEs); the in-flight request drives the toggle
+    let mut paused_hint: Option<String> = None;
+    let mut pause_pending: Option<(Option<String>, bool)> = None;
     let mut status = String::new();
     // version banner: the daemon may be older/newer than this binary —
     // hot upgrade realigns them; the header always shows the live version
@@ -1154,6 +1290,32 @@ fn cmd_dashboard(agents_first: bool) -> Option<String> {
                                 drop(term);
                                 return Some(session);
                             }
+                            // Activity View (H5.3): the poller's full
+                            // item set (most recent first) — replace the
+                            // timeline cache; the TUI never polls for it
+                            Frame::ActivityPush { items } => {
+                                activity = items;
+                                if act_sel >= activity.len() {
+                                    act_sel = activity.len().saturating_sub(1);
+                                }
+                            }
+                            // pause/resume result: flash the per-agent
+                            // ok/failed line
+                            Frame::AgentPauseOk { results, .. } => {
+                                status = format!("pause: {}", activity_pause_status(&results));
+                                // clean answer → set or clear the hint
+                                // (a failed leg leaves it unknown rather
+                                // than claiming a state)
+                                if results.iter().all(|r| r.error.is_none())
+                                    && let Some((target, paused)) = pause_pending.take()
+                                {
+                                    paused_hint = if paused {
+                                        Some(target.unwrap_or_else(|| "herd".into()))
+                                    } else {
+                                        None
+                                    };
+                                }
+                            }
                             Frame::Error { message, .. } => {
                                 status = format!("error: {message}");
                             }
@@ -1190,7 +1352,10 @@ fn cmd_dashboard(agents_first: bool) -> Option<String> {
         let input_text_ref = &input_text;
         let agents_ref = &agents;
         let agent_sel_ref = agent_sel;
-        let in_agents_ref = in_agents;
+        let section_ref = section;
+        let activity_ref = &activity;
+        let act_sel_ref = act_sel;
+        let paused_hint_ref = &paused_hint;
         let _ = term.draw(|f: &mut RFrame| {
             let area = f.area();
             let mut lines: Vec<Line> = Vec::new();
@@ -1243,10 +1408,10 @@ fn cmd_dashboard(agents_first: bool) -> Option<String> {
             }
             lines.push(Line::raw(""));
             // ----- agents section (Herd H1.3): forge agent registry -----
-            let agents_hdr = if in_agents_ref { "▶" } else { "  " };
+            let agents_hdr = if section_ref == DashSection::Agents { "▶" } else { "  " };
             lines.push(Line::from(Span::styled(
                 format!("{agents_hdr} agents"),
-                if in_agents_ref {
+                if section_ref == DashSection::Agents {
                     Style::default().add_modifier(Modifier::REVERSED)
                 } else {
                     Style::default().add_modifier(Modifier::DIM)
@@ -1260,7 +1425,7 @@ fn cmd_dashboard(agents_first: bool) -> Option<String> {
                 )));
             }
             for (i, a) in agents_ref.iter().enumerate() {
-                let cur = in_agents_ref && i == agent_sel_ref;
+                let cur = section_ref == DashSection::Agents && i == agent_sel_ref;
                 let style = if cur {
                     Style::default().add_modifier(Modifier::REVERSED)
                 } else {
@@ -1280,9 +1445,73 @@ fn cmd_dashboard(agents_first: bool) -> Option<String> {
                 )));
             }
             lines.push(Line::raw(""));
-            lines.push(Line::raw(
-                " enter: attach/talk   c: new   n: new (named)   a: new agent   p: new pi   x: kill   r: rename   tab: agents   q: quit",
-            ));
+            // ----- activity section (Herd H5.3): the herd's timeline -----
+            // grouped by agent (newest item's agent first), items
+            // newest-first; "local" = machine-wide items (the frame
+            // carries no agent identity for the local kinds)
+            let paused_tag = match paused_hint_ref {
+                Some(h) => format!("   · paused: {h}"),
+                None => String::new(),
+            };
+            let act_hdr = if section_ref == DashSection::Activity { "▶" } else { "  " };
+            lines.push(Line::from(Span::styled(
+                format!("{act_hdr} activity{paused_tag}"),
+                if section_ref == DashSection::Activity {
+                    Style::default().add_modifier(Modifier::REVERSED)
+                } else {
+                    Style::default().add_modifier(Modifier::DIM)
+                },
+            )));
+            if activity_ref.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "   No activity.".to_string(),
+                    Style::default().add_modifier(Modifier::DIM),
+                )));
+            } else {
+                let groups = activity_groups(activity_ref);
+                let mut off = 0usize;
+                for (name, idxs) in &groups {
+                    lines.push(Line::from(Span::styled(
+                        format!("   {name}"),
+                        Style::default()
+                            .add_modifier(Modifier::DIM)
+                            .add_modifier(Modifier::BOLD),
+                    )));
+                    for &i in idxs {
+                        let cur = section_ref == DashSection::Activity && off == act_sel_ref;
+                        off += 1;
+                        let it = &activity_ref[i];
+                        let marker = if cur { ">" } else { " " };
+                        let glyph = activity_glyph(&it.kind);
+                        let hhmm = activity_ts_hhmm(&it.ts);
+                        // char-count budget for "<marker>    <glyph> <HH:MM> "
+                        let prefix: usize =
+                            1 + 4 + glyph.chars().count() + 1 + hhmm.chars().count() + 1;
+                        let text =
+                            truncate_label(
+                                &it.text,
+                                area.width.saturating_sub(prefix as u16) as usize,
+                            );
+                        let when = if hhmm.is_empty() { String::new() } else { format!("{hhmm} ") };
+                        lines.push(Line::from(Span::styled(
+                            format!("{marker}    {glyph} {when}{text}"),
+                            if cur {
+                                Style::default().add_modifier(Modifier::REVERSED)
+                            } else {
+                                Style::default()
+                            },
+                        )));
+                    }
+                }
+            }
+            lines.push(Line::raw(""));
+            // context-aware key hints: p/P only mean pause in the
+            // Activity section (elsewhere p = new pi session)
+            let hint = match section_ref {
+                DashSection::Activity => " enter/o: open item   p: pause/resume herd   P: pause/resume agent   ↑↓: move   tab: next section   q: quit",
+                _ => " enter: attach/talk   c: new   n: new (named)   a: new agent   p: new pi   x: kill   r: rename   tab: next section   q: quit",
+            };
+            lines.push(Line::raw(hint));
             if !status_ref.is_empty() {
                 lines.push(Line::from(Span::styled(
                     status_ref.clone(),
@@ -1414,21 +1643,35 @@ fn cmd_dashboard(agents_first: bool) -> Option<String> {
                 KeyCode::Up | KeyCode::Char('k')
                     if !matches!(key.modifiers, KeyModifiers::CONTROL) =>
                 {
-                    if in_agents {
-                        agent_sel = agent_sel.saturating_sub(1);
-                    } else {
-                        sel = sel.saturating_sub(1);
+                    match section {
+                        DashSection::Agents => {
+                            agent_sel = agent_sel.saturating_sub(1);
+                        }
+                        DashSection::Activity => {
+                            act_sel = act_sel.saturating_sub(1);
+                        }
+                        DashSection::Sessions => {
+                            sel = sel.saturating_sub(1);
+                        }
                     }
                 }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    if in_agents {
+                KeyCode::Down | KeyCode::Char('j') => match section {
+                    DashSection::Agents => {
                         if agent_sel + 1 < agents.len() {
                             agent_sel += 1;
                         }
-                    } else if sel + 1 < sessions.len() {
-                        sel += 1;
                     }
-                }
+                    DashSection::Activity => {
+                        if act_sel + 1 < activity.len() {
+                            act_sel += 1;
+                        }
+                    }
+                    DashSection::Sessions => {
+                        if sel + 1 < sessions.len() {
+                            sel += 1;
+                        }
+                    }
+                },
                 KeyCode::Char('c') => {
                     let f = Frame::SessionsCreate {
                         req_id: Uuid::new_v4().to_string(),
@@ -1449,6 +1692,38 @@ fn cmd_dashboard(agents_first: bool) -> Option<String> {
                 KeyCode::Char('a') => {
                     input = Some("agent");
                     input_text.clear();
+                }
+                // pause keys (H5.3) — only in the Activity section,
+                // so `p` keeps meaning "new pi session" in the others.
+                // `p` targets the herd, `P` targets the highlighted
+                // item's agent; each toggles off its own paused hint
+                // (the header shows "· paused: herd|<agent>")
+                KeyCode::Char('p') if section == DashSection::Activity => {
+                    let paused = activity_pause_value("herd", paused_hint.as_deref());
+                    pause_pending = Some((None, paused));
+                    let f = Frame::AgentPause {
+                        req_id: Uuid::new_v4().to_string(),
+                        agent: None,
+                        paused,
+                    };
+                    send_frame(&mut stream, &f).ok();
+                }
+                KeyCode::Char('P') if section == DashSection::Activity => {
+                    match activity.get(act_sel).and_then(|it| it.agent.clone()) {
+                        Some(name) => {
+                            let paused = activity_pause_value(&name, paused_hint.as_deref());
+                            pause_pending = Some((Some(name.clone()), paused));
+                            let f = Frame::AgentPause {
+                                req_id: Uuid::new_v4().to_string(),
+                                agent: Some(name),
+                                paused,
+                            };
+                            send_frame(&mut stream, &f).ok();
+                        }
+                        None => {
+                            status = "machine-local item — no agent to pause".into();
+                        }
+                    }
                 }
                 KeyCode::Char('p') => {
                     input = Some("pi");
@@ -1493,8 +1768,23 @@ fn cmd_dashboard(agents_first: bool) -> Option<String> {
                         input_text.clear();
                     }
                 }
+                // Activity deep-link (H5.3): open the item's agent
+                // conversation (AgentTalk continue — AgentTalkOk
+                // handler attaches the pane); local items flash
+                // instead (no cross-pane focus in v1)
+                KeyCode::Enter | KeyCode::Char('o') if section == DashSection::Activity => {
+                    match activity.get(act_sel) {
+                        Some(it) => match activity_deep_link(it, &agents) {
+                            Ok(f) => {
+                                send_frame(&mut stream, &f).ok();
+                            }
+                            Err(msg) => status = msg,
+                        },
+                        None => status = "no activity item selected".into(),
+                    }
+                }
                 KeyCode::Enter => {
-                    if in_agents {
+                    if section == DashSection::Agents {
                         // talk: AgentTalk continue on the selected agent —
                         // AgentTalkOk handler attaches the pane
                         if let Some(a) = agents.get(agent_sel) {
@@ -1517,9 +1807,13 @@ fn cmd_dashboard(agents_first: bool) -> Option<String> {
                     }
                 }
                 KeyCode::Tab => {
-                    // switch sections: sessions <-> agents
-                    in_agents = !in_agents;
-                    if in_agents && agent_sel >= agents.len() {
+                    // cycle sections: sessions → agents → activity
+                    section = match section {
+                        DashSection::Sessions => DashSection::Agents,
+                        DashSection::Agents => DashSection::Activity,
+                        DashSection::Activity => DashSection::Sessions,
+                    };
+                    if section == DashSection::Agents && agent_sel >= agents.len() {
                         agent_sel = agents.len().saturating_sub(1);
                     }
                 }
@@ -6911,7 +7205,200 @@ pub fn main_client() {
 
 #[cfg(test)]
 mod tests {
-    use super::wrap_text;
+    use super::{
+        activity_deep_link, activity_glyph, activity_groups, activity_pause_status,
+        activity_pause_value, activity_ts_hhmm, truncate_label, wrap_text,
+    };
+    use ranch_protocol::{ActivityItem, AgentInfo, AgentPauseResult, Frame};
+
+    fn ai(id: &str, kind: &str, agent: Option<&str>, text: &str, ts: &str) -> ActivityItem {
+        ActivityItem {
+            id: id.into(),
+            kind: kind.into(),
+            agent: agent.map(str::to_string),
+            text: text.into(),
+            ts: ts.into(),
+        }
+    }
+
+    #[test]
+    fn activity_glyphs_cover_every_kind() {
+        assert_eq!(activity_glyph("belief_pending"), "🧠");
+        assert_eq!(activity_glyph("ask"), "✅");
+        assert_eq!(activity_glyph("research_open"), "🔬");
+        assert_eq!(activity_glyph("wake"), "⏰");
+        assert_eq!(activity_glyph("forge_task"), "▸");
+        assert_eq!(activity_glyph("mule_job"), "⇄");
+        assert_eq!(activity_glyph("trigger"), "⚡");
+        assert_eq!(activity_glyph("spawn"), "✚");
+        // unknown kinds fall back, never panic
+        assert_eq!(activity_glyph("brand_new_kind"), "·");
+    }
+
+    #[test]
+    fn activity_ts_hhmm_parses_and_falls_back() {
+        assert_eq!(activity_ts_hhmm("2026-10-06T14:03:22Z"), "14:03");
+        assert_eq!(activity_ts_hhmm("2026-10-06T00:09:00Z"), "00:09");
+        assert_eq!(activity_ts_hhmm("not-a-ts"), "");
+        assert_eq!(activity_ts_hhmm(""), "");
+    }
+
+    #[test]
+    fn activity_groups_by_agent_newest_first() {
+        let items = vec![
+            ai("1", "ask", None, "local ask", "2026-10-06T01:00:00Z"),
+            ai("2", "wake", Some("iris"), "wake a", "2026-10-06T03:00:00Z"),
+            ai("3", "ask", Some("iris"), "iris ask", "2026-10-06T02:00:00Z"),
+            ai(
+                "4",
+                "forge_task",
+                Some("bolt"),
+                "bolt task",
+                "2026-10-06T05:00:00Z",
+            ),
+            ai(
+                "5",
+                "mule_job",
+                Some("bolt"),
+                "bolt job",
+                "2026-10-06T04:00:00Z",
+            ),
+            ai(
+                "6",
+                "ask",
+                Some("iris"),
+                "oldest iris",
+                "2026-10-06T00:00:00Z",
+            ),
+        ];
+        let groups = activity_groups(&items);
+        // groups ordered by most-recent item: bolt (05:00), iris (03:00),
+        // local (01:00)
+        let names: Vec<&str> = groups.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, vec!["bolt", "iris", "local"]);
+        // newest-first within each group (indices into `items`, 0-based)
+        assert_eq!(groups[0].1, vec![3, 4]);
+        assert_eq!(groups[1].1, vec![1, 2, 5]);
+        assert_eq!(groups[2].1, vec![0]);
+    }
+
+    #[test]
+    fn activity_groups_empty() {
+        assert!(activity_groups(&[]).is_empty());
+    }
+
+    #[test]
+    fn activity_pause_toggles_per_target() {
+        // first press of either key pauses
+        assert!(activity_pause_value("herd", None));
+        assert!(activity_pause_value("iris", None));
+        // re-pressing the SAME confirmed target resumes…
+        assert!(!activity_pause_value("herd", Some("herd")));
+        assert!(!activity_pause_value("iris", Some("iris")));
+        // …but a DIFFERENT confirmed target still pauses
+        assert!(activity_pause_value("iris", Some("herd")));
+        assert!(activity_pause_value("herd", Some("bolt")));
+    }
+
+    #[test]
+    fn activity_pause_status_counts_and_first_error() {
+        assert_eq!(activity_pause_status(&[]), "pause: no agents known");
+        let ok = vec![
+            AgentPauseResult {
+                agent: "id-a".into(),
+                name: "iris".into(),
+                forge: Some(true),
+                mule: Some(0),
+                error: None,
+            },
+            AgentPauseResult {
+                agent: "id-b".into(),
+                name: "bolt".into(),
+                forge: Some(true),
+                mule: Some(3),
+                error: None,
+            },
+        ];
+        assert_eq!(activity_pause_status(&ok), "2 agent(s) ok");
+        let mixed = vec![
+            AgentPauseResult {
+                agent: "id-a".into(),
+                name: "iris".into(),
+                forge: Some(true),
+                mule: None,
+                error: None,
+            },
+            AgentPauseResult {
+                agent: "id-b".into(),
+                name: "bolt".into(),
+                forge: None,
+                mule: None,
+                error: Some("forge: HTTP 500".into()),
+            },
+        ];
+        assert_eq!(
+            activity_pause_status(&mixed),
+            "1 ok, 1 failed — bolt: forge: HTTP 500"
+        );
+    }
+
+    #[test]
+    fn activity_deep_link_agent_item_sends_agent_talk() {
+        let item = ai("w1", "wake", Some("iris"), "woke", "2026-10-06T03:00:00Z");
+        let agents = vec![AgentInfo {
+            id: "uuid-1".into(),
+            name: "iris".into(),
+            avatar_url: None,
+            home_machine: None,
+            last_active: None,
+            conversation_count: None,
+        }];
+        match activity_deep_link(&item, &agents).unwrap() {
+            Frame::AgentTalk { agent, mode, .. } => {
+                assert_eq!(agent, "uuid-1");
+                assert_eq!(mode, "continue");
+            }
+            other => panic!("expected AgentTalk, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn activity_deep_link_local_item_flashes_not_sends() {
+        let ask = ai("ask/1", "ask", None, "approve?", "2026-10-06T01:00:00Z");
+        let msg = activity_deep_link(&ask, &[]).unwrap_err();
+        assert!(msg.starts_with("pending approval —"), "got: {msg}");
+        let fire = ai(
+            "trigger/x",
+            "trigger",
+            None,
+            "fired",
+            "2026-10-06T01:00:00Z",
+        );
+        let msg = activity_deep_link(&fire, &[]).unwrap_err();
+        assert!(msg.starts_with("machine-local event"), "got: {msg}");
+    }
+
+    #[test]
+    fn activity_deep_link_unknown_agent_flashes() {
+        let item = ai(
+            "t1",
+            "forge_task",
+            Some("nobody"),
+            "task",
+            "2026-10-06T01:00:00Z",
+        );
+        let msg = activity_deep_link(&item, &[]).unwrap_err();
+        assert!(msg.contains("not in the registry"), "got: {msg}");
+    }
+
+    #[test]
+    fn activity_truncate_label_char_safe() {
+        // multibyte text is clipped on char boundaries, never panics
+        let long = "é".repeat(50);
+        let t = truncate_label(&long, 10);
+        assert!(t.chars().count() <= 10);
+        assert!(t.ends_with('…'));
+    }
 
     #[test]
     fn wrap_breaks_at_spaces_not_midword() {
