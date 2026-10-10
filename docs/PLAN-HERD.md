@@ -1682,7 +1682,7 @@ was deliberately deferred, and the decision that can still be re-opened.
 
 ### Owed acceptances (cannot run on this box — unblock commands)
 
-- **pgvector on forge's Postgres** — every memory DB test
+- **pgvector on forge's Postgres: DONE 2026-10-10** — `sudo pacman -S pgvector` (0.8.6) installed + `CREATE EXTENSION vector` on the scratch PG; the 11 previously-skipped H4 memory tests now run and pass. This exposed a real bug — pgvector ≥ 0.8 caps HNSW/IVFFlat at 2000 dims vs our 2560-dim embeddings; fixed in forge `9ebdbd47` (index fallback in migration 022: HNSW where allowed, else filtered sequential scan; full suite 332/332 green). 
   (H4.1/H4.4/H4.5/H4.6) ran under the documented skip contract.
   Unblock: `sudo pacman -S pgvector` on the forge host, then
   `cargo test -p forge-api --test memory_tests` (in `~/src/forge`).
