@@ -262,12 +262,16 @@ Rust workspace: edition 2024, stable toolchain (rustc 1.98 era).
 
 ## Conventions
 
-- CLI: `ranch <new|agent|pi|resume|ls|attach|kill|rename|split|switch|pause|unpause|upgrade|
+- CLI: `ranch <new|agent|agents|pi|resume|ls|attach|kill|rename|split|switch|pause|unpause|call|upgrade|
   daemon|register|login|config|machines|cloud> [args]`; `ranchd` argv0 =
   daemon. Plain `ranch` in a TTY opens the dashboard. Inside attach,
   `Ctrl-B` is the tmux-style prefix. `pause`/`unpause [AGENT]` are the
   H5.3 herd kill switch (`AgentPause` frame; no agent = all known
   agents — "unpause" because `resume` is the session-resume command).
+  `agents new` is the H6.5 specialist-dot provisioning wizard (forge
+  agent row + optional mule cron wake; the mobile ＋Agent form speaks
+  the `AgentProvision` frame — the daemon runs the same core,
+  `agents_new.rs::provision`).
 - tmux semantics are deliberate: `&`/`k` = window-kill, session-level kill
   is `:kill-session` / dashboard / phone long-press.
 - Config: `~/.config/ranch/daemon.toml` (0600: relay machine key, forge

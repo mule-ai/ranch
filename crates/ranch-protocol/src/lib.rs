@@ -1034,6 +1034,40 @@ pub enum Frame {
         req_id: String,
         results: Vec<AgentPauseResult>,
     },
+    // ----- H6.5 specialist-dot provisioning (client -> daemon) -----
+    /// Client -> daemon: provision a new agent (the `ranch agents new`
+    /// wizard, mobile-flavored). The daemon runs the same core the CLI
+    /// uses: POST /agents (forge) + optional POST /api/v1/wakes
+    /// (mule cron wake). The interactive prompts don't exist here —
+    /// the mobile form collects the fields.
+    AgentProvision {
+        req_id: String,
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        avatar: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        profile_id: Option<String>,
+        /// "agent" | "org" (forge ALLOWED_MEMORY_SCOPES)
+        memory_scope: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        org_id: Option<String>,
+        home_machine: String,
+        #[serde(default)]
+        tools_allowlist: Vec<String>,
+        /// 5-field cron expr ("07:00" is converted client-side)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wake_cron: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wake_prompt: Option<String>,
+    },
+    /// Daemon -> client: the agent row landed (+ optional wake).
+    AgentProvisionOk {
+        req_id: String,
+        agent_id: String,
+        agent_name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wake_id: Option<String>,
+    },
     // ----- triggers (Phase D) -----
     /// Client -> daemon: list trigger definitions + last runs.
     TriggerList {
@@ -2392,6 +2426,36 @@ mod tests {
                     mule: Some(3),
                     error: None,
                 }],
+            },
+            Frame::AgentProvision {
+                req_id: "r9".into(),
+                name: "Atlas".into(),
+                avatar: Some("https://x/a.png".into()),
+                profile_id: Some("p1".into()),
+                memory_scope: "org".into(),
+                org_id: Some("myorg".into()),
+                home_machine: "machine-42".into(),
+                tools_allowlist: vec!["bash".into()],
+                wake_cron: Some("0 7 * * *".into()),
+                wake_prompt: Some("Daily check-in for Atlas.".into()),
+            },
+            Frame::AgentProvision {
+                req_id: "r10".into(),
+                name: "Min".into(),
+                avatar: None,
+                profile_id: None,
+                memory_scope: "agent".into(),
+                org_id: None,
+                home_machine: "m1".into(),
+                tools_allowlist: vec![],
+                wake_cron: None,
+                wake_prompt: None,
+            },
+            Frame::AgentProvisionOk {
+                req_id: "r9".into(),
+                agent_id: "agent-1".into(),
+                agent_name: "Atlas".into(),
+                wake_id: Some("w-1".into()),
             },
         ];
         for f in frames {

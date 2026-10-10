@@ -79,6 +79,14 @@ class AgentsActivity : Activity() {
         // ---- forge agent registry ----
         agentList = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         root.addView(agentList)
+        // H6.5: the ＋Agent form (mobile twin of `ranch agents new`).
+        root.addView(Button(this).apply {
+            text = "＋ New agent"
+            setPadding(0, dp(6), 0, dp(6))
+            setOnClickListener {
+                startActivity(Intent(this@AgentsActivity, NewAgentActivity::class.java))
+            }
+        })
 
         // ---- divider: local pi manager ----
         root.addView(TextView(this).apply {
@@ -156,6 +164,11 @@ class AgentsActivity : Activity() {
                         .putExtra("sessionId", sid)
                         .putExtra("sessionName", pending.name))
                 }
+            }
+            "AgentProvisionOk" -> {
+                // The ＋Agent form reports on its own screen; here just
+                // refresh the registry so the new dot shows up.
+                relay?.send(Term.agentList())
             }
             "Error" -> {
                 val rid = f.optString("req_id")

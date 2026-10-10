@@ -1,3 +1,4 @@
+mod agents_new;
 mod client;
 mod daemon;
 mod forge;

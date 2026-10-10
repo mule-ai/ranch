@@ -91,3 +91,86 @@ launcher.
 2. Editing a profile's model changes new sessions; in-flight panes
    switch via the existing per-pane ModelSet.
 3. API key set once is never displayed again anywhere.
+
+## 7. Web-auth tool + specialist-dot provisioning (H6.5)
+
+An agent that needs a site login (billing, SaaS admin, …) must get
+the session credential **without the password ever reaching the
+model**. H6.5 ships that as a two-sided broker: the forge side mints
+the handoff, the ranch side owns the consent, and the secret store
+sits in between.
+
+### 7.1 The flow
+
+```
+model                     forge                          user's browser / ranch card
+  │ web_login(url, slot)      │
+  ├──────────────────────────►│ POST /sessions/:id/web-login
+  │                           │   → RanchToolQueue kind "web_login"
+  │                           │   → ranch_tool_request card {url, slot} ONLY
+  │                           │                        ┌──────────────────────► ranch clients
+  │                           │                        │ "Sign me in" / "Cancel" card
+  │                           │◄───────────────────────┤ POST /ranch-tools/:id/result
+  │                           │  (approval, 60 s TTL)  │
+  │                           │  mint one-time token (30 min, single-use)
+  │                           │  xdg-open GET /auth/browser-handoff?token=…&next=url
+  │  {status:"approved",      │   user: signs in to the site THEMSELVES,
+  │   handoff_url}            │   pastes the session cookie into the handoff page
+  │◄──────────────────────────┤   POST /auth/browser-handoff (token = credential;
+  │                           │   no API key) → secrets(owner, slot, value, valid_until)
+  │ web_login_done(slot)      │
+  ├──────────────────────────►│ GET /sessions/:id/web-login?slot=…
+  │ {status:"signed_in"}      │
+  │  → sandbox bash runs with $<slot> (resolve_credential_env at
+  │    exec time; expired/missing slot = fail-closed refusal naming
+  │    the slot, never the value)
+```
+
+### 7.2 The invariants (tested)
+
+- **No credential material crosses any boundary the model can read:**
+  the card payload is `{url, slot}`; the harness tool outputs are
+  status strings; the handoff URL is a one-time token, not the
+  secret. Grep audit: `tests/herd_h65_tests.rs` asserts the cookie
+  is absent from every `messages` row, card payload, and response
+  after a full round-trip. (harness: `test/web-login.test.ts`.)
+- **Fail-closed credentials:** `resolve_credential_env` (forge
+  `credentials.rs`) resolves the agent's
+  `credentials_scope.env_refs` against the `secrets` table at
+  tool-execution time — present / absent / expired are distinct
+  results, and the refusal message names the SLOT, never a value.
+  Values ride only the container env (`ContainerEnv.extra_env` →
+  nspawn `--setenv`), both the streaming and non-streaming bash
+  paths (single source of truth: `nspawn_args`).
+- **Consent is per-request:** the approval card IS the consent; a
+  crash-recovered rerun asks again (the tools are not replay-safe).
+
+### 7.3 Specialist-dot provisioning (`ranch agents new`)
+
+The wizard (CLI) and the mobile ＋Agent form (the `AgentProvision`
+frame) run the SAME core (`crates/ranch/src/agents_new.rs` →
+`provision()`): `POST /agents` (name, avatar, primary profile,
+memory scope + org label, home machine, tools allowlist) + optional
+mule cron wake (`target = {forge_conversation: {forge_url, api_key,
+agent_id}}` — the H3.3 wake shape; "07:00" → "0 7 * * *", the
+5-field standard cron the mule engine parses). The agent row always
+lands first; the wake is best-effort (mule unconfigured ⇒ skipped
+with a warning, never a failed request). Empty `home_machine` on the
+frame = the daemon's own relay machine id (the mobile form's "this
+machine"). The credential scope is deliberately NOT part of the
+request: slots are declared later via `PATCH /agents/:id
+(credentials_scope)` and filled through the §7.1 flow.
+
+### 7.4 v1 limits (documented, not bugs)
+
+- One handoff per approval; the token is single-use, 30 min. No
+  refresh loop: an expired slot means the user re-approves +
+  re-pastes.
+- The handoff page is served for ANY host header (the token IS the
+  credential): keep forge loopback- or tunnel-gated, as always.
+- Mobile form: raw profile id + "all tools" — the profile picker and
+  tools allowlist editing are the CLI/TUI's richer half; restrict
+  later via `PATCH /agents/:id`.
+- `xdg-open` is best-effort: on headless boxes the `handoff_url`
+  still comes back in the tool output so the model can relay it.
+

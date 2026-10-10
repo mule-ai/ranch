@@ -450,6 +450,18 @@ AgentAskAnswer { ask_id, choices: [index], text }
 AgentAskStatus { req_id, caller_pane, ask_id }
   → AgentAskStatusOk { req_id, ask_id, answered, choices: [index],
                        text, state: "pending"|"answered"|"expired"|"unknown" }
+
+// H6.5 web sign-in card (SHIPPED): the forge web_login broker uses the
+// SAME ranch_tool_request card lane as policy_ask. The card's `tool`
+// field is the kind: `"web_login"` with `input: {url, slot}` ONLY —
+// no credential material crosses the wire (the cookie is entered by
+// the USER into the browser handoff page, pasted into forge's
+// one-time-token exchange; the model's tool outputs are status
+// strings). Clients render it like any ask card: "Sign me in" /
+// "Cancel"; the answer rides the same queue back to forge's
+// `POST /ranch-tools/{id}/result`. The 60 s relay TTL
+// (RANCH_TOOL_TIMEOUT) covers the round-trip; expiry = "expired",
+// no token minted, browser not opened.
 ```
 
 PaneMeta gains `spawned_by: Option<String>` (pane badge). Completion
@@ -564,6 +576,21 @@ AgentPauseResult { agent, name, forge?, mule?, error? }
     // forge unconfigured); mule = wakes flipped (null = leg not
     // attempted: mule unconfigured); error = first failure detail
     // naming the leg that failed
+
+// H6.5 specialist-dot provisioning (shipped): the mobile ＋Agent form
+// AND `ranch agents new` (the CLI runs the same core in the foreground;
+// only the mobile half speaks frames). One request, two legs — the
+// agent row always lands first, the wake is best-effort.
+AgentProvision { req_id, name, avatar?, profile_id?,
+                 memory_scope: "agent"|"org", org_id?, home_machine,
+                 tools_allowlist: [string],   // empty = allow all
+                 wake_cron?, wake_prompt? }   // 5-field cron; "07:00"
+                                               // is converted client-side
+  → AgentProvisionOk { req_id, agent_id, agent_name, wake_id? }
+    // wake_id absent when no wake was requested OR the wake leg
+    // failed/skipped (mule unconfigured or rejected) — the agent row
+    // still landed; `Error` only for whole-request failures (bad name,
+    // forge down, no forge config)
 ```
 
 Semantics:
@@ -595,6 +622,20 @@ Semantics:
   { req_id }` when no targets resolve. Pausing an agent keeps its
   pending asks VISIBLE in the Activity View — pause halts new work, not
   observability (forge's agent reads stay open for a paused agent).
+- `AgentProvision` (H6.5 specialist-dot provisioning): the daemon runs
+  the shared core (`crates/ranch/src/agents_new.rs` — the same one
+  `ranch agents new` uses): `POST {forge}/agents` (the H1.1 row:
+  name, avatar, primary profile, memory scope + org label, home
+  machine, tools allowlist), then — when `wake_cron` is set —
+  `POST {mule}/api/v1/wakes` with `target =
+  {forge_conversation: {forge_url, api_key, agent_id}}` (the H3.3
+  wake shape). `home_machine` empty = the daemon's own relay machine
+  id (the mobile form's "this machine"). The credential scope is NOT
+  part of the request in v1: slots are declared later via
+  `PATCH /agents/:id` (`credentials_scope.env_refs`) and signed in
+  through the `web_login` card (forge mints the one-time handoff
+  token; the cookie lands in forge's `secrets` table, never in a
+  frame, card, or message row).
 - **Activity push** (`ActivityPush`, H5.3): the daemon's activity
   poller (a worker thread with its own pipe pair) recomputes the item
   set every 5 s — local pending asks / agent-spawned panes / recent

@@ -7140,10 +7140,13 @@ pub fn main_client() {
             return;
         }
         eprintln!(
-            "usage: ranch <new|agent|pi|resume|ls|attach|kill|rename|split|switch|pause|unpause|call|register|login|machines|cloud> [args]"
+            "usage: ranch <new|agent|agents|pi|resume|ls|attach|kill|rename|split|switch|pause|unpause|call|register|login|machines|cloud> [args]"
         );
         eprintln!(
             "  agent [name] [msg…]   talk to a forge agent (Herd) — no args = dashboard Agents section"
+        );
+        eprintln!(
+            "  agents new         provision a specialist dot (H6.5 wizard: profile, tools, memory, wake)"
         );
         eprintln!("  call <agent>         push-to-talk voice call (H6.3) — typed text in, TTS out");
         eprintln!("  pause|unpause [AGENT] H5.3 kill switch — no agent = every known agent");
@@ -7184,6 +7187,9 @@ pub fn main_client() {
         // (AgentTalk continue + first message); --new = legacy fresh
         // forge agent session (the old `ranch agent [name] [dir]` form)
         "agent" => cmd_agent(&args[1..]),
+        // ranch agents new — Herd H6.5 specialist-dot provisioning
+        // wizard (forge agent row + optional mule cron wake).
+        "agents" => crate::agents_new::run(args.get(1).cloned()),
         "ls" | "list" => cmd_ls(),
         "--version" | "version" => {
             println!("ranch {}", crate::daemon::build_version());

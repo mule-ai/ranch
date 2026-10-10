@@ -136,6 +136,33 @@ object Term {
         JSONObject().put("t", "AgentTalk").put("id", newId()).put("client", CLIENT)
             .put("req_id", reqId).put("agent", agent).put("mode", mode)
 
+    /** H6.5: the mobile ＋Agent form → daemon (the `ranch agents new`
+     *  wizard's frame twin). Blank fields are omitted; `home_machine`
+     *  empty = the daemon defaults to its own relay machine id. */
+    fun agentProvision(
+        name: String,
+        avatar: String = "",
+        memoryScope: String = "agent",
+        orgId: String = "",
+        homeMachine: String = "",
+        profileId: String = "",
+        wakeCron: String = "",
+        wakePrompt: String = "",
+    ): JSONObject =
+        JSONObject()
+            .put("t", "AgentProvision").put("req_id", "apv-" + newId())
+            .put("name", name)
+            .put("memory_scope", memoryScope)
+            .put("home_machine", homeMachine)
+            .put("tools_allowlist", org.json.JSONArray())
+            .apply {
+                if (avatar.isNotEmpty()) put("avatar", avatar)
+                if (orgId.isNotEmpty()) put("org_id", orgId)
+                if (profileId.isNotEmpty()) put("profile_id", profileId)
+                if (wakeCron.isNotEmpty()) put("wake_cron", wakeCron)
+                if (wakePrompt.isNotEmpty()) put("wake_prompt", wakePrompt)
+            }
+
     fun agentBusy(agent: String, reqId: String = "ab-" + newId()): JSONObject =
         JSONObject().put("t", "AgentBusy").put("id", newId()).put("client", CLIENT)
             .put("req_id", reqId).put("agent", agent)

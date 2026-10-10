@@ -569,3 +569,49 @@ re-broadcast; Monitor tracks pendingAsks and the home session rows
 show "❓ <question>". NOTE: fixes apply per-machine after `ranch
 upgrade` — the stalled "ranch on mini" daemon needs upgrading.
 v0.7.7 / versionCode 21.
+
+## H6.5: specialist-dot provisioning + web_login broker (2026-10-10)
+
+The Herd's provisioning UX + the web-auth tool. Two halves:
+
+**Forge** (`3a943d6f`): the secret-store seam — `secrets` table
+(migration 027, named-slab; values never serialize anywhere: the
+`/secrets` API lists names+expiry only) + `agents.org_id` (the
+wizard's memory-org label). `credentials.rs::resolve_credential_env`
+resolves the agent's `credentials_scope.env_refs` at tool-execution
+time (present/absent/expired, fail-closed, slot names only in
+errors) and both bash paths (streaming + non-streaming) ride the
+values on the container env only (`ContainerEnv.extra_env` →
+`--setenv=`). The web_login broker: harness `web_login(url, slot)` →
+`POST /sessions/:id/web-login` → `ranch_tool_request` card
+(`{url, slot}` ONLY, "Sign me in"/"Cancel") → approval mints a
+one-time handoff token (30 min, single-use) → xdg-opens
+`/auth/browser-handoff` in the user's own browser → the user signs
+in themselves and pastes the cookie (token = credential, no API
+key) → the value lands in `secrets`; `web_login_done(slot)` probes
+status. The model sees STATUS STRINGS ONLY — grep-audit test asserts
+the cookie is absent from every messages row, card payload, and
+response. Harness gains `web_login`/`web_login_done` in-process
+tools (agent sessions; CLIENT.md).
+
+**Ranch** (this commit): `ranch agents new` — the wizard
+(`agents_new.rs`; line prompts, profile picker from
+`GET /profiles`, tools allowlist, memory scope, home machine,
+default wake "07:00" → "0 7 * * *"), and the mobile ＋Agent form
+(`NewAgentActivity.kt` + the `AgentProvision`/`AgentProvisionOk`
+frames — the daemon runs the SAME core, `provision()`: POST
+/agents + best-effort mule cron wake,
+`target={forge_conversation:{forge_url, api_key, agent_id}}`).
+The daemon's card lane gained the `web_login` kind: an AgentAsk
+"Sign me in / Cancel" round-trip (shared `agent_ask_round_trip`
+helper, refactored out of the H3.5 policy lane) posted back to
+`/ranch-tools/:id/result`. Docs: `agent-builder.md` §7 (flow +
+invariants + v1 limits), PROTOCOL.md (the `web_login` card kind +
+the AgentProvision family), AGENTS.md CLI line. Gates: forge 24
+test targets + clippy/fmt + harness 63/63; ranch-2 104 tests +
+clippy 0 + fmt; mobile `assembleRelease` BUILD SUCCESSFUL.
+
+**Owed**: the plan's 24-h proactive-turn acceptance needs a real
+machine with forge+mule running (no live run here); the mobile form
+is raw-profile-id + all-tools in v1 (the CLI wizard is the richer
+half).

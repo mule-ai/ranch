@@ -5114,6 +5114,81 @@ impl Daemon {
             } => {
                 self.handle_agent_pause(from, req_id, agent.as_deref(), *paused);
             }
+            // H6.5 specialist-dot provisioning (mobile's ＋Agent form
+            // speaks this frame; the CLI wizard runs the same core in
+            // the foreground). Blocking sync-localhost HTTP, the
+            // AgentTalk pattern.
+            Frame::AgentProvision {
+                req_id,
+                name,
+                avatar,
+                profile_id,
+                memory_scope,
+                org_id,
+                home_machine,
+                tools_allowlist,
+                wake_cron,
+                wake_prompt,
+            } => {
+                let home_machine = if home_machine.trim().is_empty() {
+                    // "blank = this machine" (the mobile form): the
+                    // daemon's own relay machine id.
+                    relay::load_config()
+                        .map(|r| r.machine_id)
+                        .unwrap_or_default()
+                } else {
+                    home_machine.clone()
+                };
+                let req = crate::agents_new::ProvisionRequest {
+                    name: name.clone(),
+                    avatar: avatar.clone(),
+                    profile_id: profile_id.clone(),
+                    memory_scope: memory_scope.clone(),
+                    org_id: org_id.clone(),
+                    home_machine,
+                    tools_allowlist: tools_allowlist.clone(),
+                    wake_cron: wake_cron.clone(),
+                    wake_prompt: wake_prompt.clone(),
+                };
+                let forge_cfg = forge::load_forge_config();
+                let mule_cfg = self.mule_cfg.clone();
+                let outcome = match forge_cfg {
+                    None => Err(
+                        "no forge config (set forge_api_key in ~/.config/ranch/daemon.toml)"
+                            .to_string(),
+                    ),
+                    Some(cfg) => crate::agents_new::provision(&cfg, mule_cfg.as_ref(), &req),
+                };
+                match outcome {
+                    Ok(o) => {
+                        if let Some(e) = &o.wake_error {
+                            eprintln!("ranchd: agent provision: {e}");
+                        }
+                        if let Some(c) = self.clients.get_mut(&from) {
+                            send_frame(
+                                c,
+                                &Frame::AgentProvisionOk {
+                                    req_id: req_id.clone(),
+                                    agent_id: o.agent_id,
+                                    agent_name: o.agent_name,
+                                    wake_id: o.wake_id,
+                                },
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        if let Some(c) = self.clients.get_mut(&from) {
+                            send_frame(
+                                c,
+                                &Frame::Error {
+                                    req_id: Some(req_id.clone()),
+                                    message: e,
+                                },
+                            );
+                        }
+                    }
+                }
+            }
             Frame::AgentTalk {
                 req_id,
                 agent,

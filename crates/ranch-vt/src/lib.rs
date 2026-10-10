@@ -407,11 +407,27 @@ mod tests {
         );
     }
 
+    /// The dev-local capture artifact (bash/starship PTY, recorded on
+    /// the author's machine into /tmp). Absent elsewhere — skip
+    /// gracefully instead of failing `cargo test` on clean machines.
+    fn read_capture_or_skip() -> Option<Vec<u8>> {
+        match std::fs::read("/tmp/pty-capture.bin") {
+            Ok(d) => Some(d),
+            Err(_) => {
+                eprintln!("SKIP: /tmp/pty-capture.bin not present (dev-local artifact)");
+                None
+            }
+        }
+    }
+
     /// Replay the exact bytes the daemon captured from a real bash/starship
     /// PTY (/tmp/pty-capture.bin) — reproduces the stale-formatter bug.
     #[test]
     fn replay_real_pty_capture() {
-        let data = std::fs::read("/tmp/pty-capture.bin").expect("capture file");
+        let data = match read_capture_or_skip() {
+            Some(d) => d,
+            None => return,
+        };
         let vt = Vt::new(80, 24).unwrap();
         vt.write(&data);
         let screen = vt.screen();
@@ -430,7 +446,10 @@ mod tests {
     /// screen() calls (the daemon formats on every dirty tick).
     #[test]
     fn replay_in_daemon_batches() {
-        let data = std::fs::read("/tmp/pty-capture.bin").expect("capture file");
+        let data = match read_capture_or_skip() {
+            Some(d) => d,
+            None => return,
+        };
         let vt = Vt::new(80, 24).unwrap();
         // daemon trace batches: 32, 123, 53, 231, 32, 123, 11, 32, 123
         let bounds = [32usize, 155, 208, 439, 471, 594];

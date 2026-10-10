@@ -52,6 +52,18 @@ fire while the phone is in a drawer.
   machine, forge down) flash the status line — never crash. The
   pre-H1.4 **local pi manager** (PiList/PiMonitor/adopt) is kept as a
   second section under a "Local pi sessions" divider.
+- **＋ New agent (H6.5)** — `NewAgentActivity`, opened from the
+  **＋ New agent** button at the top of the Agents screen: the mobile
+  twin of `ranch agents new`. Collects name / avatar / memory scope
+  (agent|org + org label) / home machine (blank = this machine) /
+  profile id / wake time ("HH:MM" or a 5-field cron) / wake prompt,
+  and sends `AgentProvision` — the daemon runs the same provisioning
+  core as the CLI wizard (forge `POST /agents` + best-effort mule
+  cron wake). `AgentProvisionOk` flashes green + the registry screen
+  refreshes; `Error` (rid `apv-`) flashes the form, never crashes.
+  Credential slots are deliberately not part of the form: declare
+  them later via `PATCH /agents/:id` and sign in through the agent's
+  `web_login` card.
 - **Activity screen** — `HerdActivity`: the H5.3 Activity View (the
   herd's live timeline, mirroring the TUI's Activity section). Data is
   push-only: the daemon's activity poller broadcasts `ActivityPush`
