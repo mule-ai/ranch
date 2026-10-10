@@ -107,6 +107,12 @@ class SettingsActivity : Activity() {
         root.addView(buildConfigField("Forge STT base URL", Voice.PKEY_FORGE_BASE,
             "e.g. http://your-machine:PORT (the forge API server)"))
         root.addView(buildConfigField("Forge API key", Voice.PKEY_FORGE_KEY, "forge API key", true))
+        // H6.3 voice call (📞 on an agent row): the phone dials the
+        // mule voice_call workflow directly — mule base URL + API key
+        // (the same pair as daemon.toml's mule_url/mule_api_key).
+        root.addView(buildConfigField("Mule base URL", CallActivity.PKEY_MULE_BASE,
+            "e.g. http://your-machine:8080 (the mule API server)"))
+        root.addView(buildConfigField("Mule API key", CallActivity.PKEY_MULE_KEY, "mule API key", true))
         root.addView(TextView(this).apply {
             text = "forge STT (default): hold the mic in a chat, release to transcribe via " +
                 "forge's /v1/audio/transcriptions proxy (Parakeet). Needs the base URL + key " +

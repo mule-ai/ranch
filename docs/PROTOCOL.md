@@ -611,3 +611,26 @@ Semantics:
   Down/misconfigured forge or mule degrade their feed to empty with a
   one-time warning; the loop never stalls.
 
+### 8.7 Voice loop (Herd H6.3) — no new frames
+
+The H6.3 voice loop ("call") adds **zero wire frames**. The call
+media path bypasses the daemon on purpose: `ranch call <agent>` (CLI) and
+the mobile call screen create the mule job over the mule jobs API
+(base + key from the same `daemon.toml` mule config the daemon reads) and
+then speak mule's per-call WebSockets directly —
+`ws://mule/voice/{job}/in` (binary 16 kHz mono s16le PCM ~30 ms frames;
+text `{"hangup":true}` hangs up, `{"text": …}` is the typed-utterance
+fallback; socket close = hang-up) and `ws://mule/voice/{job}/out`
+(binary TTS PCM chunks at the step's `tts_sample_rate`, default 24 kHz;
+text `{"assistant": …}` per-turn transcript, `{"done":true}` = ended).
+Routing through ranchd would put the media path on the single local
+socket the whole pane system shares and would require the daemon to
+relay bidirectional audio between two foreign servers — pure added
+latency and failure surface for no feature; mule owns the VAD/STT/steer/TTS
+state machine (a `voice_call` workflow step), so it is the natural call
+terminator. Job lifecycle is observable through the existing
+Activity View (`mule_job` items) and the mule jobs API — no push frames
+needed. If a later phase wants daemon-mediated call control (e.g. the
+daemon dialing an outbound call on a trigger), that is a new frame
+family and must land here first.
+

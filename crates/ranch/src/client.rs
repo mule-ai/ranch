@@ -172,12 +172,25 @@ fn one_shot<F: FnOnce(&str) -> Frame>(
     let mut buf = [0u8; 65536];
     // A response must arrive or the daemon is broken/out of date —
     // never sit on a silent socket forever (e.g. a daemon binary from
-    // before this frame family exists drops the request unlogged).
-    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(30)));
+    // before this frame family exists drops the request unlogged). The
+    // read timeout surfaces as WouldBlock, so enforce the deadline
+    // explicitly rather than trusting a single read to fail.
+    const POLL: std::time::Duration = std::time::Duration::from_millis(100);
+    const DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+    let started = std::time::Instant::now();
+    let _ = stream.set_read_timeout(Some(POLL));
     loop {
         let n = match stream.read(&mut buf) {
             Ok(n) => n,
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if started.elapsed() >= DEADLINE {
+                    die(&format!(
+                        "timed out waiting for a {expect} response — the daemon \
+                         may be out of date (it dropped the request)"
+                    ));
+                }
+                continue;
+            }
             Err(_) => die("daemon closed the connection"),
         };
         if n == 0 {
@@ -271,7 +284,7 @@ fn cmd_pause_resume(paused: bool, agent: Option<String>) {
 // ---------- agent registry (Herd H1.3) ----------
 
 /// List the agents registered in forge (AgentList → AgentListOk).
-fn agent_list() -> Result<Vec<ranch_protocol::AgentInfo>, String> {
+pub(crate) fn agent_list() -> Result<Vec<ranch_protocol::AgentInfo>, String> {
     let f = one_shot(
         |req_id| Frame::AgentList {
             req_id: req_id.to_string(),
@@ -7127,11 +7140,12 @@ pub fn main_client() {
             return;
         }
         eprintln!(
-            "usage: ranch <new|agent|pi|resume|ls|attach|kill|rename|split|switch|pause|unpause|register|login|machines|cloud> [args]"
+            "usage: ranch <new|agent|pi|resume|ls|attach|kill|rename|split|switch|pause|unpause|call|register|login|machines|cloud> [args]"
         );
         eprintln!(
             "  agent [name] [msg…]   talk to a forge agent (Herd) — no args = dashboard Agents section"
         );
+        eprintln!("  call <agent>         push-to-talk voice call (H6.3) — typed text in, TTS out");
         eprintln!("  pause|unpause [AGENT] H5.3 kill switch — no agent = every known agent");
         eprintln!("  agent --new [name]    legacy: fresh forge agent session in cwd");
         eprintln!("  (run plain `ranch` in a terminal for the interactive session manager)");
@@ -7199,6 +7213,10 @@ pub fn main_client() {
         // forge-session resume command, so the inverse is "unpause".)
         "pause" => cmd_pause_resume(true, args.get(1).cloned()),
         "unpause" => cmd_pause_resume(false, args.get(1).cloned()),
+        // ranch call <agent> — Herd H6.3 voice loop v1: audio flows
+        // host ⇄ mule directly (job create + two voice WebSockets);
+        // typed-text in / aplay out fallbacks keep TUI parity.
+        "call" => crate::voicecall::run(args.get(1).cloned()),
         other => die(&format!("unknown command {other:?}")),
     }
 }

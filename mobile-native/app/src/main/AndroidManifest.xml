@@ -43,6 +43,7 @@
         </activity>
 
         <activity android:name=".AgentsActivity" android:exported="false" android:configChanges="orientation|screenSize" />
+        <activity android:name=".CallActivity" android:exported="false" android:configChanges="orientation|screenSize" android:screenOrientation="portrait" />
         <activity android:name=".HerdActivity" android:exported="false" android:configChanges="orientation|screenSize" />
         <activity android:name=".NotifyAgentsActivity" android:exported="false" android:configChanges="orientation|screenSize" />
         <activity android:name=".EditorActivity" android:exported="false" android:windowSoftInputMode="adjustResize" android:configChanges="orientation|screenSize" />

@@ -42,7 +42,7 @@ pub mod control_api;
 #[path = "media.rs"]
 pub(crate) mod media;
 #[path = "mule.rs"]
-mod mule;
+pub(crate) mod mule;
 #[path = "triggers.rs"]
 mod triggers;
 

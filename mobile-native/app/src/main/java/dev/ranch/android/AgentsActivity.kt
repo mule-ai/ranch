@@ -236,6 +236,21 @@ class AgentsActivity : Activity() {
             })
         }
         row.addView(mid, LinearLayout.LayoutParams(0, 0, 1f))
+        // H6.3: the 📞 button opens the voice call (CallActivity dials
+        // mule's voice_call workflow directly — no ranch frames, no
+        // daemon in the media path). Mule config lives in Settings
+        // (next to the H6.2 forge fields).
+        row.addView(Button(this).apply {
+            text = "📞"
+            minWidth = 0
+            minimumWidth = 0
+            setPadding(dp(6), 0, dp(6), 0)
+            setOnClickListener {
+                startActivity(Intent(this@AgentsActivity, CallActivity::class.java)
+                    .putExtra(CallActivity.EXTRA_AGENT_ID, a.id)
+                    .putExtra(CallActivity.EXTRA_AGENT_NAME, a.name))
+            }
+        })
         val dot = TextView(this).apply {
             text = "○"; setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
             setTextColor(0xFF4b5563.toInt())

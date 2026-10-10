@@ -3,6 +3,7 @@ mod daemon;
 mod forge;
 mod pilocal;
 mod relay;
+mod voicecall;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
