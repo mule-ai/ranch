@@ -151,6 +151,32 @@ fire while the phone is in a drawer.
       back to the recognizer once. forge-stt misconfig/5xx (e.g. forge's
       503 "speech-to-text is disabled" / 502 "Parakeet STT backend
       unreachable") flash the status line — never a crash (M8.4 rule).
+  - **Voice call (H6.3)** — a 📞 button on every row of the Agents screen
+    (`CallActivity`): a push-to-talk *call* with the agent, orchestrated
+    by a mule `voice_call` workflow. The phone dials **mule directly**
+    (same transport decision as `ranch call` — no ranch frames, the
+    daemon is out of the media path; see PROTOCOL.md §8.7):
+    - **Setup**: Settings & tools → *Voice input* gains **Mule base URL +
+      API key** (the same pair as `daemon.toml`'s `mule_url`/`mule_api_key`).
+      With those, 📞 looks up the agent's `voice_call` workflow
+      (`GET /api/v1/workflows` + its steps, matching `config.agent_id`),
+      starts the job (`POST /api/v1/jobs`), and opens two WebSockets.
+    - **Audio in**: `AudioRecord` 16 kHz mono s16le, 30 ms binary frames
+      → `ws {mule}/voice/{job}/in`. If the mic permission is denied, a
+      typed-text row appears instead (one line = `{"text":…}` utterance
+      frame, no STT hop; "bye" hangs up).
+    - **Audio out**: `ws {mule}/voice/{job}/out` binary TTS PCM →
+      `AudioTrack` (sample rate from the step's `tts_sample_rate`,
+      default 24 kHz — the out socket carries no rate metadata); the
+      `{"assistant":…}` text frames append to the on-screen transcript
+      (so a call still works with no speaker); `{"done":true}` = ended.
+    - **Barge-in v1** needs nothing here: mule's in-socket VAD triggers
+      on your voice while the TTS plays; the screen just keeps capturing.
+    - **Hang-up**: the Hang up / back button sends `{"hangup":true}` and
+      closes both sockets; mule also treats a closed in socket as a
+      hang-up. A mule-side crash shows "call dropped" in the transcript
+      (the conversation itself is intact — turns commit as they land).
+    - No new permission: `RECORD_AUDIO` was already declared by H6.2.
 
 ## Build
 
