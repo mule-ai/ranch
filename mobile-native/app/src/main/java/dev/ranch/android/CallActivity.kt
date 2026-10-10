@@ -31,9 +31,11 @@ import okhttp3.WebSocketListener
 import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.sqrt
 
 /**
- * H6.3 — voice loop v1 (the "call" screen, the 📞 button on an agent row).
+ * H6.3/H6.4 — voice loop v1 + full-duplex barge-in v2 (the "call" screen,
+ * the 📞 button on an agent row).
  *
  * The phone talks to MULE directly — the same transport decision as
  * `ranch call` (PROTOCOL.md §8.7: no ranch frames, the daemon is out of
@@ -53,8 +55,22 @@ import java.util.concurrent.atomic.AtomicBoolean
  *     the config); text `{"assistant": …}` appends to the transcript;
  *     `{"done":true}` = the call ended.
  *
- * Barge-in needs nothing here: mule's orchestrator VAD triggers on your
- * voice while the TTS is playing; this screen just keeps capturing.
+ * H6.4 v2 — the two full-duplex pieces this screen owns:
+ *
+ *  - **Flush control.** On a barge-in (you start talking while the
+ *    agent's TTS is playing), mule drains its out-queue and sends
+ *    `{"flush":true}` on the out socket. The [AudioTrack] still holds
+ *    queued PCM beyond mule's knowledge, so this screen stops + flushes
+ *    + restarts the track immediately (stop-to-silence on the phone is
+ *    the client-side half of mule's <150 ms barge-in budget; mule-side
+ *    stop-to-drain is asserted in its unit tests).
+ *  - **Echo guard.** While the local mic is hot (the user is speaking),
+ *    the out-channel gain is zeroed (`AudioTrack.setVolume(0f)`) so the
+ *    phone speaker can't ring the user's own voice back into the mic —
+ *    the speakerphone feedback loop. Hysteresis: a few consecutive hot
+ *    frames mute, the trailing silence (a few cold frames) restores.
+ *    The RMS thresholds sit just under mule's barge-in floor, so the
+ *    guard is hot exactly when mule would trigger a barge-in.
  *
  * Hang-up: the 📞-hangup button or the back button sends the hang-up
  * frame and closes both sockets; mule treats a closed in socket as a
@@ -71,6 +87,15 @@ class CallActivity : Activity() {
         private const val FRAME_BYTES = 960 // 30 ms @ 16 kHz s16le mono
         private const val DEFAULT_TTS_RATE = 24_000
         private const val REQ_MIC = 7
+        // Echo guard (H6.4): mute the TTS while the local mic is hot.
+        // Mule's barge-in floor is RMS 600 @ 16 kHz; the guard sits just
+        // under it so the out-channel is already silent when mule
+        // triggers, and hysteresis (hot/cold gap + streaks) stops the
+        // gain flickering on breathy speech.
+        private const val MIC_HOT_RMS = 400.0
+        private const val MIC_COLD_RMS = 200.0
+        private const val HOT_STREAK_MUTE = 3 // 3 frames ≈ 90 ms of speech
+        private const val COLD_STREAK_UNMUTE = 8 // 8 frames ≈ 240 ms trailing silence
     }
 
     private val app get() = application as App
@@ -372,6 +397,23 @@ class CallActivity : Activity() {
                     onCallEnded("call ended")
                     return
                 }
+                if (o.optBoolean("flush", false)) {
+                    // H6.4 barge-in: mule drained its out-queue; drop the
+                    // phone's playback buffer too (the AudioTrack holds
+                    // queued PCM beyond mule's knowledge). stop() halts
+                    // the stream, flush() clears the queued PCM, play()
+                    // restarts so the next TTS chunk flows.
+                    val p = player
+                    if (p != null) try {
+                        p.stop()
+                        p.flush()
+                        p.play()
+                    } catch (_: Exception) {
+                        // track already dead — new writes will fail and
+                        // be dropped, the transcript keeps working
+                    }
+                    return
+                }
                 val a = o.optString("assistant", "")
                 if (a.isNotEmpty()) appendTranscript("agent: $a")
             }
@@ -424,6 +466,9 @@ class CallActivity : Activity() {
             rec.startRecording()
             val buf = ByteArray(FRAME_BYTES)
             val ws = inWs
+            var hotStreak = 0
+            var coldStreak = 0
+            var muted = false
             while (recRunning.get()) {
                 val n = rec.read(buf, 0, buf.size)
                 if (n <= 0) continue
@@ -431,6 +476,26 @@ class CallActivity : Activity() {
                 ws?.send(ByteString.of(*buf.copyOf(n))) ?: run {
                     onCallDropped("in socket gone")
                     break
+                }
+                // Echo guard (H6.4): zero the out-channel gain while the
+                // user is speaking so the speaker can't feed their own
+                // voice back into the mic. Capture-thread only; the
+                // AudioTrack volume is safe to set from any thread.
+                val rms = frameRms(buf, n)
+                when {
+                    rms >= MIC_HOT_RMS -> { hotStreak++; coldStreak = 0 }
+                    rms < MIC_COLD_RMS -> { coldStreak++; hotStreak = 0 }
+                    else -> { hotStreak = 0; coldStreak = 0 }
+                }
+                val p = player
+                if (p != null) {
+                    if (!muted && hotStreak >= HOT_STREAK_MUTE) {
+                        muted = true
+                        try { p.setVolume(0f) } catch (_: Exception) {}
+                    } else if (muted && coldStreak >= COLD_STREAK_UNMUTE) {
+                        muted = false
+                        try { p.setVolume(1f) } catch (_: Exception) {}
+                    }
                 }
             }
             rec.stop()
@@ -441,6 +506,19 @@ class CallActivity : Activity() {
 
     private fun stopRecorder() {
         recRunning.set(false)
+    }
+
+    /** RMS of an s16le PCM frame (the same 0..32767 scale mule's VAD uses). */
+    private fun frameRms(buf: ByteArray, n: Int): Float {
+        var sumSq = 0.0
+        var i = 0
+        while (i + 1 < n) {
+            val v = (buf[i].toInt() and 0xFF) or (buf[i + 1].toInt() shl 8)
+            sumSq += v.toDouble() * v
+            i += 2
+        }
+        val c = n / 2
+        return if (c == 0) 0f else sqrt(sumSq / c).toInt().toFloat()
     }
 
     private fun typedMode(reason: String) {
