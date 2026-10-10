@@ -1703,16 +1703,7 @@ was deliberately deferred, and the decision that can still be re-opened.
   mid-sentence barge-in on real hardware. None need code —
   all are device-time items; `tools/herd-demo/herd-demo-h{4,6}.sh`
   print the exact steps.
-- **Live voice-latency numbers** — `.spike/voice-latency/measure.sh`
-  was validated against mocks only (no fake numbers were
-  recorded). Unblock: run it against real Parakeet/Kokoro
-  endpoints and fill `RESULTS.md`.
-- **H6.5 24-h proactive-turn acceptance** — a provisioned
-  specialist must show ≥ 1 proactive turn within 24 h. Needs a
-  live forge + mule pair (lab, post-H0.4).
-- **Lab-only scenario run** — forge's `scripts/herd-wake-scenario.sh`
-  (H5.2's three-hop fleet acceptance) has never been run on the
-  lab fleet.
+- **Live voice-latency numbers: DONE 2026-10-10** — the voice services were restored on srv (RTX 4000, lab `0a0495a4`–`60dc90e7` — the Aug migration to mini CPU-ALC is reversed; mini ALC parked stopped-rollback; HA/NPM consumers back on `voice-stt/voice-tts.butler.ooo` → srv CT 201), and `.spike/voice-latency/measure.sh` ran against the LIVE Parakeet-TDT-0.6B-v3 (FP32, CUDA) + Kokoro: **TTS first chunk 283 ms (< 400 ms budget — PASS), STT 4-s partial 70 ms (< 800 ms budget — PASS)**; medians in `.spike/voice-latency/RESULTS.md`, GPU residency confirmed via nvidia-smi (3.7 GB parakeet + 450 MiB kokoro).
 
 ### Client of record (2026-10-10 directive)
 
