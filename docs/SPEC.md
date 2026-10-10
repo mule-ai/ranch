@@ -345,6 +345,123 @@ Agents section; `--new` keeps the legacy fresh-forge-session form)
 and an **Agents** section in the TUI dashboard (Tab to switch,
 arrow + Enter to talk). Mobile surfaces land in H1.4.
 
+### 5.5 The agent entity (Herd)
+
+An *agent* is a first-class, persistent entity — "a dot in the
+herd" — owned by a user. It is distinct from a **profile** (a
+reusable model+tools+skills configuration) and from a **session**
+(one conversation). An agent has a name, an avatar, an owner,
+a home machine, a primary profile, a memory scope (agent-private
+or shared to a named org), and a tools allowlist; it may hold
+many conversations, each of which may be open on many ranch
+surfaces at once. The entity lives in forge (`agents` table);
+ranch and mule reference it by id, and the Supabase `agents`
+mirror (H1.4) exists only so phone clients can render the
+registry. One agent, many conversations, many surfaces — the
+talk/continue/fork semantics of §5.4 are how a surface attaches
+to an agent's life.
+
+**Proactivity.** An agent does not only answer: mule's wake
+engine fires turns at it (cron schedules, webhooks, events,
+memory-trigger conditions — §5.8), and forge runs its own
+read-only research tasks on its behalf. Proactivity is
+rate-limited (per-wake `rate_limit_per_hour`), auditable
+(`wake_log`), and halt-able — the herd kill switch (§5.6) pauses
+an agent or the whole herd in one action: paused agents reject
+new turns with 409 and drop scheduled fires, but their reads
+stay open — pause halts new work, not observability.
+
+**Learning.** Each settled turn is captured as an *episode*
+(summary + provenance, credentials redacted). Reflection — a
+mule workflow, inspectable and versioned — turns episodes into
+*belief* proposals; beliefs become active only through a human
+approval card (§5.8) and then ride the agent's prompt in every
+subsequent turn. Beliefs can carry a *watch* condition that
+wakes the agent when a matching episode is captured. Agents can
+signal each other (`agent_signal`: handoff/insight/request/
+watch), with org visibility gated by the memory ACL. The full
+concept + sequence diagrams: `docs/design/herd-overview.md`;
+phases: PLAN-HERD H1–H5.
+
+### 5.6 Activity View
+
+The Activity View is the surface for work that happens WITHOUT a
+human watching: proactive research tasks, pending approval asks,
+agent-spawned panes, memory-trigger fires, machine-launched mule
+jobs, recent wakes, and open beliefs. The daemon runs an
+activity poller (a worker with its own pipe pair — the
+AGENTS.md worker pattern): every 5 s it recomputes the full item
+set (local state + per-agent forge feeds + mule's `wakes/
+activity` feed), and — after a 2 s debounce that re-checks so
+churn that settles never ships — broadcasts `ActivityPush` with
+the whole new set. Items are keyed by (kind, agent, id); clients
+are push-only: `ActivityPush` replaces the cached set, nothing
+polls.
+
+Every surface renders the same frames: the TUI dashboard's
+Activity section (Tab to reach; Enter deep-links via AgentTalk,
+`p` pauses the herd, `P` pauses the highlighted agent), the
+native Android Settings → Tools → Activity screen, and the Expo
+activity tab. The pause action sends `AgentPause` (one agent or
+all known agents) — the H5.3 kill switch, `ranch pause|unpause
+[AGENT]` from the CLI. Down/misconfigured forge or mule degrade
+their feed to empty with a one-time warning; the loop never
+stalls. Frames: PROTOCOL.md §8.6; phases: PLAN-HERD H5.
+
+### 5.7 Voice: input and the voice loop
+
+Two independent halves. **Voice input** (H6.2) turns speech into
+text before it is sent: mobile-native's composer mic button is
+push-to-talk against forge's Parakeet STT endpoint by default
+(the phone talks to forge directly — no daemon in this path),
+with the on-device `SpeechRecognizer` as the airplane-mode
+fallback; the web/Expo client uses hold-to-talk with the browser
+MediaRecorder against the same forge endpoint.
+
+**The voice loop** (H6.3/H6.4) is a live back-and-forth *call*
+with an agent, and it adds **zero wire frames**: the call media
+path bypasses the daemon on purpose. `ranch call <agent>` (CLI,
+mic tools when available, otherwise the typed-text fallback) and
+the phone's call screen each create a mule job for the
+voice-loop workflow, then hold two WebSockets to mule: in = 16
+kHz PCM frames (or one utterance per line typed), out = 24 kHz
+TTS PCM + `{"assistant":…}` transcript frames. Mule's call state
+machine (energy VAD, ratio endpointing) routes utterances into
+the agent's conversation (mid-task steer submits into the
+in-flight turn) and plays the replies back. Full-duplex
+**barge-in** (H6.4): speaking over the TTS stops it within ~150
+ms (a `flush` control drains the out-queue) with an echo guard
+(out-channel gain zeroed while the local mic is hot). Transport
++ decision record: PROTOCOL.md §8.7; phases: PLAN-HERD H6.
+
+### 5.8 Policies: consent from the outside
+
+An agent's tools are constrained by a policy engine that lives
+**outside** the agent, in mule — the safety separation from the
+OpenAI Dots design (research §2.2): the rules are not in the
+agent's prompt, so they cannot be talked out of. A *policy* is a
+versioned, owner-scoped bundle of rules (`tool` glob →
+`allow | deny | ask`, with a human-readable reason); evaluation
+is deterministic and memoized — the action hash
+(tool + canonicalized input) makes a decided action settle
+to its verdict forever, so resume never re-asks and the same
+action is never re-chipped.
+
+The enforcement point is forge's `before_tool` hook: deny
+blocks the tool (the reason is visible to the model, which can
+work around it legitimately); ask parks the turn (≤ 60 s)
+while the decision is routed as a ranch card — the phone's
+"Allow this action / Deny" notification button or the TUI's
+pending-ask banner — and the human's allow is recorded as a
+memo by the same path the evaluator uses (no drift). The hook
+is **fail-closed**: any error or timeout blocks the tool — a
+policy deployment can never be bypassed by a flaky network.
+Audit: every policy write and every evaluate/ask/memo lands in
+`policy_audit`; policy changes themselves can be proposed and
+approved through the same card currency as beliefs. Design:
+`docs/design/agent-tools.md` (bridge section); phases:
+PLAN-HERD H3.5.
+
 ---
 
 ## 6. Workflows: mule
@@ -505,6 +622,7 @@ New frames (full reference lives in PROTOCOL.md as they land):
 | triggers | `TriggerList/TriggerListOk`, `TriggerPut/TriggerPutOk`, `TriggerDelete/TriggerDeleteOk`, `TriggerRun/TriggerRunOk` |
 | webhooks | `WebhookList/…`, `WebhookPut/…`, `WebhookDelete/…`, `WebhookEvent` (relay → daemon) |
 | agent tools | `AgentSpawn/AgentSpawnOk`, `AgentSend`, `AgentStatus/AgentStatusOk`, `AgentRead/AgentReadOk`, `AgentClose/AgentCloseOk`, `AgentDone` (daemon → caller pane, completion callback), `AgentAsk/AgentAskOk`, `AgentAskRequest` (broadcast), `AgentAskAnswer`, `AgentAskStatus/AgentAskStatusOk` |
+| agent registry / activity (Herd, §5.5–5.7) | `AgentList/AgentListOk`, `AgentTalk/AgentTalkOk`, `AgentBusy/AgentBusyOk`, `AgentActivity/AgentActivityOk`, `ActivityPush` (broadcast), `AgentPause/AgentPauseOk`, `AgentProvision/AgentProvisionOk` (full reference: PROTOCOL.md §8.6–8.7; the voice loop adds no frames) |
 
 All follow the existing conventions: `req_id` correlation, broadcast +
 client-side match, `Error {req_id, message}` on failure, unknown

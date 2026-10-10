@@ -615,3 +615,74 @@ clippy 0 + fmt; mobile `assembleRelease` BUILD SUCCESSFUL.
 machine with forge+mule running (no live run here); the mobile form
 is raw-profile-id + all-tools in v1 (the CLI wizard is the richer
 half).
+
+## Herd H0–H6: always-on agents land end to end (2026-10-10)
+
+Consolidated entry for the Herd initiative (PLAN-HERD.md, H0–H6.5
+complete — see its status ledger + Closeout for the full per-task
+record). The agent entity, the learning loop, proactivity, the
+behavior plane, and the voice loop all shipped across the three
+repos:
+
+**H0 Foundations** — pi-durable vendored (ae92585d = 1.0.4); Postgres
+Storage backend `durable-pg` in forge (`57d5035b`, conformance
+23/23 green, kill-9 ×2 green); runtime decision recorded (pi-durable
+upstream in a Node harness — kill-criteria in
+`forge/docs/HERD-DURABLE-DECISION.md`); lab infra configs written
+(pgvector on the forge machine, new private `mule` machine @ 8091 —
+reconcile still owed); pins frozen (H0.5).
+
+**H1 Agent entity** — forge `418c7bce` (+`8dd668ad`): migration 016
+`agents` + sessions.agent_id, agent CRUD API, agent-scoped
+conversations (continue/new/fork), `/active`; ranch-2 `eca27c1`:
+AgentList/AgentTalk/AgentBusy frames + PROTOCOL §8.6 + `ranch agent`
+CLI + dashboard Agents section; `a81a40a`: Supabase `agents` mirror
+(0008) + ranchd sync; mobile-native `ecec532` registry screen;
+Expo `170d606` Agents tab; mule `b2aa75e`: agents.external_ref.
+
+**H2 Durable core** — the pi-durable Node harness (forge `147486a9`,
+`7d530311` IpcClient, `5ba85553` routing flag, `002f89da` subagents +
+durable timers, `89032406` compaction/reset/history/documents/hooks)
+and the cutover `73c67650`: `resume.rs`/`session_replay.rs`/legacy
+turn driver DELETED; the harness is the only turn path;
+`dual_kill9_recover_mid_turn` green. Lab rollout owed (heartbeat
+re-register).
+
+**H3 Behavior plane (mule)** — tenancy `93aad23`;
+`forge_conversation` step + per-job WS `62f409e`; wakes (cron/
+webhook/event/job, `wake_log`, rate limit) `e09ddc0`; policy engine
+(evaluate/memo/proposals/audit) `f4185c5` + `0293244`; forge's
+before_tool policy hook `a0e8b52b` + ranch-2 `9ba9a71` (the
+`policy_ask` card lane); ranch-2 `969d03c` (mule_forward webhook).
+
+**H4 Learning** — forge `c9d4ee54` (memory tables, pgvector),
+`4a2127e8` (episode capture), `dd737acf` (belief proposals +
+`memory_review` card; ranch-2 `9bcb5c3` lane), mule `c217760`
+(reflection workflow), forge `619918e8` + mule `e9f08ec` (memory
+triggers), forge `bccb7b4c` (cross-agent signals). pgvector install
+owed → memory DB tests under the skip contract.
+
+**H5 Proactivity** — forge `883ace25` read-only research +
+`research_report` card (ranch-2 `d8d5e83` lane); forge `bbdde8e1`
+wake conditions (file-watch, turn-end forwarder, schedule_reminder,
+`scripts/herd-wake-scenario.sh`); H5.3 Activity View: forge
+`96c31aef` + mule `36d0b9e` (pause/activity) + ranch-2 poller/
+`ActivityPush`/`AgentPause` + TUI `7b86899` + mobile UIs `ad8ce74`
++ `ranch pause|unpause`.
+
+**H6 Presence & voice** — notifications `9f734ba` (both phone
+clients, action buttons, per-agent mute/priority); voice input
+`feb68e9` (Parakeet push-to-talk + on-device recognizer); voice
+loop mule `8b402f0` + ranch-2 `f32a00f` (`ranch call`, CallActivity,
+zero new frames — PROTOCOL §8.7); barge-in v2 mule `e8f4c86` +
+ranch-2 `d4a07df` (echo guard, `.spike/voice-latency/`); H6.5
+provisioning forge `3a943d6f` (secrets, credentials scope,
+web_login broker + grep-audit) + ranch-2 `aa24619` (`ranch agents
+new` wizard, mobile ＋Agent form).
+
+**§10 sweep (this entry)**: `docs/design/herd-overview.md` (concept
+architecture + sequence diagrams), SPEC.md §5.5–5.8 (agent entity,
+Activity View, voice, policies), PROTOCOL §8.1 card-kinds note,
+`tools/herd-demo/` (six hand-run acceptance scripts,
+exit code = failed-step count), PLAN-HERD Closeout (owed
+acceptances + deliberate deferrals + kill-criteria reminder).

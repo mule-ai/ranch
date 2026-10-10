@@ -462,6 +462,13 @@ AgentAskStatus { req_id, caller_pane, ask_id }
 // `POST /ranch-tools/{id}/result`. The 60 s relay TTL
 // (RANCH_TOOL_TIMEOUT) covers the round-trip; expiry = "expired",
 // no token minted, browser not opened.
+//
+// CARD KINDS RIDING THIS LANE (Herd; the card's `tool` field = the
+// kind, all answered via AgentAsk + POST /ranch-tools/{id}/result):
+//   "policy_ask"     H3.5  tool gate: Allow this action / Deny
+//   "memory_review"  H4.4  belief approval: Keep / Forget (+free text = edit)
+//   "research_report" H5.1 research card: Use / Discard / Ask more
+//   "web_login"      H6.5  web sign-in: Sign me in / Cancel
 ```
 
 PaneMeta gains `spawned_by: Option<String>` (pane badge). Completion
