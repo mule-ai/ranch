@@ -1682,10 +1682,7 @@ was deliberately deferred, and the decision that can still be re-opened.
 
 ### Owed acceptances (cannot run on this box — unblock commands)
 
-- **pgvector on forge's Postgres: DONE 2026-10-10** — `sudo pacman -S pgvector` (0.8.6) installed + `CREATE EXTENSION vector` on the scratch PG; the 11 previously-skipped H4 memory tests now run and pass. This exposed a real bug — pgvector ≥ 0.8 caps HNSW/IVFFlat at 2000 dims vs our 2560-dim embeddings; fixed in forge `9ebdbd47` (index fallback in migration 022: HNSW where allowed, else filtered sequential scan; full suite 332/332 green). 
-  (H4.1/H4.4/H4.5/H4.6) ran under the documented skip contract.
-  Unblock: `sudo pacman -S pgvector` on the forge host, then
-  `cargo test -p forge-api --test memory_tests` (in `~/src/forge`).
+- **pgvector on forge's Postgres: DONE 2026-10-10** — `sudo pacman -S pgvector` (0.8.6) installed + `CREATE EXTENSION vector` on the scratch PG; the 11 previously-skipped H4 memory tests now run and pass. This exposed a real bug — pgvector ≥ 0.8 caps HNSW/IVFFlat at 2000 dims vs our 2560-dim embeddings; fixed in forge `9ebdbd47` (index fallback in migration 022: HNSW where allowed, else filtered sequential scan; full suite 332/332 green).
 - **H0.4 lab reconcile** — the new ALC machine configs (forge
   pgvector, private `mule` machine @ 8091) are written but the
   containers were never reconciled. Unblock: image build +
@@ -1716,6 +1713,14 @@ was deliberately deferred, and the decision that can still be re-opened.
 - **Lab-only scenario run** — forge's `scripts/herd-wake-scenario.sh`
   (H5.2's three-hop fleet acceptance) has never been run on the
   lab fleet.
+
+### Client of record (2026-10-10 directive)
+
+The **Kotlin app** (`mobile-native/`, `dev.ranch.android`) is the
+client of record for all phone acceptance above; the Expo app
+(`mobile/`) is a parity reference only — it gets no further feature
+work and its open items (notification buttons, device-recognizer
+parity) stay deferred behind it.
 
 ### Deliberate deferrals (documented, not owed)
 
