@@ -33,27 +33,22 @@ something you *see*.
    CPU-only speech machine (it stays available for rollback). If it asks
    about the forge machine being recreated, that's expected.
 
-2. **Create the phone-facing agent table** in your Supabase project.
-   Open the Supabase dashboard → SQL editor → paste and run the whole
-   file `supabase/migrations/0008_agents.sql` (it's short; it just adds
-   the `agents` table the phone reads the agent list from).
-
-3. **Save two secrets to Bitwarden** (vault `mule`):
+2. **Save two secrets to Bitwarden** (vault `mule`):
    - the mule admin API key — it was printed to your terminal when the
      setup ran (starts with `sk_mule_`). The phone and this guide use it.
    - the mule encryption secret (32 hex characters, also printed once).
 
-4. **Install the new phone app.** The current release build is at
+3. **Install the new phone app.** The current release build is at
    `mobile-native/app/build/outputs/apk/release/app-release.apk` on the
    laptop — sideload it (or `adb install`). It's the same app, updated
    with the agent screens, activity feed, calls, and notifications.
 
-5. **Two small settings in the phone app** (Settings screen):
+4. **Two small settings in the phone app** (Settings screen):
    - *Voice input* section: forge address `http://10.10.199.29:8110` and
      the lab forge key (the one your laptop uses — it's in
      `~/.config/ranch/daemon.toml`).
    - *Voice call* section: mule address `http://10.10.199.29:8091` and
-     the mule key from step 3.
+     the mule key from step 2.
 
 ## Flow 1 — Create your first specialist agent
 
@@ -197,7 +192,7 @@ a follow-up; **Discard** closes it out.
 
 | Symptom | First check |
 |---|---|
-| No agents on the phone | Is Supabase step 2 done? Is the laptop's `ranchd` running (`pgrep -f ranchd`)? |
+| No agents on the phone | Is the laptop's `ranchd` running (`pgrep -f ranchd`)? Is forge up? |
 | Call says "mule unreachable" | Is the mule machine up on mini? `curl http://10.10.199.29:8091/health` from the laptop. |
 | Voice input says STT disabled | Phone Settings: forge address/key set? `curl http://10.10.199.29:8110/v1/audio/voices` should now say STT + TTS enabled (it didn't before the rebuild). |
 | Agent never answers | Is forge up? `curl http://10.10.199.29:8110/health`. Right after the reconcile, give it a few minutes (first-boot restore). |
