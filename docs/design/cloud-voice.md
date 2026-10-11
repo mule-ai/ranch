@@ -1,7 +1,10 @@
 # Cloud voice (Herd): off-lab phone → Supabase edge → your lab
 
-Status: **edge gateway live + tested (2026-10-11); lab public surface pending
-(NPM proxy host + `ct/voice-gw` allowlist container + DNS record).**
+Status: **edge gateway live; lab allowlist + NPM proxy host live
+(2026-10-11); pending: PUBLIC A record for voice-lab.butler.ooo
+(only the lab-internal zone has it — the Supabase edge, and phones off
+the lab network, need it in the public Cloudflare butler.ooo zone →
+173.48.243.181).**
 
 The goal: a phone that is NOT on the user's local network can still use the
 user's voice stack (forge STT/TTS, mule voice-loop calls) with **Supabase
@@ -63,10 +66,18 @@ lab-side API keys still gate the proxied API paths.
 | `voice_gateways` table + `upsert_voice_gateway` RPC (RLS, SECURITY INVOKER) | ranch-2 `supabase/migrations/0009_voice_gateways.sql` | **applied** |
 | `ranch-voice` edge function (verify JWT → own row → forward; caps: 10 MB audio, 30 audio req/min, 10 jobs/min, 60 s uid cache) | ranch-2 `supabase/functions/ranch-voice/index.ts` | **deployed + tested** (health/401/STT multipart passthrough/jobs Bearer injection/gateway) |
 | Phone cloud mode: PTT STT via edge fn; call setup (workflows list + job POST) via edge fn; call WS dials `GET /gateway` base; Settings toggle + "Save cloud gateway" (CG fields + RPC) | mobile-native `Voice.kt` (CloudVoice), `SessionActivity.kt`, `CallActivity.kt`, `SettingsActivity.kt` | **built (APK in CI release)** |
-| `voice-gw` nginx allowlist container + host forward 8843→8443 | lab `ct/voice-gw/` + `hosts/mini/alc.toml` | **committed, not deployed** (needs image pull + reconcile) |
-| NPM proxy host `voice-lab.butler.ooo` → `10.10.199.29:8843` (Force SSL, WebSockets on) | NPM admin (:81) | **pending (dashboard)** |
-| Public DNS A record `voice-lab.butler.ooo` → lab router public IP | public butler.ooo zone | **pending (dashboard)** |
+| `voice-gw` nginx allowlist container + host forward 8843→8443 | lab `ct/voice-gw/` + `hosts/mini/alc.toml` | **deployed + verified** (healthz 200 / deny 404 / mule+forge reached, via LAN and public NPM) |
+| NPM proxy host `voice-lab.butler.ooo` → `10.10.199.29:8843` | NPM (proxy host id 79; `forward_scheme=http` — the forward is plain HTTP behind NPM's ACME TLS) | **live** (DNS-01 cert; TLS + proxy verified from the laptop on-lab) |
+| Lab-internal DNS A record `voice-lab.butler.ooo → 10.10.199.28` | lab Technitium zone | **live** (phones on the lab resolve it) |
+| **Public** DNS A record `voice-lab.butler.ooo → 173.48.243.181` | Cloudflare `butler.ooo` zone | **pending (the one remaining step)** |
 | Google OAuth provider on the Supabase project | Google Cloud client + `POST /auth/providers/google` (sbp_ token) | **pending (needs the OAuth client)** |
+
+> **Why the public record matters:** the Supabase edge function runs on the
+> public internet and saw `NXDOMAIN` for voice-lab.butler.ooo (verified
+> 2026-10-11 via Google DoH: the *.butler.ooo subdomains exist only in the
+> lab-internal Technitium zone). Until the public A record exists, cloud
+> mode's proxied paths fail DNS at the edge (direct on-lab mode is
+> unaffected, and the call's wss:// dials work from phones on the lab).
 
 ## Test record (2026-10-11)
 
@@ -99,19 +110,39 @@ lab-side API keys still gate the proxied API paths.
 
 ## Remaining manual steps (owner)
 
-1. NPM: new proxy host `voice-lab.butler.ooo` → `10.10.199.29:8843`,
-   Force SSL, WebSockets on.
-2. Public DNS: A record `voice-lab.butler.ooo` → the lab router's public
-   IP (same target as the other *.butler.ooo records).
-3. Mini: `mkdir -p ~/.lab-alc/data/voice-gw && cp ct/voice-gw/nginx.conf
-   ~/.lab-alc/data/voice-gw/default.conf && sudo container image pull
-   nginx:alpine && sudo lab-alc-reconcile`; verify
-   `curl http://10.10.199.29:8843/healthz` → `ok` and
-   `curl -o /dev/null -w '%{http_code}' http://10.10.199.29:8843/api/v1/agents`
-   → `404`.
-4. Phone: sign in (password now; Google once enabled), Settings → enable
+1. **Cloudflare `butler.ooo` zone: A record `voice-lab.butler.ooo →
+   173.48.243.181`** (lab router public IP, same target the router's NAT
+   443-forward already serves to NPM). Proxied or DNS-only both work
+   (DNS-01 cert already issued); DNS-only keeps voice audio off CF's
+   edge. Re-point if the home IP changes (dynamic IP — no DDNS on
+   butler.ooo today).
+2. Phone: sign in (password now; Google once enabled), Settings → enable
    "Cloud voice", set the CG fields to `https://voice-lab.butler.ooo` +
    the two keys, "Save cloud gateway", then PTT + 📞 off-lab.
-5. Google: create an OAuth client (redirect `ranch://auth-callback`), then
+3. Google: create an OAuth client (redirect `ranch://auth-callback`), then
    enable the provider via the Supabase mgmt API (runbook in
    `docs/LAB-SECRETS.md`).
+
+## Ops learnings (2026-10-11 deploy)
+
+- **ALC `image tag` clobber**: the reconciler's machine re-tag step ran
+  for containers too and pointed `nginx:alpine` at the NixOS machine
+  rootfs. Fixed: tag line gated on `wtype=machine`
+  (scripts/mac-alc-reconcile.sh, pending host rebuild via
+  `sudo darwin-rebuild switch --flake /var/lib/lab-gitops/repo#mini`).
+- **ALC run flags**: `--entrypoint` needs an absolute path
+  (`/usr/sbin/nginx`); args without an entrypoint are treated as the
+  executable; `-m` is memory (mounts are `--mount type=bind,…`).
+- **nginx as uid 101**: ALC rejects `-u root` for nginx:alpine
+  (noPasswdEntries); main.nginx (not `*.conf`, so its own http include
+  can't pick it up) moves pid + temp paths to /tmp. Scratch dirs must be
+  single-level (/tmp/nginx-proxy, not /tmp/nginx-tmp/proxy — nginx won't
+  mkdir the parent).
+- **reconcile set -e**: a transient ALC API flap made `machine_exists`
+  false-positive on mule; the unguarded recreate then aborted the whole
+  loop. Both recreate branches now double-check after 2 s and WARN
+  instead of dying.
+- **NPM proxy host**: `forward_scheme` must stay `http` (NPM terminates
+  TLS; the upstream is plain). UI default is ON — flip it off, or the
+  documented sqlite edit (`update proxy_host set forward_scheme='http'
+  where id=…` + regenerate/reload).
