@@ -19,3 +19,4 @@ vendor/
 *.env
 node_modules/
 releases/
+docs/LAB-SECRETS.md
