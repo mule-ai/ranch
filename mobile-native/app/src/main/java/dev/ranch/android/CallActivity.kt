@@ -201,10 +201,13 @@ class CallActivity : Activity() {
         setContentView(root)
         applyEdgeToEdgeInsets(findViewById(android.R.id.content))
 
-        val base = app.prefs.get(PKEY_MULE_BASE, "").trim().trimEnd('/')
-        val key = app.prefs.get(PKEY_MULE_KEY, "").trim()
-        if (base.isEmpty() || key.isEmpty()) {
-            status.text = "mule is not configured"
+        val cloud = CloudVoice.enabled(app.prefs)
+        val base = if (cloud) CloudVoice.BASE
+        else app.prefs.get(PKEY_MULE_BASE, "").trim().trimEnd('/')
+        val key = if (cloud) CloudVoice.token(app.prefs)
+        else app.prefs.get(PKEY_MULE_KEY, "").trim()
+        if (cloud && key.isEmpty()) {
+            status.text = "cloud voice needs a Supabase sign-in (Google) — sign in on the main screen, or use direct mode"
             status.setTextColor(0xFFF59E0B.toInt())
             root.addView(Button(this).apply {
                 text = "Open settings"
@@ -214,14 +217,25 @@ class CallActivity : Activity() {
             })
             return
         }
-        startCall(base, key)
+        if (base.isEmpty() || key.isEmpty()) {
+            status.text = if (cloud) "cloud voice not enabled" else "mule is not configured"
+            status.setTextColor(0xFFF59E0B.toInt())
+            root.addView(Button(this).apply {
+                text = "Open settings"
+                setOnClickListener {
+                    startActivity(Intent(this@CallActivity, SettingsActivity::class.java))
+                }
+            })
+            return
+        }
+        startCall(base, key, cloud)
     }
 
     // ------------------------------------------------------------------
     // call start: find the voice_call workflow, start the job, dial WS
     // ------------------------------------------------------------------
 
-    private fun startCall(base: String, key: String) {
+    private fun startCall(base: String, key: String, cloud: Boolean) {
         exec.execute {
             val wfResult = findVoiceWorkflow(base, key, agentId)
             val found = wfResult.getOrNull()
@@ -240,9 +254,23 @@ class CallActivity : Activity() {
                 return@execute
             }
             status2("dialing… (job ${jobId.take(8)})")
+            // cloud: the WebSockets can't cross the Supabase edge (the
+            // platform rejects WS upgrades), so the call dials the user's
+            // PUBLIC mule base that the /gateway endpoint resolves from
+            // their voice_gateways row. Direct mode dials the base itself.
+            var wsBase = base
+            if (cloud) {
+                wsBase = (muleGet(base, key, "/gateway") as? JSONObject)
+                    ?.optString("mule_base_url")?.trim()?.trimEnd('/') ?: ""
+                if (wsBase.isEmpty()) {
+                    ended = true
+                    fail("cloud: /gateway returned no mule base — set your public tunnel URL in the voice gateway settings")
+                    return@execute
+                }
+            }
             try {
-                connectOut(base, jobId, ttsRate)
-                connectIn(base, jobId)
+                connectOut(wsBase, jobId, ttsRate)
+                connectIn(wsBase, jobId)
             } catch (e: Exception) {
                 fail("ws connect: ${e.message}")
                 return@execute

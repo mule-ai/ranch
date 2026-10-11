@@ -54,6 +54,73 @@ object Voice {
 }
 
 /**
+ * Cloud voice mode (Herd cloud-voice): instead of the phone holding the
+ * lab's forge/mule base URLs + API keys, it signs in to Supabase
+ * (Google/password) and routes every voice request through the
+ * `ranch-voice` edge function, which verifies the Supabase user JWT and
+ * forwards to the endpoints recorded in the user's OWN `voice_gateways`
+ * row (migration 0009, RLS-scoped) — the keys never reach the phone.
+ * The call's WebSockets are the one exception: Supabase edge cannot
+ * carry WS upgrades (platform-rejected), so the call dials the user's
+ * public mule base returned by GET /gateway (the 128-bit job id is the
+ * capability on those sockets; no key travels).
+ */
+object CloudVoice {
+    const val PKEY_ENABLED = "voice_cloud"
+    // local staging prefs for the gateway row (the row itself lives in
+    // Supabase's voice_gateways table, owned by the signed-in user).
+    const val PKEY_CG_BASE = "cg_base_url"
+    const val PKEY_CG_FORGE_KEY = "cg_forge_api_key"
+    const val PKEY_CG_MULE_KEY = "cg_mule_api_key"
+    const val BASE = Supabase.URL + "/functions/v1/ranch-voice"
+
+    /** Cloud routing is on when enabled in settings AND signed in
+     *  (the Supabase access token lives in the same prefs — Auth.kt). */
+    fun enabled(prefs: Prefs): Boolean =
+        prefs.getBool(PKEY_ENABLED, false) && token(prefs).isNotEmpty()
+
+    fun token(prefs: Prefs): String = prefs.get("access_token", "")
+
+    /** Upsert the user's voice_gateways row via the SECURITY INVOKER RPC
+     *  (RLS binds the row to auth.uid()). @return null on success. */
+    fun saveGateway(prefs: Prefs): String? {
+        val base = prefs.get(PKEY_CG_BASE, "").trim().trimEnd('/')
+        val forgeKey = prefs.get(PKEY_CG_FORGE_KEY, "").trim()
+        val muleKey = prefs.get(PKEY_CG_MULE_KEY, "").trim()
+        val tok = token(prefs)
+        if (base.isEmpty() || forgeKey.isEmpty() || muleKey.isEmpty()) {
+            return "fill the CG fields first"
+        }
+        if (tok.isEmpty()) return "sign in to Supabase first"
+        val body = JSONObject()
+            .put("p_forge_base_url", base)
+            .put("p_forge_api_key", forgeKey)
+            .put("p_mule_base_url", base)
+            .put("p_mule_api_key", muleKey)
+            .toString()
+        val req = Request.Builder()
+            .url(Supabase.URL + "/rest/v1/rpc/upsert_voice_gateway")
+            .header("apikey", Supabase.ANON)
+            .header("Authorization", "Bearer $tok")
+            .header("Content-Type", "application/json")
+            .post(body.toRequestBody("application/json".toMediaType()))
+            .build()
+        return try {
+            client.newCall(req).execute().use { resp ->
+                val text = resp.body?.string().orEmpty()
+                if (resp.code == 204 || resp.isSuccessful) null
+                else "HTTP ${resp.code}: ${text.take(160)}"
+            }
+        } catch (e: Exception) { "${e.message}" }
+    }
+
+    private val client = OkHttpClient.Builder()
+        .connectTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(15, TimeUnit.SECONDS)
+        .build()
+}
+
+/**
  * 16 kHz mono dictation memo via [MediaRecorder] into an m4a/AAC file
  * (64 kbps AAC-LC; ~0.8 KB/s → ~50 KB for a minute of speech, well under
  * forge's 25 MiB inbound cap). Parakeet sniffs the bytes (wave, then
@@ -115,8 +182,16 @@ object ForgeStt {
         .readTimeout(30, TimeUnit.SECONDS)
         .build()
 
-    /** @return transcript ("" = no speech detected), or failure with the error. */
-    fun transcribe(base: String, apiKey: String, audio: ByteArray, filename: String): Result<String> {
+    /** @return transcript ("" = no speech detected), or failure with the error.
+     *  [bearer] switches auth to `Authorization: Bearer` (cloud mode via the
+     *  ranch-voice edge function; leave null + set [apiKey] for direct use). */
+    fun transcribe(
+        base: String,
+        apiKey: String?,
+        audio: ByteArray,
+        filename: String,
+        bearer: String? = null,
+    ): Result<String> {
         val url = base.trim().trimEnd('/') + "/v1/audio/transcriptions"
         val form = MultipartBody.Builder().setType(MultipartBody.FORM)
             .addFormDataPart("file", filename,
@@ -124,7 +199,10 @@ object ForgeStt {
             .addFormDataPart("model", "parakeet")
             .addFormDataPart("response_format", "json")
             .build()
-        val req = Request.Builder().url(url).header("X-API-Key", apiKey).post(form).build()
+        val b = Request.Builder().url(url).post(form)
+        if (bearer != null) b.header("Authorization", "Bearer $bearer")
+        else b.header("X-API-Key", apiKey ?: "")
+        val req = b.build()
         return try {
             client.newCall(req).execute().use { resp ->
                 val body = resp.body?.string() ?: ""

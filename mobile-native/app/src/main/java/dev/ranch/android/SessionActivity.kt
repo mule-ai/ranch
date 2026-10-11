@@ -506,10 +506,14 @@ class SessionActivity : Activity() {
             return
         }
         statusView.text = "transcribing\u2026"
-        val base = prefs().get(Voice.PKEY_FORGE_BASE, "").trim()
-        val key = prefs().get(Voice.PKEY_FORGE_KEY, "").trim()
         uploadExec.execute {
-            val r = ForgeStt.transcribe(base, key, bytes, "dictation.m4a")
+            val r = if (CloudVoice.enabled(prefs())) {
+                ForgeStt.transcribe(CloudVoice.BASE, null, bytes, "dictation.m4a", CloudVoice.token(prefs()))
+            } else {
+                val base = prefs().get(Voice.PKEY_FORGE_BASE, "").trim()
+                val key = prefs().get(Voice.PKEY_FORGE_KEY, "").trim()
+                ForgeStt.transcribe(base, key, bytes, "dictation.m4a")
+            }
             handler.post {
                 when {
                     dictating -> {} // a new recording superseded this one

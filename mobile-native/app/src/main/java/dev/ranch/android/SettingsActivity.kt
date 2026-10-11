@@ -104,6 +104,43 @@ class SettingsActivity : Activity() {
         // ---- voice input (H6.2) ----
         root.addView(sectionHeader("Voice input"))
         root.addView(buildVoiceModeRow())
+        // Cloud voice (Herd): route voice through the Supabase edge
+        // function instead of the phone holding the lab's keys. Needs a
+        // Supabase sign-in + a voice_gateways row (public tunnel URLs).
+        root.addView(buildSwitch(CloudVoice.PKEY_ENABLED,
+            "Cloud voice via Supabase sign-in (keys stay in Supabase)", false))
+        root.addView(TextView(this).apply {
+            text = "Cloud voice: STT/call setup go through the ranch-voice edge " +
+                "function with your Supabase token; your lab endpoints + keys live in " +
+                "your voice_gateways row, not on the phone. Call audio still dials your " +
+                "public mule URL directly (the Supabase edge can't carry WebSockets). " +
+                "Direct mode (below) uses the base URLs + keys on the phone instead."
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            setTextColor(0xFF6B7280.toInt())
+            setPadding(0, 0, 0, dp(4))
+        })
+        // Cloud gateway row (voice_gateways in Supabase, owned via RLS).
+        root.addView(buildConfigField("CG: public lab base URL",
+            CloudVoice.PKEY_CG_BASE,
+            "e.g. https://voice-lab.butler.ooo (NPM/tunnel allowlist)"))
+        root.addView(buildConfigField("CG: forge API key",
+            CloudVoice.PKEY_CG_FORGE_KEY, "forge API key (stored in Supabase)", true))
+        root.addView(buildConfigField("CG: mule API key",
+            CloudVoice.PKEY_CG_MULE_KEY, "mule admin API key (stored in Supabase)", true))
+        root.addView(Button(this).apply {
+            text = "Save cloud gateway to Supabase"
+            setPadding(0, dp(6), 0, dp(6))
+            setOnClickListener {
+                if (CloudVoice.token(app.prefs).isEmpty()) {
+                    diagText.text = "sign in to Supabase first (main screen)"
+                } else {
+                    exec.execute {
+                        val msg = CloudVoice.saveGateway(app.prefs) ?: "saved"
+                        handler.post { diagText.text = "cloud gateway: $msg" }
+                    }
+                }
+            }
+        })
         root.addView(buildConfigField("Forge STT base URL", Voice.PKEY_FORGE_BASE,
             "e.g. http://your-machine:PORT (the forge API server)"))
         root.addView(buildConfigField("Forge API key", Voice.PKEY_FORGE_KEY, "forge API key", true))
