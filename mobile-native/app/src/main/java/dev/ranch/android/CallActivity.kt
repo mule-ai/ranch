@@ -270,8 +270,12 @@ class CallActivity : Activity() {
         agentId: String,
     ): Result<Pair<String, Int>?> {
         val wfs = muleGet(base, key, "/api/v1/workflows") ?: return resFail("list workflows")
+        // mule's list endpoints are inconsistent: /api/v1/workflows is a BARE
+        // array, /api/v1/wakes is {wakes: [...]}, job POST is {data: {...}} —
+        // accept every shape we've seen.
         val arr = when (wfs) {
             is JSONObject -> wfs.optJSONArray("workflows") ?: wfs.optJSONArray("data")
+            is org.json.JSONArray -> wfs
             else -> null
         }
         if (arr == null) return resFail("list workflows: unexpected shape")
@@ -307,7 +311,15 @@ class CallActivity : Activity() {
             http.newCall(req).execute().use { resp ->
                 val text = resp.body?.string().orEmpty()
                 if (!resp.isSuccessful) resFail("HTTP ${resp.code}: ${text.take(200)}")
-                else Result.success(JSONObject(text).optString("id"))
+                // mule wraps the created job in {"data": {...}} (the GET by id
+                // is a bare object — same API, two shapes).
+                else {
+                    val j = JSONObject(text)
+                    val id = j.optJSONObject("data")?.optString("id")?.takeIf { it.isNotEmpty() }
+                        ?: j.optString("id")
+                    if (id.isEmpty()) resFail("job id not in response: ${text.take(200)}")
+                    else Result.success(id)
+                }
             }
         } catch (e: Exception) {
             resFail(e.message ?: "request failed")
