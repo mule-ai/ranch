@@ -9,6 +9,11 @@ tunnel** (ephemeral `*.trycloudflare.com` URL — changes whenever the
 container restarts); a **named tunnel** (one-time dashboard step) makes
 it permanent.
 
+> **Alternative design (parked):** Supabase Realtime broadcast as the
+> relay — zero public address at all, no Cloudflare, lab keys leave
+> Postgres; caps measured, build plan written. See
+> `cloud-voice-relay.md`.
+
 The goal: a phone that is NOT on the user's local network can still use the
 user's voice stack (forge STT/TTS, mule voice-loop calls) with **Supabase
 sign-in (Google or password) as the credential and the routing key**. The
