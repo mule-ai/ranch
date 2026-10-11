@@ -19,38 +19,45 @@ something you *see*.
     running on the lab's GPU box.
 - **Your phone** — the Android app (the Kotlin one, `dev.ranch.android`).
 
-## One-time setup (about 10 minutes, you do these)
+## One-time setup (mostly done — check the boxes you haven't)
 
-1. **Bring up the lab machines.** One command, on your laptop:
+Done on 2026-10-10/11 (no action needed):
 
-   ```bash
-   ssh -tt mini 'sudo lab-alc-reconcile'
-   ```
+- [x] **Lab machines up.** `ssh -tt mini 'sudo lab-alc-reconcile'` has
+  been run six times; the forge machine carries the Herd harness +
+  pgvector + the restored GPU voice backends, and the mule machine is
+  live at port 8091 with its workflows/wakes/modules restored. (If a
+  future image rebuild needs it: `scp` the changed `ct/forge`/`ct/mule`
+  files to `mini:/Users/jbutler/alcbld/repo/...`, build the image in
+  the machine, swap `/var/lib/lab-alc/images/*-alc-latest.tar`, then
+  reconcile. Expect brief agent downtime.)
+- [x] **Mule secrets saved** to the lab Vaultwarden (`vault.butler.ooo`)
+  in the `mule-private` folder: the admin API key (`sk_mule_…`) and the
+  encryption secret.
+- [x] **The "billing" specialist agent exists** in lab forge
+  (restricted tools, read-only, org memory scope) and the
+  `billing-daily` mule workflow + 07:00 UTC wake is registered —
+  so Flow 1 below can start from "talk to it" if you want.
 
-   This does three things: rebuilds the forge machine (memory + voice now
-   enabled — agents will be briefly unreachable during the few minutes it
-   takes), creates the new mule machine (port 8091), and parks the old
-   CPU-only speech machine (it stays available for rollback). If it asks
-   about the forge machine being recreated, that's expected.
+Still yours to do (phone):
 
-2. **Save two secrets to Bitwarden** (vault `mule`):
-   - the mule admin API key — it was printed to your terminal when the
-     setup ran (starts with `sk_mule_`). The phone and this guide use it.
-   - the mule encryption secret (32 hex characters, also printed once).
-
-3. **Install the new phone app.** The current release build is at
+1. **Install the new phone app.** The current release build is at
    `mobile-native/app/build/outputs/apk/release/app-release.apk` on the
    laptop — sideload it (or `adb install`). It's the same app, updated
    with the agent screens, activity feed, calls, and notifications.
-
-4. **Two small settings in the phone app** (Settings screen):
+2. **Two small settings in the phone app** (Settings screen):
    - *Voice input* section: forge address `http://10.10.199.29:8110` and
      the lab forge key (the one your laptop uses — it's in
      `~/.config/ranch/daemon.toml`).
    - *Voice call* section: mule address `http://10.10.199.29:8091` and
-     the mule key from step 2.
+     the mule key from the `mule-private` vault folder.
 
 ## Flow 1 — Create your first specialist agent
+
+*(The `billing` agent from the plan already exists in lab forge —
+created during setup, with the `billing-daily` wake registered. To
+verify *creation* itself, make a second one (e.g. `travel`), or just
+skip to Flow 2 and confirm `billing` appears on both surfaces.)*
 
 The "billing" agent from the plan: it gets a restricted tool set,
 org-shared memory, and wakes up every morning at 7:00 on its own.
@@ -195,7 +202,7 @@ a follow-up; **Discard** closes it out.
 | No agents on the phone | Is the laptop's `ranchd` running (`pgrep -f ranchd`)? Is forge up? |
 | Call says "mule unreachable" | Is the mule machine up on mini? `curl http://10.10.199.29:8091/health` from the laptop. |
 | Voice input says STT disabled | Phone Settings: forge address/key set? `curl http://10.10.199.29:8110/v1/audio/voices` should now say STT + TTS enabled (it didn't before the rebuild). |
-| Agent never answers | Is forge up? `curl http://10.10.199.29:8110/health`. Right after the reconcile, give it a few minutes (first-boot restore). |
+| Agent never answers | Is forge up? `curl http://10.10.199.29:8110/health`. Right after a machine rebuild, give it a few minutes (first-boot restore). If the answer is "harness unavailable", the `forge-harness` service is down inside the forge machine — it starts with the machine; check it there (`container machine run -n forge -- systemctl status forge-harness forge-api`). |
 | Wakes don't fire | Mule up + laptop on the lab network; the daemon's activity view should show wake entries once one fires. |
 | Notifications silent for one agent | Settings → per-agent notifications: that agent may be muted or on *quiet*. |
 
