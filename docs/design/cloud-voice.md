@@ -1,10 +1,13 @@
 # Cloud voice (Herd): off-lab phone → Supabase edge → your lab
 
-Status: **edge gateway live; lab allowlist + NPM proxy host live
-(2026-10-11); pending: PUBLIC A record for voice-lab.butler.ooo
-(only the lab-internal zone has it — the Supabase edge, and phones off
-the lab network, need it in the public Cloudflare butler.ooo zone →
-173.48.243.181).**
+Status: **end-to-end live over the public internet via an outbound
+Cloudflare tunnel (2026-10-11).** The lab keeps **zero public ingress**:
+no NAT forwards, no public A record, no inbound ports — a `cloudflared`
+agent inside the voice-gw container dials OUT to Cloudflare, and the
+public hostname terminates at the CF edge. Currently on a **quick
+tunnel** (ephemeral `*.trycloudflare.com` URL — changes whenever the
+container restarts); a **named tunnel** (one-time dashboard step) makes
+it permanent.
 
 The goal: a phone that is NOT on the user's local network can still use the
 user's voice stack (forge STT/TTS, mule voice-loop calls) with **Supabase
@@ -33,11 +36,28 @@ ranch-voice edge function (public Supabase edge)
   ▼
 phone dials wss://{mule_base_url}/voice/{job}/in|out   (TLS, public)
   ▼
-voice-lab.butler.ooo  (public DNS + NPM ACME) → voice-gw ALC container
-  nginx allowlist (ct/voice-gw/nginx.conf): /voice/* → mule :8091,
-  /v1/audio/* → forge :8110, /api/v1/jobs + /api/v1/workflows* → mule,
-  everything else 404.
+public tunnel hostname (quick: <rand>.trycloudflare.com; named: e.g.
+voice-lab.jbutler.dev CNAME'd to the tunnel's *.cfargotunnel.com)
+  ▼
+Cloudflare edge (TLS, WebSockets-capable)
+  │  ← the INBOUND leg of a dial the lab made OUTBOUND (cloudflared
+  │    agent in the voice-gw container; the lab router sees no inbound
+  │    connections at all — zero public ingress by policy)
+  ▼
+voice-gw ALC container on mini (two processes, image local/voice-gw-alc;
+repo sources ct/voice-gw/Dockerfile + run.sh): cloudflared agent +
+nginx allowlist on localhost:8443 (ct/voice-gw/nginx.conf): /voice/* →
+mule :8091, /v1/audio/* → forge :8110, /api/v1/jobs +
+/api/v1/workflows* → mule, everything else 404.
 ```
+
+The edge function's `{forge_base}` / `{mule_base}` rows point at the same
+tunnel hostname, so proxied STT/jobs/workflows cross the public internet
+once (phone→Supabase) and again at Supabase→CF→lab — all outbound from
+the lab's point of view. **On-lab fallback (unchanged, optional):**
+`voice-lab.butler.ooo` internal DNS → NPM proxy host (id 79) → host
+forward 8843→8443 still serves lab-network devices; off-lab uses the
+tunnel hostname.
 
 ### Why the call's WebSockets don't cross the edge function
 
@@ -66,18 +86,18 @@ lab-side API keys still gate the proxied API paths.
 | `voice_gateways` table + `upsert_voice_gateway` RPC (RLS, SECURITY INVOKER) | ranch-2 `supabase/migrations/0009_voice_gateways.sql` | **applied** |
 | `ranch-voice` edge function (verify JWT → own row → forward; caps: 10 MB audio, 30 audio req/min, 10 jobs/min, 60 s uid cache) | ranch-2 `supabase/functions/ranch-voice/index.ts` | **deployed + tested** (health/401/STT multipart passthrough/jobs Bearer injection/gateway) |
 | Phone cloud mode: PTT STT via edge fn; call setup (workflows list + job POST) via edge fn; call WS dials `GET /gateway` base; Settings toggle + "Save cloud gateway" (CG fields + RPC) | mobile-native `Voice.kt` (CloudVoice), `SessionActivity.kt`, `CallActivity.kt`, `SettingsActivity.kt` | **built (APK in CI release)** |
-| `voice-gw` nginx allowlist container + host forward 8843→8443 | lab `ct/voice-gw/` + `hosts/mini/alc.toml` | **deployed + verified** (healthz 200 / deny 404 / mule+forge reached, via LAN and public NPM) |
-| NPM proxy host `voice-lab.butler.ooo` → `10.10.199.29:8843` | NPM (proxy host id 79; `forward_scheme=http` — the forward is plain HTTP behind NPM's ACME TLS) | **live** (DNS-01 cert; TLS + proxy verified from the laptop on-lab) |
-| Lab-internal DNS A record `voice-lab.butler.ooo → 10.10.199.28` | lab Technitium zone | **live** (phones on the lab resolve it) |
-| **Public** DNS A record `voice-lab.butler.ooo → 173.48.243.181` | Cloudflare `butler.ooo` zone | **pending (the one remaining step)** |
+| `voice-gw` allowlist container + **outbound cloudflared tunnel agent** (two processes; image `local/voice-gw-alc` built from `ct/voice-gw/Dockerfile` + `run.sh`) | lab `ct/voice-gw/` + `hosts/mini/alc.toml` | **deployed + verified** (allowlist verified through the public URL: healthz 200 / deny 404 / mule 401→200 / WS reached mule) |
+| Quick tunnel `https://catering-integral-andrew-yields.trycloudflare.com` (ephemeral) | voice-gw container; URL logged to `~/.lab-alc/data/voice-gw/tunnel.log` | **live now** — the test user's `voice_gateways` row points here |
+| Named tunnel (permanent hostname, e.g. `voice-lab.jbutler.dev` → service `http://localhost:8443`; `VOICE_GW_TUNNEL_TOKEN` in the pool env) | CF dashboard + pool env | **optional next step** |
+| NPM proxy host `voice-lab.butler.ooo` + internal DNS record + host forward 8843→8443 | NPM id 79 / lab Technitium / forwarder | **live, now optional** (on-lab fallback path) |
 | Google OAuth provider on the Supabase project | Google Cloud client + `POST /auth/providers/google` (sbp_ token) | **pending (needs the OAuth client)** |
 
-> **Why the public record matters:** the Supabase edge function runs on the
-> public internet and saw `NXDOMAIN` for voice-lab.butler.ooo (verified
-> 2026-10-11 via Google DoH: the *.butler.ooo subdomains exist only in the
-> lab-internal Technitium zone). Until the public A record exists, cloud
-> mode's proxied paths fail DNS at the edge (direct on-lab mode is
-> unaffected, and the call's wss:// dials work from phones on the lab).
+> **Why a tunnel, not a public A record:** policy is zero public ingress
+> to the lab — no NAT forwards, no public IP exposure. `voice-lab.
+> butler.ooo` exists only in the lab-internal Technitium zone (public DoH
+> shows NXDOMAIN), so the Supabase edge could not resolve it; the
+> outbound Cloudflare tunnel is the fix: the lab's only connection to
+> the public internet is cloudflared's outbound 443 dial.
 
 ## Test record (2026-10-11)
 
@@ -85,13 +105,16 @@ lab-side API keys still gate the proxied API paths.
 - Test user `voice-gw-test2@jbutler.dev` (admin-confirmed via a
   since-removed token-gated hook): password grant → user JWT.
 - `rpc/upsert_voice_gateway` with that JWT → 204; RLS read-back returns the
-  row; **row points at public-echo stubs (httpbingo/postman-echo)** so the
-  forwarding plumbing was proven without lab exposure.
+  row; row first pointed at public-echo stubs (httpbingo/postman-echo) to
+  prove forwarding plumbing, then re-pointed at the tunnel hostname.
 - STT: multipart body forwarded intact (boundary + content-length echoed by
   the stub); jobs: `Authorization: Bearer <row key>` injected (echoed);
   workflows: forwarded.
-- WS upgrades: platform 502 even for a plain JSON response — documented
-  limit, not a code bug.
+- **Through the tunnel (final, off-lab):** healthz 200 / deny 404 / mule
+  401-no-key / mule workflows 200-with-key / WS upgrade reaches mule (not
+  nginx-404); edge fn → tunnel → mule workflows 200; edge fn → tunnel →
+  forge TTS hits real forge validation (422 on a malformed probe — i.e.
+  the request reached forge, not a 502).
 
 ## Security posture (documented decisions)
 
@@ -110,15 +133,19 @@ lab-side API keys still gate the proxied API paths.
 
 ## Remaining manual steps (owner)
 
-1. **Cloudflare `butler.ooo` zone: A record `voice-lab.butler.ooo →
-   173.48.243.181`** (lab router public IP, same target the router's NAT
-   443-forward already serves to NPM). Proxied or DNS-only both work
-   (DNS-01 cert already issued); DNS-only keeps voice audio off CF's
-   edge. Re-point if the home IP changes (dynamic IP — no DDNS on
-   butler.ooo today).
-2. Phone: sign in (password now; Google once enabled), Settings → enable
-   "Cloud voice", set the CG fields to `https://voice-lab.butler.ooo` +
-   the two keys, "Save cloud gateway", then PTT + 📞 off-lab.
+1. **Optional — permanent hostname (named tunnel):** CF dashboard → Zero
+   Trust → Networks → Tunnels → New tunnel (Cloudflared connector) → copy
+   the token → lab: put `VOICE_GW_TUNNEL_TOKEN=<token>` in the pool env
+   (`~/.lab-alc/data/voice-gw/env`, sourced by `run.sh`) → dashboard:
+   public hostname `voice-lab.jbutler.dev` → service
+   `http://localhost:8443` → restart the voice-gw container → re-point
+   the `voice_gateways` row (phone Settings → "Save cloud gateway", or
+   the RPC). Until then the quick-tunnel URL stands — it **changes on
+   every container restart** (read `~/.lab-alc/data/voice-gw/tunnel.log`
+   and update the row).
+2. Phone: sign in, Settings → enable "Cloud voice", CG fields =
+   `https://catering-integral-andrew-yields.trycloudflare.com` (today)
+   + the two lab keys, "Save cloud gateway", then PTT + 📞 off-lab.
 3. Google: create an OAuth client (redirect `ranch://auth-callback`), then
    enable the provider via the Supabase mgmt API (runbook in
    `docs/LAB-SECRETS.md`).
@@ -141,8 +168,20 @@ lab-side API keys still gate the proxied API paths.
 - **reconcile set -e**: a transient ALC API flap made `machine_exists`
   false-positive on mule; the unguarded recreate then aborted the whole
   loop. Both recreate branches now double-check after 2 s and WARN
-  instead of dying.
+  instead of dying. Also added: **container image-mismatch detection**
+  (name-based adoption otherwise keeps starting a container whose image
+  the manifest no longer names — observed with the voice-gw
+  nginx:alpine → local/voice-gw-alc move).
+- **ALC CLI auth is per-user**: `sudo container …` write ops fail with
+  "unauthorized request" (root's apiserver ≠ the user's containers);
+  use the plain CLI as the user (reconcile's `alc()` helper does
+  `launchctl asuser 501 su jbutler`). A macOS ALC runtime update
+  (2026-10-11 14:30) briefly put the apiserver in exactly this state.
 - **NPM proxy host**: `forward_scheme` must stay `http` (NPM terminates
   TLS; the upstream is plain). UI default is ON — flip it off, or the
   documented sqlite edit (`update proxy_host set forward_scheme='http'
   where id=…` + regenerate/reload).
+- **`container run` (foreground) blocks** the session at "Starting
+  container" even when the container came up fine — always use `-d`;
+  a killed foreground run can still leave the container created+running
+  (clean it up before the next named create).
