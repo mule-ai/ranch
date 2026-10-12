@@ -52,6 +52,18 @@ Still yours to do (phone):
    - *Voice call* section: mule address `http://10.10.199.29:8091` and
      the mule key from the `mule-private` vault folder.
 
+## The three “agent-ish” things (read this first — they’re different)
+
+| What | What it is | Where it lives | Create it |
+|---|---|---|---|
+| **Herd agent** (a “dot”) | A named registry agent: model profile, memory scope, tools, wakes. Persistent. | Forge `agents` table | Phone: Agents screen → **＋ New agent**. Terminal: `ranch agents new` |
+| **One-off pi chat** | A disposable conversation running the `pi` binary *on the machine you’re monitoring* (its own pane, its own folder). Not in the registry; no wakes. | The monitored machine (ranchd spawns `pi --mode rpc`) | Phone: monitor home → **new agent** → “π one-off chat — pi on THIS machine” |
+| **One-off forge chat** | A conversation on a lab-forge model/profile. Also not in the registry. | Lab forge | Phone: monitor home → **new agent** → “🤖 one-off chat — lab forge model” |
+
+Rule of thumb: *will you talk to it by name later, wake it on a
+schedule, or share its memory?* → herd agent. *Just need a scratch
+conversation right now?* → one-off chat.
+
 ## Flow 1 — Create your first specialist agent
 
 *(The `billing` agent from the plan already exists in lab forge —
@@ -62,9 +74,13 @@ skip to Flow 2 and confirm `billing` appears on both surfaces.)*
 The "billing" agent from the plan: it gets a restricted tool set,
 org-shared memory, and wakes up every morning at 7:00 on its own.
 
-**Phone:** open the app → Agents screen → the **+** button. Fill in:
-name `billing`, memory scope `org` (org label: whatever your other
-agents use — or `butler`), a daily wake at `07:00`. Save.
+**Phone:** open the app → Agents screen → the **+** button. The form
+is the full builder: name; **model profile** (pick an existing one from
+the dropdown, or **＋ new profile** to create one inline — provider,
+catalog model, base URL, key, system prompt); memory scope (`agent` or
+`org` + label); home machine; daily wake at `07:00`; and the **tools
+allowlist** (check what it may use — uncheck *bash*/*read*/*write* for
+a reason-only agent; none checked = all). Save.
 
 **Terminal** (same thing, more knobs): `ranch agents new` — it walks you
 through name → avatar (pick an image file) → model profile → which tools

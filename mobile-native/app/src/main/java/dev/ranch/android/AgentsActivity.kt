@@ -77,6 +77,11 @@ class AgentsActivity : Activity() {
         root.addView(status)
 
         // ---- forge agent registry ----
+        root.addView(TextView(this).apply {
+            text = "HERD AGENTS — registered agents (name, model, memory, wakes). Tap one to talk; ＋ creates a new one."
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            setTextColor(0xFF6B7280.toInt()); setPadding(0, dp(2), 0, dp(4))
+        })
         agentList = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         root.addView(agentList)
         // H6.5: the ＋Agent form (mobile twin of `ranch agents new`).
@@ -90,7 +95,8 @@ class AgentsActivity : Activity() {
 
         // ---- divider: local pi manager ----
         root.addView(TextView(this).apply {
-            text = "LOCAL PI SESSIONS"; setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            text = "ONE-OFF PI CHATS — disposable local pi sessions on ${Monitor.machineName} (not in the registry)"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
             setTextColor(0xFF9aa0a6.toInt()); setPadding(0, dp(12), 0, dp(4))
         })
 
@@ -104,9 +110,13 @@ class AgentsActivity : Activity() {
         root.addView(monitorSw)
 
         root.addView(Button(this).apply {
-            text = "＋ New agent session"
+            text = "＋ New one-off pi chat"
             setPadding(0, dp(6), 0, dp(6))
-            setOnClickListener { relay?.send(Term.sessionsCreate("pi")) }
+            setOnClickListener {
+                val reqId = "sc-" + Term.newId()
+                relay?.send(Term.sessionsCreate("pi", null, null, reqId))
+                status.text = "creating one-off pi chat…"
+            }
         })
 
         piList = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
@@ -178,6 +188,7 @@ class AgentsActivity : Activity() {
                     rid.startsWith("ab-") -> { /* a busy probe failing is noise */ }
                     rid.startsWith("at-") -> flash("talk: $msg")
                     rid.startsWith("pil-") -> flash("pi list: $msg")
+                    rid.startsWith("sc-") -> status.text = "create failed: $msg"
                     else -> { /* SessionsCreate & friends report via SessionsAck */ }
                 }
             }

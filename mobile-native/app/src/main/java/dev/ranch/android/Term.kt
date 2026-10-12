@@ -63,12 +63,58 @@ object Term {
         JSONObject().put("t", "FileGet").put("id", newId()).put("client", CLIENT)
             .put("req_id", "fg-" + newId()).put("path", path)
 
-    fun sessionsCreate(kind: String = "shell", name: String? = null, cwd: String? = null): JSONObject {
+    fun sessionsCreate(
+        kind: String = "shell",
+        name: String? = null,
+        cwd: String? = null,
+        reqId: String = "sc-" + newId(),
+    ): JSONObject {
         val o = JSONObject()
-            .put("t", "SessionsCreate").put("req_id", newId()).put("client", CLIENT)
+            .put("t", "SessionsCreate").put("req_id", reqId).put("client", CLIENT)
             .put("kind", kind)
         if (name != null) o.put("name", name)
         if (cwd != null && cwd.isNotEmpty()) o.put("cwd", cwd)
+        return o
+    }
+
+    // ----- agent builder (Phase B): forge profile CRUD proxy -----
+    fun profileList(reqId: String = "pl-" + newId()): JSONObject =
+        JSONObject().put("t", "ProfileList").put("req_id", reqId).put("client", CLIENT)
+
+    fun modelCatalog(reqId: String = "mc-" + newId()): JSONObject =
+        JSONObject().put("t", "ModelCatalog").put("req_id", reqId).put("client", CLIENT)
+
+    fun profilePut(
+        profileId: String? = null,
+        name: String,
+        provider: String,
+        model: String,
+        description: String = "",
+        baseUrl: String = "",
+        apiKey: String = "",
+        workingDir: String = "",
+        systemPrompt: String = "",
+        tools: List<String> = emptyList(),
+        reqId: String = "pp-" + newId(),
+    ): JSONObject {
+        val o = JSONObject()
+            .put("t", "ProfilePut").put("req_id", reqId).put("client", CLIENT)
+            .put(
+                "draft", JSONObject()
+                    .put("name", name).put("provider", provider).put("model", model)
+            )
+        if (profileId != null && profileId.isNotEmpty()) o.put("profile_id", profileId)
+        val d = o.getJSONObject("draft")
+        if (description.isNotEmpty()) d.put("description", description)
+        if (baseUrl.isNotEmpty()) d.put("base_url", baseUrl)
+        if (apiKey.isNotEmpty()) d.put("api_key", apiKey)
+        if (workingDir.isNotEmpty()) d.put("working_dir", workingDir)
+        if (systemPrompt.isNotEmpty()) d.put("system_prompt", systemPrompt)
+        if (tools.isNotEmpty()) {
+            val arr = org.json.JSONArray()
+            tools.forEach { arr.put(it) }
+            d.put("tools", arr)
+        }
         return o
     }
 
@@ -148,13 +194,16 @@ object Term {
         profileId: String = "",
         wakeCron: String = "",
         wakePrompt: String = "",
-    ): JSONObject =
-        JSONObject()
+        tools: List<String> = emptyList(),
+    ): JSONObject {
+        val toolsArr = org.json.JSONArray()
+        tools.forEach { toolsArr.put(it) }
+        return JSONObject()
             .put("t", "AgentProvision").put("req_id", "apv-" + newId())
             .put("name", name)
             .put("memory_scope", memoryScope)
             .put("home_machine", homeMachine)
-            .put("tools_allowlist", org.json.JSONArray())
+            .put("tools_allowlist", toolsArr)
             .apply {
                 if (avatar.isNotEmpty()) put("avatar", avatar)
                 if (orgId.isNotEmpty()) put("org_id", orgId)
@@ -162,6 +211,7 @@ object Term {
                 if (wakeCron.isNotEmpty()) put("wake_cron", wakeCron)
                 if (wakePrompt.isNotEmpty()) put("wake_prompt", wakePrompt)
             }
+    }
 
     fun agentBusy(agent: String, reqId: String = "ab-" + newId()): JSONObject =
         JSONObject().put("t", "AgentBusy").put("id", newId()).put("client", CLIENT)

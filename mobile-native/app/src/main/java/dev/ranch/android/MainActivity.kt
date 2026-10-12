@@ -502,7 +502,18 @@ class MainActivity : Activity() {
         // re-register on the new session (drop the stale one first)
         frameSink?.let { old -> frameSinkRelay?.removeSink(old) }
         val sink: (JSONObject) -> Unit = { f ->
-            if (f.optString("t") == "DirListOk") handler.post { onDirListOk(f) }
+            when (f.optString("t")) {
+                "DirListOk" -> handler.post { onDirListOk(f) }
+                // Create-error surfacing: SessionsCreate failures (e.g.
+                // "pi spawn failed: No such file or directory") used to
+                // leave the "creating …" status hanging forever.
+                "Error" -> {
+                    val rid = f.optString("req_id", "")
+                    if (rid.startsWith("sc-")) {
+                        handler.post { homeStatus?.text = "create failed: ${f.optString("message", "unknown error")}" }
+                    }
+                }
+            }
         }
         frameSink = sink
         frameSinkRelay = relay
@@ -519,14 +530,20 @@ class MainActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(16), dp(12), dp(16), dp(8))
         }
-        val kindRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val kindRow = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         var piChip: Button? = null
         var forgeChip: Button? = null
         var dirRow: LinearLayout? = null
-        piChip = agentChip("π local pi") {
+        piChip = agentChip(
+            "π one-off chat — pi on THIS machine",
+            "Runs a local pi agent in a folder on ${Monitor.machineName}. No registry, no wake — just a chat that lives on this machine.",
+        ) {
             agentKind = "pi"; styleAgentChips(piChip!!, forgeChip!!, dirRow!!)
         }
-        forgeChip = agentChip("🤖 forge") {
+        forgeChip = agentChip(
+            "🤖 one-off chat — lab forge model",
+            "A conversation on a lab forge profile (default profile). Lives in forge, not on this machine.",
+        ) {
             agentKind = "forge"; styleAgentChips(piChip!!, forgeChip!!, dirRow!!)
         }
         kindRow.addView(piChip)
@@ -547,20 +564,21 @@ class MainActivity : Activity() {
             setPadding(0, dp(8), 0, 0)
         }
         var dirChip: Button? = null
-        dirChip = agentChip("dir: \$HOME") { showDirPicker(dirChip!!) }
+        dirChip = agentChip("dir: \$HOME", "pick the folder the pi agent works in") { showDirPicker(dirChip!!) }
         dirRow!!.addView(dirChip!!)
         root.addView(dirRow)
 
         styleAgentChips(piChip!!, forgeChip!!, dirRow!!)
 
         android.app.AlertDialog.Builder(this)
-            .setTitle("New agent session")
+            .setTitle("New one-off chat")
             .setView(root)
             .setPositiveButton("create") { _, _ ->
                 val name = nameEdit.text.toString().trim().ifEmpty { null }
                 val cwd = if (agentKind == "pi") agentDir.ifEmpty { null } else null
-                relay.send(Term.sessionsCreate(agentKind, name, cwd))
-                homeStatus?.text = "creating $agentKind session…"
+                val reqId = "sc-" + Term.newId()
+                relay.send(Term.sessionsCreate(agentKind, name, cwd, reqId))
+                homeStatus?.text = "creating ${if (agentKind == "pi") "local pi" else "forge"} chat…"
             }
             .setNegativeButton("cancel", null)
             .show()
@@ -578,13 +596,16 @@ class MainActivity : Activity() {
         b.setBackgroundColor(if (on) 0xFF1B6FD4.toInt() else 0xFF1B2126.toInt())
     }
 
-    private fun agentChip(label: String, click: () -> Unit): Button = Button(this).apply {
-        text = label
-        setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-        setPadding(dp(10), dp(6), dp(10), dp(6))
-        minWidth = 0
-        setOnClickListener { click() }
-    }
+    private fun agentChip(label: String, subtitle: String, click: () -> Unit): Button =
+        Button(this).apply {
+            text = "$label\n$subtitle"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            setPadding(dp(10), dp(8), dp(10), dp(8))
+            minWidth = 0
+            isAllCaps = false
+            gravity = Gravity.START or Gravity.CENTER_VERTICAL
+            setOnClickListener { click() }
+        }
 
     private fun showDirPicker(dirChip: Button) {
         val relay = Monitor.relay ?: return
@@ -611,14 +632,14 @@ class MainActivity : Activity() {
             ).apply { setMargins(0, 0, 0, dp(8)) })
 
         val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        val up = agentChip("up…") { pickerParent?.let { browseDir(it) } }
+        val up = agentChip("up…", "") { pickerParent?.let { browseDir(it) } }
         row.addView(up)
-        row.addView(agentChip("use this dir") {
+        row.addView(agentChip("use this dir", "") {
             agentDir = pickerPath
             dirChip.text = "dir: " + (agentDir.ifEmpty { "\$HOME" })
             pickerDialog?.dismiss()
         })
-        row.addView(agentChip("cancel") { pickerDialog?.dismiss() })
+        row.addView(agentChip("cancel", "") { pickerDialog?.dismiss() })
         root.addView(row)
         this@MainActivity.pickerUp = up
 

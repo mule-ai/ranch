@@ -168,9 +168,11 @@ request: slots are declared later via `PATCH /agents/:id
   re-pastes.
 - The handoff page is served for ANY host header (the token IS the
   credential): keep forge loopback- or tunnel-gated, as always.
-- Mobile form: raw profile id + "all tools" — the profile picker and
-  tools allowlist editing are the CLI/TUI's richer half; restrict
-  later via `PATCH /agents/:id`.
+- Mobile form v1: raw profile id + "all tools". **v2 (2026-10-12, shipped): the
+  mobile NewAgentActivity is now the full builder** — profile picker
+  (ProfileList), inline new-profile form (ModelCatalog + ProfilePut),
+  and the tools allowlist checkbox set (the daemon's KNOWN_TOOLS;
+  unchecked = all, the H1.1 empty-allowlist convention).
 - `xdg-open` is best-effort: on headless boxes the `handoff_url`
   still comes back in the tool output so the model can relay it.
 
