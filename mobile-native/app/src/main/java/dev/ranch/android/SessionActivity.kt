@@ -79,6 +79,14 @@ class SessionActivity : Activity() {
     private var uiKind = ""
     private var agentStatus = ""
 
+    // H6.3: the 📞 on the conversation page. This session is an agent
+    // conversation when it has a forge-chat pane AND the agent registry
+    // (AgentListOk) has an agent whose name matches the session name
+    // (AgentTalk-created sessions are named for the agent).
+    private var callBtn: Button? = null
+    private val agentRegistry = mutableListOf<Term.AgentInfo>()
+    private var callAgent: Term.AgentInfo? = null
+
     // agent ask
     private var pendingAsk: Term.AgentAsk? = null
     private var askAnswerNote: String? = null
@@ -317,6 +325,13 @@ class SessionActivity : Activity() {
         }
         top.addView(back)
         top.addView(titleView, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f))
+        callBtn = iconBtn("📞", 0xFF7fd4ff.toInt()) {
+            val agent = callAgent ?: return@iconBtn
+            startActivity(Intent(this, CallActivity::class.java)
+                .putExtra(CallActivity.EXTRA_AGENT_ID, agent.id)
+                .putExtra(CallActivity.EXTRA_AGENT_NAME, agent.name))
+        }.apply { visibility = View.GONE }
+        top.addView(callBtn)
         top.addView(iconBtn("✎", 0xFFE5E5E5.toInt()) { renameSession() })
         top.addView(iconBtn("✕", 0xFFef4444.toInt()) {
             relay?.send(Term.sessionsKill(sessionId))
@@ -401,6 +416,10 @@ class SessionActivity : Activity() {
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
 
         setContentView(root)
+
+        // H6.3: agent registry for the 📞 conversation-page button
+        // (one round trip; the registry is small).
+        r.send(Term.agentList())
 
         // restore compaction state + queued messages that outlived the
         // screen (back-swipe, backgrounding, process kill)
@@ -586,6 +605,7 @@ class SessionActivity : Activity() {
             "AgentAskRequest" -> onAgentAsk(f)
             "AgentAskAnswer" -> onAgentAskAnswer(f)
             "ModelListOk" -> onModelListOk(f)
+            "AgentListOk" -> onAgentListOk(f)
             "ChatHistoryOk" -> onChatHistoryOk(f)
             "Scrollback" -> onScrollback(f)
             "FileGetOk" -> {
@@ -680,6 +700,7 @@ class SessionActivity : Activity() {
         rebuildTabs()
         renderActive()
         updateModelBar()
+        updateCallButton()
         // compaction completed while the app was away? the daemon caches the
         // last context readout on the pane, so the Snapshot tells us
         if (compacting && panes[compactingPane]?.context?.startsWith("compacted") == true) {
@@ -1066,6 +1087,33 @@ class SessionActivity : Activity() {
         } ?: emptyList()
         modelOpts[paneId] = models
         showModelPicker(models)
+    }
+
+    /** H6.3: agent registry reply — cache it, re-evaluate the 📞 button. */
+    private fun onAgentListOk(f: JSONObject) {
+        val agents = f.optJSONArray("agents")
+        val list = mutableListOf<Term.AgentInfo>()
+        if (agents != null) {
+            for (i in 0 until agents.length()) {
+                list.add(Term.parseAgentInfo(agents.getJSONObject(i)))
+            }
+        }
+        agentRegistry.clear()
+        agentRegistry.addAll(list)
+        updateCallButton()
+    }
+
+    /** Show the 📞 when this session is an agent conversation and the
+     *  registry names that agent (AgentTalk sessions carry the agent
+     *  name as the session name). */
+    private fun updateCallButton() {
+        val isAgentConv = panes.values.any { it.kind == "forge-chat" }
+        val name = sessionName.trim()
+        val match = if (isAgentConv && name.isNotEmpty()) {
+            agentRegistry.firstOrNull { it.name.equals(name, ignoreCase = true) }
+        } else null
+        callAgent = match
+        callBtn?.visibility = if (match != null) View.VISIBLE else View.GONE
     }
 
     /** Scrollable model picker with type-to-filter. */

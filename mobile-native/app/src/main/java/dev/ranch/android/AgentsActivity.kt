@@ -252,12 +252,15 @@ class AgentsActivity : Activity() {
         // H6.3: the 📞 button opens the voice call (CallActivity dials
         // mule's voice_call workflow directly — no ranch frames, no
         // daemon in the media path). Mule config lives in Settings
-        // (next to the H6.2 forge fields).
+        // (next to the H6.2 forge fields). Sized as a real touch target
+        // (≥44 dp), not an icon garnish — it's the primary action here.
         row.addView(Button(this).apply {
             text = "📞"
-            minWidth = 0
-            minimumWidth = 0
-            setPadding(dp(6), 0, dp(6), 0)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+            minWidth = dp(48)
+            minimumWidth = dp(48)
+            minHeight = dp(40)
+            setPadding(dp(10), 0, dp(10), 0)
             setOnClickListener {
                 startActivity(Intent(this@AgentsActivity, CallActivity::class.java)
                     .putExtra(CallActivity.EXTRA_AGENT_ID, a.id)

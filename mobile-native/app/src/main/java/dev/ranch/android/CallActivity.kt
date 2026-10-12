@@ -241,7 +241,11 @@ class CallActivity : Activity() {
             val found = wfResult.getOrNull()
             if (found == null) {
                 val err = wfResult.exceptionOrNull()
-                if (err != null) { fail(err.message ?: "workflow lookup failed"); return@execute }
+                if (err != null) {
+                    fail((err.message ?: "workflow lookup failed") +
+                        if (cloud) "\n\n(cloud: this Supabase account must have a saved cloud gateway — Settings → Save cloud gateway; and the tunnel must be up on the lab)" else "")
+                    return@execute
+                }
                 status2("no voice_call workflow for this agent — seed one (mule examples/voice-loop/seed.sh)")
                 ended = true
                 return@execute
@@ -260,7 +264,7 @@ class CallActivity : Activity() {
             // their voice_gateways row. Direct mode dials the base itself.
             var wsBase = base
             if (cloud) {
-                wsBase = (muleGet(base, key, "/gateway") as? JSONObject)
+                wsBase = (muleGet(base, key, "/gateway").getOrNull() as? JSONObject)
                     ?.optString("mule_base_url")?.trim()?.trimEnd('/') ?: ""
                 if (wsBase.isEmpty()) {
                     ended = true
@@ -297,7 +301,8 @@ class CallActivity : Activity() {
         key: String,
         agentId: String,
     ): Result<Pair<String, Int>?> {
-        val wfs = muleGet(base, key, "/api/v1/workflows") ?: return resFail("list workflows")
+        val wfRes = muleGet(base, key, "/api/v1/workflows")
+        val wfs = wfRes.getOrElse { return resFail(it.message ?: "list workflows") }
         // mule's list endpoints are inconsistent: /api/v1/workflows is a BARE
         // array, /api/v1/wakes is {wakes: [...]}, job POST is {data: {...}} —
         // accept every shape we've seen.
@@ -306,12 +311,14 @@ class CallActivity : Activity() {
             is org.json.JSONArray -> wfs
             else -> null
         }
-        if (arr == null) return resFail("list workflows: unexpected shape")
+        if (arr == null) return resFail("list workflows: unexpected shape: ${wfs}")
+        var firstErr: String? = null
         for (i in 0 until arr.length()) {
             val wf = arr.getJSONObject(i)
             val wfId = wf.optString("id")
             if (wfId.isEmpty()) continue
-            val steps = muleGet(base, key, "/api/v1/workflows/$wfId/steps") ?: continue
+            val steps = muleGet(base, key, "/api/v1/workflows/$wfId/steps")
+                .getOrElse { firstErr = firstErr ?: (it.message ?: "steps"); continue }
             val sArr = if (steps is JSONObject) steps.optJSONArray("steps") else null
             val list = sArr ?: (steps as? org.json.JSONArray) ?: continue
             for (j in 0 until list.length()) {
@@ -325,6 +332,7 @@ class CallActivity : Activity() {
                 return Result.success(wfId to rate)
             }
         }
+        if (firstErr != null && arr.length() == 0) return resFail(firstErr)
         return Result.success(null as Pair<String, Int>?)
     }
 
@@ -354,27 +362,36 @@ class CallActivity : Activity() {
         }
     }
 
-    private fun muleGet(base: String, key: String, path: String): Any? = try {
+    /**
+     * GET with the real error surfaced: the previous version swallowed
+     * every failure as `null`, so a 401/404/DNS failure showed up as the
+     * useless "list workflows".
+     */
+    private fun muleGet(base: String, key: String, path: String): Result<Any?> = try {
         val req = Request.Builder()
             .url(base + path)
             .header("Authorization", "Bearer $key")
             .get()
             .build()
         http.newCall(req).execute().use { resp ->
-            if (!resp.isSuccessful) return null
             val text = resp.body?.string().orEmpty()
+            if (!resp.isSuccessful) {
+                return@use Result.failure<Any?>(
+                    Exception("HTTP ${resp.code} on $path: ${text.take(200)}")
+                )
+            }
             try {
                 when {
-                    text.startsWith("[") -> org.json.JSONArray(text)
-                    text.startsWith("{") -> JSONObject(text)
-                    else -> null
+                    text.startsWith("[") -> Result.success<Any?>(org.json.JSONArray(text))
+                    text.startsWith("{") -> Result.success<Any?>(JSONObject(text))
+                    else -> Result.failure<Any?>(Exception("$path: unexpected body: ${text.take(120)}"))
                 }
             } catch (e: Exception) {
-                null
+                Result.failure<Any?>(Exception("$path: bad JSON: ${text.take(120)}"))
             }
         }
     } catch (e: Exception) {
-        null
+        Result.failure<Any?>(Exception("$path: ${e.message}"))
     }
 
     // ------------------------------------------------------------------
