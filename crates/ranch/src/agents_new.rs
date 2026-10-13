@@ -269,7 +269,11 @@ pub fn provision(
     );
     let created = forge_req(cfg, "POST", "/agents", Some(&body))
         .map_err(|e| format!("creating agent: {e}"))?;
-    let agent_id = created
+    // forge wraps the agent in {"agent": {...}}
+    let agent = created
+        .get("agent")
+        .unwrap_or(&created);
+    let agent_id = agent
         .get("id")
         .and_then(|x| x.as_str())
         .map(str::to_string)
