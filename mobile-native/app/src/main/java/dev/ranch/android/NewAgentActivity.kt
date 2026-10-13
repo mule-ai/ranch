@@ -156,6 +156,7 @@ class NewAgentActivity : Activity() {
             toolChecks.add(box)
             toolsBox.addView(box)
         }
+        form.addView(toolsBox)
 
         root.addView(ScrollView(this).apply { addView(form) })
 
@@ -389,7 +390,7 @@ class NewAgentActivity : Activity() {
             text = label; setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
             setTextColor(0xFF9aa0a6.toInt()); setPadding(0, dp(8), 0, dp(2))
         })
-        return EditText(this).apply {
+        val edit = EditText(this).apply {
             this.hint = hint
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
             setTextColor(0xFFE5E5E5.toInt())
@@ -397,6 +398,8 @@ class NewAgentActivity : Activity() {
             setSingleLine(true)
             background.setTint(0xFF9aa0a6.toInt())
         }
+        parent.addView(edit)
+        return edit
     }
 
     private fun flash(msg: String, green: Boolean = false) {
