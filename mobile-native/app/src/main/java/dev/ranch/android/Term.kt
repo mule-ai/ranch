@@ -227,6 +227,11 @@ object Term {
             .apply { if (agent != null) put("agent", agent) }
             .put("paused", paused)
 
+    /** Delete a herd agent (forge DELETE /agents/:id). */
+    fun agentDelete(agentId: String, reqId: String = "ad-" + newId()): JSONObject =
+        JSONObject().put("t", "AgentDelete").put("id", newId()).put("client", CLIENT)
+            .put("req_id", reqId).put("agent_id", agentId)
+
     // ---- Phase 4: agents / pi manager ----
     fun piList(): JSONObject =
         JSONObject().put("t", "PiList").put("id", newId()).put("client", CLIENT)

@@ -5189,6 +5189,57 @@ impl Daemon {
                     }
                 }
             }
+            Frame::AgentDelete { req_id, agent_id } => {
+                let forge = crate::forge::load_forge_config();
+                match &forge {
+                    Some(cfg) => {
+                        let url = format!("{}/agents/{}", cfg.base, agent_id);
+                        let agent = ureq::Agent::new_with_config(
+                            ureq::Agent::config_builder()
+                                .http_status_as_error(false)
+                                .build(),
+                        );
+                        match agent
+                            .delete(&url)
+                            .header("X-API-Key", &cfg.key)
+                            .call()
+                        {
+                            Ok(_) => {
+                                if let Some(c) = self.clients.get_mut(&from) {
+                                    send_frame(
+                                        c,
+                                        &Frame::AgentDeleteOk {
+                                            req_id: req_id.clone(),
+                                        },
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                if let Some(c) = self.clients.get_mut(&from) {
+                                    send_frame(
+                                        c,
+                                        &Frame::Error {
+                                            req_id: Some(req_id.clone()),
+                                            message: format!("delete agent: {e}"),
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    None => {
+                        if let Some(c) = self.clients.get_mut(&from) {
+                            send_frame(
+                                c,
+                                &Frame::Error {
+                                    req_id: Some(req_id.clone()),
+                                    message: "no forge config".into(),
+                                },
+                            );
+                        }
+                    }
+                }
+            }
             Frame::AgentTalk {
                 req_id,
                 agent,

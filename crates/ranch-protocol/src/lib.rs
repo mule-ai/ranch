@@ -1068,6 +1068,15 @@ pub enum Frame {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         wake_id: Option<String>,
     },
+    /// Client -> daemon: delete a herd agent (forge DELETE /agents/:id).
+    AgentDelete {
+        req_id: String,
+        agent_id: String,
+    },
+    /// Daemon -> client: the agent was deleted.
+    AgentDeleteOk {
+        req_id: String,
+    },
     // ----- triggers (Phase D) -----
     /// Client -> daemon: list trigger definitions + last runs.
     TriggerList {
@@ -2456,6 +2465,13 @@ mod tests {
                 agent_id: "agent-1".into(),
                 agent_name: "Atlas".into(),
                 wake_id: Some("w-1".into()),
+            },
+            Frame::AgentDelete {
+                req_id: "r10".into(),
+                agent_id: "agent-1".into(),
+            },
+            Frame::AgentDeleteOk {
+                req_id: "r10".into(),
             },
         ];
         for f in frames {

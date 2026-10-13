@@ -180,6 +180,10 @@ class AgentsActivity : Activity() {
                 // refresh the registry so the new dot shows up.
                 relay?.send(Term.agentList())
             }
+            "AgentDeleteOk" -> {
+                flash("agent deleted", green = true)
+                relay?.send(Term.agentList())
+            }
             "Error" -> {
                 val rid = f.optString("req_id")
                 val msg = f.optString("message", "error")
@@ -187,6 +191,7 @@ class AgentsActivity : Activity() {
                     rid.startsWith("al-") -> flash("registry: $msg")
                     rid.startsWith("ab-") -> { /* a busy probe failing is noise */ }
                     rid.startsWith("at-") -> flash("talk: $msg")
+                    rid.startsWith("ad-") -> flash("delete: $msg")
                     rid.startsWith("pil-") -> flash("pi list: $msg")
                     rid.startsWith("sc-") -> status.text = "create failed: $msg"
                     else -> { /* SessionsCreate & friends report via SessionsAck */ }
@@ -215,10 +220,13 @@ class AgentsActivity : Activity() {
     }
 
     /** Flash the status line (amber, "flash, don't die"). */
-    private fun flash(msg: String) {
+    private fun flash(msg: String, green: Boolean = false) {
         status.text = msg
-        status.setTextColor(0xFFF59E0B.toInt())
-        handler.postDelayed({ status.setTextColor(0xFF9aa0a6.toInt()) }, 4000)
+        status.setTextColor(if (green) 0xFF34d399.toInt() else 0xFFF59E0B.toInt())
+        handler.postDelayed({
+            status.setTextColor(0xFF9aa0a6.toInt())
+            if (green) status.text = ""
+        }, 4000)
     }
 
     // ---- forge agent rows ----
@@ -276,6 +284,26 @@ class AgentsActivity : Activity() {
                 startActivity(Intent(this@AgentsActivity, CallActivity::class.java)
                     .putExtra(CallActivity.EXTRA_AGENT_ID, a.id)
                     .putExtra(CallActivity.EXTRA_AGENT_NAME, a.name))
+            }
+        })
+        row.addView(Button(this).apply {
+            text = "✕"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+            setTextColor(0xFF6B7280.toInt())
+            minWidth = dp(40)
+            minimumWidth = dp(40)
+            minHeight = dp(40)
+            setPadding(dp(8), 0, dp(8), 0)
+            setOnClickListener {
+                android.app.AlertDialog.Builder(this@AgentsActivity)
+                    .setTitle("Delete agent")
+                    .setMessage("Delete \"${a.name.ifEmpty { a.id.take(8) }}\" from the registry? Its conversations and memory stay in forge but the agent row is removed.")
+                    .setPositiveButton("delete") { _, _ ->
+                        relay?.send(Term.agentDelete(a.id))
+                        flash("deleting ${a.name.ifEmpty { a.id.take(8) }}…")
+                    }
+                    .setNegativeButton("cancel", null)
+                    .show()
             }
         })
         val dot = TextView(this).apply {
