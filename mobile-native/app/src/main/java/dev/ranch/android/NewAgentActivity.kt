@@ -158,7 +158,10 @@ class NewAgentActivity : Activity() {
         }
         form.addView(toolsBox)
 
-        root.addView(ScrollView(this).apply { addView(form) })
+        root.addView(ScrollView(this).apply { addView(form) },
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
+            ))
 
         val create = Button(this).apply {
             text = "Create agent"
