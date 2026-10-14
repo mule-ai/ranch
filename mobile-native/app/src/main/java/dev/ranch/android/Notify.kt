@@ -171,6 +171,7 @@ class Notify(private val app: App) {
                 "AgentAskRequest" -> onAsk(f, sessionName)
                 "AgentAskAnswer" -> f.optString("ask_id").takeIf { it.isNotEmpty() }?.let(notifiedAsks::remove)
                 "ActivityPush" -> onActivityPush(f)
+                "AgentNotify" -> onAgentNotify(f)
                 else -> Unit
             }
         } catch (e: Exception) {
@@ -193,6 +194,7 @@ class Notify(private val app: App) {
         lastFrameAt = System.currentTimeMillis()
         rememberSession(f)
         val status = f.optString("status")
+        val background = f.optBoolean("background", false)
         when {
             status == "working" -> {
                 busy[pane] = true
@@ -200,6 +202,14 @@ class Notify(private val app: App) {
             }
             status == "idle" && busy[pane] == true -> {
                 busy[pane] = false
+                if (background) {
+                    // background turn (mule wake / cron) — suppress
+                    // the turn-end notification; the agent can still
+                    // fire an explicit AgentNotify if it matters
+                    turnLast.remove(pane)
+                    skippedOff++
+                    return
+                }
                 val agent = Monitor.agentFor(pane, f.optString("session"))
                 val body = turnLast.remove(pane)
                     ?.replace(Regex("\\s+"), " ")
@@ -343,6 +353,22 @@ class Notify(private val app: App) {
         }
         seenTasks.clear()
         seenTasks.addAll(now)
+    }
+
+    /** Explicit agent notification (the agent called notify_user).
+     *  Always posts — this is the opt-in path for background turns. */
+    private fun onAgentNotify(f: JSONObject) {
+        framesSeen++
+        lastFrameAt = System.currentTimeMillis()
+        val agent = f.optString("agent").ifEmpty { "agent" }
+        val msg = f.optString("message").replace(Regex("\\s+"), " ").take(200)
+        val priority = f.optString("priority").ifEmpty { "normal" }
+        // Bypass the background gate: this is an explicit notification
+        postLocal(
+            agent, msg,
+            agent, f.optString("pane").takeIf { it.isNotEmpty() },
+            emptyList(), priority,
+        )
     }
 
     // ---- gating + posting ----

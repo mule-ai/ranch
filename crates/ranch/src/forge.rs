@@ -155,6 +155,10 @@ struct WatchState {
     /// bumped on every "working" signal; delayed idle timers no-op if
     /// the generation moved on (a new turn started)
     turn_gen: AtomicU64,
+    /// true when the current turn was initiated by a mule wake —
+    /// the idle Meta carries `background: true` so clients suppress
+    /// the turn-end notification
+    background_turn: AtomicBool,
 }
 
 /// Shared pipe writer (SSE threads + job thread all emit frames).
@@ -334,6 +338,11 @@ fn handle_event(
             // until turn_ended. Clients show the working indicator.
             if msg.role == "user" {
                 state.turn_gen.fetch_add(1, Ordering::Relaxed);
+                // mule-wake-initiated turns are background: the user
+                // should not get a turn-end notification unless the
+                // agent explicitly calls notify_user
+                let is_bg = msg.text.starts_with("[mule wake");
+                state.background_turn.store(is_bg, Ordering::Relaxed);
                 write_agent_status(w, state.pane, "working");
             }
             write_frame(
@@ -342,10 +351,25 @@ fn handle_event(
                     id: String::new(),
                     session: String::new(), // filled by the main loop
                     pane: state.pane.to_string(),
-                    msgs: vec![msg],
+                    msgs: vec![msg.clone()],
                     reset: false,
                 },
             );
+            // @notify: prefix in an assistant message = explicit
+            // user notification (the agent called notify_user)
+            if msg.role == "assistant" && msg.text.starts_with("@notify:") {
+                let body = msg.text.trim_start_matches("@notify:").trim().to_string();
+                write_frame(
+                    w,
+                    &Frame::AgentNotify {
+                        session: String::new(),
+                        pane: state.pane.to_string(),
+                        agent: name.to_string(),
+                        message: body,
+                        priority: None,
+                    },
+                );
+            }
         }
         "turn_ended" => {
             // agent finished the turn — but the assistant's message rows
@@ -365,7 +389,8 @@ fn handle_event(
                 {
                     return; // cancelled: a new turn started
                 }
-                write_agent_status(&w, pane, "idle");
+                let bg = state.background_turn.swap(false, Ordering::Relaxed);
+                write_agent_status_bg(&w, pane, "idle", bg);
                 // the turn may have grown the context — refresh the
                 // readout so clients show the new usage
                 emit_context(&w, &cfg, pane, state.forge_sid);
@@ -1001,6 +1026,13 @@ fn post_result_to_forge(
 
 /// Agent busy/idle signal (client typing indicator).
 fn write_agent_status(w: &PipeWriter, pane: Uuid, status: &str) {
+    write_agent_status_bg(w, pane, status, false);
+}
+
+/// Like write_agent_status but carries the `background` flag on the
+/// Meta frame (used for the idle transition that closes a mule-wake
+/// turn, so mobile clients can suppress the turn-end notification).
+fn write_agent_status_bg(w: &PipeWriter, pane: Uuid, status: &str, background: bool) {
     write_frame(
         w,
         &Frame::Meta {
@@ -1008,6 +1040,7 @@ fn write_agent_status(w: &PipeWriter, pane: Uuid, status: &str) {
             pane: Some(pane.to_string()),
             kind: "agent".into(),
             status: Some(status.into()),
+            background: if background { Some(true) } else { None },
         },
     );
 }
@@ -1035,6 +1068,7 @@ pub fn spawn_worker(cfg: ForgeConfig, pipe_w: std::fs::File, rx: mpsc::Receiver<
                             last_seq: AtomicI64::new(0),
                             stop: AtomicBool::new(false),
                             turn_gen: AtomicU64::new(0),
+                            background_turn: AtomicBool::new(false),
                         });
                         let t_cfg = ForgeConfig {
                             base: cfg.base.clone(),
@@ -1053,6 +1087,7 @@ pub fn spawn_worker(cfg: ForgeConfig, pipe_w: std::fs::File, rx: mpsc::Receiver<
                                     pane: Some(pane.to_string()),
                                     kind: "model".into(),
                                     status: Some(cur.name),
+                                background: None,
                                 },
                             );
                         }
@@ -1204,6 +1239,7 @@ pub fn spawn_worker(cfg: ForgeConfig, pipe_w: std::fs::File, rx: mpsc::Receiver<
                                         pane: Some(pane.to_string()),
                                         kind: "context".into(),
                                         status: Some(note),
+                                    background: None,
                                     },
                                 );
                                 // close the "compacting" lifecycle machine-wide
@@ -1214,6 +1250,7 @@ pub fn spawn_worker(cfg: ForgeConfig, pipe_w: std::fs::File, rx: mpsc::Receiver<
                                         pane: Some(pane.to_string()),
                                         kind: "agent".into(),
                                         status: Some("idle".into()),
+                                    background: None,
                                     },
                                 );
                                 // the compaction changed the window — refresh
@@ -1272,6 +1309,7 @@ pub fn spawn_worker(cfg: ForgeConfig, pipe_w: std::fs::File, rx: mpsc::Receiver<
                                     pane: Some(pane.to_string()),
                                     kind: "model".into(),
                                     status: Some(display),
+                                background: None,
                                 },
                             ),
                             Err(e) => {
@@ -1567,6 +1605,7 @@ fn emit_context(pipe: &PipeWriter, cfg: &ForgeConfig, pane: Uuid, forge_sid: Uui
             pane: Some(pane.to_string()),
             kind: "context".into(),
             status: Some(status),
+        background: None,
         },
     );
 }
@@ -2247,6 +2286,7 @@ mod tests {
             last_seq: AtomicI64::new(0),
             stop: AtomicBool::new(false),
             turn_gen: AtomicU64::new(0),
+            background_turn: AtomicBool::new(false),
         });
         let path = std::env::temp_dir().join(format!("ranch-forge-sse-test-{}", Uuid::new_v4()));
         let file = std::fs::File::create(&path).expect("create pipe file");

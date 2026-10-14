@@ -401,6 +401,7 @@ fn run_ws_reader(
                                                 } else {
                                                     "failed".into()
                                                 }),
+                                            background: None,
                                             },
                                         );
                                     }
@@ -790,6 +791,7 @@ pub fn spawn_worker(cfg: MuleConfig, pipe_w: std::fs::File, rx: mpsc::Receiver<M
                                         pane: Some(pane.to_string()),
                                         kind: "workflow".into(),
                                         status: Some("running".into()),
+                                    background: None,
                                     },
                                 );
                             }

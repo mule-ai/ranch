@@ -2309,6 +2309,7 @@ impl Daemon {
                     pane: None,
                     kind: "exited".into(),
                     status: Some("session ended".into()),
+                background: None,
                 };
                 let recipients: Vec<RawFd> = self.clients.keys().copied().collect();
                 for rfd in recipients {
@@ -4181,6 +4182,7 @@ impl Daemon {
                             pane: Some(pid.to_string()),
                             kind: "agent".into(),
                             status: Some("compacting".into()),
+                        background: None,
                         };
                         let fds: Vec<RawFd> = self.clients.keys().copied().collect();
                         for fd in fds {
@@ -5789,6 +5791,7 @@ impl Daemon {
                 pane,
                 kind,
                 status,
+                ..
             } if session.is_empty()
                 && (kind == "agent"
                     || kind == "model"
@@ -5911,6 +5914,7 @@ impl Daemon {
                         pane: Some(pid.to_string()),
                         kind: kind.clone(),
                         status: status.clone(),
+                    background: None,
                     };
                     // Agent working/idle is machine-level lifecycle info (like
                     // AgentAskRequest): every connected client gets it, so a
@@ -6675,6 +6679,7 @@ impl Daemon {
                         pane: None,
                         kind: "exited".into(),
                         status: Some("session killed".into()),
+                    background: None,
                     };
                     let recipients: Vec<RawFd> = self.clients.keys().copied().collect();
                     for rfd in recipients {
@@ -7142,6 +7147,7 @@ impl Daemon {
                             pane: None,
                             kind: "exited".into(),
                             status: Some("session ended".into()),
+                        background: None,
                         };
                         let recipients: Vec<RawFd> = self.clients.keys().copied().collect();
                         for rfd in recipients {
@@ -7839,6 +7845,7 @@ fn run(
                     pane: None,
                     kind: "exited".into(),
                     status: Some("session ended".into()),
+                background: None,
                 };
                 let recipients: Vec<RawFd> = daemon.clients.keys().copied().collect();
                 for rfd in recipients {

@@ -602,6 +602,11 @@ pub enum Frame {
         kind: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         status: Option<String>,
+        /// true = this idle transition closed a background turn (e.g.
+        /// a mule wake) — clients should suppress the turn-end
+        /// notification.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        background: Option<bool>,
     },
     /// Error response to a failed request.
     Error {
@@ -1078,6 +1083,18 @@ pub enum Frame {
     /// Daemon -> client: the agent was deleted.
     AgentDeleteOk {
         req_id: String,
+    },
+    /// Daemon -> clients: an explicit user notification emitted by an
+    /// agent (its `notify_user` tool / `@notify:` message prefix).
+    /// Clients post this as a notification regardless of background
+    /// suppression; `priority` is "high" | "normal" | "quiet".
+    AgentNotify {
+        session: String,
+        pane: String,
+        agent: String,
+        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        priority: Option<String>,
     },
     // ----- triggers (Phase D) -----
     /// Client -> daemon: list trigger definitions + last runs.

@@ -2745,6 +2745,7 @@ fn cmd_attach_link(stream: Link, ref_: &str, cloud_machine: Option<&str>) -> Att
                                 pane: mpane,
                                 kind: mkind,
                                 status: mstat,
+                                ..
                             } => {
                                 if msess == session_id && mkind == "agent" {
                                     if let (Some(pv), Some(status)) = (
