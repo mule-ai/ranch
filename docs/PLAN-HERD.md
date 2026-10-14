@@ -1687,6 +1687,51 @@ was deliberately deferred, and the decision that can still be re-opened.
 - **Lab fleet cutover (2026-10-10/11) — six `lab-alc-reconcile`s on mini, three image rebuilds of the forge machine**: (1) **mule DSN anomaly** — the aarch64 mule binary ignores the DSN database name and writes all data to the `postgres` db inside its VM (the amd64 build honors it; root cause unresolved — accepted). `lab/ct/mule/configuration.nix` now aligns with reality: DSN `/postgres`, `backup.sh` dumps `postgres` (was the empty `mule` db — backups had been silently 371 bytes), `db-init.sh` restores `-d postgres`. (2) **forge harness startup race + model catalog** — `FORGE_HARNESS_SOCKET`/`FORGE_HARNESS_EVENTS_SOCKET` are baked into forge-api's NixOS config (env + `After=`/`Wants=` forge-harness + an `ExecStartPre` 60 s socket wait; `lab/ct/forge/configuration.nix`), so a recreated machine can no longer run an api that 503s every generation with "harness unavailable (disabled mode)". Forge `6d6f7ff9` + `cabc64a1`: `createModels()` starts with an EMPTY provider map and pi-durable receives `runtime.models` prebuilt, so the harness is the only registration site — it now registers the pi-ai builtins plus the machine's `models.json` (default `/root/.pi/agent/models.json`, `FORGE_HARNESS_MODELS` overrides) via `createProvider` + the builtin api implementations, filling the provider-scoped model fields (`api`/`provider`/`baseUrl`/`type`) that `createProvider` passes through (`harness/src/main.ts` `applyModelsJson`, `test/models-json.test.ts`). (3) **thinking-fallback projection** — forge `f10ac6a5`: small reasoning models (laguna-xs-2.1 via llama.cpp) answer entirely in `reasoning_content` (pi-ai `thinking` block, empty `content`), so `extract_assistant_text` falls back to the thinking text when no text blocks exist — without it mule's `forge_conversation` step failed with "ended without an assistant reply" on turns that had visibly answered. Mule PR #130 (reflection seed fixes + `0016_voice_step.sql`) merged 2026-10-11 (admin override of the repo's PR-only branch policy — the one merge this plan still needs a human to ratify). End-to-end evidence: the `billing-daily` mule workflow fires a real forge turn through the lab LLM proxy (Laguna), the agent thinks, calls tools (`web_login` correctly blocked by the `tools_allowlist` — H1.1/H3.5 live on the wire), and the assistant row projects into `messages` (re-fire the job for the completed-job record).
 - **Mid-conversation model switch (2026-10-11, forge `7d491926`, image `cd2a64d7`)** — the per-session model switcher used to apply only at conversation creation: an attached durable conversation kept its creation-time model forever (the H2.6 documented limitation), so "switching" billing to spark was a silent no-op. Now: harness `setModel` RPC (`Conversation.configure({model})` in its own commit, effective from the next provider request) + `conversationModel` RPC (drift detection via `agent()` resolution); `PATCH /sessions/:id` rebinds the attached conversation to the effective model (post-update override ?? profile) and a no-op re-save on a drifted conversation still heals it (conversations switched before this deployment). Live-switch failure returns 502 saying the DB row is recorded but the conversation is not — no more silent no-ops. Live acceptance on the lab: cleared billing's override (live switched laguna), re-set spark (live switched spark; `conversationModel` RPC confirms `proxy/spark/qwen3.8-sglang` on the real harness socket) — the agent the user believed was on spark now actually is, and mule's `billing-daily` (which reuses the active conversation) follows it. Test-infra fixes in the same commit: agent-pause test seeds its provider + provider_id (schema drift vs the shared test PG), and `test_helpers::auth_post` retries 429 per RETRY_AFTER (the H3 auth token bucket — burst 5, 1/s — raced any test registering >2 users in under a second; 5 test files updated, 333 forge-api tests green). Also: the lab's own ranch machine (`ranch-mini` VM) was registered (machine name `lab`, via the `register_machine` RPC) and its `daemon.toml` landed in the data pool `/Users/jbutler/.lab-alc/data/ranch-mini/` — it had booted local-only since Sept 29 because that file never existed (ranch-mini-dirs failed its ExecStartPre); heartbeats + relay now live. Note: the machine was registered under `owner@ranch.local` and then moved to the Google account (`jeremiah.butler@jbutler.dev`, the phone's sign-in) by a one-off `UPDATE machines/machines_info SET user_id` via the sbp_ management API — the phone's account is the account of record for the fleet.
 - **Mobile UX: three agent flows + full agent builder (2026-10-12)** — user: “pi agent created nothing / how do I tell a one-off pi from a forge chat from a herd agent / the full agent builder you skipped”. Root cause of “nothing appeared”: the ranch-mini ALC image was built without the `pi` binary, so `SessionsCreate kind=pi` failed server-side (“spawn pi: No such file or directory”) and the app never surfaced the `Error` frame (the “creating pi session…” status hung forever). Fixed three ways: (1) ranch-mini flake now bakes `pi` 0.84.4 (mirrors the forge flake derivation) + sets `RANCH_PI_BIN` on the ranchd service; image rebuilt on the forge machine and reconciled onto the VM; (2) the app now surfaces `Error` frames for `sc-…` create req-ids in both the home “new agent” dialog and the Agents screen (a failed create is visible, not a hang); (3) the three flows are now labeled as such in every entry point: “π one-off chat — pi on THIS machine” (SessionsCreate kind=pi → local pi pane on that machine), “🤖 one-off chat — lab forge model” (SessionsCreate kind=forge → forge-backed conversation), and “＋ New agent” on the Agents screen = **herd agent** (registry row via the `ranch agents new` core: profile, memory scope, tools, wakes). The mobile `NewAgentActivity` is now the full builder (v2): profile picker (`ProfileList`), inline new-profile form (`ModelCatalog` + `ProfilePut`), and the tools-allowlist checkbox set (KNOWN_TOOLS; unchecked = all tools, the H1.1 empty-allowlist convention). The daemon proxy frames (ProfileList/ProfilePut/ModelCatalog) already existed from H6.5 — only the app was missing them. APK builds clean; on-device + on-lab smokes are the next step.
+- **Public edge removal (2026-10-14, lab `f50ca75a`)** — user: “all of the
+  public stuff should be removed; we got rid of it, no longer needed.”
+  Removed the whole public surface: the NPM ALC container (the
+  *.butler.ooo TLS edge on the 10.10.199.28 alias), `ct/npm`,
+  `ct/forge-public` + `ct/mule-public` (vendor trees), the
+  `lab-npm-alias` launchd oneshot, `mac-alc-forward.sh`'s NPM
+  auto-sync (the conf/DB rewrite + nginx-reload pass), and the stale
+  ranch-demo/mule-public doc references. Live on mini: container
+  stopped + deleted, data pool `/Users/jbutler/.lab-alc/data/npm/` +
+  the image tarball removed, alias IP off en0, oneshot booted out,
+  darwin system re-switched (the plist is gone from the current
+  system). The lab is LAN-only now: every workload's only reachability
+  path is the socat forwarder on 10.10.199.29. Two adjacent things
+  deliberately kept (flagged to the user, not asked for):
+  the ha-edge alias + its pinned `.221:443` forward (ha.botnet's
+  TLS edge — also public-shaped), and the router-side public NAT
+  forwards themselves (unreachable from here; user confirms they're
+  already gone). Note: with NPM gone, `vault.butler.ooo` no longer
+  resolves — Vaultwarden access is now LAN-only if it still is
+  used at all.
+- **Spark agentic profile (2026-10-14)** — user: “VRAM isn't actually
+  running laguna; create another forge profile that uses our spark
+  qwen3.8-27b model, that's better for agentic work.” The lab forge's
+  only profile was `Laguna (dev)` pointing at
+  `http://10.10.199.146:8080/v1` (the vram llama.cpp box that isn't
+  running it). Created profile **`Spark (Qwen3.8-27B)`**
+  (id `f5f3f12c`): provider `proxy`, model `spark/qwen3.8-sglang`,
+  `base_url http://10.10.199.174:8001/v1` (SGLang DIRECT — the same
+  bypass as the lab pi panes, because Bifrost v1.6.4 400s pi's spark
+  requests), `api_key none`, working dir `/forge/work`. Rebound the
+  `test` agent's `primary_profile_id` to it. First live turn 400'd
+  (“provider API error”) — the forge's `models.json` had
+  `reasoning: true` on the spark entry (pi then sends reasoning
+  params SGLang rejects, and SGLang's always-on
+  `reasoning_content` would have been swallowed as thinking anyway);
+  set `reasoning: false` in the forge data-pool `models.json`
+  (`/Users/jbutler/.lab-alc/data/forge/pi/models.json` + the live
+  `/root/.pi/agent/` copy, harness restarted). Verified: new agent
+  conversation → `SPARK PROFILE LIVE` via the sandboxed bash tool
+  (exit 0) + the model self-identifies as Qwen. The old `Laguna
+  (dev)` profile still exists but is unbound — delete it when you're
+  happy with spark. (Also observed: the forge's `agents` table now
+  holds ONLY `test` — the billing agent `ea978f3a` is gone, presumably
+  deleted through the new mobile ✕ flow; the mule `billing-daily`
+  wake has no target agent anymore.)
 - **H2 lab rollout** — the lab heartbeat agents still run on
   systemd timers. **Moot (verified 2026-10-14):** the forge-public CT
   no longer exists on mini and no legacy heartbeat agent-timers
