@@ -1688,11 +1688,46 @@ was deliberately deferred, and the decision that can still be re-opened.
 - **Mid-conversation model switch (2026-10-11, forge `7d491926`, image `cd2a64d7`)** — the per-session model switcher used to apply only at conversation creation: an attached durable conversation kept its creation-time model forever (the H2.6 documented limitation), so "switching" billing to spark was a silent no-op. Now: harness `setModel` RPC (`Conversation.configure({model})` in its own commit, effective from the next provider request) + `conversationModel` RPC (drift detection via `agent()` resolution); `PATCH /sessions/:id` rebinds the attached conversation to the effective model (post-update override ?? profile) and a no-op re-save on a drifted conversation still heals it (conversations switched before this deployment). Live-switch failure returns 502 saying the DB row is recorded but the conversation is not — no more silent no-ops. Live acceptance on the lab: cleared billing's override (live switched laguna), re-set spark (live switched spark; `conversationModel` RPC confirms `proxy/spark/qwen3.8-sglang` on the real harness socket) — the agent the user believed was on spark now actually is, and mule's `billing-daily` (which reuses the active conversation) follows it. Test-infra fixes in the same commit: agent-pause test seeds its provider + provider_id (schema drift vs the shared test PG), and `test_helpers::auth_post` retries 429 per RETRY_AFTER (the H3 auth token bucket — burst 5, 1/s — raced any test registering >2 users in under a second; 5 test files updated, 333 forge-api tests green). Also: the lab's own ranch machine (`ranch-mini` VM) was registered (machine name `lab`, via the `register_machine` RPC) and its `daemon.toml` landed in the data pool `/Users/jbutler/.lab-alc/data/ranch-mini/` — it had booted local-only since Sept 29 because that file never existed (ranch-mini-dirs failed its ExecStartPre); heartbeats + relay now live. Note: the machine was registered under `owner@ranch.local` and then moved to the Google account (`jeremiah.butler@jbutler.dev`, the phone's sign-in) by a one-off `UPDATE machines/machines_info SET user_id` via the sbp_ management API — the phone's account is the account of record for the fleet.
 - **Mobile UX: three agent flows + full agent builder (2026-10-12)** — user: “pi agent created nothing / how do I tell a one-off pi from a forge chat from a herd agent / the full agent builder you skipped”. Root cause of “nothing appeared”: the ranch-mini ALC image was built without the `pi` binary, so `SessionsCreate kind=pi` failed server-side (“spawn pi: No such file or directory”) and the app never surfaced the `Error` frame (the “creating pi session…” status hung forever). Fixed three ways: (1) ranch-mini flake now bakes `pi` 0.84.4 (mirrors the forge flake derivation) + sets `RANCH_PI_BIN` on the ranchd service; image rebuilt on the forge machine and reconciled onto the VM; (2) the app now surfaces `Error` frames for `sc-…` create req-ids in both the home “new agent” dialog and the Agents screen (a failed create is visible, not a hang); (3) the three flows are now labeled as such in every entry point: “π one-off chat — pi on THIS machine” (SessionsCreate kind=pi → local pi pane on that machine), “🤖 one-off chat — lab forge model” (SessionsCreate kind=forge → forge-backed conversation), and “＋ New agent” on the Agents screen = **herd agent** (registry row via the `ranch agents new` core: profile, memory scope, tools, wakes). The mobile `NewAgentActivity` is now the full builder (v2): profile picker (`ProfileList`), inline new-profile form (`ModelCatalog` + `ProfilePut`), and the tools-allowlist checkbox set (KNOWN_TOOLS; unchecked = all tools, the H1.1 empty-allowlist convention). The daemon proxy frames (ProfileList/ProfilePut/ModelCatalog) already existed from H6.5 — only the app was missing them. APK builds clean; on-device + on-lab smokes are the next step.
 - **H2 lab rollout** — the lab heartbeat agents still run on
-  systemd timers. Unblock: re-register each as a forge durable
-  timer (`POST /sessions/:id/timers`) and retire the systemd
-  timers on the lab machine; re-vendor forge into
-  `lab/ct/forge-public/vendor/forge/` from post-`73c67650`
-  first (the vendor snapshot predates the harness).
+  systemd timers. **Moot (verified 2026-10-14):** the forge-public CT
+  no longer exists on mini and no legacy heartbeat agent-timers
+  remain in the lab config; nothing to re-register or retire.
+  The forge-public vendor re-sync is likewise moot (no forge-public
+  consumer left on the fleet).
+- **Forge img7 + ranch-mini image v3 (2026-10-14)** — the two
+  outstanding image rebuilds:
+  (1) **Forge img7** (`lab` `2f48ca86`/`aec9ea4c`/`441b1b0c`, source
+  `0a18df68`): rebuilds the forge ALC machine with the four new
+  inter-agent tools (`notify_user`, `list_agents`, `send_message`,
+  `create_agent` in `forge-ext.ts`) and the `forge-sandbox-base`
+  oneshot that bakes `/forge/sandbox/base/` from live NixOS binaries
+  (sh, bash, coreutils incl. `timeout`, + a stub `/etc/debian_version`
+  to pass the forge's rehydration check) — the sandbox base now
+  survives VM recreation instead of the earlier manual `cp -a`. Live
+  verification on the recreated machine: `list_agents` returns the
+  agent registry from inside a turn, and a sandboxed bash call
+  (`POST /sandbox/sessions/:id` → `echo IMG7 VERIFIED`) exits 0.
+  Two operational fixes landed on the same machine: the test-agent
+  profile's `llamacpp/laguna-xs-2.1` had `contextWindow: 81920` in
+  `models.json` while the llama.cpp backend only serves 16384 — turns
+  died with `exceed_context_size_error` 400s because pi never
+  compacted; corrected to `contextWindow: 16000 / maxTokens: 4096`
+  (source `/Users/jbutler/.lab-alc/data/forge/pi/models.json` + live
+  copy, harness restarted) so auto-compaction stays under the
+  backend's cap.
+  (2) **Ranch-mini image v3** (`lab` `ef5dfddf`): the `pkgs.bash`
+  flake fix (pi's bash tool spawns `sh`, which was absent from the
+  NixOS systemd service PATH → every tool call `spawn sh ENOENT`) is
+  now BAKED into the image instead of the rw-nix-store workaround;
+  built on the forge machine (the alcbuild2 nix-daemon access
+  problem avoided — `NIX_CONFIG="sandbox = false"` for the pi
+  `__noChroot` npm derivation) with the current static aarch64
+  binary (ranch-2 `d139e2e`: `@notify:` detection for user-role
+  rows, agent-name resolution, all-clients `AgentNotify`
+  broadcast). Verified end-to-end on the recreated VM
+  (192.168.64.189): `sh` resolves inside the ranchd service PATH,
+  `pi -p` under that exact PATH runs its bash tool (`PII SH OK`),
+  relay joined + heartbeats flowing. The earlier rw-nix-store and
+  bind-mount workarounds are dead with the old VM.
 - **Phone smoke tests** — (a) H1.4 live registry behavior
   (registry screen, AgentTalk attach, avatar) on a real phone;
   (b) H6.1 locked-phone Keep-tap → belief activated;
