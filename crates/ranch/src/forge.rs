@@ -355,20 +355,29 @@ fn handle_event(
                     reset: false,
                 },
             );
-            // @notify: prefix in an assistant message = explicit
-            // user notification (the agent called notify_user)
-            if msg.role == "assistant" && msg.text.starts_with("@notify:") {
+            // @notify: prefix = explicit user notification (the agent
+            // called notify_user, which POSTs the prefixed text via
+            // POST /messages — so it lands as a USER row; assistant
+            // rows are covered too, e.g. a mule step that writes it).
+            if (msg.role == "user" || msg.role == "assistant") && msg.text.starts_with("@notify:") {
                 let body = msg.text.trim_start_matches("@notify:").trim().to_string();
-                write_frame(
-                    w,
-                    &Frame::AgentNotify {
-                        session: String::new(),
-                        pane: state.pane.to_string(),
-                        agent: name.to_string(),
-                        message: body,
-                        priority: None,
-                    },
-                );
+                let pane = state.pane;
+                let sid = state.forge_sid;
+                let cfg = cfg.clone();
+                let w = w.clone();
+                std::thread::spawn(move || {
+                    let agent = notify_agent_name(&cfg, sid);
+                    write_frame(
+                        &w,
+                        &Frame::AgentNotify {
+                            session: String::new(),
+                            pane: pane.to_string(),
+                            agent,
+                            message: body,
+                            priority: None,
+                        },
+                    );
+                });
             }
         }
         "turn_ended" => {
@@ -1875,6 +1884,30 @@ pub fn agent_list_names(
         }
     }
     Ok(out)
+}
+
+/// Resolve the display name of the agent that owns a forge session
+/// (for the `AgentNotify` frame the `@notify:` message spawns):
+/// session row -> `agent_id` -> agents row `name`. Falls back to the
+/// session title, then to "agent". One thread, two localhost GETs.
+fn notify_agent_name(cfg: &ForgeConfig, forge_sid: Uuid) -> String {
+    let s = http_json(cfg, "GET", &format!("/sessions/{forge_sid}"), None)
+        .ok()
+        .and_then(|v| v.get("session").cloned());
+    if let Some(s) = s {
+        if let Some(aid) = s.get("agent_id").and_then(|x| x.as_str())
+            && !aid.is_empty()
+            && let Ok(a) = agent_get(cfg, aid)
+            && let Some(n) = a.get("name").and_then(|x| x.as_str())
+            && !n.is_empty()
+        {
+            return n.to_string();
+        }
+        if let Some(t) = s.get("title").and_then(|x| x.as_str()) && !t.is_empty() {
+            return t.to_string();
+        }
+    }
+    "agent".to_string()
 }
 
 /// `POST /agents/{agent}/pause` | `/resume` (H5.3 kill switch) →

@@ -5791,7 +5791,7 @@ impl Daemon {
                 pane,
                 kind,
                 status,
-                ..
+                background,
             } if session.is_empty()
                 && (kind == "agent"
                     || kind == "model"
@@ -5914,7 +5914,7 @@ impl Daemon {
                         pane: Some(pid.to_string()),
                         kind: kind.clone(),
                         status: status.clone(),
-                    background: None,
+                        background: *background,
                     };
                     // Agent working/idle is machine-level lifecycle info (like
                     // AgentAskRequest): every connected client gets it, so a
@@ -5975,6 +5975,32 @@ impl Daemon {
                         if let Some(c) = self.clients.get_mut(&rfd) {
                             send_frame(c, &filled);
                         }
+                    }
+                }
+                return;
+            }
+            // forge worker: an agent's explicit `@notify:` message
+            // (notify_user tool). Fill the session from the pane and
+            // broadcast to EVERY client — machine-level lifecycle
+            // info like `Meta { kind: "agent" }`, so a phone sitting
+            // on the session list still gets the notification.
+            Frame::AgentNotify { session, pane, .. } if session.is_empty() => {
+                let found = self
+                    .sessions
+                    .iter()
+                    .find_map(|(sid, s)| {
+                        s.chats
+                            .iter()
+                            .find(|(pid, cp)| pid.to_string() == pane.as_str() || cp.forge_sid.to_string() == pane.as_str())
+                            .map(|(_, _)| *sid)
+                    });
+                if let Some(sid) = found {
+                    let mut filled = frame.clone();
+                    if let Frame::AgentNotify { session, .. } = &mut filled {
+                        *session = sid.to_string();
+                    }
+                    for c in self.clients.values_mut() {
+                        send_frame(c, &filled);
                     }
                 }
                 return;
