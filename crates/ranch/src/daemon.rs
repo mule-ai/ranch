@@ -5172,6 +5172,7 @@ impl Daemon {
                                     agent_id: o.agent_id,
                                     agent_name: o.agent_name,
                                     wake_id: o.wake_id,
+                                    wake_error: o.wake_error,
                                 },
                             );
                         }

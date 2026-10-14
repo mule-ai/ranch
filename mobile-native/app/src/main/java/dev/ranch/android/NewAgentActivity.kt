@@ -230,12 +230,12 @@ class NewAgentActivity : Activity() {
                 busy = false
                 val n = f.optString("agent_name")
                 val wake = f.optString("wake_id", "")
-                flash(
-                    "created $n" +
-                        (if (wake.isNotEmpty()) " + wake ${wake.take(8)}" else ""),
-                    green = true,
-                )
-                handler.postDelayed({ finish() }, 900)
+                val wakeErr = f.optString("wake_error", "")
+                val msg = "created $n" +
+                    (if (wake.isNotEmpty()) " + wake ${wake.take(8)}" else "") +
+                    (if (wakeErr.isNotEmpty()) "\n⚠ wake: $wakeErr" else "")
+                flash(msg, green = wakeErr.isEmpty())
+                if (wakeErr.isEmpty()) handler.postDelayed({ finish() }, 900)
             }
             "ProfilePutOk" -> {
                 pickedProfile = f.optString("profile_id")

@@ -1067,6 +1067,8 @@ pub enum Frame {
         agent_name: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         wake_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wake_error: Option<String>,
     },
     /// Client -> daemon: delete a herd agent (forge DELETE /agents/:id).
     AgentDelete {
@@ -2465,6 +2467,7 @@ mod tests {
                 agent_id: "agent-1".into(),
                 agent_name: "Atlas".into(),
                 wake_id: Some("w-1".into()),
+                wake_error: None,
             },
             Frame::AgentDelete {
                 req_id: "r10".into(),
