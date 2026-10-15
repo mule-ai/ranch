@@ -1594,6 +1594,55 @@ impl Daemon {
                 }
             },
         };
+        // "continue" is idempotent: if a ranch session is already watching
+        // this agent's conversation, reuse it instead of stacking another
+        // wrapper on top. Every AgentTalk{continue} (each phone tap,
+        // reconnect, deep-link) used to mint a fresh session row — all
+        // pointing at the same underlying conversation — so the session
+        // list piled up N duplicates per agent. Only "new"/"fork" open a
+        // fresh surface.
+        if mode == "continue" {
+            let reused = self.sessions.values().find_map(|s| {
+                (s.kind == "forge").then(|| {
+                    s.chats
+                        .iter()
+                        .find(|(_, c)| c.forge_sid == forge_sid)
+                        .map(|(pid, _)| (s.id, *pid))
+                })
+                .flatten()
+            });
+            if let Some((existing_sid, existing_pid)) = reused {
+                eprintln!(
+                    "ranchd: agent_talk {name} (continue, reuse) -> session {existing_sid} pane {existing_pid} -> forge {forge_sid}"
+                );
+                if let Some(tx) = &self.forge_tx {
+                    // re-arm the watch (cheap + idempotent) so the surface
+                    // streams live, then deliver any inline text
+                    let _ = tx.send(forge::ForgeJob::Watch {
+                        pane: existing_pid,
+                        forge_sid,
+                    });
+                    if let Some(t) = text.as_ref().filter(|t| !t.trim().is_empty()) {
+                        let _ = tx.send(forge::ForgeJob::Send {
+                            pane: existing_pid,
+                            forge_sid,
+                            text: t.clone(),
+                        });
+                    }
+                }
+                if let Some(c) = self.clients.get_mut(&from) {
+                    send_frame(
+                        c,
+                        &Frame::AgentTalkOk {
+                            req_id: req_id.to_string(),
+                            session: existing_sid.to_string(),
+                            pane: existing_pid.to_string(),
+                        },
+                    );
+                }
+                return;
+            }
+        }
         // the ranch-side surface: a session + forge-chat pane (the same
         // factory as `SessionsCreate kind=forge forge_session=…`) so
         // history replays via the SSE watch on every surface.
