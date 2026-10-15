@@ -340,8 +340,13 @@ fn handle_event(
                 state.turn_gen.fetch_add(1, Ordering::Relaxed);
                 // mule-wake-initiated turns are background: the user
                 // should not get a turn-end notification unless the
-                // agent explicitly calls notify_user
-                let is_bg = msg.text.starts_with("[mule wake");
+                // agent explicitly calls notify_user. @notify: rows
+                // are the notify_user path itself (the agent POSTed
+                // them to this session) — their turn is the echo of an
+                // explicit notification, so it must stay background or
+                // every notify_user fires a SECOND (turn_end) ping.
+                let is_bg = msg.text.starts_with("[mule wake")
+                    || msg.text.starts_with("@notify:");
                 state.background_turn.store(is_bg, Ordering::Relaxed);
                 write_agent_status(w, state.pane, "working");
             }
