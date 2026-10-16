@@ -46,7 +46,11 @@ object NotifyPolicy {
         APPROVAL to true,
         RESEARCH to true,
         MEMORY to true,
-        TASK_DONE to true,
+        // Default OFF: every forge_task completion fired a notification
+        // regardless of background status — the H6.1 "agent-initiated"
+        // model says agents notify, we don't auto-announce background
+        // task completion. Users can still turn it on per-app.
+        TASK_DONE to false,
         EVERY_MESSAGE to false,
     )
 

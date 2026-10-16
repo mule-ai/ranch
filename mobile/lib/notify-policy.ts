@@ -16,10 +16,14 @@
 //   approval     true   policy_ask card ("Allow this action" / "Deny")
 //   research     true   research_report card ("Use" / "Discard" / "Ask more")
 //   memory       true   memory_review card ("Keep" / "Forget")
-//   task_done    true   a forge_task activity item left the ActivityPush
+//   task_done    false  a forge_task activity item left the ActivityPush
 //                       set (its forge state went terminal — the poller
-//                       only lists pending/running tasks; a feed outage
-//                       is indistinguishable and also fires this)
+//                       only lists pending/running tasks, so a feed
+//                       outage fires this too). Default OFF: the
+//                       "agent-initiated" model says the agent notifies
+//                       via notify_user; background task completion is
+//                       not a default-on announcement. Feed outages
+//                       would otherwise spam. Users can turn it on.
 //   every_message false (only when turn_end is off)
 //
 // Mute/priority: `muted` suppresses notifications ONLY — the agent's
@@ -52,7 +56,7 @@ export const KIND_DEFAULTS: Record<NotifyKind, boolean> = {
   approval: true,
   research: true,
   memory: true,
-  task_done: true,
+  task_done: false,
 };
 
 /** Kinds whose notification would carry actionable buttons. */
