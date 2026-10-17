@@ -1773,7 +1773,7 @@ fn write_model_status(pipe: &PipeWriter, pane: Uuid, display: &str) {
             pane: Some(pane.to_string()),
             kind: "model".into(),
             status: Some(display.to_string()),
-        background: None,
+            background: None,
         },
     );
 }
@@ -1787,7 +1787,7 @@ fn write_context_status(pipe: &PipeWriter, pane: Uuid, status: &str) {
             pane: Some(pane.to_string()),
             kind: "context".into(),
             status: Some(status.to_string()),
-        background: None,
+            background: None,
         },
     );
 }
@@ -1811,7 +1811,7 @@ fn write_status(pipe: &PipeWriter, pane: Uuid, status: &str) {
             pane: Some(pane.to_string()),
             kind: "agent".to_string(),
             status: Some(status.to_string()),
-        background: None,
+            background: None,
         },
     );
 }

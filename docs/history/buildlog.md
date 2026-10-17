@@ -729,3 +729,51 @@ release path changed.
 **Not touched:** `docs/history/` entries (including the Phase-6 parity
 matrix of 2026-09-21) and the research doc's footnote about RN
 notification limits — append-only record.
+
+## H6.5b: the herd agent editor (2026-10-17)
+
+The phone could create a dot (＋Agent) and delete one (✕) but never
+change one; the CLI had no edit path either. Shipped the editor as a
+frame family plus two clients on the shared core:
+
+- **Protocol** (`ranch-protocol`): `AgentUpdate`/`AgentUpdateOk` and
+  `WakeList`/`WakePut`/`WakeDelete` (+ `WakeInfo`); `AgentInfo` grows
+  the editor's prefill tail (`primary_profile`, `memory_scope`,
+  `org_id`, `visibility`, `tools_allowlist`, `extra_instructions`,
+  `paused`) — additive optional fields, old clients drop them.
+  **Absent = "leave the column alone"** (forge PATCH treats null and a
+  missing key the same): no nullable column can be cleared from a
+  client, so the editors' blanks mean "keep".
+- **Shared core** (`crates/ranch/src/agents_new.rs`):
+  `UpdateRequest`/`update_agent_body`/`validate_update`/
+  `update_agent`, the single `agent_info_from_value` decoder used by
+  `GET /agents` (forge worker), the PATCH reply and the CLI;
+  `get_agent`/`resolve_agent_id` (name → id); wake CRUD
+  (`list_wakes`/`put_wake`/`delete_wake` + `mule_req`) with the
+  ownership match on `target.agent_id` ∪
+  `target.forge_conversation.agent_id` ∪ `spec.agent_id`, and the rule
+  **blank cron = "leave the schedule alone" on update** (pause/resume;
+  non-cron kinds have no `spec.expr`) while create requires one.
+- **Daemon**: `Frame::AgentUpdate` arm + `handle_wake` (mule proxy),
+  new `reply_to` helper; validation runs before any HTTP.
+- **CLI**: `ranch agents edit <name|id>` (current values as
+  `[brackets]`, `*` = allow all tools); `agents_new::run(&[String])`.
+- **Mobile**: `EditAgentActivity` (✎ per registry row) — the agent
+  fields with a diff-only Save, plus the **wakes** section (edit
+  schedule/prompt/name, pause/resume, delete, ＋ add wake, saved
+  per-row). New `AgentForm.kt` extracts the profile picker +
+  inline-`ProfilePut` form + tools checkbox set from `NewAgentActivity`
+  so builder and editor cannot drift; `Term.kt` gains the four builders
+  and the `AgentInfo`/`WakeInfo` parsers.
+- **Docs**: PROTOCOL §8.6 (family + semantics), design/agent-builder.md
+  §7.5, SPEC parity row (web still has no ＋Agent/editor form),
+  AGENTS.md CLI line, mobile-native README.
+
+Gates: `cargo test -p ranch -q` 85, `cargo test -p ranch-protocol -q`
+14, clippy 0 (pre-existing `voicecall.rs` collapsible_if only), `cargo
+fmt --all` clean (normalized three pre-existing mis-indented
+`background: None` lines in `mule.rs`/`pilocal.rs`), `./gradlew
+assembleRelease` BUILD SUCCESSFUL (APK 1.39 MB). Frames + CLI verified
+against a mock forge/mule on an isolated `HOME` + throwaway daemon
+(patch body, wake filter/create/update/delete, error paths). On-device
+smoke of the ✎ screen is still owed.

@@ -168,6 +168,7 @@ parity for every user-facing capability:
 | agent spawn/steer/close tools | daemon-side | daemon-side | daemon-side |
 | webhook receiver config | ✅ | ✅ | ✅ |
 | agent registry (Herd H1): list + talk | ✅ (CLI + dashboard) | H1.4 | H1.4 |
+| herd agent editor (H6.5b): edit the row + its wakes | ✅ `ranch agents edit` | ⏳ not built (no ＋Agent form either) | ✅ ✎ `EditAgentActivity` (＋Agent builder: `NewAgentActivity`) |
 
 The web client is the reference thin client (browser = phone = TUI).
 Local TUI additionally owns tmux-style keyboard bindings; mobile adds

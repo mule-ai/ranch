@@ -1084,6 +1084,88 @@ pub enum Frame {
     AgentDeleteOk {
         req_id: String,
     },
+    /// Client -> daemon: edit a herd agent (the mobile ✎ form / `ranch
+    /// agents edit`). The daemon PATCHes forge `/agents/:id`. Every
+    /// field is optional and **absent means "leave the column
+    /// alone"** — forge's partial update treats JSON `null` and an absent key the
+    /// same, so clearing a nullable column (avatar_url, home_machine,
+    /// primary_profile_id, extra_instructions) is NOT supported (forge
+    /// H1 limitation, documented).
+    AgentUpdate {
+        req_id: String,
+        agent_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        avatar: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        profile_id: Option<String>,
+        /// "agent" | "org" (forge ALLOWED_MEMORY_SCOPES)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        memory_scope: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        org_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        home_machine: Option<String>,
+        /// "private" | "org" (forge ALLOWED_VISIBILITIES)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        visibility: Option<String>,
+        /// Some(vec![]) = allow all (the H1.1 empty-allowlist convention)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tools_allowlist: Option<Vec<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        extra_instructions: Option<String>,
+    },
+    /// Daemon -> client: the edited agent (the fresh forge row).
+    AgentUpdateOk {
+        req_id: String,
+        agent: AgentInfo,
+    },
+    // ----- H6.5b wake editing (client -> daemon, mule proxy) -----
+    /// Client -> daemon: list the mule wakes bound to one agent (the
+    /// editor's schedule section). The daemon GETs
+    /// `{mule}/api/v1/wakes` and filters by `target.agent_id`.
+    WakeList {
+        req_id: String,
+        agent_id: String,
+    },
+    /// Daemon -> client: the agent's wakes (cron and event kinds).
+    WakeListOk {
+        req_id: String,
+        wakes: Vec<WakeInfo>,
+    },
+    /// Client -> daemon: create (wake_id None) or update (wake_id Some)
+    /// one of the agent's wakes. Creating uses the same H3.3
+    /// `target = {forge_conversation: {forge_url, api_key, agent_id}}`
+    /// shape the provisioning core uses.
+    WakePut {
+        req_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wake_id: Option<String>,
+        agent_id: String,
+        /// 5-field cron expr ("07:00" is converted client-side)
+        cron: String,
+        prompt: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        /// false = paused (None on create = enabled)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        enabled: Option<bool>,
+    },
+    /// Daemon -> client: the wake's id.
+    WakePutOk {
+        req_id: String,
+        wake_id: String,
+    },
+    /// Client -> daemon: delete one wake.
+    WakeDelete {
+        req_id: String,
+        wake_id: String,
+    },
+    /// Daemon -> client: the wake was deleted.
+    WakeDeleteOk {
+        req_id: String,
+    },
     /// Daemon -> clients: an explicit user notification emitted by an
     /// agent (its `notify_user` tool / `@notify:` message prefix).
     /// Clients post this as a notification regardless of background
@@ -1210,7 +1292,7 @@ fn default_true() -> bool {
 /// first-class forge `agents` row — distinct from a profile (the
 /// model/tool config an agent runs on) and a session (a conversation
 /// the agent has had).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct AgentInfo {
     /// agent id (uuid string)
     pub id: String,
@@ -1229,6 +1311,55 @@ pub struct AgentInfo {
     /// how many conversations the agent has (H1: None; TODO(H5)).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conversation_count: Option<u64>,
+    /// the agent's model profile (forge `agents.primary_profile_id`);
+    /// None = no model attached. Filled from `GET /agents` (H6.5b —
+    /// the editor prefills its profile chip from it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_profile: Option<String>,
+    /// "agent" | "org" (forge `agents.memory_scope`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_scope: Option<String>,
+    /// declared memory org label (H6.5), when the scope is "org".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub org_id: Option<String>,
+    /// "private" | "org" (forge `agents.visibility`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visibility: Option<String>,
+    /// the agent's tool allowlist; Some(vec![]) = allow all. None =
+    /// forge did not return the column (older server).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools_allowlist: Option<Vec<String>>,
+    /// free-form instructions appended to the agent's system prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extra_instructions: Option<String>,
+    /// the H5.3 kill-switch state (forge `agents.paused`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused: Option<bool>,
+}
+
+/// One row of the agent's mule wake list (H6.5b — the editor's
+/// schedule section). Mirrors mule's `wakeAPI` (`cmd/api/
+/// wake_handlers.go`) for the fields the editor shows; `spec.expr` is
+/// surfaced as `cron` for cron wakes (None for event/other kinds).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct WakeInfo {
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    /// "cron" | "event" | "interval" | … (mule wake kinds)
+    #[serde(default)]
+    pub kind: String,
+    /// the cron expression for cron wakes (None otherwise)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cron: Option<String>,
+    #[serde(default)]
+    pub prompt: String,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_fired_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_due_at: Option<String>,
 }
 
 /// One row of the Activity View (H5). H1 ships the frame only;
@@ -2373,6 +2504,13 @@ mod tests {
                     home_machine: Some("omarchy".into()),
                     last_active: None,
                     conversation_count: Some(3),
+                    primary_profile: Some("p-1".into()),
+                    memory_scope: Some("org".into()),
+                    org_id: Some("myorg".into()),
+                    visibility: Some("private".into()),
+                    tools_allowlist: Some(vec!["bash".into(), "read".into()]),
+                    extra_instructions: Some("be terse".into()),
+                    paused: Some(false),
                 }],
             },
             Frame::AgentTalk {
@@ -2492,6 +2630,87 @@ mod tests {
             },
             Frame::AgentDeleteOk {
                 req_id: "r10".into(),
+            },
+            Frame::AgentUpdate {
+                req_id: "r11".into(),
+                agent_id: "agent-1".into(),
+                name: Some("Atlas II".into()),
+                avatar: None,
+                profile_id: Some("p-9".into()),
+                memory_scope: Some("org".into()),
+                org_id: Some("myorg".into()),
+                home_machine: None,
+                visibility: None,
+                tools_allowlist: Some(vec![]),
+                extra_instructions: Some("be terse".into()),
+            },
+            Frame::AgentUpdate {
+                req_id: "r12".into(),
+                agent_id: "agent-2".into(),
+                name: None,
+                avatar: None,
+                profile_id: None,
+                memory_scope: None,
+                org_id: None,
+                home_machine: None,
+                visibility: None,
+                tools_allowlist: None,
+                extra_instructions: None,
+            },
+            Frame::AgentUpdateOk {
+                req_id: "r11".into(),
+                agent: AgentInfo {
+                    id: "agent-1".into(),
+                    name: "Atlas II".into(),
+                    avatar_url: None,
+                    home_machine: None,
+                    last_active: None,
+                    conversation_count: None,
+                    primary_profile: Some("p-9".into()),
+                    memory_scope: Some("org".into()),
+                    org_id: Some("myorg".into()),
+                    visibility: Some("private".into()),
+                    tools_allowlist: Some(vec![]),
+                    extra_instructions: Some("be terse".into()),
+                    paused: Some(true),
+                },
+            },
+            Frame::WakeList {
+                req_id: "r13".into(),
+                agent_id: "agent-1".into(),
+            },
+            Frame::WakeListOk {
+                req_id: "r13".into(),
+                wakes: vec![WakeInfo {
+                    id: "w-1".into(),
+                    name: "wake-Atlas".into(),
+                    kind: "cron".into(),
+                    cron: Some("0 7 * * *".into()),
+                    prompt: "Daily check-in for Atlas.".into(),
+                    enabled: true,
+                    last_fired_at: Some("2026-10-17T07:00:00Z".into()),
+                    next_due_at: Some("2026-10-18T07:00:00Z".into()),
+                }],
+            },
+            Frame::WakePut {
+                req_id: "r14".into(),
+                wake_id: Some("w-1".into()),
+                agent_id: "agent-1".into(),
+                cron: "30 6 * * 1-5".into(),
+                prompt: "Standup.".into(),
+                name: None,
+                enabled: Some(false),
+            },
+            Frame::WakePutOk {
+                req_id: "r14".into(),
+                wake_id: "w-1".into(),
+            },
+            Frame::WakeDelete {
+                req_id: "r15".into(),
+                wake_id: "w-1".into(),
+            },
+            Frame::WakeDeleteOk {
+                req_id: "r15".into(),
             },
         ];
         for f in frames {

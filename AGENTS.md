@@ -269,7 +269,11 @@ Rust workspace: edition 2024, stable toolchain (rustc 1.98 era).
   `agents new` is the H6.5 specialist-dot provisioning wizard (forge
   agent row + optional mule cron wake; the mobile ＋Agent form speaks
   the `AgentProvision` frame — the daemon runs the same core,
-  `agents_new.rs::provision`).
+  `agents_new.rs::provision`). `agents edit <name|id>` is its H6.5b
+  twin (forge `PATCH /agents/:id`; the mobile ✎ form speaks the
+  `AgentUpdate` frame and edits the agent's mule wakes over
+  `WakeList`/`WakePut`/`WakeDelete` — same core,
+  `agents_new.rs::update_agent`).
 - tmux semantics are deliberate: `&`/`k` = window-kill, session-level kill
   is `:kill-session` / dashboard / phone long-press.
 - Config: `~/.config/ranch/daemon.toml` (0600: relay machine key, forge

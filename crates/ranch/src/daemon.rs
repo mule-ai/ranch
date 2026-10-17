@@ -1258,6 +1258,13 @@ fn snapshot_session(s: &Session, chat_limit: Option<usize>) -> Option<Frame> {
 }
 
 /// Serialize + chunk a frame and write all bytes to the client's sink.
+/// Which wake operation `Daemon::handle_wake` performs (H6.5b).
+enum WakeOp {
+    List { agent_id: String },
+    Put(crate::agents_new::WakeRequest),
+    Delete(String),
+}
+
 fn send_frame(c: &mut Client, frame: &Frame) {
     let cid = Uuid::new_v4().to_string();
     for line in ranch_protocol::encode_frame(frame, &cid) {
@@ -1603,13 +1610,14 @@ impl Daemon {
         // fresh surface.
         if mode == "continue" {
             let reused = self.sessions.values().find_map(|s| {
-                (s.kind == "forge").then(|| {
-                    s.chats
-                        .iter()
-                        .find(|(_, c)| c.forge_sid == forge_sid)
-                        .map(|(pid, _)| (s.id, *pid))
-                })
-                .flatten()
+                (s.kind == "forge")
+                    .then(|| {
+                        s.chats
+                            .iter()
+                            .find(|(_, c)| c.forge_sid == forge_sid)
+                            .map(|(pid, _)| (s.id, *pid))
+                    })
+                    .flatten()
             });
             if let Some((existing_sid, existing_pid)) = reused {
                 eprintln!(
@@ -2358,7 +2366,7 @@ impl Daemon {
                     pane: None,
                     kind: "exited".into(),
                     status: Some("session ended".into()),
-                background: None,
+                    background: None,
                 };
                 let recipients: Vec<RawFd> = self.clients.keys().copied().collect();
                 for rfd in recipients {
@@ -3761,6 +3769,66 @@ impl Daemon {
         }
     }
 
+    /// Send one frame back to a single client (no-op when it has
+    /// already disconnected).
+    fn reply_to(&mut self, from: RawFd, frame: &Frame) {
+        if let Some(c) = self.clients.get_mut(&from) {
+            send_frame(c, frame);
+        }
+    }
+
+    /// H6.5b — the editor's wake section: list (`GET /api/v1/wakes`,
+    /// filtered by the agent), create/update (`POST`/`PATCH`), delete.
+    /// `wake_id` None + method "put" = create. Blocking
+    /// sync-localhost HTTP; missing mule/forge config answers `Error`
+    /// naming the leg, never a stall.
+    fn handle_wake(&mut self, from: RawFd, req_id: String, op: WakeOp) {
+        let (Some(mule), Some(forge_cfg)) = (self.mule_cfg.clone(), forge::load_forge_config())
+        else {
+            self.reply_to(
+                from,
+                &Frame::Error {
+                    req_id: Some(req_id),
+                    message: "mule not configured (set mule_url in ~/.config/ranch/daemon.toml)"
+                        .into(),
+                },
+            );
+            return;
+        };
+        let outcome = match op {
+            WakeOp::List { agent_id } => {
+                crate::agents_new::list_wakes(&mule, &agent_id).map(|wakes| Frame::WakeListOk {
+                    req_id: req_id.clone(),
+                    wakes,
+                })
+            }
+            WakeOp::Put(req) => {
+                let req_id_c = req_id.clone();
+                crate::agents_new::put_wake(&mule, &forge_cfg, &req).map(|wake_id| {
+                    Frame::WakePutOk {
+                        req_id: req_id_c,
+                        wake_id,
+                    }
+                })
+            }
+            WakeOp::Delete(wake_id) => {
+                crate::agents_new::delete_wake(&mule, &wake_id).map(|()| Frame::WakeDeleteOk {
+                    req_id: req_id.clone(),
+                })
+            }
+        };
+        match outcome {
+            Ok(frame) => self.reply_to(from, &frame),
+            Err(e) => self.reply_to(
+                from,
+                &Frame::Error {
+                    req_id: Some(req_id),
+                    message: e,
+                },
+            ),
+        }
+    }
+
     fn handle_frame(&mut self, from: RawFd, frame: &Frame) {
         match frame {
             // hot upgrade: exec the same binary with --inherit — all
@@ -4231,7 +4299,7 @@ impl Daemon {
                             pane: Some(pid.to_string()),
                             kind: "agent".into(),
                             status: Some("compacting".into()),
-                        background: None,
+                            background: None,
                         };
                         let fds: Vec<RawFd> = self.clients.keys().copied().collect();
                         for fd in fds {
@@ -5251,11 +5319,7 @@ impl Daemon {
                                 .http_status_as_error(false)
                                 .build(),
                         );
-                        match agent
-                            .delete(&url)
-                            .header("X-API-Key", &cfg.key)
-                            .call()
-                        {
+                        match agent.delete(&url).header("X-API-Key", &cfg.key).call() {
                             Ok(_) => {
                                 if let Some(c) = self.clients.get_mut(&from) {
                                     send_frame(
@@ -5291,6 +5355,91 @@ impl Daemon {
                         }
                     }
                 }
+            }
+            // H6.5b — the agent editor: PATCH the registry row and
+            // CRUD the agent's mule wakes. Same blocking-localhost
+            // pattern as AgentProvision / AgentDelete.
+            Frame::AgentUpdate {
+                req_id,
+                agent_id,
+                name,
+                avatar,
+                profile_id,
+                memory_scope,
+                org_id,
+                home_machine,
+                visibility,
+                tools_allowlist,
+                extra_instructions,
+            } => {
+                let req = crate::agents_new::UpdateRequest {
+                    agent_id: agent_id.clone(),
+                    name: name.clone(),
+                    avatar: avatar.clone(),
+                    profile_id: profile_id.clone(),
+                    memory_scope: memory_scope.clone(),
+                    org_id: org_id.clone(),
+                    home_machine: home_machine.clone(),
+                    visibility: visibility.clone(),
+                    tools_allowlist: tools_allowlist.clone(),
+                    extra_instructions: extra_instructions.clone(),
+                };
+                // the shared core validates (name, scope, visibility,
+                // "nothing to update") — surface its message on Error.
+                let reply = match forge::load_forge_config() {
+                    None => Err(
+                        "no forge config (set forge_api_key in ~/.config/ranch/daemon.toml)"
+                            .to_string(),
+                    ),
+                    Some(cfg) => crate::agents_new::update_agent(&cfg, &req),
+                };
+                match reply {
+                    Ok(agent) => self.reply_to(
+                        from,
+                        &Frame::AgentUpdateOk {
+                            req_id: req_id.clone(),
+                            agent,
+                        },
+                    ),
+                    Err(e) => self.reply_to(
+                        from,
+                        &Frame::Error {
+                            req_id: Some(req_id.clone()),
+                            message: e,
+                        },
+                    ),
+                }
+            }
+            Frame::WakeList { req_id, agent_id } => {
+                self.handle_wake(
+                    from,
+                    req_id.clone(),
+                    WakeOp::List {
+                        agent_id: agent_id.clone(),
+                    },
+                );
+            }
+            Frame::WakePut {
+                req_id,
+                wake_id,
+                agent_id,
+                cron,
+                prompt,
+                name,
+                enabled,
+            } => {
+                let req = crate::agents_new::WakeRequest {
+                    wake_id: wake_id.clone(),
+                    agent_id: agent_id.clone(),
+                    cron: cron.clone(),
+                    prompt: prompt.clone(),
+                    name: name.clone(),
+                    enabled: *enabled,
+                };
+                self.handle_wake(from, req_id.clone(), WakeOp::Put(req));
+            }
+            Frame::WakeDelete { req_id, wake_id } => {
+                self.handle_wake(from, req_id.clone(), WakeOp::Delete(wake_id.clone()));
             }
             Frame::AgentTalk {
                 req_id,
@@ -6034,15 +6183,15 @@ impl Daemon {
             // info like `Meta { kind: "agent" }`, so a phone sitting
             // on the session list still gets the notification.
             Frame::AgentNotify { session, pane, .. } if session.is_empty() => {
-                let found = self
-                    .sessions
-                    .iter()
-                    .find_map(|(sid, s)| {
-                        s.chats
-                            .iter()
-                            .find(|(pid, cp)| pid.to_string() == pane.as_str() || cp.forge_sid.to_string() == pane.as_str())
-                            .map(|(_, _)| *sid)
-                    });
+                let found = self.sessions.iter().find_map(|(sid, s)| {
+                    s.chats
+                        .iter()
+                        .find(|(pid, cp)| {
+                            pid.to_string() == pane.as_str()
+                                || cp.forge_sid.to_string() == pane.as_str()
+                        })
+                        .map(|(_, _)| *sid)
+                });
                 if let Some(sid) = found {
                     let mut filled = frame.clone();
                     if let Frame::AgentNotify { session, .. } = &mut filled {
@@ -6754,7 +6903,7 @@ impl Daemon {
                         pane: None,
                         kind: "exited".into(),
                         status: Some("session killed".into()),
-                    background: None,
+                        background: None,
                     };
                     let recipients: Vec<RawFd> = self.clients.keys().copied().collect();
                     for rfd in recipients {
@@ -7222,7 +7371,7 @@ impl Daemon {
                             pane: None,
                             kind: "exited".into(),
                             status: Some("session ended".into()),
-                        background: None,
+                            background: None,
                         };
                         let recipients: Vec<RawFd> = self.clients.keys().copied().collect();
                         for rfd in recipients {
@@ -7920,7 +8069,7 @@ fn run(
                     pane: None,
                     kind: "exited".into(),
                     status: Some("session ended".into()),
-                background: None,
+                    background: None,
                 };
                 let recipients: Vec<RawFd> = daemon.clients.keys().copied().collect();
                 for rfd in recipients {

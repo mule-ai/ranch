@@ -30,6 +30,7 @@
 
 use std::io::{BufRead, Write};
 
+use ranch_protocol::{AgentInfo, WakeInfo};
 use serde_json::{Value, json};
 
 use crate::daemon::mule::load_mule_config;
@@ -270,9 +271,7 @@ pub fn provision(
     let created = forge_req(cfg, "POST", "/agents", Some(&body))
         .map_err(|e| format!("creating agent: {e}"))?;
     // forge wraps the agent in {"agent": {...}}
-    let agent = created
-        .get("agent")
-        .unwrap_or(&created);
+    let agent = created.get("agent").unwrap_or(&created);
     let agent_id = agent
         .get("id")
         .and_then(|x| x.as_str())
@@ -335,6 +334,10 @@ fn forge_req(
             .post(&url)
             .header("X-API-Key", &cfg.key)
             .send_json(b.cloned().unwrap_or(Value::Null)),
+        ("PATCH", b) => agent
+            .patch(&url)
+            .header("X-API-Key", &cfg.key)
+            .send_json(b.cloned().unwrap_or(Value::Null)),
         _ => return Err(format!("unsupported method {m}")),
     };
     let mut res = sent.map_err(|e| format!("forge {m} {path}: {e}"))?;
@@ -352,6 +355,596 @@ fn forge_req(
         });
     }
     serde_json::from_str(&text).map_err(|e| format!("forge decode {path}: {e}"))
+}
+
+// ---------- agent registry edit (H6.5b: mobile ✎ + `ranch agents edit`) ----------
+
+/// One edit request: the forge `PATCH /agents/:id` fields. `None` =
+/// "leave the column alone" (forge's partial update treats JSON `null`
+/// and an absent key identically, so clearing a nullable column is not
+/// supported — documented in the `AgentUpdate` frame docs).
+#[derive(Debug, Clone, Default)]
+pub struct UpdateRequest {
+    pub agent_id: String,
+    pub name: Option<String>,
+    pub avatar: Option<String>,
+    pub profile_id: Option<String>,
+    /// "agent" | "org"
+    pub memory_scope: Option<String>,
+    pub org_id: Option<String>,
+    pub home_machine: Option<String>,
+    /// "private" | "org"
+    pub visibility: Option<String>,
+    /// Some(vec![]) = allow all tools
+    pub tools_allowlist: Option<Vec<String>>,
+    pub extra_instructions: Option<String>,
+}
+
+/// Build the forge `PATCH /agents/:id` body: only present, non-blank
+/// fields are sent (blank strings are dropped rather than sent as "" —
+/// forge cannot distinguish "clear" from "keep" and an empty name would
+/// be rejected server-side anyway).
+pub fn update_agent_body(req: &UpdateRequest) -> Value {
+    let mut v = serde_json::Map::new();
+    let mut put = |key: &str, val: &Option<String>| {
+        if let Some(s) = val {
+            let t = s.trim();
+            if !t.is_empty() {
+                v.insert(key.to_string(), Value::String(t.to_string()));
+            }
+        }
+    };
+    put("name", &req.name);
+    put("avatar_url", &req.avatar);
+    put("primary_profile_id", &req.profile_id);
+    put("memory_scope", &req.memory_scope);
+    put("org_id", &req.org_id);
+    put("home_machine", &req.home_machine);
+    put("visibility", &req.visibility);
+    put("extra_instructions", &req.extra_instructions);
+    if let Some(tools) = &req.tools_allowlist {
+        // Some(vec![]) is meaningful (= allow all), so it is always sent.
+        v.insert(
+            "tools_allowlist".to_string(),
+            Value::Array(
+                tools
+                    .iter()
+                    .map(|t| Value::String(t.trim().to_string()))
+                    .collect(),
+            ),
+        );
+    }
+    Value::Object(v)
+}
+
+/// Validate an edit request (before any HTTP). At least one field must
+/// be present — forge answers 400 "No fields to update".
+pub fn validate_update(req: &UpdateRequest) -> Result<(), String> {
+    if let Some(n) = &req.name {
+        validate_agent_name(n).map_err(|e| format!("name: {e}"))?;
+    }
+    if let Some(s) = &req.memory_scope
+        && s != "agent"
+        && s != "org"
+    {
+        return Err(format!("memory_scope must be 'agent' or 'org' (got '{s}')"));
+    }
+    if let Some(v) = &req.visibility
+        && v != "private"
+        && v != "org"
+    {
+        return Err(format!("visibility must be 'private' or 'org' (got '{v}')"));
+    }
+    let body = update_agent_body(req);
+    if body.as_object().map(|m| m.is_empty()).unwrap_or(true) {
+        return Err("nothing to update".into());
+    }
+    Ok(())
+}
+
+/// PATCH the agent row and return the fresh registry row. Blocking
+/// localhost HTTP (the provision/AgentPause pattern).
+pub fn update_agent(cfg: &ForgeConfig, req: &UpdateRequest) -> Result<AgentInfo, String> {
+    validate_update(req)?;
+    let body = update_agent_body(req);
+    let patched = forge_req(
+        cfg,
+        "PATCH",
+        &format!("/agents/{}", req.agent_id),
+        Some(&body),
+    )
+    .map_err(|e| format!("updating agent: {e}"))?;
+    let agent = patched.get("agent").unwrap_or(&patched);
+    agent_info_from_value(agent).ok_or_else(|| "forge did not return the agent row".to_string())
+}
+
+/// Decode a forge `agents` row into the wire `AgentInfo`. Shared by
+/// `ForgeJob::AgentList` (GET /agents), the update reply (PATCH), and
+/// the CLI edit wizard (GET /agents/:id) so every surface prefills the
+/// same fields.
+pub fn agent_info_from_value(a: &Value) -> Option<AgentInfo> {
+    let opt_str = |k: &str| a.get(k).and_then(|x| x.as_str()).map(str::to_string);
+    let tools = a
+        .get("tools_allowlist")
+        .and_then(|x| x.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|t| t.as_str().map(str::to_string))
+                .collect::<Vec<_>>()
+        });
+    Some(AgentInfo {
+        id: a.get("id")?.as_str()?.to_string(),
+        name: a
+            .get("name")
+            .and_then(|n| n.as_str())
+            .unwrap_or("")
+            .to_string(),
+        avatar_url: opt_str("avatar_url"),
+        home_machine: opt_str("home_machine"),
+        // TODO(H5): derive from the agent's most-active conversation
+        // (GET /agents/:id/conversations?latest=1 per agent — not worth
+        // N round trips on a list call).
+        last_active: None,
+        conversation_count: None,
+        primary_profile: opt_str("primary_profile_id"),
+        memory_scope: opt_str("memory_scope"),
+        org_id: opt_str("org_id"),
+        visibility: opt_str("visibility"),
+        tools_allowlist: tools,
+        extra_instructions: opt_str("extra_instructions"),
+        paused: a.get("paused").and_then(|x| x.as_bool()),
+    })
+}
+
+/// Fetch one agent row (GET /agents/:id) — the CLI edit wizard's
+/// prefill source.
+pub fn get_agent(cfg: &ForgeConfig, agent_id: &str) -> Result<AgentInfo, String> {
+    let v = forge_req(cfg, "GET", &format!("/agents/{agent_id}"), None)
+        .map_err(|e| format!("reading agent: {e}"))?;
+    let agent = v.get("agent").unwrap_or(&v);
+    agent_info_from_value(agent).ok_or_else(|| "forge returned no agent row".to_string())
+}
+
+/// Resolve a registry name to its id (case-insensitive name match,
+/// falling back to "the caller already passed an id").
+pub fn resolve_agent_id(cfg: &ForgeConfig, name_or_id: &str) -> Result<String, String> {
+    let want = name_or_id.trim();
+    if want.is_empty() {
+        return Err("agent name or id must not be empty".into());
+    }
+    let v = forge_req(cfg, "GET", "/agents", None).map_err(|e| format!("listing agents: {e}"))?;
+    let arr = v
+        .get("agents")
+        .and_then(|x| x.as_array())
+        .cloned()
+        .or_else(|| v.as_array().cloned())
+        .unwrap_or_default();
+    let rows: Vec<AgentInfo> = arr.iter().filter_map(agent_info_from_value).collect();
+    if let Some(hit) = rows.iter().find(|a| a.name.eq_ignore_ascii_case(want)) {
+        return Ok(hit.id.clone());
+    }
+    // no name match — assume the caller passed an id (the frames take
+    // ids; the CLI takes either)
+    Ok(want.to_string())
+}
+
+// ---------- wake CRUD (H6.5b: the editor's schedule section) ----------
+
+/// One wake create/update request (the editor's schedule row).
+#[derive(Debug, Clone)]
+pub struct WakeRequest {
+    /// None = create
+    pub wake_id: Option<String>,
+    pub agent_id: String,
+    /// 5-field cron expr (HH:MM inputs are converted by the caller)
+    pub cron: String,
+    pub prompt: String,
+    pub name: Option<String>,
+    /// None on create = enabled; Some(b) = the toggle
+    pub enabled: Option<bool>,
+}
+
+/// The `PATCH /api/v1/wakes/{id}` body (only present keys are sent —
+/// mule applies the patch key-by-key).
+pub fn wake_update_body(req: &WakeRequest) -> Value {
+    let mut v = serde_json::Map::new();
+    if let Some(n) = &req.name {
+        let t = n.trim();
+        if !t.is_empty() {
+            v.insert("name".into(), Value::String(t.to_string()));
+        }
+    }
+    if !req.cron.trim().is_empty() {
+        v.insert("spec".into(), json!({"expr": req.cron.trim()}));
+    }
+    if !req.prompt.trim().is_empty() {
+        v.insert(
+            "prompt_template".into(),
+            Value::String(req.prompt.trim().to_string()),
+        );
+    }
+    if let Some(e) = req.enabled {
+        v.insert("enabled".into(), Value::Bool(e));
+    }
+    Value::Object(v)
+}
+
+/// Decode mule's `{"wakes":[…]}` (or a bare array) into the editor's
+/// wake rows, keeping only the ones bound to `agent_id`
+/// (`target.agent_id`, the H3.3 wake shape).
+pub fn wakes_for_agent(v: &Value, agent_id: &str) -> Vec<WakeInfo> {
+    let arr = v
+        .get("wakes")
+        .and_then(|x| x.as_array())
+        .cloned()
+        .or_else(|| v.as_array().cloned())
+        .unwrap_or_default();
+    arr.iter()
+        .filter(|w| wake_belongs_to(w, agent_id))
+        .filter_map(|w| {
+            let id = w.get("id")?.as_str()?.to_string();
+            let opt_str = |k: &str| w.get(k).and_then(|x| x.as_str()).map(str::to_string);
+            Some(WakeInfo {
+                id,
+                name: w
+                    .get("name")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                kind: w
+                    .get("kind")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                cron: w
+                    .get("spec")
+                    .and_then(|s| s.get("expr"))
+                    .and_then(|e| e.as_str())
+                    .map(str::to_string),
+                prompt: w
+                    .get("prompt_template")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                enabled: w.get("enabled").and_then(|x| x.as_bool()).unwrap_or(true),
+                last_fired_at: opt_str("last_fired_at"),
+                next_due_at: opt_str("next_due_at"),
+            })
+        })
+        .collect()
+}
+
+/// Does one wake row belong to this agent? The provisioning core
+/// writes `target.forge_conversation.agent_id` (the H3.3 shape, and
+/// the path mule's own bulk-pause queries); hand-made wakes may carry
+/// `target.agent_id` or, for the memory / agent_signal kinds,
+/// `spec.agent_id`. Match any of them so the editor never hides a
+/// wake the agent will actually hear.
+fn wake_belongs_to(w: &Value, agent_id: &str) -> bool {
+    [
+        w.get("target").and_then(|t| t.get("agent_id")),
+        w.get("target")
+            .and_then(|t| t.get("forge_conversation"))
+            .and_then(|fc| fc.get("agent_id")),
+        w.get("spec").and_then(|s| s.get("agent_id")),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|a| a.as_str() == Some(agent_id))
+}
+
+/// List the agent's wakes (mule `GET /api/v1/wakes`, filtered).
+pub fn list_wakes(
+    mule: &crate::daemon::mule::MuleConfig,
+    agent_id: &str,
+) -> Result<Vec<WakeInfo>, String> {
+    let v = mule_req(mule, "GET", "/api/v1/wakes", None)?;
+    Ok(wakes_for_agent(&v, agent_id))
+}
+
+/// Create or update one wake; returns its id.
+pub fn put_wake(
+    mule: &crate::daemon::mule::MuleConfig,
+    forge: &ForgeConfig,
+    req: &WakeRequest,
+) -> Result<String, String> {
+    if req.agent_id.trim().is_empty() {
+        return Err("agent_id must not be empty".into());
+    }
+    if req.prompt.trim().is_empty() {
+        return Err("wake prompt must not be empty".into());
+    }
+    // A blank cron means "leave the schedule alone" on an UPDATE (the
+    // editor pauses/resumes a wake without touching its spec — and
+    // non-cron kinds have no expr at all); a CREATE needs one.
+    if req.wake_id.is_none() && req.cron.trim().is_empty() {
+        return Err("a new wake needs a schedule (HH:MM or 5-field cron)".into());
+    }
+    if !req.cron.trim().is_empty() {
+        parse_wake_schedule(&req.cron).map_err(|e| format!("wake schedule: {e}"))?;
+    }
+    let (method, path, body) = match &req.wake_id {
+        Some(id) => (
+            "PATCH",
+            format!("/api/v1/wakes/{id}"),
+            wake_update_body(req),
+        ),
+        None => (
+            "POST",
+            "/api/v1/wakes".to_string(),
+            wake_body(
+                &req.name
+                    .clone()
+                    .filter(|n| !n.trim().is_empty())
+                    .unwrap_or_else(|| format!("wake-{}", req.agent_id)),
+                &req.agent_id,
+                req.cron.trim(),
+                req.prompt.trim(),
+                &forge.base,
+                &forge.key,
+            ),
+        ),
+    };
+    // create honours the enabled toggle too (wake_body defaults true)
+    let body = match (req.wake_id.as_deref(), req.enabled) {
+        (None, Some(false)) => {
+            let mut o = body.as_object().cloned().unwrap_or_default();
+            o.insert("enabled".into(), Value::Bool(false));
+            Value::Object(o)
+        }
+        _ => body,
+    };
+    let v = mule_req(mule, method, &path, Some(&body))?;
+    v.get("id")
+        .and_then(|x| x.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| "mule did not return the wake id".to_string())
+}
+
+/// Delete one wake.
+pub fn delete_wake(mule: &crate::daemon::mule::MuleConfig, wake_id: &str) -> Result<(), String> {
+    mule_req(mule, "DELETE", &format!("/api/v1/wakes/{wake_id}"), None)?;
+    Ok(())
+}
+
+/// mule wakes HTTP (the post_wake shape, widened to the methods the
+/// editor needs). Blocking localhost HTTP.
+fn mule_req(
+    cfg: &crate::daemon::mule::MuleConfig,
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+) -> Result<Value, String> {
+    use std::io::Read as _;
+    let url = format!("{}{}", cfg.wakes_url, path);
+    let m = method.to_ascii_uppercase();
+    let agent = ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .build(),
+    );
+    let auth = |k: &Option<String>| k.as_ref().map(|k| format!("Bearer {k}"));
+    let sent = match (m.as_str(), body) {
+        ("GET", _) => {
+            let mut r = agent.get(&url);
+            if let Some(h) = auth(&cfg.wakes_api_key) {
+                r = r.header("Authorization", &h);
+            }
+            r.call()
+        }
+        ("DELETE", _) => {
+            let mut r = agent.delete(&url);
+            if let Some(h) = auth(&cfg.wakes_api_key) {
+                r = r.header("Authorization", &h);
+            }
+            r.call()
+        }
+        ("POST", Some(b)) => {
+            let mut r = agent.post(&url);
+            if let Some(h) = auth(&cfg.wakes_api_key) {
+                r = r.header("Authorization", &h);
+            }
+            r.send_json(b.clone())
+        }
+        ("PATCH", Some(b)) => {
+            let mut r = agent.patch(&url);
+            if let Some(h) = auth(&cfg.wakes_api_key) {
+                r = r.header("Authorization", &h);
+            }
+            r.send_json(b.clone())
+        }
+        _ => return Err(format!("mule: unsupported method {m}")),
+    };
+    let mut res = sent.map_err(|e| format!("mule {m} {path}: {e}"))?;
+    let mut text = String::new();
+    res.body_mut()
+        .as_reader()
+        .read_to_string(&mut text)
+        .map_err(|e| format!("mule read {path}: {e}"))?;
+    if !res.status().is_success() {
+        let detail = text.trim();
+        return Err(if detail.is_empty() {
+            format!("mule {m} {path}: HTTP {}", res.status())
+        } else {
+            format!("mule {m} {path}: HTTP {} — {detail}", res.status())
+        });
+    }
+    if text.trim().is_empty() {
+        return Ok(Value::Null);
+    }
+    serde_json::from_str(&text).map_err(|e| format!("mule decode {path}: {e}"))
+}
+
+// ---------- the edit wizard (CLI twin of mobile's ✎ form) ----------
+
+fn run_edit(target: &str) {
+    let cfg = load_forge_config().unwrap_or_else(|| {
+        die("no forge config (set forge_api_key [+ forge_url] in \
+             ~/.config/ranch/daemon.toml — see `ranch register`)")
+    });
+    if target.is_empty() {
+        die("usage: ranch agents edit <name-or-id>");
+    }
+    let agent_id = match resolve_agent_id(&cfg, target) {
+        Ok(id) => id,
+        Err(e) => die(&e),
+    };
+    let current = match get_agent(&cfg, &agent_id) {
+        Ok(a) => a,
+        Err(e) => die(&e),
+    };
+
+    println!("editing \"{}\" ({})", current.name, current.id);
+    println!("(Enter keeps the current value shown in [brackets])");
+    let name = prompt("name", &current.name);
+    let avatar = prompt(
+        "avatar (url; blank = none)",
+        current.avatar_url.as_deref().unwrap_or(""),
+    );
+
+    let profiles: Vec<(String, String)> = match forge_req(&cfg, "GET", "/profiles", None) {
+        Ok(v) => v
+            .get("profiles")
+            .and_then(|x| x.as_array())
+            .cloned()
+            .or_else(|| v.as_array().cloned())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|p| {
+                let id = p.get("id")?.as_str()?.to_string();
+                let nm = p
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                Some((id, nm))
+            })
+            .collect(),
+        Err(e) => {
+            eprintln!("warning: could not list profiles ({e}); Enter keeps current");
+            Vec::new()
+        }
+    };
+    let current_profile = current.primary_profile.clone().unwrap_or_default();
+    let profile = prompt(
+        &format!(
+            "primary profile (id or name; blank keeps '{}')",
+            if current_profile.is_empty() {
+                "none".to_string()
+            } else {
+                profiles
+                    .iter()
+                    .find(|(id, _)| *id == current_profile)
+                    .map(|(_, n)| n.clone())
+                    .unwrap_or_else(|| current_profile.clone())
+            }
+        ),
+        "",
+    );
+    let profile_id = {
+        let t = profile.trim();
+        if t.is_empty() {
+            None
+        } else if let Some((id, _)) = profiles.iter().find(|(_, n)| n.eq_ignore_ascii_case(t)) {
+            Some(id.clone())
+        } else {
+            Some(t.to_string())
+        }
+    };
+
+    let current_tools = current
+        .tools_allowlist
+        .clone()
+        .unwrap_or_default()
+        .join(", ");
+    let tools = prompt(
+        &format!(
+            "tools allowlist (comma-separated; '*' = all; blank keeps '{}')",
+            if current_tools.is_empty() {
+                "all"
+            } else {
+                &current_tools
+            }
+        ),
+        "",
+    );
+    let tools_input = tools.trim().to_string();
+    let tools_allowlist = if tools_input.is_empty() {
+        None
+    } else if tools_input == "*" {
+        Some(vec![])
+    } else {
+        Some(
+            tools_input
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
+        )
+    };
+
+    let scope = prompt(
+        &format!(
+            "memory scope (agent|org; blank keeps '{}')",
+            current
+                .memory_scope
+                .clone()
+                .unwrap_or_else(|| "agent".into())
+        ),
+        "",
+    );
+    let memory_scope = match scope.trim() {
+        "agent" => Some("agent".to_string()),
+        "org" => Some("org".to_string()),
+        _ => None,
+    };
+    let org = prompt(
+        "org label (blank keeps current)",
+        current.org_id.as_deref().unwrap_or(""),
+    );
+    let org_id = (!org.trim().is_empty() && org.trim() != current.org_id.as_deref().unwrap_or(""))
+        .then(|| org.trim().to_string());
+    let home = prompt(
+        "home machine (blank keeps current)",
+        current.home_machine.as_deref().unwrap_or(""),
+    );
+    let home_machine = (!home.trim().is_empty()
+        && home.trim() != current.home_machine.as_deref().unwrap_or(""))
+    .then(|| home.trim().to_string());
+    let instr = prompt(
+        "extra instructions (blank keeps current)",
+        current.extra_instructions.as_deref().unwrap_or(""),
+    );
+    let extra_instructions = (!instr.trim().is_empty()
+        && instr.trim() != current.extra_instructions.as_deref().unwrap_or(""))
+    .then(|| instr.trim().to_string());
+
+    let req = UpdateRequest {
+        agent_id: current.id.clone(),
+        name: (name.trim() != current.name && !name.trim().is_empty()).then(|| name.clone()),
+        avatar: (!avatar.trim().is_empty()).then(|| avatar.clone()),
+        profile_id,
+        memory_scope,
+        org_id,
+        home_machine,
+        visibility: None,
+        tools_allowlist,
+        extra_instructions,
+    };
+    if let Err(e) = validate_update(&req) {
+        die(&e);
+    }
+    let body = update_agent_body(&req);
+    println!("\n---\npatching {} with {body}\n---", current.id);
+    let confirm = prompt("save?", "y");
+    if !confirm.eq_ignore_ascii_case("y") {
+        println!("aborted");
+        return;
+    }
+    match update_agent(&cfg, &req) {
+        Ok(a) => println!("saved \"{}\" ({})", a.name, a.id),
+        Err(e) => die(&e),
+    }
 }
 
 // ---------- interactive prompt plumbing ----------
@@ -410,15 +1003,21 @@ fn prompt_choice(label: &str, options: &[&str], default: usize) -> usize {
 
 // ---------- the wizard ----------
 
-/// `ranch agents new` — run the wizard; `ranch agents` (anything else)
-/// is a usage error.
-pub fn run(sub: Option<String>) {
-    match sub.as_deref() {
+/// `ranch agents new` — run the wizard; `ranch agents edit` — edit one
+/// registry row; `ranch agents` (anything else) is a usage error.
+pub fn run(sub: &[String]) {
+    match sub.first().map(|s| s.as_str()) {
         Some("new") => run_new(),
+        Some("edit") => match sub.get(1) {
+            Some(target) => run_edit(target.trim()),
+            None => die("usage: ranch agents edit <name-or-id>"),
+        },
         Some(other) => die(&format!(
-            "unknown subcommand 'agents {other}' (usage: ranch agents new)"
+            "unknown subcommand 'agents {other}' (usage: ranch agents new | \
+             ranch agents edit <name-or-id>)"
         )),
-        None => die("usage: ranch agents new — provision a specialist dot"),
+        None => die("usage: ranch agents new — provision a specialist dot; \
+             ranch agents edit <name-or-id> — edit one"),
     }
 }
 
@@ -748,5 +1347,233 @@ mod tests {
             "http://forge.local"
         );
         assert_eq!(b["enabled"], true);
+    }
+
+    // ---------- H6.5b: the editor's core ----------
+
+    #[test]
+    fn update_body_sends_only_present_fields() {
+        let req = UpdateRequest {
+            agent_id: "a1".into(),
+            name: Some("  Atlas II  ".into()),
+            avatar: Some("   ".into()), // blank => dropped
+            profile_id: Some("p-9".into()),
+            memory_scope: Some("org".into()),
+            org_id: None,
+            home_machine: None,
+            visibility: None,
+            tools_allowlist: Some(vec![]), // empty is MEANINGFUL
+            extra_instructions: Some("be terse".into()),
+        };
+        let b = update_agent_body(&req);
+        assert_eq!(b["name"], "Atlas II");
+        assert!(b.get("avatar_url").is_none());
+        assert_eq!(b["primary_profile_id"], "p-9");
+        assert_eq!(b["memory_scope"], "org");
+        assert!(b.get("org_id").is_none());
+        assert!(b.get("home_machine").is_none());
+        assert_eq!(b["tools_allowlist"], json!([]));
+        assert_eq!(b["extra_instructions"], "be terse");
+        // an edit with nothing present is not a patch
+        let empty = UpdateRequest {
+            agent_id: "a1".into(),
+            ..Default::default()
+        };
+        assert_eq!(update_agent_body(&empty), json!({}));
+        assert_eq!(validate_update(&empty).unwrap_err(), "nothing to update");
+    }
+
+    #[test]
+    fn update_validation() {
+        let bad_name = UpdateRequest {
+            agent_id: "a1".into(),
+            name: Some("".into()),
+            ..Default::default()
+        };
+        assert!(validate_update(&bad_name).unwrap_err().starts_with("name:"));
+        let bad_scope = UpdateRequest {
+            agent_id: "a1".into(),
+            memory_scope: Some("everyone".into()),
+            ..Default::default()
+        };
+        assert!(
+            validate_update(&bad_scope)
+                .unwrap_err()
+                .contains("memory_scope")
+        );
+        let bad_vis = UpdateRequest {
+            agent_id: "a1".into(),
+            visibility: Some("public".into()),
+            ..Default::default()
+        };
+        assert!(
+            validate_update(&bad_vis)
+                .unwrap_err()
+                .contains("visibility")
+        );
+        let ok = UpdateRequest {
+            agent_id: "a1".into(),
+            home_machine: Some("omarchy".into()),
+            tools_allowlist: Some(vec!["bash".into()]),
+            ..Default::default()
+        };
+        assert!(validate_update(&ok).is_ok());
+    }
+
+    #[test]
+    fn agent_info_decodes_editor_fields() {
+        let row = json!({
+            "id": "uuid-1",
+            "name": "Atlas",
+            "avatar_url": null,
+            "home_machine": "omarchy",
+            "primary_profile_id": "p-1",
+            "memory_scope": "org",
+            "org_id": "myorg",
+            "visibility": "private",
+            "tools_allowlist": ["bash", "read"],
+            "extra_instructions": "be terse",
+            "paused": true
+        });
+        let a = agent_info_from_value(&row).unwrap();
+        assert_eq!(a.id, "uuid-1");
+        assert_eq!(a.primary_profile.as_deref(), Some("p-1"));
+        assert_eq!(a.memory_scope.as_deref(), Some("org"));
+        assert_eq!(a.org_id.as_deref(), Some("myorg"));
+        assert_eq!(a.visibility.as_deref(), Some("private"));
+        assert_eq!(a.tools_allowlist.as_deref().unwrap(), ["bash", "read"]);
+        assert_eq!(a.extra_instructions.as_deref(), Some("be terse"));
+        assert_eq!(a.paused, Some(true));
+        // an older forge row without the columns still decodes
+        let thin = json!({"id": "x", "name": "n"});
+        let t = agent_info_from_value(&thin).unwrap();
+        assert_eq!(t.primary_profile, None);
+        assert_eq!(t.tools_allowlist, None);
+        assert_eq!(t.paused, None);
+        // no id => no row
+        assert!(agent_info_from_value(&json!({"name": "n"})).is_none());
+    }
+
+    #[test]
+    fn wake_patch_body_only_present_keys() {
+        let req = WakeRequest {
+            wake_id: Some("w-1".into()),
+            agent_id: "a1".into(),
+            cron: "30 6 * * 1-5".into(),
+            prompt: "Standup.".into(),
+            name: Some("   ".into()),
+            enabled: Some(false),
+        };
+        let b = wake_update_body(&req);
+        assert_eq!(b["spec"]["expr"], "30 6 * * 1-5");
+        assert_eq!(b["prompt_template"], "Standup.");
+        assert_eq!(b["enabled"], false);
+        assert!(b.get("name").is_none());
+        // blank cron/prompt are left alone (mule rejects empty ones)
+        let blank = WakeRequest {
+            wake_id: Some("w-1".into()),
+            agent_id: "a1".into(),
+            cron: "".into(),
+            prompt: "".into(),
+            name: Some("morning".into()),
+            enabled: None,
+        };
+        let b2 = wake_update_body(&blank);
+        assert_eq!(b2, json!({"name": "morning"}));
+    }
+
+    #[test]
+    fn wake_list_filters_by_agent_and_decodes() {
+        let v = json!({"wakes": [
+            {"id": "w-1", "name": "wake-Atlas", "kind": "cron",
+             "spec": {"expr": "0 7 * * *"}, "prompt_template": "Daily check-in for Atlas.",
+             "enabled": true, "last_fired_at": "2026-10-17T07:00:00Z",
+             "next_due_at": "2026-10-18T07:00:00Z",
+             "target": {"forge_conversation": {"agent_id": "a1", "forge_url": "http://f"}}},
+            {"id": "w-2", "name": "other", "kind": "cron", "spec": {"expr": "0 8 * * *"},
+             "prompt_template": "x", "enabled": false,
+             "target": {"forge_conversation": {"agent_id": "a2"}}},
+            {"id": "w-3", "name": "memory", "kind": "memory",
+             "spec": {"agent_id": "a1", "predicate": "recall(\"x\")"},
+             "prompt_template": "belief", "enabled": true, "target": {}},
+            {"id": "w-4", "name": "bare", "kind": "event", "spec": {},
+             "prompt_template": "e", "enabled": true,
+             "target": {"agent_id": "a1"}}
+        ]});
+        let wakes = wakes_for_agent(&v, "a1");
+        let ids: Vec<&str> = wakes.iter().map(|w| w.id.as_str()).collect();
+        assert_eq!(ids, ["w-1", "w-3", "w-4"]);
+        assert_eq!(wakes[0].cron.as_deref(), Some("0 7 * * *"));
+        assert_eq!(wakes[0].prompt, "Daily check-in for Atlas.");
+        assert_eq!(
+            wakes[0].next_due_at.as_deref(),
+            Some("2026-10-18T07:00:00Z")
+        );
+        assert_eq!(wakes[1].kind, "memory");
+        assert_eq!(wakes[1].cron, None);
+        assert!(wakes[2].enabled);
+        // a bare array answer shape works too
+        let bare = json!([{"id": "w-9", "kind": "cron", "spec": {"expr": "0 1 * * *"},
+                           "prompt_template": "p", "enabled": true,
+                           "target": {"forge_conversation": {"agent_id": "a1"}}}]);
+        assert_eq!(wakes_for_agent(&bare, "a1").len(), 1);
+        assert!(wakes_for_agent(&bare, "nope").is_empty());
+    }
+
+    #[test]
+    fn put_wake_requires_schedule_only_on_create() {
+        // unreachable mule: validation errors must surface BEFORE any
+        // HTTP (their message, not a connect error).
+        let mule = crate::daemon::mule::MuleConfig {
+            base: "http://127.0.0.1:1".into(),
+            api_key: None,
+            wakes_forward: false,
+            wakes_url: "http://127.0.0.1:1".into(),
+            wakes_api_key: None,
+        };
+        let forge = ForgeConfig {
+            base: "http://127.0.0.1:1".into(),
+            key: "sk-test".into(),
+            profile: None,
+        };
+        let create = WakeRequest {
+            wake_id: None,
+            agent_id: "a1".into(),
+            cron: "".into(),
+            prompt: "p".into(),
+            name: None,
+            enabled: None,
+        };
+        assert!(
+            put_wake(&mule, &forge, &create)
+                .unwrap_err()
+                .contains("needs a schedule")
+        );
+        // an update (the editor's pause/resume) may omit the cron —
+        // non-cron kinds have no expr to send
+        let update = WakeRequest {
+            wake_id: Some("w-1".into()),
+            agent_id: "a1".into(),
+            cron: "".into(),
+            prompt: "p".into(),
+            name: None,
+            enabled: Some(false),
+        };
+        let e = put_wake(&mule, &forge, &update).unwrap_err();
+        assert!(
+            !e.contains("wake schedule"),
+            "update with a blank cron reached cron validation: {e}"
+        );
+        // a bad cron is still rejected on update
+        let bad = WakeRequest {
+            wake_id: Some("w-1".into()),
+            cron: "every morning".into(),
+            ..update
+        };
+        assert!(
+            put_wake(&mule, &forge, &bad)
+                .unwrap_err()
+                .contains("wake schedule")
+        );
     }
 }

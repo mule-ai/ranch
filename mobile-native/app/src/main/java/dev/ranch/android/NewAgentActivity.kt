@@ -9,8 +9,6 @@ import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
 import android.widget.Button
-import android.widget.CheckBox
-import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
@@ -41,12 +39,6 @@ class NewAgentActivity : Activity() {
 
     companion object {
         const val EXTRA_PRESET_NAME = "presetName"
-        /** The harness tool names the allowlist offers (agents_new.rs KNOWN_TOOLS). */
-        private val KNOWN_TOOLS = listOf(
-            "bash", "read", "write", "webfetch", "search",
-            "web_login", "web_login_done", "spawn_subagent",
-            "memory_remember", "agent_signal", "schedule_reminder",
-        )
     }
 
     private val handler = Handler(Looper.getMainLooper())
@@ -55,11 +47,11 @@ class NewAgentActivity : Activity() {
     private lateinit var status: TextView
     private var busy = false
 
-    // profile picker state
-    private val profiles = mutableListOf<Triple<String, String, String>>() // id, name, "provider/model"
+    // profile picker state (shared shape with the ✎ editor — AgentForm)
+    private val profiles = mutableListOf<AgentForm.ProfileRow>()
     private var pickedProfile = ""
     private var profileChip: Button? = null
-    private var modelCatalog: List<Triple<String, String, String>> = emptyList() // provider, id, name
+    private var modelCatalog: List<AgentForm.ModelRow> = emptyList()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -93,8 +85,8 @@ class NewAgentActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             setPadding(0, dp(4), 0, dp(4))
         }
-        val name = field(form, "name", "e.g. Atlas")
-        val avatar = field(form, "avatar (url, blank = none)", "https://…")
+        val name = AgentForm.field(this, form, "name", "e.g. Atlas")
+        val avatar = AgentForm.field(this, form, "avatar (url, blank = none)", "https://…")
 
         // ---- model profile (picker + inline new-profile) ----
         form.addView(TextView(this).apply {
@@ -106,7 +98,16 @@ class NewAgentActivity : Activity() {
             setTextColor(0xFFE5E5E5.toInt())
             isAllCaps = false
             setPadding(dp(10), dp(8), dp(10), dp(8))
-            setOnClickListener { showProfilePicker() }
+            setOnClickListener {
+                if (profiles.isEmpty()) {
+                    flash("no profiles loaded (forge unreachable?) — use ＋ new profile")
+                    return@setOnClickListener
+                }
+                AgentForm.showProfilePicker(this@NewAgentActivity, profiles, pickedProfile) { pick ->
+                    pickedProfile = pick
+                    paintProfileChip()
+                }
+            }
         }
         form.addView(profileChip)
         form.addView(Button(this).apply {
@@ -114,12 +115,16 @@ class NewAgentActivity : Activity() {
             setTextColor(0xFF7FD4FF.toInt())
             isAllCaps = false
             setPadding(0, dp(4), 0, 0)
-            setOnClickListener { showNewProfileForm() }
+            setOnClickListener {
+                AgentForm.showNewProfileForm(this@NewAgentActivity, modelCatalog) { frame ->
+                    relay?.send(frame)
+                }
+            }
         })
-        val orgId = field(form, "org label (org scope only)", "org")
-        val machine = field(form, "home machine (blank = this machine)", "")
-        val wake = field(form, "wake time: HH:MM or 5-field cron (blank = none)", "07:00")
-        val wakePrompt = field(form, "wake prompt (blank = default)", "")
+        val orgId = AgentForm.field(this, form, "org label (org scope only)", "org")
+        val machine = AgentForm.field(this, form, "home machine (blank = this machine)", "")
+        val wake = AgentForm.field(this, form, "wake time: HH:MM or 5-field cron (blank = none)", "07:00")
+        val wakePrompt = AgentForm.field(this, form, "wake prompt (blank = default)", "")
 
         // memory scope toggle: two small buttons
         val scopeRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
@@ -144,18 +149,7 @@ class NewAgentActivity : Activity() {
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
             setTextColor(0xFF9aa0a6.toInt()); setPadding(0, dp(8), 0, dp(2))
         })
-        val toolsBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        val toolChecks = mutableListOf<CheckBox>()
-        for (t in KNOWN_TOOLS) {
-            val box = CheckBox(this).apply {
-                text = t
-                setTextColor(0xFFE5E5E5.toInt())
-                textSize = 13f
-                setPadding(0, dp(2), 0, dp(2))
-            }
-            toolChecks.add(box)
-            toolsBox.addView(box)
-        }
+        val (toolsBox, toolsGet) = AgentForm.toolsBox(this, emptySet())
         form.addView(toolsBox)
 
         root.addView(ScrollView(this).apply { addView(form) },
@@ -171,7 +165,7 @@ class NewAgentActivity : Activity() {
                 val n = name.text.toString().trim()
                 if (n.isEmpty()) { flash("name is required"); return@setOnClickListener }
                 if (n.length > 64) { flash("name too long (max 64)"); return@setOnClickListener }
-                val tools = toolChecks.filter { it.isChecked }.map { it.text.toString() }
+                val tools = toolsGet()
                 busy = true
                 status.text = "creating $n…"
                 relay?.send(
@@ -208,23 +202,12 @@ class NewAgentActivity : Activity() {
     private fun onFrame(f: JSONObject) {
         when (f.optString("t")) {
             "ProfileListOk" -> {
-                val arr = f.optJSONArray("profiles") ?: return
                 profiles.clear()
-                for (i in 0 until arr.length()) {
-                    val p = arr.getJSONObject(i)
-                    val id = p.optString("id")
-                    if (id.isEmpty()) continue
-                    val pm = "${p.optString("provider")}/${p.optString("model")}"
-                    profiles.add(Triple(id, p.optString("name", id), pm))
-                }
+                profiles.addAll(AgentForm.parseProfiles(f.optJSONArray("profiles")))
                 paintProfileChip()
             }
             "ModelCatalogOk" -> {
-                val arr = f.optJSONArray("models") ?: return
-                modelCatalog = (0 until arr.length()).map { i ->
-                    val m = arr.getJSONObject(i)
-                    Triple(m.optString("provider"), m.optString("id"), m.optString("name"))
-                }
+                modelCatalog = AgentForm.parseModels(f.optJSONArray("models"))
             }
             "AgentProvisionOk" -> {
                 busy = false
@@ -256,153 +239,7 @@ class NewAgentActivity : Activity() {
 
     private fun paintProfileChip() {
         val chip = profileChip ?: return
-        chip.text = when {
-            pickedProfile.isNotEmpty() -> {
-                val p = profiles.firstOrNull { it.first == pickedProfile }
-                "profile: ${p?.second ?: pickedProfile.take(8)}${if (p != null) " (${p.third})" else ""}"
-            }
-            profiles.isEmpty() -> "no profiles — forge unreachable? (use ＋ new profile)"
-            else -> "profile: none (blank agent)"
-        }
-    }
-
-    /** The profile picker: one row per profile + "none". */
-    private fun showProfilePicker() {
-        if (profiles.isEmpty()) {
-            flash("no profiles loaded (forge unreachable?) — use ＋ new profile")
-            return
-        }
-        val body = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(8), dp(8), dp(8), dp(8))
-        }
-        val dialog = android.app.AlertDialog.Builder(this)
-            .setTitle("Choose the agent's model profile")
-            .setView(body)
-            .create()
-        fun addRow(label: String, sub: String, pick: String) {
-            val row = Button(this).apply {
-                text = label + (if (sub.isNotEmpty()) "\n$sub" else "")
-                isAllCaps = false
-                gravity = Gravity.START or Gravity.CENTER_VERTICAL
-                setTextColor(0xFFE5E5E5.toInt())
-                setPadding(dp(10), dp(8), dp(10), dp(8))
-                setOnClickListener {
-                    pickedProfile = pick
-                    paintProfileChip()
-                    dialog.dismiss()
-                }
-            }
-            body.addView(row)
-        }
-        addRow("no profile", "the agent has no model until one is attached", "")
-        for (p in profiles) addRow(p.second, p.third, p.first)
-        dialog.show()
-    }
-
-    /** Inline new-profile form (ProfilePut). Model rows come from the
-     *  catalog; a custom model id works too when the catalog is empty. */
-    private fun showNewProfileForm() {
-        val body = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(8), dp(8), dp(8), dp(8))
-        }
-        fun addField(label: String, hint: String, multiline: Boolean = false): EditText {
-            body.addView(TextView(this).apply {
-                text = label; setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
-                setTextColor(0xFF9aa0a6.toInt())
-            })
-            val edit = EditText(this).apply {
-                this.hint = hint
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
-                setTextColor(0xFFE5E5E5.toInt())
-                setHintTextColor(0xFF4b5563.toInt())
-                if (multiline) { minLines = 3; setSingleLine(false) } else setSingleLine(true)
-                background.setTint(0xFF9aa0a6.toInt())
-            }
-            body.addView(edit)
-            return edit
-        }
-        val pName = addField("name", "e.g. \"spark work\"")
-        val provider = addField("provider", "proxy / openai / anthropic / …")
-        val modelEdit = addField("model", "provider/model (or see model below)")
-        val baseUrl = addField("base url (blank = provider default)", "http://…")
-        val apiKey = addField("api key (blank = use forge's stored key)", "sk_…")
-        val workDir = addField("working dir (blank = none)", "/root/…")
-        val prompt = addField("system prompt (blank = none)", "You are …", multiline = true)
-
-        if (modelCatalog.isNotEmpty()) {
-            body.addView(TextView(this).apply {
-                text = "or pick a catalog model:"; setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
-                setTextColor(0xFF9aa0a6.toInt()); setPadding(0, dp(4), 0, 0)
-            })
-            val pick = ScrollView(this)
-            val inner = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-            for (m in modelCatalog) {
-                val b = Button(this).apply {
-                    text = "${m.second}"
-                    isAllCaps = false
-                    setTextColor(0xFFE5E5E5.toInt())
-                    setPadding(0, dp(2), 0, dp(2))
-                    setOnClickListener {
-                        provider.setText(m.first)
-                        modelEdit.setText("${m.first}/${m.second}")
-                    }
-                }
-                inner.addView(b, LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.MATCH_PARENT,
-                    LinearLayout.LayoutParams.WRAP_CONTENT
-                ).apply { setMargins(0, 0, dp(6), 0) })
-            }
-            pick.addView(inner)
-            body.addView(pick, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, dp(160)
-            ))
-        }
-
-        val dialog = android.app.AlertDialog.Builder(this)
-            .setTitle("New forge profile")
-            .setView(body)
-            .setPositiveButton("save profile") { _, _ ->
-                val n = pName.text.toString().trim()
-                val prov = provider.text.toString().trim()
-                val md = modelEdit.text.toString().trim()
-                if (n.isEmpty() || prov.isEmpty() || md.isEmpty()) {
-                    android.widget.Toast.makeText(this, "name, provider and model are required", 0).show()
-                    return@setPositiveButton
-                }
-                relay?.send(
-                    Term.profilePut(
-                        name = n,
-                        provider = prov,
-                        model = md,
-                        baseUrl = baseUrl.text.toString().trim(),
-                        apiKey = apiKey.text.toString().trim(),
-                        workingDir = workDir.text.toString().trim(),
-                        systemPrompt = prompt.text.toString().trim(),
-                    )
-                )
-            }
-            .setNegativeButton("cancel", null)
-            .create()
-        dialog.show()
-    }
-
-    private fun field(parent: LinearLayout, label: String, hint: String): EditText {
-        parent.addView(TextView(this).apply {
-            text = label; setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
-            setTextColor(0xFF9aa0a6.toInt()); setPadding(0, dp(8), 0, dp(2))
-        })
-        val edit = EditText(this).apply {
-            this.hint = hint
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
-            setTextColor(0xFFE5E5E5.toInt())
-            setHintTextColor(0xFF4b5563.toInt())
-            setSingleLine(true)
-            background.setTint(0xFF9aa0a6.toInt())
-        }
-        parent.addView(edit)
-        return edit
+        AgentForm.paintChip(chip, pickedProfile, profiles)
     }
 
     private fun flash(msg: String, green: Boolean = false) {

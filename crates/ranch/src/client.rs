@@ -7149,6 +7149,9 @@ pub fn main_client() {
         eprintln!(
             "  agents new         provision a specialist dot (H6.5 wizard: profile, tools, memory, wake)"
         );
+        eprintln!(
+            "  agents edit <name> edit a herd agent (H6.5b: name, profile, tools, memory, home, instructions)"
+        );
         eprintln!("  call <agent>         push-to-talk voice call (H6.3) — typed text in, TTS out");
         eprintln!("  pause|unpause [AGENT] H5.3 kill switch — no agent = every known agent");
         eprintln!("  agent --new [name]    legacy: fresh forge agent session in cwd");
@@ -7190,7 +7193,7 @@ pub fn main_client() {
         "agent" => cmd_agent(&args[1..]),
         // ranch agents new — Herd H6.5 specialist-dot provisioning
         // wizard (forge agent row + optional mule cron wake).
-        "agents" => crate::agents_new::run(args.get(1).cloned()),
+        "agents" => crate::agents_new::run(&args[1..]),
         "ls" | "list" => cmd_ls(),
         "--version" | "version" => {
             println!("ranch {}", crate::daemon::build_version());
@@ -7392,6 +7395,7 @@ mod tests {
             home_machine: None,
             last_active: None,
             conversation_count: None,
+            ..Default::default()
         }];
         match activity_deep_link(&item, &agents).unwrap() {
             Frame::AgentTalk { agent, mode, .. } => {

@@ -345,8 +345,7 @@ fn handle_event(
                 // them to this session) — their turn is the echo of an
                 // explicit notification, so it must stay background or
                 // every notify_user fires a SECOND (turn_end) ping.
-                let is_bg = msg.text.starts_with("[mule wake")
-                    || msg.text.starts_with("@notify:");
+                let is_bg = msg.text.starts_with("[mule wake") || msg.text.starts_with("@notify:");
                 state.background_turn.store(is_bg, Ordering::Relaxed);
                 write_agent_status(w, state.pane, "working");
             }
@@ -1101,7 +1100,7 @@ pub fn spawn_worker(cfg: ForgeConfig, pipe_w: std::fs::File, rx: mpsc::Receiver<
                                     pane: Some(pane.to_string()),
                                     kind: "model".into(),
                                     status: Some(cur.name),
-                                background: None,
+                                    background: None,
                                 },
                             );
                         }
@@ -1253,7 +1252,7 @@ pub fn spawn_worker(cfg: ForgeConfig, pipe_w: std::fs::File, rx: mpsc::Receiver<
                                         pane: Some(pane.to_string()),
                                         kind: "context".into(),
                                         status: Some(note),
-                                    background: None,
+                                        background: None,
                                     },
                                 );
                                 // close the "compacting" lifecycle machine-wide
@@ -1264,7 +1263,7 @@ pub fn spawn_worker(cfg: ForgeConfig, pipe_w: std::fs::File, rx: mpsc::Receiver<
                                         pane: Some(pane.to_string()),
                                         kind: "agent".into(),
                                         status: Some("idle".into()),
-                                    background: None,
+                                        background: None,
                                     },
                                 );
                                 // the compaction changed the window — refresh
@@ -1323,7 +1322,7 @@ pub fn spawn_worker(cfg: ForgeConfig, pipe_w: std::fs::File, rx: mpsc::Receiver<
                                     pane: Some(pane.to_string()),
                                     kind: "model".into(),
                                     status: Some(display),
-                                background: None,
+                                    background: None,
                                 },
                             ),
                             Err(e) => {
@@ -1504,33 +1503,12 @@ pub fn spawn_worker(cfg: ForgeConfig, pipe_w: std::fs::File, rx: mpsc::Receiver<
                                     .cloned()
                                     .or_else(|| v.as_array().cloned())
                                     .unwrap_or_default();
+                                // One decoder for every agent-row surface
+                                // (list, PATCH reply, CLI edit) — see
+                                // agents_new::agent_info_from_value.
                                 let agents: Vec<ranch_protocol::AgentInfo> = arr
                                     .iter()
-                                    .filter_map(|a| {
-                                        Some(ranch_protocol::AgentInfo {
-                                            id: a.get("id")?.as_str()?.to_string(),
-                                            name: a
-                                                .get("name")
-                                                .and_then(|n| n.as_str())
-                                                .unwrap_or("")
-                                                .to_string(),
-                                            avatar_url: a
-                                                .get("avatar_url")
-                                                .and_then(|x| x.as_str())
-                                                .map(String::from),
-                                            home_machine: a
-                                                .get("home_machine")
-                                                .and_then(|x| x.as_str())
-                                                .map(String::from),
-                                            // TODO(H5): derive from the agent's
-                                            // most-active conversation
-                                            // (GET /agents/:id/conversations?latest=1
-                                            // per agent — not worth N round
-                                            // trips on a list call in H1)
-                                            last_active: None,
-                                            conversation_count: None,
-                                        })
-                                    })
+                                    .filter_map(crate::agents_new::agent_info_from_value)
                                     .collect();
                                 write_frame(&pipe, &Frame::AgentListOk { req_id, agents });
                             }
@@ -1619,7 +1597,7 @@ fn emit_context(pipe: &PipeWriter, cfg: &ForgeConfig, pane: Uuid, forge_sid: Uui
             pane: Some(pane.to_string()),
             kind: "context".into(),
             status: Some(status),
-        background: None,
+            background: None,
         },
     );
 }
@@ -1908,7 +1886,9 @@ fn notify_agent_name(cfg: &ForgeConfig, forge_sid: Uuid) -> String {
         {
             return n.to_string();
         }
-        if let Some(t) = s.get("title").and_then(|x| x.as_str()) && !t.is_empty() {
+        if let Some(t) = s.get("title").and_then(|x| x.as_str())
+            && !t.is_empty()
+        {
             return t.to_string();
         }
     }

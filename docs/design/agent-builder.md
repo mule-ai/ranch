@@ -161,6 +161,45 @@ machine"). The credential scope is deliberately NOT part of the
 request: slots are declared later via `PATCH /agents/:id
 (credentials_scope)` and filled through the §7.1 flow.
 
+### 7.5 Editing a dot (`ranch agents edit`, mobile ✎) — H6.5b
+
+Creation is half the lifecycle; the other half is the **editor**, and
+it follows the same rule as provisioning: one core, many surfaces.
+
+```
+mobile ✎ (EditAgentActivity)   ranch agents edit <name|id>
+        │  AgentUpdate frame             │ direct (foreground)
+        └────────────┬───────────────────┘
+                     ▼
+     agents_new::update_agent  →  forge PATCH /agents/:id
+                     ▼
+     AgentUpdateOk { agent } — the fresh row, which is also what
+     AgentListOk now ships (one decoder: agent_info_from_value)
+
+     wakes (mule rows, saved per-row, not by Save):
+     WakeList / WakePut / WakeDelete  →  GET|POST|PATCH|DELETE
+                                         {mule}/api/v1/wakes[/{id}]
+```
+
+Form fields = the agent's own columns (name, avatar, home machine,
+memory scope + org label, visibility, tools allowlist, extra
+instructions) + the **profile** (chosen from `ProfileList`, created
+inline with `ProfilePut` — the §2 form, shared with the builder in
+`AgentForm.kt`) + the agent's **wake schedule**.
+
+Two deliberate rules:
+
+- **Absent = keep.** forge's PATCH cannot distinguish `null` from a
+  missing key, so no client can clear a nullable column; the editor's
+  blanks mean "keep", never "unset", and Save ships only the diff.
+- **A wake is not an agent column.** It saves on its own row action
+  (`WakePut`/`WakeDelete`) instead of waiting for the agent Save, and
+  a blank cron on an UPDATE means "leave the schedule alone" — that is
+  how pause/resume works and how non-cron kinds (no `spec.expr`) stay
+  editable. Ownership is matched on `target.agent_id`,
+  `target.forge_conversation.agent_id` (what provisioning writes) or
+  `spec.agent_id` (memory / agent_signal kinds).
+
 ### 7.4 v1 limits (documented, not bugs)
 
 - One handoff per approval; the token is single-use, 30 min. No

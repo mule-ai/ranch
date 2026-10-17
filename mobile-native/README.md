@@ -66,6 +66,23 @@ fire while the phone is in a drawer.
   Credential slots are deliberately not part of the form: declare
   them later via `PATCH /agents/:id` and sign in through the agent's
   `web_login` card.
+- **✎ Edit agent (H6.5b)** — `EditAgentActivity`, opened from the **✎**
+  button on a registry row: the mobile twin of `ranch agents edit`.
+  Prefills from the `AgentListOk` row (name, avatar, model profile,
+  home machine, memory scope + org label, visibility, tools allowlist,
+  extra instructions) and on **Save** sends `AgentUpdate` with ONLY
+  what changed — absent means "leave the column alone" in forge's
+  partial update, so no column can be cleared from the phone (documented
+  forge limitation). `AgentUpdateOk` carries the fresh row and the form
+  re-renders from it. Below the agent fields, a **wakes** section lists
+  the agent's mule wakes (`WakeList`, filtered by agent) with per-row
+  **edit** (schedule + prompt + name), **pause/resume**, **✕** delete,
+  and **＋ add wake** — wakes are mule rows, not agent columns, so they
+  save immediately (`WakePut`/`WakeDelete`) rather than waiting for
+  Save. The profile picker / new-profile form / tools checkbox set are
+  shared with the builder via `AgentForm.kt` so the two screens cannot
+  drift. Every `Error` (rid `au-`/`wl-`/`wp-`/`wd-`/`pp-`) flashes the
+  status line, never crashes (M8.4).
 - **Activity screen** — `HerdActivity`: the H5.3 Activity View (the
   herd's live timeline, mirroring the TUI's Activity section). Data is
   push-only: the daemon's activity poller broadcasts `ActivityPush`

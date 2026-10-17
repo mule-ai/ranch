@@ -547,8 +547,13 @@ pattern) because it creates the ranch session + chat pane.
 AgentList { req_id }                           → AgentListOk { req_id, agents: [AgentInfo] }
 
 AgentInfo { id, name, avatar_url?, home_machine?,
-            last_active?, conversation_count? }   // H1: last_active/
-                                                  // conversation_count = null (H5)
+            last_active?, conversation_count?,
+            primary_profile?, memory_scope?, org_id?,
+            visibility?, tools_allowlist?, extra_instructions?,
+            paused? }                         // H1: last_active/
+                                                  // conversation_count = null (H5);
+                                                  // the H6.5b tail is the editor's
+                                                  // prefill (forge agents row)
 
 AgentTalk { req_id, agent, mode: "continue"|"new"|"fork",
             text?, title?, fork_from? }
@@ -598,6 +603,31 @@ AgentProvision { req_id, name, avatar?, profile_id?,
     // failed/skipped (mule unconfigured or rejected) — the agent row
     // still landed; `Error` only for whole-request failures (bad name,
     // forge down, no forge config)
+
+// H6.5b the agent EDITOR (mobile ✎ form; `ranch agents edit` runs the
+// same core in the foreground and speaks no frames):
+AgentUpdate { req_id, agent_id, name?, avatar?, profile_id?,
+              memory_scope?, org_id?, home_machine?, visibility?,
+              tools_allowlist?, extra_instructions? }
+  → AgentUpdateOk { req_id, agent: AgentInfo }  // the fresh forge row
+    // EVERY field is optional and absent = "leave the column alone":
+    // forge's PATCH treats JSON null and a missing key identically, so
+    // no nullable column (avatar_url, home_machine, primary_profile_id,
+    // extra_instructions) can be CLEARED from any client. An empty
+    // tools_allowlist is meaningful (= allow all) and is always sent
+    // when present. Validation (name ≤ 64 / no newlines, memory_scope
+    // agent|org, visibility private|org, ≥ 1 field) happens daemon-side
+    // before any HTTP — a bad request costs one `Error`, not a forge 400.
+
+// H6.5b wake editing (mule proxy; the editor's schedule section). A
+// wake is a mule row, not an agent column, so these save per-row.
+WakeList { req_id, agent_id }                 → WakeListOk { req_id, wakes: [WakeInfo] }
+WakeInfo { id, name, kind, cron?, prompt, enabled,
+           last_fired_at?, next_due_at? }      // cron = spec.expr for cron
+                                               // wakes (null for other kinds)
+WakePut { req_id, wake_id?, agent_id, cron, prompt, name?, enabled? }
+  → WakePutOk { req_id, wake_id }              // wake_id absent = create
+WakeDelete { req_id, wake_id }                → WakeDeleteOk { req_id }
 ```
 
 Semantics:
@@ -643,6 +673,21 @@ Semantics:
   through the `web_login` card (forge mints the one-time handoff
   token; the cookie lands in forge's `secrets` table, never in a
   frame, card, or message row).
+- `AgentUpdate` / `Wake*` (H6.5b, the editor): `AgentUpdate` runs
+  `agents_new::update_agent` — forge `PATCH /agents/:id` with only the
+  fields that are present, and the reply carries the fresh row so the
+  form re-renders from the server's truth. The wake trio proxies mule:
+  `GET /api/v1/wakes` filtered to the agent (`target.agent_id`,
+  `target.forge_conversation.agent_id` — the shape the provisioning
+  core writes and mule's own bulk-pause queries — or `spec.agent_id`
+  for the memory / agent_signal kinds), `POST`/`PATCH
+  /api/v1/wakes[/{id}]`, `DELETE /api/v1/wakes/{id}`. `WakePut` with a
+  blank `cron` on an UPDATE means "leave the schedule alone" (how the
+  editor pauses/resumes a wake, and how non-cron kinds — which have no
+  `spec.expr` — stay editable); a CREATE requires one. `cron` is
+  validated daemon-side (HH:MM converted client-side, 5-field subset)
+  before mule sees it. No mule config ⇒ `Error` naming the leg; the
+  agent-row half of the editor keeps working without mule.
 - **Activity push** (`ActivityPush`, H5.3): the daemon's activity
   poller (a worker thread with its own pipe pair) recomputes the item
   set every 5 s — local pending asks / agent-spawned panes / recent

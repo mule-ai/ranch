@@ -390,19 +390,133 @@ object Term {
         val homeMachine: String?,
         val lastActive: String?,
         val conversationCount: Long?,
+        // H6.5b — the editor's prefill fields (forge agents row via
+        // AgentListOk / AgentUpdateOk; all optional on the wire).
+        val primaryProfile: String? = null,
+        val memoryScope: String? = null,
+        val orgId: String? = null,
+        val visibility: String? = null,
+        val toolsAllowlist: List<String>? = null,
+        val extraInstructions: String? = null,
+        val paused: Boolean? = null,
     )
+
+    private fun nullableStr(o: JSONObject, k: String): String? =
+        if (o.has(k) && !o.isNull(k)) o.optString(k).takeIf { it.isNotEmpty() } else null
 
     fun parseAgentInfo(o: JSONObject): AgentInfo =
         AgentInfo(
             id = o.optString("id"),
             name = o.optString("name"),
-            avatarUrl = o.optString("avatar_url").takeIf { it.isNotEmpty() },
-            homeMachine = o.optString("home_machine").takeIf { it.isNotEmpty() },
-            lastActive = o.optString("last_active").takeIf { it.isNotEmpty() },
+            avatarUrl = nullableStr(o, "avatar_url"),
+            homeMachine = nullableStr(o, "home_machine"),
+            lastActive = nullableStr(o, "last_active"),
             conversationCount =
                 if (o.has("conversation_count") && !o.isNull("conversation_count"))
                     o.optLong("conversation_count") else null,
+            primaryProfile = nullableStr(o, "primary_profile"),
+            memoryScope = nullableStr(o, "memory_scope"),
+            orgId = nullableStr(o, "org_id"),
+            visibility = nullableStr(o, "visibility"),
+            toolsAllowlist = o.optJSONArray("tools_allowlist")?.let { arr ->
+                (0 until arr.length()).map { arr.optString(it) }
+            },
+            extraInstructions = nullableStr(o, "extra_instructions"),
+            paused = if (o.has("paused") && !o.isNull("paused")) o.optBoolean("paused") else null,
         )
+
+    /** One of the agent's mule wakes (H6.5b editor schedule section) —
+     *  mirrors `ranch_protocol::WakeInfo`. */
+    data class WakeInfo(
+        val id: String,
+        val name: String,
+        val kind: String,
+        val cron: String?,
+        val prompt: String,
+        val enabled: Boolean,
+        val lastFiredAt: String?,
+        val nextDueAt: String?,
+    )
+
+    fun parseWakeInfo(o: JSONObject): WakeInfo =
+        WakeInfo(
+            id = o.optString("id"),
+            name = o.optString("name"),
+            kind = o.optString("kind"),
+            cron = nullableStr(o, "cron"),
+            prompt = o.optString("prompt"),
+            enabled = if (o.has("enabled") && !o.isNull("enabled")) o.optBoolean("enabled") else true,
+            lastFiredAt = nullableStr(o, "last_fired_at"),
+            nextDueAt = nullableStr(o, "next_due_at"),
+        )
+
+    /** H6.5b: edit a herd agent (forge PATCH /agents/:id). `null` /
+     *  blank fields are OMITTED — absent means "leave the column
+     *  alone" (forge cannot clear a nullable column). [tools] = null
+     *  keeps the current allowlist; empty list means "allow all". */
+    fun agentUpdate(
+        agentId: String,
+        name: String? = null,
+        avatar: String? = null,
+        profileId: String? = null,
+        memoryScope: String? = null,
+        orgId: String? = null,
+        homeMachine: String? = null,
+        visibility: String? = null,
+        tools: List<String>? = null,
+        extraInstructions: String? = null,
+        reqId: String = "au-" + newId(),
+    ): JSONObject {
+        val o = JSONObject()
+            .put("t", "AgentUpdate").put("id", newId()).put("client", CLIENT)
+            .put("req_id", reqId).put("agent_id", agentId)
+        fun putStr(key: String, v: String?) {
+            val t = v?.trim().orEmpty()
+            if (t.isNotEmpty()) o.put(key, t)
+        }
+        putStr("name", name)
+        putStr("avatar", avatar)
+        putStr("profile_id", profileId)
+        putStr("memory_scope", memoryScope)
+        putStr("org_id", orgId)
+        putStr("home_machine", homeMachine)
+        putStr("visibility", visibility)
+        putStr("extra_instructions", extraInstructions)
+        if (tools != null) {
+            val arr = JSONArray()
+            tools.forEach { arr.put(it) }
+            o.put("tools_allowlist", arr)
+        }
+        return o
+    }
+
+    /** H6.5b: the agent's mule wakes (list / create / update / delete). */
+    fun wakeList(agentId: String, reqId: String = "wl-" + newId()): JSONObject =
+        JSONObject().put("t", "WakeList").put("id", newId()).put("client", CLIENT)
+            .put("req_id", reqId).put("agent_id", agentId)
+
+    fun wakePut(
+        agentId: String,
+        cron: String,
+        prompt: String,
+        wakeId: String? = null,
+        name: String? = null,
+        enabled: Boolean? = null,
+        reqId: String = "wp-" + newId(),
+    ): JSONObject {
+        val o = JSONObject()
+            .put("t", "WakePut").put("id", newId()).put("client", CLIENT)
+            .put("req_id", reqId).put("agent_id", agentId)
+            .put("cron", cron).put("prompt", prompt)
+        if (!wakeId.isNullOrEmpty()) o.put("wake_id", wakeId)
+        if (!name.isNullOrEmpty()) o.put("name", name)
+        if (enabled != null) o.put("enabled", enabled)
+        return o
+    }
+
+    fun wakeDelete(wakeId: String, reqId: String = "wd-" + newId()): JSONObject =
+        JSONObject().put("t", "WakeDelete").put("id", newId()).put("client", CLIENT)
+            .put("req_id", reqId).put("wake_id", wakeId)
 
     /** One row of the Activity View (Herd H5.3) — mirrors
      *  `ranch_protocol::ActivityItem`. [agent] is the registry name;

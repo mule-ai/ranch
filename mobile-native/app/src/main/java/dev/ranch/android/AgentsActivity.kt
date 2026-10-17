@@ -286,6 +286,24 @@ class AgentsActivity : Activity() {
                     .putExtra(CallActivity.EXTRA_AGENT_NAME, a.name))
             }
         })
+        // H6.5b: the ✎ editor (forge PATCH /agents/:id + the agent's
+        // mule wakes). The whole registry row rides along as the
+        // prefill — no extra round trip before the form paints.
+        row.addView(Button(this).apply {
+            text = "✎"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+            setTextColor(0xFF7FD4FF.toInt())
+            minWidth = dp(40)
+            minimumWidth = dp(40)
+            minHeight = dp(40)
+            setPadding(dp(8), 0, dp(8), 0)
+            setOnClickListener {
+                startActivity(
+                    Intent(this@AgentsActivity, EditAgentActivity::class.java)
+                        .putExtra(EditAgentActivity.EXTRA_AGENT, agentRowJson(a).toString())
+                )
+            }
+        })
         row.addView(Button(this).apply {
             text = "✕"
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
@@ -315,6 +333,23 @@ class AgentsActivity : Activity() {
         row.addView(dot)
         return row
     }
+
+    /** The row back as the wire JSON the editor parses (the same
+     *  field names `AgentListOk` carries) — the prefill source. */
+    private fun agentRowJson(a: Term.AgentInfo): JSONObject = JSONObject()
+        .put("id", a.id)
+        .put("name", a.name)
+        .apply {
+            a.avatarUrl?.let { put("avatar_url", it) }
+            a.homeMachine?.let { put("home_machine", it) }
+            a.primaryProfile?.let { put("primary_profile", it) }
+            a.memoryScope?.let { put("memory_scope", it) }
+            a.orgId?.let { put("org_id", it) }
+            a.visibility?.let { put("visibility", it) }
+            a.toolsAllowlist?.let { l -> put("tools_allowlist", org.json.JSONArray(l)) }
+            a.extraInstructions?.let { put("extra_instructions", it) }
+            a.paused?.let { put("paused", it) }
+        }
 
     /** Deterministic colored circle with the agent's initial (avatar
      *  placeholder — no image loader in the native app yet). */
