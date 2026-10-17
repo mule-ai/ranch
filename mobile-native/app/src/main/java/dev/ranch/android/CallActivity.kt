@@ -168,6 +168,18 @@ class CallActivity : Activity() {
     private var recorder: AudioRecord? = null
     private var player: AudioTrack? = null
     @Volatile private var lastWriteAt = 0L
+    // Bytes handed to the AudioTrack since the last flush — compared
+    // against playbackHeadPosition to know whether the speaker is
+    // ACTUALLY emitting right now (the echo reference).
+    private val bytesRequested = java.util.concurrent.atomic.AtomicLong(0)
+    // Bumped by barge-in flush; queued writer tasks with an older
+    // generation are skipped so the flush isn't stuck behind seconds
+    // of unplayed PCM.
+    @Volatile private var writeGen = 0
+    private val audioWriter =
+        java.util.concurrent.Executors.newSingleThreadExecutor { r ->
+            Thread(r, "tts-write").apply { isDaemon = true }
+        }
     @Volatile private var mutedAt = 0L
     private val recRunning = AtomicBoolean(false)
     @Volatile private var ended = false
@@ -529,11 +541,27 @@ class CallActivity : Activity() {
             override fun onMessage(ws: WebSocket, bytes: okio.ByteString) {
                 val p = player ?: return
                 val arr = bytes.toByteArray()
-                try {
-                    lastWriteAt = SystemClock.uptimeMillis()
-                    p.write(arr, 0, arr.size)
-                } catch (_: Exception) {
-                    // player died: drop the rest (documented v1 behavior)
+                lastWriteAt = SystemClock.uptimeMillis()
+                // AudioTrack.write blocks until the bytes are accepted;
+                // doing it on the OkHttp reader thread stalls the NEXT
+                // binary frame behind the current one (head-of-line
+                // blocking → the speaker underruns between sentences =
+                // "choppy audio"). A single writer thread keeps order;
+                // the generation counter lets a barge-in flush skip
+                // queued-but-unplayed chunks immediately.
+                val g = writeGen
+                bytesRequested.addAndGet(arr.size.toLong())
+                audioWriter.execute {
+                    if (g == writeGen) {
+                        try {
+                            p.write(arr, 0, arr.size)
+                        } catch (_: Exception) {
+                            // player died: drop the rest (documented v1
+                            // behavior — transcript keeps working)
+                        }
+                    } else {
+                        bytesRequested.addAndGet(-arr.size.toLong())
+                    }
                 }
             }
 
@@ -550,10 +578,19 @@ class CallActivity : Activity() {
                     // the stream, flush() clears the queued PCM, play()
                     // restarts so the next TTS chunk flows.
                     val p = player
+                    // Stale-out every queued-but-unplayed chunk (their
+                    // bytes leave the echo estimate) and reset the track.
+                    writeGen++
                     if (p != null) try {
                         p.stop()
                         p.flush()
                         p.play()
+                        // playbackHeadPosition resets on stop/flush/play —
+                        // the echo estimate must reset with it (2026-10-17
+                        // choppy-audio bug: stale counters kept the guard
+                        // classifying the agent's own voice as caller
+                        // speech and ducking itself mid-sentence)
+                        bytesRequested.set(0L)
                     } catch (_: Exception) {
                         // track already dead — new writes will fail and
                         // be dropped, the transcript keeps working
@@ -739,12 +776,24 @@ class CallActivity : Activity() {
                 val p = player
                 if (p != null) {
                     val now = SystemClock.uptimeMillis()
-                    // Hot mic right after we played audio = OUR OWN
-                    // voice from the speaker (echo), not the caller —
-                    // never duck for it (a real barge-in is mule's
-                    // 600-RMS barge-in detector + flush frame, which
-                    // stops the track outright).
-                    val echoWindow = now - lastWriteAt < ECHO_GRACE_MS
+                    // Hot mic while the speaker is AUDIBLY emitting = OUR
+                    // OWN voice (echo), not the caller — never duck for
+                    // it. The reference must be playback position, not
+                    // write time: chunks are written in bursts then play
+                    // for seconds while the next sentence synthesizes,
+                    // and a write-time window went stale mid-sentence —
+                    // the guard ducked the agent's own voice repeatedly
+                    // (2026-10-17: “audio sounds choppy and shitty”).
+                    // A real barge-in is mule's 600-RMS detector + the
+                    // flush frame, which stops the track outright.
+                    val playedFrames = try {
+                        p.playbackHeadPosition.toLong()
+                    } catch (_: Exception) {
+                        0L
+                    }
+                    val buffered = bytesRequested.get() - playedFrames * 2L
+                    val echoWindow = buffered > FRAME_BYTES * 2L ||
+                        now - lastWriteAt < ECHO_GRACE_MS
                     if (!muted && hotStreak >= HOT_STREAK_MUTE && !echoWindow) {
                         muted = true
                         mutedAt = now
