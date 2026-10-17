@@ -869,7 +869,24 @@ class CallActivity : Activity() {
             val a = getSystemService(AUDIO_SERVICE) as AudioManager
             audioMgr = a
             a.mode = AudioManager.MODE_NORMAL
-            a.isSpeakerphoneOn = true
+            // Route to what the user is actually wearing (2026-10-17:
+            // forcing speakerphone sent the agent's TTS to the phone
+            // speaker while the headphones kept playing music — the
+            // caller heard music in their ears and a midget Bob from
+            // the bottom of the phone). Only grab the loudspeaker when
+            // no wired/BT audio device is connected; USAGE_MEDIA then
+            // follows the active device (headphones) on its own.
+            val wired = try {
+                @Suppress("DEPRECATION") a.isWiredHeadsetOn
+            } catch (_: Exception) {
+                false
+            }
+            val bt = try {
+                @Suppress("DEPRECATION") a.isBluetoothA2dpOn
+            } catch (_: Exception) {
+                false
+            }
+            a.isSpeakerphoneOn = !(wired || bt)
             val l = AudioManager.OnAudioFocusChangeListener { /* keep playing through ducking */ }
             focusListener = l
             a.requestAudioFocus(l, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN)
