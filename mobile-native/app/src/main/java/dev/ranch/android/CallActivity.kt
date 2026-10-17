@@ -5,12 +5,14 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.media.AudioAttributes
 import android.media.AudioFormat
+import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.AudioTrack
 import android.media.MediaRecorder
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.text.InputType
 import android.util.TypedValue
 import android.view.Gravity
@@ -110,6 +112,15 @@ class CallActivity : Activity() {
         private const val MIC_COLD_RMS = 200.0
         private const val HOT_STREAK_MUTE = 3 // 3 frames ≈ 90 ms of speech
         private const val COLD_STREAK_UNMUTE = 8 // 8 frames ≈ 240 ms trailing silence
+        // Echo guard refinement (2026-10-17 phone report “agent never
+        // spoke back”): the agent's OWN voice from the speaker keeps
+        // the mic hot — ducking on a hot streak muted the player while
+        // it was speaking (and room noise above MIC_COLD_RMS never let
+        // it back up). Hot counts as “the caller speaks” only when no
+        // audio was played recently; and a ducked player ALWAYS comes
+        // back after the watchdog.
+        private const val ECHO_GRACE_MS = 700L
+        private const val MUTE_WATCHDOG_MS = 2_500L
     }
 
     private val app get() = application as App
@@ -119,6 +130,29 @@ class CallActivity : Activity() {
         .connectTimeout(6, TimeUnit.SECONDS)
         .readTimeout(20, TimeUnit.SECONDS)
         .build()
+
+    // The two call WebSockets ride this client: pings every 25 s keep
+    // the call alive across Cloudflare's ~100 s idle edge (an idle OUT
+    // socket — the caller just listening — was silently dropped, and
+    // every later turn came back silent).
+    private val wsHttp = OkHttpClient.Builder()
+        .connectTimeout(6, TimeUnit.SECONDS)
+        .pingInterval(25, TimeUnit.SECONDS)
+        .build()
+
+    // Audio routing for the call: force speaker + media focus, else
+    // “the agent never speaks back” on devices that idle-route or
+    // duck media when a call screen opens the mic.
+    private var audioMgr: AudioManager? = null
+    private var focusListener: AudioManager.OnAudioFocusChangeListener? = null
+
+    // Out-socket resilience (2026-10-17): an out socket that dies
+    // mid-call (edge hiccup) is re-dialled; mule re-arms its TTS lane
+    // on re-attach.
+    private var outReconnects = 0
+    private var lastTtsRate = 24_000
+    private var lastWsBase = ""
+    private var lastJobId = ""
 
     private var agentId = ""
     private var agentName = ""
@@ -133,6 +167,8 @@ class CallActivity : Activity() {
     private var outWs: WebSocket? = null
     private var recorder: AudioRecord? = null
     private var player: AudioTrack? = null
+    @Volatile private var lastWriteAt = 0L
+    @Volatile private var mutedAt = 0L
     private val recRunning = AtomicBoolean(false)
     @Volatile private var ended = false
 
@@ -297,6 +333,7 @@ class CallActivity : Activity() {
                 return@execute
             }
             status2("dialing… (job ${jobId.take(8)})")
+            lastJobId = jobId
             // cloud: the WebSockets can't cross the Supabase edge (the
             // platform rejects WS upgrades), so the call dials the user's
             // PUBLIC mule base that the /gateway endpoint resolves from
@@ -311,6 +348,7 @@ class CallActivity : Activity() {
                     return@execute
                 }
             }
+            lastWsBase = wsBase
             try {
                 connectOut(wsBase, jobId, ttsRate)
                 connectIn(wsBase, jobId)
@@ -445,7 +483,7 @@ class CallActivity : Activity() {
 
     private fun connectIn(base: String, jobId: String) {
         val url = wsUrl(base) + "/voice/$jobId/in"
-        inWs = http.newWebSocket(request(url), object : WebSocketListener() {
+        inWs = wsHttp.newWebSocket(request(url), object : WebSocketListener() {
             override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
                 if (!ended) onCallDropped("in socket: ${t.message}")
             }
@@ -457,9 +495,12 @@ class CallActivity : Activity() {
     }
 
     private fun connectOut(base: String, jobId: String, ttsRate: Int) {
+        lastTtsRate = ttsRate
         val url = wsUrl(base) + "/voice/$jobId/out"
-        outWs = http.newWebSocket(request(url), object : WebSocketListener() {
+        outWs = wsHttp.newWebSocket(request(url), object : WebSocketListener() {
             override fun onOpen(ws: WebSocket, response: Response) {
+                outReconnects = 0
+                acquireAudio()
                 player = try {
                     val min = AudioTrack.getMinBufferSize(
                         ttsRate, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT)
@@ -473,7 +514,9 @@ class CallActivity : Activity() {
                             .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
                             .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
                             .build(),
-                        maxOf(min, 4096),
+                        // generous buffer: one min-size buffer (~85 ms @
+                        // 24 kHz) stuttered under per-sentence TTS arrival
+                        maxOf(min * 4, 16_384),
                         AudioTrack.MODE_STREAM,
                         0,
                     ).also { it.play() }
@@ -487,6 +530,7 @@ class CallActivity : Activity() {
                 val p = player ?: return
                 val arr = bytes.toByteArray()
                 try {
+                    lastWriteAt = SystemClock.uptimeMillis()
                     p.write(arr, 0, arr.size)
                 } catch (_: Exception) {
                     // player died: drop the rest (documented v1 behavior)
@@ -551,7 +595,23 @@ class CallActivity : Activity() {
             }
 
             override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
-                if (!ended) onCallDropped("out socket: ${t.message}")
+                // A dead out socket means NO audio for the rest of the
+                // call — re-dial it (mule re-arms the TTS lane on
+                // re-attach) before giving up.
+                if (ended) return
+                if (outReconnects < 3) {
+                    outReconnects++
+                    status2("audio link dropped (${t.message}) — reconnecting ($outReconnects/3)…")
+                    handler.postDelayed({
+                        if (!ended) try {
+                            connectOut(lastWsBase, lastJobId, lastTtsRate)
+                        } catch (_: Exception) {
+                            onCallDropped("out socket: ${t.message}")
+                        }
+                    }, 1_000L)
+                } else {
+                    onCallDropped("out socket: ${t.message}")
+                }
             }
 
             override fun onClosed(ws: WebSocket, code: Int, reason: String) {
@@ -678,10 +738,21 @@ class CallActivity : Activity() {
                 }
                 val p = player
                 if (p != null) {
-                    if (!muted && hotStreak >= HOT_STREAK_MUTE) {
+                    val now = SystemClock.uptimeMillis()
+                    // Hot mic right after we played audio = OUR OWN
+                    // voice from the speaker (echo), not the caller —
+                    // never duck for it (a real barge-in is mule's
+                    // 600-RMS barge-in detector + flush frame, which
+                    // stops the track outright).
+                    val echoWindow = now - lastWriteAt < ECHO_GRACE_MS
+                    if (!muted && hotStreak >= HOT_STREAK_MUTE && !echoWindow) {
                         muted = true
+                        mutedAt = now
                         try { p.setVolume(0f) } catch (_: Exception) {}
-                    } else if (muted && coldStreak >= COLD_STREAK_UNMUTE) {
+                    } else if (muted && (coldStreak >= COLD_STREAK_UNMUTE ||
+                            now - mutedAt > MUTE_WATCHDOG_MS)) {
+                        // watchdog: noisy rooms must never strand the
+                        // player muted ("the agent never spoke back")
                         muted = false
                         try { p.setVolume(1f) } catch (_: Exception) {}
                     }
@@ -731,6 +802,7 @@ class CallActivity : Activity() {
         if (ended) { finish(); return }
         ended = true
         stopRecorder()
+        releaseAudio()
         try { inWs?.send("""{"hangup":true}""") } catch (_: Exception) {}
         try { inWs?.close(1000, null) } catch (_: Exception) {}
         try { outWs?.close(1000, null) } catch (_: Exception) {}
@@ -746,6 +818,7 @@ class CallActivity : Activity() {
         if (ended) return
         ended = true
         stopRecorder()
+        releaseAudio()
         try { player?.stop() } catch (_: Exception) {}
         try { inWs?.close(1000, null) } catch (_: Exception) {}
         try { outWs?.close(1000, null) } catch (_: Exception) {}
@@ -761,6 +834,7 @@ class CallActivity : Activity() {
         if (ended) return
         ended = true
         stopRecorder()
+        releaseAudio()
         try { player?.stop() } catch (_: Exception) {}
         try { inWs?.close(1000, null) } catch (_: Exception) {}
         try { outWs?.close(1000, null) } catch (_: Exception) {}
@@ -783,6 +857,40 @@ class CallActivity : Activity() {
 
     private fun status2(msg: String) = handler.post { status.text = msg }
 
+    /**
+     * Call audio routing: speakerphone + media focus, MODE_NORMAL.
+     * Without this the agent's TTS could land on an earpiece/ducked
+     * route and the call “had no voice” (2026-10-17). USAGE_MEDIA +
+     * MODE_NORMAL keeps mic capture (MIC source) from pulling the
+     * device into telephony routing.
+     */
+    private fun acquireAudio() {
+        try {
+            val a = getSystemService(AUDIO_SERVICE) as AudioManager
+            audioMgr = a
+            a.mode = AudioManager.MODE_NORMAL
+            a.isSpeakerphoneOn = true
+            val l = AudioManager.OnAudioFocusChangeListener { /* keep playing through ducking */ }
+            focusListener = l
+            a.requestAudioFocus(l, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN)
+        } catch (_: Exception) {
+            // routing is best-effort; transcript still works
+        }
+    }
+
+    private fun releaseAudio() {
+        try {
+            val a = audioMgr ?: return
+            focusListener?.let { a.abandonAudioFocus(it) }
+            a.isSpeakerphoneOn = false
+            a.mode = AudioManager.MODE_NORMAL
+        } catch (_: Exception) {
+        } finally {
+            audioMgr = null
+            focusListener = null
+        }
+    }
+
     private fun fail(msg: String) {
         ended = true
         handler.post {
@@ -797,6 +905,7 @@ class CallActivity : Activity() {
             // sockets — mule treats the in-socket close as a hang-up.
             ended = true
             stopRecorder()
+            releaseAudio()
             try { player?.stop() } catch (_: Exception) {}
             try { inWs?.close(1000, null) } catch (_: Exception) {}
             try { outWs?.close(1000, null) } catch (_: Exception) {}
