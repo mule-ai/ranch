@@ -13,6 +13,7 @@
 //     POST /v1/audio/transcriptions  -> {forge_base}/v1/audio/transcriptions
 //     POST /v1/audio/speech          -> {forge_base}/v1/audio/speech
 //     POST /api/v1/jobs              -> {mule_base}/api/v1/jobs
+//     GET  /api/v1/workflows*        -> {mule_base}/api/v1/workflows*
 //     GET  /gateway                  -> {mule_base_url: "…"} (public base
 //                                       for the call's WebSocket, which
 //                                       the Supabase edge cannot carry —
@@ -198,7 +199,13 @@ Deno.serve(async (req: Request): Promise<Response> => {
       return err(502, `mule: ${String(e).slice(0, 120)}`);
     }
   }
-  if (req.method === "GET" && path === "/api/v1/workflows") {
+  // workflows + their steps (call setup finds the voice_call workflow by
+  // matching config.agent_id over EVERY workflow's steps —
+  // CallActivity.findVoiceWorkflow / the CLI's pick_voice_workflow both
+  // GET /api/v1/workflows/{id}/steps, so the whole /api/v1/workflows*
+  // prefix must forward, not just the collection — 2026-10-16: cloud calls
+  // silently found "no voice_call workflow" because steps lookups 404'd)
+  if (req.method === "GET" && path.startsWith("/api/v1/workflows")) {
     try {
       return await forwardHttp(req, gw.muleBase, path, [
         "Authorization",
