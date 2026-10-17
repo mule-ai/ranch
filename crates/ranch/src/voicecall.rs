@@ -48,7 +48,7 @@ type Ws = WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>;
 const IN_FRAME_BYTES: usize = 960;
 
 /// `ranch call [agent]` entry point (client dispatch).
-pub fn run(agent_arg: Option<String>) {
+pub fn run(agent_arg: Option<String>, model: Option<String>) {
     let Some(agent) = resolve_agent(agent_arg) else {
         return;
     };
@@ -59,9 +59,12 @@ pub fn run(agent_arg: Option<String>) {
     let Some((workflow_id, tts_rate)) = pick_voice_workflow(&cfg, &agent) else {
         die_no_workflow(&agent);
     };
-    let job_id = create_job(&cfg, &workflow_id);
+    let job_id = create_job(&cfg, &workflow_id, model.as_deref());
 
     eprintln!("ranch: calling {} (job {job_id})", agent.name);
+    if let Some(m) = &model {
+        eprintln!("ranch: voice model {m} (⚠ fallback notice = it ran on the default)");
+    }
     eprintln!("ranch: mule {} · TTS out {tts_rate} Hz pcm", cfg.base);
 
     // ---------- out socket (reader thread) ----------
@@ -252,9 +255,14 @@ fn tts_rate_from_config(config: &Value) -> u32 {
         .unwrap_or(24_000)
 }
 
-/// POST /api/v1/jobs {workflow_id} → the new job id.
-fn create_job(cfg: &MuleConfig, workflow_id: &str) -> String {
-    let body = serde_json::json!({ "workflow_id": workflow_id });
+/// POST /api/v1/jobs {workflow_id, input_data?} → the new job id.
+/// `model` is the chosen "voice model" label (forge profile name/id,
+/// e.g. "Laguna (dev)" or "laguna"); mule applies it per-call.
+fn create_job(cfg: &MuleConfig, workflow_id: &str, model: Option<&str>) -> String {
+    let mut body = serde_json::json!({ "workflow_id": workflow_id });
+    if let Some(m) = model.filter(|m| !m.trim().is_empty()) {
+        body["input_data"] = serde_json::json!({ "model": m });
+    }
     let v = http_json(cfg, "POST", "/api/v1/jobs", Some(body)).unwrap_or_else(|e| {
         eprintln!("error: failed to start the call job: {e}");
         std::process::exit(1);
