@@ -104,7 +104,7 @@ dial OUT — zero inbound to the lab)         │
   Postgres entirely** (the key columns were only ever read by the edge
   fn). The machine channel's RLS becomes the whole access boundary.
   Keep the table dormant (don't drop) until v2 is live.
-- **Current tunnel design: kept as fallback** (web/Expo path, LAN, and
+- **Current tunnel design: kept as fallback** (web path, LAN, and
   the escape hatch during cutover) until the relay path is proven
   end-to-end off-lab; then it can go dark.
 
@@ -204,12 +204,12 @@ plumbing (mobile notification engines already key off `⚠` rows and
 
 ## What gets retired (when v2 is proven)
 
-- `ranch-voice` edge function (or keep for the Expo/web parity path only).
+- `ranch-voice` edge function (or keep for the web parity path only).
 - `voice_gateways` key columns (table stays dormant).
 - Phone CG settings fields + "Save cloud gateway" (cloud mode becomes a
   one-line toggle: relay vs direct).
 - The Cloudflare tunnel + `voice-gw` container **can** be retired, but
-  the allowlist container is cheap to keep as the web/Expo + LAN path —
+  the allowlist container is cheap to keep as the web + LAN path —
   decision at cutover.
 
 ## Build order (when picked up)

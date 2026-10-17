@@ -42,7 +42,7 @@ heard.*
    is `panes.is_empty() && chats.is_empty()`; pi errors surface as
    `⚠` chat rows.
 4. **Feature parity**: every user-facing capability lands on TUI, web
-   (Expo `mobile/`), and mobile-native (`mobile-native/`) in the same
+   (`web/`), and mobile-native (`mobile-native/`) in the same
    phase, or is explicitly daemon-side.
 5. **Forge invariants**: Postgres is the source of truth; tenancy
    (users + SHA-256 API keys + admin, `src/api/auth.rs`) is preserved
@@ -281,7 +281,8 @@ scheduler|timer|forge` in `*.go` (non-test) returns nothing.
   manager** (PiList/adopt), not an agent registry; `SessionActivity.kt`
   (1860) terminal/chat panes; `Realtime.kt` (404) join/send;
   `Prefs.kt` (23).
-- Web: Expo web build of `mobile/` (same React Native app).
+- Web: `web/` (Vite + React, GitHub Pages). The old Expo web build of
+  `mobile/` is gone — the RN app was deleted 2026-10-16.
 - Cloud: `supabase/migrations/0001`–`0007` (machines, sessions mirror,
   Realtime RLS via `realtime.messages` probe, self-serve register,
   webhooks/triggers mirror), `supabase/functions/webhook-relay`.
@@ -1431,8 +1432,9 @@ pane-turn-end + `⚠`-error rows (`onMeta` L115, `onChat` L139,
   digests); a "notifications" screen (new, off SettingsActivity or
   the Agents screen) lists agents with toggles.
 - **Expo/web parity**: web gets a browser Notification API mirror of
-  the same policy (the Expo app's `mobile/lib` notification code is
-  the reference; keep the *policy* in one shared module).
+  the same policy (the former Expo app's `mobile/lib` notification code
+  was the reference — now in git history; the live policy module is
+  `NotifyPolicy.kt`).
 - **Acceptance**: phone locked, agent's approval card fires →
   notification with agent avatar + Keep/Forget buttons → tap Keep
   while phone stays locked → belief activates (verified in forge);
@@ -1537,7 +1539,7 @@ All new frames land in `crates/ranch-protocol/src/lib.rs` (Frame enum
 L19) and are documented in `docs/PROTOCOL.md` §8 (new §8.6–8.10).
 Every new client-facing frame must be handled (at minimum: ignored
 with a warning log) by all four clients: TUI (`client.rs`), web
-(`mobile/`), mobile-native (`Monitor.kt`), and the raw test client
+(`web/`), mobile-native (`Monitor.kt`), and the raw test client
 (`tools/relay-test.mjs` updated to print them).
 
 | Frame | Phase | Direction | Purpose |
@@ -1676,6 +1678,7 @@ kill-criteria). Nothing open blocks starting H0.
 
 | Live ops 2026-10-16 | ✅ lab fleet recovery + memory search decode fix | ALC apiserver outage orphaned all 8 machines; recovered by killing the orphan runtimes + `machine run` (data intact). (1) **Embeddings live**: Bifrost back up at the ALC-internal forwarder (10.10.199.29:8080); `FORGE_EMBEDDING_URL` added to the host-side `forge.env` (model default `embeddings/qwen3-embedding-4b`, 2560 dims). (2) **memory/search latent decode bugs fixed** — forge `45dfb375` + `635735c9`: `(Episode|Belief, f32)` tuple decode → `FromRow` flatten on the hit structs (sqlx bound column 0 as a composite record named `Episode`), and the cosine score is FLOAT8 from pgvector → `::float4` cast for the f32 bind. Both only surface once an agent has embedded episodes/beliefs — the H4.4 reflection pull step 500ed live the first time Bob had one. Hot-deployed to the lab forge via `/opt/forge-hotfix` + `/run/systemd/system/forge-api.service.d` drop-in (image rebuild rides the lab-repo flake bump to `635735c9`, lab `b713bd0a`). (3) **mule daily jobs fixed**: both pointed at forge agent `ea978f3a` (deleted 10/11 — the "billing agent is gone" residual noted at H2 rollout); re-pointed to Bob (`0a5ad23d`) in `wasm_modules.config` + the `forge_conversation` step; both workflows now complete (agent-reflection full pull→agent→check→submit green; the agent step needed a `Default` pi provider entry for the forge `/v1` endpoint in the host-side `pi/models.json`, + the stale `bitfrost.botnet` URL corrected). The genai memory tool needed role `mule` + pgvector on the mule DB (created live; made durable in lab `2153aa0d` via `withPackages ps.pgvector` + `mule-pg-user` oneshot). Stray `test-agent-30m` wake disabled (rate-limited fire-drops re-fire on every 30 s scan — scheduler should back off dropped fires; noted, not fixed). (4) **ranch-mini image v4**: built on the forge VM (alcbuild2 had lost NAT egress + its stopped-state held the mDNS hostname), shipped via the shared volume, `lab-alc-reconcile` recreated the machine on the new image; running binary cksum-verified against the pinned source. Six PRE-EXISTING memory_tests failures remain (H4.4 card-push semantics, H4.6 redaction expectations — red on CI since ~10/11, unrelated to the decode fix; CI fmt+clippy now green after forge `9e2dfc10`/`f9f77485`). |
 | Live ops 2026-10-16b (voice calls) | ✅ mic calls fixed end-to-end | "Call an agent" never answered — three stacked failures, all live: (1) **mule `EncodeWAV` wrote its RIFF/WAVE/fmt/data magics byte-reversed** (big-endian constants through `LittleEndian.PutUint32` → ffmpeg saw `FFIR…WIVE…fmt …dat ` and 415'd every mic upload; the STT hop is degraded-not-dead so the phone sat in silence — never worked against real forge: fakeforge never parsed WAVs and wav_test pinned the same wrong constants; mule-ai/mule#131, lab `ct/mule` pinned at `9f94474`); (2) **the cloud voice tunnel was gone** — CF deleted the named tunnel during the public-edge cleanup and anonymous quick tunnels are now rejected outright ("Unauthorized: Tunnel not found"), while `voice_gateways` rows still pointed at the dead 10/11 `trycloudflare` hostname → new named tunnel **ranch-voice** (id `16a95558-3522-44f2-b945-bdcaf7086dc4`) with DNS **voice-lab.butler.ooo** → voice-gw nginx:8443; token via pool env `~/.lab-alc/data/voice-gw/voice-gw.env` + entrypoint wrapper `run-with-env.sh` (cloudflared 2026.10.0 moved `--token` under `tunnel run`; alc.toml entrypoint updated; gateway rows re-pointed); (3) **edge fn lacked `/api/v1/workflows/{id}/steps`** → cloud-mode calls couldn't find the voice_call workflow at all (ranch-2 `e2e9d0e`, deployed). Degraded hops now emit an out-socket `{"notice": …}` frame (mule) rendered as ⚠ by `ranch call` and the Kotlin call screen (ranch-2 `3944c6b`) — no more unexplained silence. Verified: synthesized utterance → VAD → Parakeet STT → Bob → "2 plus 2 is 4." + Kokoro TTS over LAN and wss://voice-lab.butler.ooo. |
+| Live ops 2026-10-16c (fleet rebuild) | ✅ ALC network recovery + durable deploy | Debugging surfaced a latent Apple Container bug: **two `container-network-vmnet` NAT daemons** (an orphan from the 10/15 `container system start` raced the fleet-wide stop/start), corrupting per-VM WAN egress while LAN stayed fine — victims were exactly the VMs never restarted since (mule, alcbuild2; the latter still stopped + hostname-locked, flagged for `machine delete` + re-run). Recovery: `container system stop/start` + full delete/recreate via `lab-alc-reconcile` onto a fresh 192.168.67.x subnet — all 8 machines + 22 containers re-verified (forge 2 agents, mule 4 wakes/4 workflows, STT 200, memory search 3 hits, bifrost 101 models, vaultwarden bw-syncs, butler-edge + voice-lab healthz 200, ranchd relay broadcasting). **Mule now runs the durable image binary `mule-9f94474`** (WAV fix baked; hotfix drop-in retired); mic-to-mic via `wss://voice-lab.butler.ooo` answered "2 plus 2 is 4" + TTS in 7 s on the durable path. Lab repo: `289e8b7f` (voice-gw `tunnel run --token` form, mule flake bump). Known-cost notes: `container stop/start` does NOT re-lease container IPs after a bridge-subnet change — containers must be deleted and reconciled; forwarder ports live (socat supervisors track machine IPs via state files). |
 ## Closeout (2026-10-10)
 
 All Herd phases H0–H6.5 are complete. The status ledger above is the
@@ -1790,9 +1793,9 @@ was deliberately deferred, and the decision that can still be re-opened.
 
 The **Kotlin app** (`mobile-native/`, `dev.ranch.android`) is the
 client of record for all phone acceptance above; the Expo app
-(`mobile/`) is a parity reference only — it gets no further feature
-work and its open items (notification buttons, device-recognizer
-parity) stay deferred behind it.
+(`mobile/`) was a parity reference only — it got no further feature
+work and was **deleted 2026-10-16** (its open items — notification
+buttons, device-recognizer parity — die with it).
 
 ### Deliberate deferrals (documented, not owed)
 
@@ -1803,12 +1806,10 @@ parity) stay deferred behind it.
   the frame + UI half is missing. See §10.1.
 - **`ranch activity` CLI one-shot** — replaced in practice by the
   TUI Activity section + both mobile Activity UIs (§10.1).
-- **Expo notification action buttons** — browser/expo-notifications
-  local notifications can't attach working actions; the Expo app
-  ships policy + kind mapping + firing, with the limitation
-  documented in Settings.
+- **Expo notification action buttons** — moot: the Expo app is deleted
+  (2026-10-16); notification actions live only in the Kotlin client.
 - **On-device recognizer parity beyond web** — the web hold-to-talk
-  is the Expo half of H6.2; there is no web equivalent of the
+  is the browser half of H6.2; there is no web equivalent of the
   on-device `SpeechRecognizer` (documented asymmetry).
 - **"Secure sign-in pauses the model"** — H6.5's explicit
   out-scope remainder; the shipped substitute is the `web_login`

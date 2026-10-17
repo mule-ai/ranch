@@ -82,9 +82,9 @@ jobs:
         with:
           distribution: temurin
           java-version: "17"
-      # native Kotlin client (mobile-native/) — replaced the Expo/RN app
-      # (mobile/) during the RN->Kotlin migration. Plain Gradle build: no
-      # Node, no expo prebuild, no NDK.
+      # native Kotlin client (mobile-native/) — the only mobile client; the
+      # Expo/RN app it replaced was deleted 2026-10-16. Plain Gradle build:
+      # no Node, no expo prebuild, no NDK.
       - name: Android SDK (licenses + components)
         run: |
           export ANDROID_HOME=/usr/local/lib/android/sdk

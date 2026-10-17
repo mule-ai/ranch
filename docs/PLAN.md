@@ -92,11 +92,12 @@ until the human answers (or the 30-min TTL expires → "no answer").
   or empty). Web + mobile show an inline question card (choice
   buttons + free-text input) above the chat input; mobile additionally
   pushes a local notification (settings toggle "Agent questions").
-- Mobile notifications + settings page (`mobile/screens/Settings.tsx`,
-  `mobile/lib/notifications.ts`, expo-notifications): toggles for
+- Mobile notifications + settings (native client: `SettingsActivity` +
+  `NotifyPolicy.kt`, foreground-service notification channels): toggles for
   turn-end / every message / ignore tool calls / questions; settings
-  in AsyncStorage; notifications fire only while the app is
-  backgrounded.
+  in SharedPreferences; notifications fire only while the app is
+  backgrounded. (The Expo/RN app that originally shipped these is
+  deleted; the native client is the only mobile surface.)
 
 ### A3. Tool exposure to agents (topology matters)
 
@@ -220,8 +221,9 @@ can interject by focusing the pane and typing (it's just a chat pane).
 - **Web**: `Agents` page in WebApp.tsx (same page pattern as the
   session dashboard) — form with model `<select>` from the catalog,
   system-prompt textarea, tools checkboxes, save.
-- **Mobile**: Agents screen (pattern: Machines.tsx + Editor.tsx) —
-  profile list → editor form; write-only API key field.
+- **Mobile** (`mobile-native/`): Agents screen (pattern: the existing
+  Machines / Workflows screens) — profile list → editor form;
+  write-only API key field.
 - All three: "new agent pane from profile" action (existing
   `SessionsCreate kind:"forge"` + `forge_session` adoption covers
   launching; builder just needs to expose profile ids).

@@ -36,7 +36,7 @@ The one-paragraph version (from this repo's AGENTS.md):
 ```
                     ┌──────────────────────────────────────────┐
                     │                 the user                 │
-                    │  TUI · web · Android (native + Expo)     │
+                    │  TUI · web · Android (native Kotlin)     │
                     └───────┬──────────────┬──────────────┬────┘
                             │ frames       │ frames       │ WebSockets
                             ▼              ▼              ▼
@@ -243,7 +243,7 @@ tagged and the delivery mode in the step config).
 | surface | registry | cards | activity | voice |
 |---|---|---|---|---|
 | TUI (`client.rs`) | Agents section | pending-ask banner + card prompts | Activity section (Tab; `p`/`P` pause) | `ranch call <agent>` |
-| web (`mobile/` Expo) | Agents tab | AgentAsk prompts | activity tab | hold-to-talk STT (forge Parakeet) |
+| web (`web/`) | Agents tab | AgentAsk prompts | activity tab | hold-to-talk STT (forge Parakeet) |
 | native Android (`mobile-native/`) | registry screen + ＋Agent | notifications with action buttons (works locked/backgrounded) | Settings → Tools → Activity; pause herd/agent | CallActivity (mic ⇄ mule WebSockets) + STT composer input |
 | CLI | `ranch agent <name> [msg]`, `ranch agents new`, `ranch pause\|unpause [AGENT]` | — | — | `ranch call <agent>` |
 | `tools/relay-test.mjs` | prints the new frames | | | — |

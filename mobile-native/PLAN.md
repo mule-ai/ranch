@@ -1,9 +1,15 @@
 # mobile-native — migration plan (RN → native Kotlin)
 
-Goal: a native Android client that is a full replacement for `../mobile/`
-(React Native/Expo), with reliable background notifications as the reason
-it exists at all. This document is the source of truth for scope and
-ordering. Update it as phases ship.
+Goal: a native Android client that is a full replacement for the old
+`../mobile/` app (React Native/Expo), with reliable background
+notifications as the reason it exists at all. This document is the source
+of truth for scope and ordering. Update it as phases ship.
+
+> **Status (2026-10-16): migration complete, Phase 6 done.** `mobile/`
+> (Expo/RN) is deleted from the tree and this app is the only mobile
+> client. RN file paths cited below (`lib/*.ts`, `screens/*.tsx`) are
+> historical port references — recover them from git history if ever
+> needed.
 
 ## Why native (recap)
 
@@ -180,16 +186,18 @@ since Agents/Editor are used most.
   for completions. Autocomplete is explicitly deferred to a later pass, as
   requested.
 
-## Phase 6 — retire the RN app
+## Phase 6 — retire the RN app ✅ (done 2026-10-16)
 
-Only after Phases 3–4 are verified on-device:
-- Confirm every RN screen has a working native equivalent (parity matrix).
-- Remove `mobile/` (keep the RN `sgr.ts`/`highlight.ts` as reference if
-  ever needed, or delete).
-- Update root `AGENTS.md`, `docs/SPEC.md` (client surface), and the build
-  log; drop RN from the build/release docs.
-- Decide whether the web client (`web/`) is in scope for the same
-  treatment or stays as-is.
+- Confirmed every RN screen has a working native equivalent (parity matrix
+  in the build log, "Native app — Phase 6 prep").
+- Removed `mobile/` (Expo/RN) from the repo.
+- Updated root `AGENTS.md`, `README.md`, `docs/SPEC.md`, `docs/PLAN.md`,
+  `docs/design/`, and the build log; RN is gone from the build/release
+  docs (CI already built only `mobile-native/`).
+- Web client (`web/`) stays as-is.
+- RN-only features that never made the parity matrix are now native
+  follow-ups: true split-pane layout, window stack ops, pane ops
+  (split/resize/kill/swap), forge resume, full workflow/trigger edit forms.
 
 ## Cross-cutting
 
@@ -203,5 +211,4 @@ Only after Phases 3–4 are verified on-device:
   crate first and keep all clients in lockstep.
 - **Build/sign.** `cd mobile-native && ./gradlew assembleRelease`
   (AGP 8.12.0, Gradle 9.4.1, Kotlin 2.2.10, SDK 35, JDK 17), signed with the
-  shared `ranch` keystore. `applicationId` is `dev.ranch.android`
-  (coexists with RN `dev.ranch.app` until Phase 6).
+  shared `ranch` keystore. `applicationId` is `dev.ranch.android`.

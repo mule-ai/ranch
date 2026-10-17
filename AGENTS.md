@@ -112,18 +112,16 @@ the target-system spec.
   crossterm, key encoding via ghostty-vt), `daemon.rs`/`forge.rs`/
   `pilocal.rs`/`relay.rs` (ranchd). Plain `ranch` in a TTY opens the
   interactive session manager/dashboard.
-- `mobile/` — Expo/React Native app, **Android only**. See
-  `mobile/AGENTS.md` (and the versioned Expo v57 docs) before touching
-  it. `mobile/CLAUDE.md` just points at `mobile/AGENTS.md`.
-- `mobile-native/` — native Android (Kotlin) client, the replacement for
-  `mobile/`. (1) A foreground service holds the Supabase Realtime socket so
+- `mobile-native/` — native Android (Kotlin) client, the **only** mobile
+  app (the Expo/React Native app in `mobile/` was deleted on 2026-10-16).
+  (1) A foreground service holds the Supabase Realtime socket so
   agent-event notifications fire in the background. (2) A session/terminal
   screen: session list → attach → PTY grid (SGR cell renderer + cursor,
   sentinel-EditText key capture + special-key row) or agent chat pane
   (`ChatSend`), plus `Resize`/`PaneSelect`/seq-gap resync. Speaks the same
   wire protocol / private channel as every other client (outbound frames as
   Realtime `broadcast`). See `mobile-native/README.md` + `BUILD-APK.md`.
-  `applicationId` is `dev.ranch.android` (coexists with the RN app).
+  `applicationId` is `dev.ranch.android`.
   Build: `cd mobile-native && ./gradlew assembleRelease` (AGP 8.12.0,
   Gradle 9.4.1, Kotlin 2.2.10, SDK 35, JDK 17).
 - `supabase/migrations/` — schema + RLS (machines, sessions mirror,
@@ -208,7 +206,7 @@ Rust workspace: edition 2024, stable toolchain (rustc 1.98 era).
   {success:false, finalError}`, `message_end` with `stopReason:"error"`,
   or `extension_error`, and `pilocal.rs` maps all of them (plus retry
   attempts via `auto_retry_start`) to error rows so every client — TUI,
-  web, and both mobile apps — shows them. Compact failures are ⚠ rows
+  web, and the mobile app — shows them. Compact failures are ⚠ rows
   too (user-initiated AND the auto path). Auto compact+retry: when a
   turn dies with a context-exhaustion error (`stopReason:"error"` +
   overflow-ish `errorMessage`, incl. bare "400/413 status code

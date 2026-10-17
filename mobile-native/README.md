@@ -1,10 +1,12 @@
 # mobile-native (Ranch Native)
 
-Native Android (Kotlin) client that runs alongside the React Native app in
-`../mobile/`. Goal: a lean app whose **primary** job is to hold a Supabase
-Realtime connection in the background (via a foreground service) and fire
-local notifications for agent events on every parallel session. The full
-terminal/chat UI is a later phase; the RN app remains the UI reference.
+Native Android (Kotlin) client — the **only** mobile app. Its original job
+was to hold a Supabase Realtime connection in the background (via a
+foreground service) and fire local notifications for agent events on every
+parallel session; it now covers the full terminal/chat/file/workflow UI.
+The Expo/React Native app that used to live in `../mobile/` is deleted
+(2026-10-16) — references to `mobile/…ts`/`.tsx` files in these docs point
+at git history, not the working tree.
 
 ## Why this exists
 
@@ -93,9 +95,9 @@ fire while the phone is in a drawer.
   agent's items still appear in the Activity View. quiet/high pick
   the low/high-importance notification channels. The shared
   notification POLICY (kinds, defaults, card-lane choice
-  fingerprints, action labels) lives in `NotifyPolicy.kt`, mirrored
-  from the Expo app's `mobile/lib/notify-policy.ts` (source of
-  truth — keep in sync). Notification buttons (Keep/Forget,
+  fingerprints, action labels) lives in `NotifyPolicy.kt` — the **source
+  of truth** since the Expo app was deleted (it was mirrored from
+  `mobile/lib/notify-policy.ts`). Notification buttons (Keep/Forget,
   Use/Discard, Allow/Deny — the ask's first two choices) route
   `AgentAskAnswer` through the foreground service's Realtime socket
   (`MonitorService`); task-done notifications carry **Open** / **Fork**
@@ -193,8 +195,7 @@ fire while the phone is in a drawer.
 ## Build
 
 Requires the Android SDK (platform 35, build-tools 35) + a JDK 17. Uses the
-same `ranch` signing keystore as the RN app
-(`~/.local/android-keystore/ranch.keystore`).
+`ranch` signing keystore (`~/.local/android-keystore/ranch.keystore`).
 
 ```sh
 cd mobile-native
@@ -205,15 +206,14 @@ export JAVA_HOME=$(mise where java) ANDROID_HOME=~/.local/android-sdk
 ```
 
 - AGP 8.12.0, Gradle 9.4.1, Kotlin 2.2.10.
-- `applicationId` is `dev.ranch.android` (distinct from the RN
-  `dev.ranch.app`) so both apps coexist on one device during migration.
+- `applicationId` is `dev.ranch.android`.
 
 ## Wiring it to the daemon
 
 No daemon changes needed: the daemon already broadcasts agent `Meta`
 (working/idle), `Chat`, and `AgentAskRequest` frames to **all** connected
 clients (see commit `bf045b8`). The native client simply joins the same
-private channel the RN app uses, with the same user JWT.
+private channel every other client uses, with the same user JWT.
 
 ## Roadmap
 

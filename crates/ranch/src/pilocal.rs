@@ -1472,7 +1472,7 @@ fn run_pi_reader(stdout: Box<dyn std::io::Read + Send>, t_pane: Uuid, s: PiReade
                             // a failed provider call ends the message with
                             // stopReason "error" and no text — without this
                             // row the turn just goes quiet and every client
-                            // (TUI + both mobile apps) shows nothing. pi
+                            // (TUI + web + mobile) shows nothing. pi
                             // carries the provider's error in
                             // `errorMessage` when it has one (e.g. "400
                             // status code (no body)" from a gateway) —

@@ -686,3 +686,46 @@ Activity View, voice, policies), PROTOCOL §8.1 card-kinds note,
 `tools/herd-demo/` (six hand-run acceptance scripts,
 exit code = failed-step count), PLAN-HERD Closeout (owed
 acceptances + deliberate deferrals + kill-criteria reminder).
+
+## Expo/RN app retired — mobile-native is the only mobile client (2026-10-16)
+
+`mobile/` (Expo / React Native, ~2,400 lines of screens + `lib/`) is
+deleted. The native Kotlin client in `mobile-native/` (`dev.ranch.android`)
+is now the sole Android app; CI already built only that one, so no build or
+release path changed.
+
+**Doc sweep** (RN references removed or marked historical):
+
+- `AGENTS.md`: dropped the `mobile/` bullet; `mobile-native/` is now
+  "the **only** mobile app", `applicationId` note simplified.
+- `README.md`: surface diagram says "phone (native Kotlin)"; development
+  tree lists `mobile-native/` instead of `mobile/`.
+- `docs/SPEC.md`: parity table header → "Mobile (native Kotlin/Android)";
+  file-browser bullet, Activity View surface list, and voice-input
+  paragraph no longer mention Expo; repo tree lists `mobile-native/`.
+- `docs/PLAN.md`: A2 notification/settings notes point at
+  `SettingsActivity` + `NotifyPolicy.kt` (SharedPreferences, notification
+  channels) instead of `mobile/screens/Settings.tsx` / expo-notifications;
+  B3 mobile pattern references the native Machines/Workflows screens.
+- `docs/design/herd-overview.md`: surface box "Android (native Kotlin)";
+  the mislabeled `web (mobile/ Expo)` table row is now `web (web/)`.
+- `docs/design/cloud-voice-relay.md`: fallback/parity paths are "web",
+  not "web/Expo".
+- `docs/research/always-on-agents-research.md` §4.3: three clients →
+  TUI, web React, native Kotlin Android.
+- `mobile-native/README.md` + `BUILD-APK.md`: header records the deletion
+  and warns that `mobile/*.ts|tsx` citations are git-history references;
+  `NotifyPolicy.kt` is now the **source of truth** for notification policy
+  (it was mirrored from `mobile/lib/notify-policy.ts`); coexistence notes
+  and the shared-keystore parenthetical removed.
+- `mobile-native/PLAN.md`: Phase 6 marked done, with the RN-only features
+  that never reached parity promoted to native follow-ups — true
+  split-pane layout, window stack ops, pane ops (split/resize/kill/swap),
+  forge resume, full workflow/trigger edit forms.
+- `.github/workflows/release.yml`: comment updated (no functional change).
+- `crates/ranch/src/pilocal.rs`: comment "both mobile apps" → "web +
+  mobile".
+
+**Not touched:** `docs/history/` entries (including the Phase-6 parity
+matrix of 2026-09-21) and the research doc's footnote about RN
+notification limits — append-only record.

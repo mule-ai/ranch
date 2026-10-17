@@ -320,8 +320,8 @@ drop workflow UI; OpenAI-compatible API as the main interface
 ### 4.3 Ranch — the surface (`~/src/ranch-2/`)
 
 **What it is.** Terminal multiplexer + daemon (`ranchd`) + three clients
-(TUI ratatui, web React, Android — both Expo/RN and a newer **native
-Kotlin** client); server-side ghostty-vt terminal emulation; chat panes
+(TUI ratatui, web React, and a **native
+Kotlin** Android client); server-side ghostty-vt terminal emulation; chat panes
 over forge or local pi; workflow panes; trigger scheduler (cron/event/
 webhook); webhook relay via Supabase edge function; **agent tools**
 (`ranch_spawn/send/status/read/close/ask`) with daemon-side ownership,

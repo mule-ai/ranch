@@ -138,7 +138,7 @@ bridge, so a forge agent can spawn panes right beside your shells.
 ## How it fits together
 
 ```
- local TUI ─┐                                      ┌─ phone (Expo)
+ local TUI ─┐                                      ┌─ phone (native Kotlin)
  browser ───┼─ Supabase Realtime ── ranch daemon ──┼─ PTY panes (libghostty-vt)
  ranch CLI ─┘    (RLS-gated relay)                ├─ agent children (pi, forge)
  external ─────webhooks──── edge function ────────┴─ mule workflow runs
@@ -199,7 +199,7 @@ crates/ranch         the binary: client (client.rs) + daemon (daemon.rs,
 crates/ranch-protocol  wire protocol (same frames on socket + relay)
 crates/ranch-vt        server-side terminal emulation (libghostty-vt)
 web/               Vite + React web app (GitHub Pages)
-mobile/            Expo Android app
+mobile-native/     native Android (Kotlin) app — the only mobile client
 supabase/migrations  schema + RLS policies
 docs/SPEC.md       target-system spec
 docs/PLAN.md       implementation plan (grounded in the code)

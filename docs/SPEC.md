@@ -151,7 +151,7 @@ One process per machine (systemd user unit; `ranch daemon` /
 All three surfaces speak the same frame protocol and implement feature
 parity for every user-facing capability:
 
-| capability | TUI (ratatui) | Web (React) | Mobile (Expo/Android) |
+| capability | TUI (ratatui) | Web (React) | Mobile (native Kotlin/Android) |
 |---|---|---|---|
 | session list / dashboard | ✅ | ✅ | ✅ |
 | attach: grid render + keys | ✅ | ✅ | ✅ |
@@ -207,7 +207,7 @@ Shipped:
   opts in to listing dotfiles/dotdirs; `FileDownload` is a binary-safe
   read of any file (the "save to phone" path; shares the FileRead/FileWrite
   trust boundary, 16 MiB cap, chunked when large).
-- Mobile (RN + native): directory browser with a **show-hidden-files**
+- Mobile (native Kotlin): directory browser with a **show-hidden-files**
   toggle, a real code editor (CodeMirror 5 in a WebView — syntax
   highlighting, line numbers, undo, bracket matching), upload (`FilePut`,
   SAF pick) and download (`FileDownload`, SAF save-as) to the phone.
@@ -401,7 +401,7 @@ polls.
 Every surface renders the same frames: the TUI dashboard's
 Activity section (Tab to reach; Enter deep-links via AgentTalk,
 `p` pauses the herd, `P` pauses the highlighted agent), the
-native Android Settings → Tools → Activity screen, and the Expo
+native Android Settings → Tools → Activity screen, and the web
 activity tab. The pause action sends `AgentPause` (one agent or
 all known agents) — the H5.3 kill switch, `ranch pause|unpause
 [AGENT]` from the CLI. Down/misconfigured forge or mule degrade
@@ -415,7 +415,7 @@ text before it is sent: mobile-native's composer mic button is
 push-to-talk against forge's Parakeet STT endpoint by default
 (the phone talks to forge directly — no daemon in this path),
 with the on-device `SpeechRecognizer` as the airplane-mode
-fallback; the web/Expo client uses hold-to-talk with the browser
+fallback; the web client uses hold-to-talk with the browser
 MediaRecorder against the same forge endpoint.
 
 **The voice loop** (H6.3/H6.4) is a live back-and-forth *call*
@@ -693,7 +693,7 @@ ranch/
 │                         relay.rs, mule.rs*, triggers.rs*,
 │                         webhooks.rs*, agenttools.rs*)
 ├── web/                  Vite + React web app (GitHub Pages)
-├── mobile/               Expo/Android app
+├── mobile-native/        native Android (Kotlin) app — the only mobile client
 ├── supabase/
 │   ├── migrations/       schema + RLS (+ webhooks, triggers, log)
 │   └── functions/        edge functions (webhook-relay) — deployed

@@ -5,7 +5,7 @@
 - Android SDK (platform 35, build-tools 35.0.0)
 - JDK 17 (`mise where java`)
 - Gradle 9.4.1 (via wrapper)
-- Signing keystore at `~/.local/android-keystore/ranch.keystore` (shared with the RN app)
+- Signing keystore at `~/.local/android-keystore/ranch.keystore`
 
 ## Build
 
@@ -35,9 +35,8 @@ cp app/build/outputs/apk/release/app-release.apk ../releases/ranch-native-0.2.0.
 
 ## Notes
 
-- `applicationId` is `dev.ranch.android` (distinct from the RN app's `dev.ranch.app`).
-- Both APKs can coexist on one device.
+- `applicationId` is `dev.ranch.android`.
 - The app requires internet access to Supabase and the `POST_NOTIFICATIONS`
   permission (Android 13+).
-- First run: sign in with email/password (same Supabase account as the RN app),
+- First run: sign in with email/password (your Supabase account),
   load machines, pick one, tap "Start monitoring".
