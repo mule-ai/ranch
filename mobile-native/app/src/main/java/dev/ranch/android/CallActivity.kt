@@ -53,7 +53,9 @@ import kotlin.math.sqrt
  *     [AudioTrack] (rate from the step's `tts_sample_rate`, default 24
  *     kHz; the out socket carries no rate metadata, both surfaces read
  *     the config); text `{"assistant": …}` appends to the transcript;
- *     `{"done":true}` = the call ended.
+ *     text `{"notice": …}` (degraded hop: stt/tts/agent failure) shows a
+ *     ⚠ transcript line — never unexplained silence; `{"done":true}` =
+ *     the call ended.
  *
  * H6.4 v2 — the two full-duplex pieces this screen owns:
  *
@@ -469,6 +471,13 @@ class CallActivity : Activity() {
                         // track already dead — new writes will fail and
                         // be dropped, the transcript keeps working
                     }
+                    return
+                }
+                val n = o.optString("notice", "")
+                if (n.isNotEmpty()) {
+                    // mule degraded hop (stt/tts/agent failure): show WHY
+                    // instead of leaving the caller in silence.
+                    appendTranscript("⚠ $n")
                     return
                 }
                 val a = o.optString("assistant", "")

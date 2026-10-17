@@ -13,7 +13,8 @@
 //!   line, no STT). The in socket closing also hangs up the call.
 //! - OUT: `ws://mule/voice/{job}/out` — binary TTS chunks
 //!   (tts_sample_rate from the step config, v1 24 kHz PCM) and text
-//!   frames `{"assistant": …}` (per-turn transcript) + `{"done":true}`.
+//!   frames `{"assistant": …}` (per-turn transcript) + `{"notice": …}`
+//!   (degraded hop: stt/tts/agent failure — printed as ⚠) + `{"done":true}`.
 //!
 //! Audio in: `arecord`/`parecord` when present on PATH; otherwise the
 //! typed-text fallback (plan's "audio in via mic if available else
@@ -101,6 +102,11 @@ pub fn run(agent_arg: Option<String>) {
                     }
                     if let Some(a) = v.get("assistant").and_then(Value::as_str) {
                         eprintln!("agent: {a}");
+                    }
+                    // Degraded-hop status from mule (stt/tts/agent
+                    // failure): the caller hears WHY, not silence.
+                    if let Some(n) = v.get("notice").and_then(Value::as_str) {
+                        eprintln!("\u{26a0} {n}");
                     }
                 }
                 Ok(_) => {}
