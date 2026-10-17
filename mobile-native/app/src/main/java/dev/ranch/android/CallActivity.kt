@@ -54,8 +54,13 @@ import kotlin.math.sqrt
  *     kHz; the out socket carries no rate metadata, both surfaces read
  *     the config); text `{"assistant": …}` appends to the transcript;
  *     text `{"notice": …}` (degraded hop: stt/tts/agent failure) shows a
- *     ⚠ transcript line — never unexplained silence; `{"done":true}` =
- *     the call ended.
+ *     ⚠ transcript line — never unexplained silence; text `{"user": …}`
+ *     echoes the caller's own words; text `{"state": …}`
+ *     (listening/utterance/thinking/speaking) drives the status line —
+ *     the "is it working?" lane; `{"done":true}` =
+ *     the call ended. The agent greets first (mule's answer-the-call
+ *     turn fires when the in socket attaches), so the call is "answered"
+ *     before the caller speaks.
  *
  * H6.4 v2 — the two full-duplex pieces this screen owns:
  *
@@ -478,6 +483,28 @@ class CallActivity : Activity() {
                     // mule degraded hop (stt/tts/agent failure): show WHY
                     // instead of leaving the caller in silence.
                     appendTranscript("⚠ $n")
+                    return
+                }
+                // Your own words, as mule's STT heard them (or as typed)
+                // — the caller sees immediately whether the mic worked.
+                val u = o.optString("user", "")
+                if (u.isNotEmpty()) {
+                    appendTranscript("you: $u")
+                    return
+                }
+                // Call phase: the "is it working?" lane. Without this
+                // the screen sat on the dialing status between the
+                // caller's words and the agent's answer (2026-10-17).
+                val st = o.optString("state", "")
+                if (st.isNotEmpty()) {
+                    val who = agentName.ifEmpty { "agent" }
+                    status2(when (st) {
+                        "thinking" -> "$who is thinking\u2026"
+                        "speaking" -> "$who is speaking\u2026"
+                        "listening" -> "listening \u2014 speak; 'Hang up' ends the call"
+                        "utterance" -> "hearing you\u2026"
+                        else -> st
+                    })
                     return
                 }
                 val a = o.optString("assistant", "")
