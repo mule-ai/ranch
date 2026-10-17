@@ -7220,10 +7220,25 @@ pub fn main_client() {
         // forge-session resume command, so the inverse is "unpause".)
         "pause" => cmd_pause_resume(true, args.get(1).cloned()),
         "unpause" => cmd_pause_resume(false, args.get(1).cloned()),
-        // ranch call <agent> — Herd H6.3 voice loop v1: audio flows
-        // host ⇄ mule directly (job create + two voice WebSockets);
-        // typed-text in / aplay out fallbacks keep TUI parity.
-        "call" => crate::voicecall::run(args.get(1).cloned()),
+        // ranch call <agent> [--model NAME] — Herd H6.3 voice loop;
+        // --model picks the per-call "voice model" (a forge profile
+        // name/id, fuzzy: "laguna" matches "Laguna (dev)").
+        "call" => {
+            let mut agent: Option<String> = None;
+            let mut model: Option<String> = None;
+            let mut rest = args.iter().skip(1).peekable();
+            while let Some(a) = rest.next() {
+                match a.as_str() {
+                    "--model" | "-m" => model = rest.next().cloned(),
+                    s if s.starts_with("--model=") => {
+                        model = Some(s.trim_start_matches("--model=").to_string());
+                    }
+                    s if !s.starts_with('-') && agent.is_none() => agent = Some(s.to_string()),
+                    _ => {}
+                }
+            }
+            crate::voicecall::run(agent, model)
+        }
         other => die(&format!("unknown command {other:?}")),
     }
 }

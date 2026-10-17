@@ -15,10 +15,13 @@ import android.text.InputType
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
+import android.widget.AdapterView
+import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
+import android.widget.Spinner
 import android.widget.TextView
 import okio.ByteString
 import okhttp3.MediaType.Companion.toMediaType
@@ -89,6 +92,9 @@ class CallActivity : Activity() {
     companion object {
         const val PKEY_MULE_BASE = "mule_base_url"
         const val PKEY_MULE_KEY = "mule_api_key"
+        /** Persisted "voice model" choice (forge profile label). */
+        const val PKEY_VOICE_MODEL = "voice_model"
+        const val AGENT_DEFAULT = "agent default"
         const val EXTRA_AGENT_ID = "agent_id"
         const val EXTRA_AGENT_NAME = "agent_name"
         private const val MIC_RATE = 16_000
@@ -130,6 +136,13 @@ class CallActivity : Activity() {
     private val recRunning = AtomicBoolean(false)
     @Volatile private var ended = false
 
+    // Voice-model picker (per-call model choice): chosen label is
+    // persisted (applies to this and future calls); "agent default"
+    // sends no override. The list comes from forge /v1/models (cloud:
+    // via the edge function; direct: the configured forge base).
+    private var modelSpinner: Spinner? = null
+    private var chosenModel: String? = null
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         agentId = intent.getStringExtra(EXTRA_AGENT_ID).orEmpty()
@@ -154,6 +167,24 @@ class CallActivity : Activity() {
             setPadding(dp(8), 0, 0, 0)
         }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f))
         root.addView(bar)
+
+        // Voice-model row (populated async; hidden until models land).
+        val modelRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            visibility = View.GONE
+        }
+        modelRow.addView(TextView(this).apply {
+            text = "voice model"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            setTextColor(0xFF9aa0a6.toInt())
+            setPadding(dp(2), 0, dp(8), 0)
+        })
+        val spinner = Spinner(this)
+        modelRow.addView(spinner, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        root.addView(modelRow)
+        modelSpinner = spinner
+        loadVoiceModels()
 
         status = TextView(this).apply {
             text = "starting…"
@@ -345,7 +376,13 @@ class CallActivity : Activity() {
     }
 
     private fun startJob(base: String, key: String, workflowId: String): Result<String> {
-        val body = JSONObject().put("workflow_id", workflowId).toString()
+        val obj = JSONObject().put("workflow_id", workflowId)
+        // Per-call voice-model choice (mule: input_data.model → forge
+        // session setModel before the first turn; see mule spec).
+        chosenModel?.takeIf { it.isNotBlank() }?.let {
+            obj.put("input_data", JSONObject().put("model", it))
+        }
+        val body = obj.toString()
         val req = Request.Builder()
             .url(base + "/api/v1/jobs")
             .header("Authorization", "Bearer $key")
@@ -524,6 +561,63 @@ class CallActivity : Activity() {
     }
 
     private fun request(url: String): Request = Request.Builder().url(url).build()
+
+    /**
+     * Voice-model picker: forge /v1/models (profile names are the
+     * model ids — "Laguna (dev)", "Spark (Qwen3.8-27B)"). Cloud:
+     * through the edge function; direct: the configured forge base.
+     * The picker is OPTIONAL — any failure just leaves it hidden and
+     * calls run on the agent's default profile.
+     */
+    private fun loadVoiceModels() {
+        val saved = app.prefs.get(PKEY_VOICE_MODEL, "").trim()
+        chosenModel = saved.takeUnless { it.isEmpty() || it == AGENT_DEFAULT }
+        exec.execute {
+            try {
+                val cloud = CloudVoice.enabled(app.prefs)
+                val (base, auth) = if (cloud) {
+                    CloudVoice.BASE to "Authorization: Bearer ${CloudVoice.token(app.prefs)}"
+                } else {
+                    val fb = app.prefs.get(Voice.PKEY_FORGE_BASE, "").trim().trimEnd('/')
+                    val fk = app.prefs.get(Voice.PKEY_FORGE_KEY, "").trim()
+                    if (fb.isEmpty() || fk.isEmpty()) return@execute
+                    fb to "X-API-Key: $fk"
+                }
+                val (hdr, value) = auth.split(": ", limit = 2)
+                val req = Request.Builder().url("$base/v1/models")
+                    .header(hdr, value).get().build()
+                http.newCall(req).execute().use { resp ->
+                    if (!resp.isSuccessful) return@use
+                    val arr = JSONObject(resp.body?.string().orEmpty())
+                        .optJSONArray("data") ?: return@use
+                    val ids = (0 until arr.length()).mapNotNull { i ->
+                        arr.optJSONObject(i)?.optString("id")?.takeIf { it.isNotEmpty() }
+                    }
+                    if (ids.isEmpty()) return@use
+                    handler.post {
+                        if (ended || isFinishing) return@post
+                        val entries = listOf(AGENT_DEFAULT) + ids
+                        modelSpinner?.adapter = ArrayAdapter(
+                            this, android.R.layout.simple_spinner_dropdown_item, entries)
+                        (modelSpinner?.parent as? View)?.visibility = View.VISIBLE
+                        modelSpinner?.setSelection(entries.indexOf(saved).coerceAtLeast(0))
+                        modelSpinner?.onItemSelectedListener =
+                            object : AdapterView.OnItemSelectedListener {
+                                override fun onItemSelected(
+                                    parent: AdapterView<*>?, view: View?, pos: Int, id: Long) {
+                                    val sel = entries[pos]
+                                    chosenModel = sel.takeUnless { it == AGENT_DEFAULT }
+                                    app.prefs.set(PKEY_VOICE_MODEL, sel)
+                                }
+                                override fun onNothingSelected(parent: AdapterView<*>?) {}
+                            }
+                    }
+                }
+            } catch (_: Exception) {
+                // picker is best-effort; a failed list never blocks a call
+            }
+        }
+    }
 
     private fun wsUrl(base: String): String =
         when {

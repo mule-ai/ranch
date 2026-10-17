@@ -170,12 +170,14 @@ Deno.serve(async (req: Request): Promise<Response> => {
     return err(503, "no voice gateway configured (add your lab endpoints via the app settings or rpc/upsert_voice_gateway)");
   }
 
-  // forge audio (STT/TTS)
+  // forge audio (STT/TTS) + voice-model picker (GET /v1/models —
+  // forge profile names are the model ids the call screen offers)
   if (
-    req.method === "POST" &&
-    (path === "/v1/audio/transcriptions" || path === "/v1/audio/speech")
+    (req.method === "POST" &&
+      (path === "/v1/audio/transcriptions" || path === "/v1/audio/speech")) ||
+    (req.method === "GET" && path === "/v1/models")
   ) {
-    if (!rateOk(uid, RATE_PER_MIN)) return err(429, "rate limit");
+    if (req.method === "POST" && !rateOk(uid, RATE_PER_MIN)) return err(429, "rate limit");
     try {
       return await forwardHttp(req, gw.forgeBase, path, [
         "X-API-Key",
@@ -225,5 +227,5 @@ Deno.serve(async (req: Request): Promise<Response> => {
     });
   }
 
-  return err(404, "unknown route (this function proxies /v1/audio/*, /api/v1/jobs, /api/v1/workflows, GET /gateway)");
+  return err(404, "unknown route (this function proxies /v1/audio/*, GET /v1/models, /api/v1/jobs, /api/v1/workflows, GET /gateway)");
 });
