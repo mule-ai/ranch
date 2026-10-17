@@ -56,11 +56,12 @@ import kotlin.math.sqrt
  *     text `{"notice": …}` (degraded hop: stt/tts/agent failure) shows a
  *     ⚠ transcript line — never unexplained silence; text `{"user": …}`
  *     echoes the caller's own words; text `{"state": …}`
- *     (listening/utterance/thinking/speaking) drives the status line —
+ *     (listening/utterance/thinking/speaking/greeting) drives the status line —
  *     the "is it working?" lane; `{"done":true}` =
  *     the call ended. The agent greets first (mule's answer-the-call
- *     turn fires when the in socket attaches), so the call is "answered"
- *     before the caller speaks.
+ *     process fires ASYNC on in-socket attach — the caller can talk
+ *     immediately and talking cancels the greeting), so the call is
+ *     "answered" before the caller speaks.
  *
  * H6.4 v2 — the two full-duplex pieces this screen owns:
  *
@@ -499,6 +500,7 @@ class CallActivity : Activity() {
                 if (st.isNotEmpty()) {
                     val who = agentName.ifEmpty { "agent" }
                     status2(when (st) {
+                        "greeting" -> "$who is answering\u2026 (you can talk already)"
                         "thinking" -> "$who is thinking\u2026"
                         "speaking" -> "$who is speaking\u2026"
                         "listening" -> "listening \u2014 speak; 'Hang up' ends the call"

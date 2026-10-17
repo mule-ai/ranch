@@ -16,7 +16,8 @@
 //!   frames `{"assistant": …}` (per-turn transcript) + `{"notice": …}`
 //!   (degraded hop: stt/tts/agent failure — printed as ⚠) +
 //!   `{"user": …}` (the caller's own words, echoed) + `{"state": …}`
-//!   (call phase — printed when there is no player) + `{"done":true}`.
+//!   (call phase — listening/utterance/thinking/speaking/greeting;
+//!   printed when there is no player) + `{"done":true}`.
 //!
 //! Audio in: `arecord`/`parecord` when present on PATH; otherwise the
 //! typed-text fallback (plan's "audio in via mic if available else
