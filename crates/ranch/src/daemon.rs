@@ -5371,6 +5371,7 @@ impl Daemon {
                 visibility,
                 tools_allowlist,
                 extra_instructions,
+                env_refs,
             } => {
                 let req = crate::agents_new::UpdateRequest {
                     agent_id: agent_id.clone(),
@@ -5383,6 +5384,7 @@ impl Daemon {
                     visibility: visibility.clone(),
                     tools_allowlist: tools_allowlist.clone(),
                     extra_instructions: extra_instructions.clone(),
+                    env_refs: env_refs.clone(),
                 };
                 // the shared core validates (name, scope, visibility,
                 // "nothing to update") — surface its message on Error.
@@ -5513,7 +5515,7 @@ impl Daemon {
                     ),
                 }
             }
-                        Frame::SandboxRequest {
+            Frame::SandboxRequest {
                 req_id,
                 agent_id,
                 packages,
@@ -5570,6 +5572,111 @@ impl Daemon {
                         &Frame::SandboxResetOk {
                             req_id: req_id.clone(),
                             rootfs_removed: n,
+                        },
+                    ),
+                    Err(e) => self.reply_to(
+                        from,
+                        &Frame::Error {
+                            req_id: Some(req_id.clone()),
+                            message: e,
+                        },
+                    ),
+                }
+            }
+            // ----- credential slots + vault picker (2026-10-18) -----
+            // Forge-proxied; the daemon key is the USER's, which is
+            // exactly the tenancy forge requires for /secrets (slots
+            // are owner-level). Values never transit here — a vault
+            // binding stores only the bw:// pointer.
+            Frame::SecretsList { req_id } => {
+                let Some(forge_cfg) = forge::load_forge_config() else {
+                    self.reply_to(
+                        from,
+                        &Frame::Error {
+                            req_id: Some(req_id.clone()),
+                            message: "forge not configured (set forge_api_key in daemon.toml)"
+                                .into(),
+                        },
+                    );
+                    return;
+                };
+                match crate::agents_new::secrets_list(&forge_cfg) {
+                    Ok((slots, vault_items, vault_enabled)) => self.reply_to(
+                        from,
+                        &Frame::SecretsListOk {
+                            req_id: req_id.clone(),
+                            slots,
+                            vault_items,
+                            vault_enabled,
+                        },
+                    ),
+                    Err(e) => self.reply_to(
+                        from,
+                        &Frame::Error {
+                            req_id: Some(req_id.clone()),
+                            message: e,
+                        },
+                    ),
+                }
+            }
+            Frame::SecretsBind {
+                req_id,
+                name,
+                vault_item,
+                literal,
+            } => {
+                let Some(forge_cfg) = forge::load_forge_config() else {
+                    self.reply_to(
+                        from,
+                        &Frame::Error {
+                            req_id: Some(req_id.clone()),
+                            message: "forge not configured (set forge_api_key in daemon.toml)"
+                                .into(),
+                        },
+                    );
+                    return;
+                };
+                match crate::agents_new::secrets_bind(
+                    &forge_cfg,
+                    name,
+                    vault_item.as_deref(),
+                    literal.as_deref(),
+                ) {
+                    Ok(slot) => self.reply_to(
+                        from,
+                        &Frame::SecretsBindOk {
+                            req_id: req_id.clone(),
+                            slot,
+                        },
+                    ),
+                    Err(e) => self.reply_to(
+                        from,
+                        &Frame::Error {
+                            req_id: Some(req_id.clone()),
+                            message: e,
+                        },
+                    ),
+                }
+            }
+            Frame::SecretsUnbind { req_id, name } => {
+                let Some(forge_cfg) = forge::load_forge_config() else {
+                    self.reply_to(
+                        from,
+                        &Frame::Error {
+                            req_id: Some(req_id.clone()),
+                            message: "forge not configured (set forge_api_key in daemon.toml)"
+                                .into(),
+                        },
+                    );
+                    return;
+                };
+                match crate::agents_new::secrets_unbind(&forge_cfg, name) {
+                    Ok(removed) => self.reply_to(
+                        from,
+                        &Frame::SecretsUnbindOk {
+                            req_id: req_id.clone(),
+                            name: name.clone(),
+                            removed,
                         },
                     ),
                     Err(e) => self.reply_to(

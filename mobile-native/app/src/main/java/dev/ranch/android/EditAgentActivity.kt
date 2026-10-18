@@ -58,8 +58,17 @@ class EditAgentActivity : Activity() {
     private lateinit var form: LinearLayout
     private lateinit var wakeBox: LinearLayout
     private lateinit var sandboxBox: LinearLayout
+    private lateinit var secretsBox: LinearLayout
     private lateinit var saveBtn: Button
     private lateinit var profileChip: Button
+
+    // Secrets section state (2026-10-18): the owner's credential
+    // slots + the Vaultwarden item names (picker) + THIS agent's
+    // injected set (checkboxes → AgentUpdate.env_refs on Save).
+    private var vaultItems: List<String> = emptyList()
+    private var vaultEnabled = false
+    private var lastSecrets: JSONObject? = null
+    private var pendingRefs: List<String>? = null
 
     private var agent = Term.AgentInfo(id = "", name = "", avatarUrl = null, homeMachine = null,
         lastActive = null, conversationCount = null)
@@ -207,6 +216,23 @@ class EditAgentActivity : Activity() {
                     setPadding(0, dp(4), 0, dp(4))
                     setOnClickListener { showWakeForm(null) }
                 })
+                // ---- credential slots + vault picker (2026-10-18) ----
+                addView(AgentForm.label(this@EditAgentActivity, "secrets (vault-backed injection)", 14))
+                secretsBox = LinearLayout(this@EditAgentActivity).apply {
+                    orientation = LinearLayout.VERTICAL
+                }
+                addView(secretsBox)
+                val scBtns = LinearLayout(this@EditAgentActivity).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                }
+                scBtns.addView(Button(this@EditAgentActivity).apply {
+                    text = "＋ new slot"
+                    isAllCaps = false; setTextColor(0xFF7FD4FF.toInt())
+                    setPadding(dp(8), 0, dp(8), 0)
+                    setOnClickListener { showSlotForm(null) }
+                })
+                addView(scBtns)
+
                 // ---- sandbox packages (forge governance, 2026-10-18) ----
                 addView(AgentForm.label(this@EditAgentActivity, "sandbox packages (forge)", 14))
                 sandboxBox = LinearLayout(this@EditAgentActivity).apply {
@@ -255,6 +281,7 @@ class EditAgentActivity : Activity() {
         setContentView(root)
         applyEdgeToEdgeInsets(findViewById(android.R.id.content))
         paintChip()
+        pendingRefs = agent.envRefs   // checkbox seed until SecretsListOk paints
         status.text = "editing \"${agent.name.ifEmpty { agent.id.take(8) }}\"" +
             (if (agent.paused == true) " · PAUSED" else "")
 
@@ -265,6 +292,7 @@ class EditAgentActivity : Activity() {
         r.send(Term.agentList())        // refresh our row (paused state, columns)
         r.send(Term.wakeList(agent.id))
         r.send(Term.sandboxPackages(agent.id))
+        r.send(Term.secretsList())
     }
 
     override fun onDestroy() {
@@ -298,6 +326,12 @@ class EditAgentActivity : Activity() {
         val currentTools = agent.toolsAllowlist ?: emptyList()
         val toolsPatch = tools.takeIf { it.sorted() != currentTools.sorted() }
 
+        // injected credential slots: the checkboxes are authoritative
+        // once they've painted (pendingRefs); only sent when the set
+        // actually differs from the agent's current env_refs
+        val currentRefs = agent.envRefs ?: emptyList()
+        val refsPatch = pendingRefs?.takeIf { it.sorted() != currentRefs.sorted() }
+
         val frame = Term.agentUpdate(
             agentId = agent.id,
             name = n.takeIf { it != agent.name },
@@ -309,6 +343,7 @@ class EditAgentActivity : Activity() {
             visibility = visibility.takeIf { it != (agent.visibility ?: "private") },
             tools = toolsPatch,
             extraInstructions = changed(instr, agent.extraInstructions),
+            envRefs = refsPatch,
         )
         val keys = frame.keys().asSequence().filter { it !in setOf("t", "id", "client", "req_id", "agent_id") }
         if (!keys.iterator().hasNext()) { flash("nothing to save"); return }
@@ -354,6 +389,13 @@ class EditAgentActivity : Activity() {
                         paintChip()
                         status.text = "editing \"${a.name.ifEmpty { a.id.take(8) }}\"" +
                             (if (a.paused == true) " · PAUSED" else "")
+                        // re-anchor the injected checkboxes to the
+                        // fresh row (unless untouched — pendingRefs
+                        // starts equal) and repaint the section
+                        if (pendingRefs == null || pendingRefs == agent.envRefs) {
+                            pendingRefs = a.envRefs
+                        }
+                        lastSecrets?.let { renderSecrets(it) }
                         break
                     }
                 }
@@ -390,6 +432,27 @@ class EditAgentActivity : Activity() {
                 flash("sandbox reinstalled", green = true)
                 relay?.send(Term.sandboxPackages(agent.id))
             }
+            "SecretsListOk" -> {
+                lastSecrets = f
+                vaultItems = f.optJSONArray("vault_items")?.let { arr ->
+                    (0 until arr.length()).map { arr.optString(it) }
+                } ?: emptyList()
+                vaultEnabled = f.optBoolean("vault_enabled", false)
+                renderSecrets(f)
+            }
+            "SecretsBindOk" -> {
+                val s = f.optJSONObject("slot")
+                flash("slot ${s?.optString("name", "?")} → " +
+                    (s?.optString("bw_ref")?.takeIf { it.isNotEmpty() && it != "null" }
+                        ?: "literal value"), green = true)
+                relay?.send(Term.secretsList())
+            }
+            "SecretsUnbindOk" -> {
+                flash(if (f.optBoolean("removed", false)) "slot removed" else "no such slot",
+                    green = f.optBoolean("removed", false))
+                relay?.send(Term.secretsList())
+                relay?.send(Term.agentList()) // injected rows may go stale
+            }
             "Error" -> {
                 val rid = f.optString("req_id")
                 val msg = f.optString("message", "error")
@@ -402,6 +465,9 @@ class EditAgentActivity : Activity() {
                     rid.startsWith("sd-") -> flash("decision failed: $msg")
                     rid.startsWith("sq-") -> flash("request failed: $msg")
                     rid.startsWith("sr-") -> flash("reinstall failed: $msg")
+                    rid.startsWith("sc-") -> renderSecretsUnavailable(msg)
+                    rid.startsWith("sb-") -> flash("slot bind failed: $msg")
+                    rid.startsWith("su-") -> flash("slot remove failed: $msg")
                     rid.startsWith("pp-") -> flash("profile save failed: $msg")
                     rid.startsWith("al-") -> { /* registry refresh is silent */ }
                 }
@@ -673,6 +739,208 @@ class EditAgentActivity : Activity() {
                     )
                 )
                 flash("requesting ${list.joinToString(", ")}…")
+            }
+            .setNegativeButton("cancel", null)
+            .create()
+            .show()
+    }
+
+    // ---- secrets (credential slots + vault picker, 2026-10-18) ----
+
+    private fun renderSecretsUnavailable(msg: String) {
+        secretsBox.removeAllViews()
+        secretsBox.addView(TextView(this).apply {
+            text = "slots unavailable \u2014 $msg"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            setTextColor(0xFF6b7280.toInt()); setPadding(0, dp(4), 0, dp(4))
+        })
+    }
+
+    /** One row per OWNER slot (slots are user-level; agents merely
+     *  name them). The checkbox is THIS agent's injection (the
+     *  credentials_scope.env_refs mapping, written by Save); \u270e rebinds
+     *  (point the slot at a different vault item), \u2715 deletes. */
+    private fun renderSecrets(f: JSONObject) {
+        secretsBox.removeAllViews()
+        secretsBox.addView(TextView(this).apply {
+            text = "vault: " + if (vaultEnabled) "configured \u00b7 ${vaultItems.size} item(s)"
+                   else "not configured \u2014 literal slots only (set it up: PUT /bitwarden)"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            setTextColor(0xFF6b7280.toInt())
+            setPadding(0, dp(4), 0, dp(2))
+        })
+        if (pendingRefs == null) pendingRefs = agent.envRefs
+        val refs = pendingRefs ?: emptyList()
+        val arr = f.optJSONArray("slots")
+        if (arr == null || arr.length() == 0) {
+            secretsBox.addView(TextView(this).apply {
+                text = "no slots yet \u2014 \uff0b one, then check it to inject it into this agent"
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+                setTextColor(0xFF6b7280.toInt()); setPadding(0, dp(4), 0, dp(4))
+            })
+            return
+        }
+        for (i in 0 until arr.length()) {
+            val sl = arr.optJSONObject(i) ?: continue
+            val name = sl.optString("name")
+            if (name.isEmpty()) continue
+            val isVault = sl.optBoolean("vault", false)
+            val bwRef = sl.optString("bw_ref", "")
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(0, dp(4), 0, dp(4))
+            }
+            val top = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+            val cb = android.widget.CheckBox(this).apply {
+                isChecked = name in refs
+                contentDescription = "inject $name"
+                setOnCheckedChangeListener { _, on ->
+                    val cur = pendingRefs ?: agent.envRefs ?: emptyList()
+                    pendingRefs = if (on) (cur + name).distinct() else cur - name
+                }
+            }
+            top.addView(cb)
+            top.addView(TextView(this).apply {
+                text = (if (isVault) "\ud83d\udd10 " else "\ud83d\udd11 ") + name
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+                setTextColor(0xFFE5E5E5.toInt())
+                layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            })
+            top.addView(Button(this).apply {
+                text = "\u270e"; isAllCaps = false; setTextColor(0xFF7FD4FF.toInt())
+                setPadding(dp(8), 0, dp(8), 0)
+                setOnClickListener { showSlotForm(name) }
+            })
+            top.addView(Button(this).apply {
+                text = "\u2715"; isAllCaps = false; setTextColor(0xFFF87171.toInt())
+                setPadding(dp(8), 0, dp(8), 0)
+                setOnClickListener {
+                    android.app.AlertDialog.Builder(this@EditAgentActivity)
+                        .setTitle("Delete slot $name?")
+                        .setMessage(if (isVault)
+                            "Removes the vault binding (the vault item itself is untouched). " +
+                                "Agents still naming it will report it unavailable."
+                        else "Agents still naming it will report it unavailable.")
+                        .setPositiveButton("delete") { _, _ ->
+                            relay?.send(Term.secretsUnbind(name))
+                            flash("removing $name\u2026")
+                        }
+                        .setNegativeButton("cancel", null)
+                        .show()
+                }
+            })
+            row.addView(top)
+            val meta = when {
+                isVault && bwRef.isNotEmpty() && bwRef != "null" -> bwRef
+                isVault -> "vault-backed"
+                else -> "literal \u00b7 value never leaves forge"
+            }
+            row.addView(TextView(this).apply {
+                text = meta
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 10f)
+                setTextColor(0xFF6b7280.toInt())
+                setPadding(dp(36), 0, 0, 0)
+            })
+            secretsBox.addView(row)
+        }
+    }
+
+    /** Create a slot (name null) or rebind one (name given). Source:
+     *  a Vaultwarden item from the picker (stores bw://notes/<item>),
+     *  or a literal value typed here. The secret VALUE is fetched by
+     *  forge at exec time \u2014 only the pointer rides this dialog for
+     *  vault slots. */
+    private fun showSlotForm(existing: String?) {
+        val body = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(8), dp(8), dp(8), dp(8))
+        }
+        val nameField = EditText(this).apply {
+            hint = "SLOT_NAME (A-Z, 0-9, _)"
+            setText(existing ?: "")
+            isEnabled = existing == null
+            inputType = android.text.InputType.TYPE_CLASS_TEXT or
+                android.text.InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS
+        }
+        body.addView(nameField)
+        val srcOptions = mutableListOf<String>()
+        if (vaultEnabled) srcOptions.add("vault item")
+        srcOptions.add("literal value")
+        val srcSpinner = android.widget.Spinner(this)
+        srcSpinner.adapter = android.widget.ArrayAdapter(
+            this, android.R.layout.simple_spinner_dropdown_item, srcOptions
+        )
+        body.addView(srcSpinner)
+        val itemOptions = mutableListOf<String>()
+        val cur = lastSecrets?.optJSONArray("slots")?.let { a ->
+            (0 until a.length()).asSequence()
+                .mapNotNull { a.optJSONObject(it) }
+                .firstOrNull { it.optString("name") == existing }
+        }
+        val curRef = cur?.optString("bw_ref", "").orEmpty()
+        var preselectItem: String? = null
+        if (vaultEnabled) {
+            if (curRef.startsWith("bw://notes/"))
+                preselectItem = curRef.removePrefix("bw://notes/")
+            itemOptions.addAll(vaultItems)
+            if (preselectItem != null && preselectItem !in itemOptions) itemOptions.add(preselectItem)
+            itemOptions.add("\u2026type manually")
+        }
+        val itemSpinner = android.widget.Spinner(this)
+        itemSpinner.adapter = android.widget.ArrayAdapter(
+            this, android.R.layout.simple_spinner_dropdown_item, itemOptions
+        )
+        if (preselectItem != null && preselectItem in itemOptions)
+            itemSpinner.setSelection(itemOptions.indexOf(preselectItem))
+        val itemManual = EditText(this).apply {
+            hint = "vault item name"
+            visibility = View.GONE
+        }
+        val literalField = EditText(this).apply {
+            hint = "the value (stored server-side, never listed back)"
+            visibility = View.GONE
+            inputType = android.text.InputType.TYPE_CLASS_TEXT or
+                android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD
+        }
+        body.addView(itemSpinner)
+        body.addView(itemManual)
+        body.addView(literalField)
+        fun syncSource() {
+            val vault = srcOptions[srcSpinner.selectedItemPosition] == "vault item"
+            itemSpinner.visibility = if (vault) View.VISIBLE else View.GONE
+            itemManual.visibility =
+                if (vault && itemOptions.getOrElse(itemSpinner.selectedItemPosition) { "" }
+                        .startsWith("\u2026")) View.VISIBLE else View.GONE
+            literalField.visibility = if (vault) View.GONE else View.VISIBLE
+        }
+        srcSpinner.onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(p: android.widget.AdapterView<*>?, v: View?, pos: Int, id: Long) = syncSource()
+            override fun onNothingSelected(p: android.widget.AdapterView<*>?) {}
+        }
+        if (existing != null && !vaultEnabled) srcSpinner.setSelection(srcOptions.size - 1)
+        syncSource()
+        android.app.AlertDialog.Builder(this)
+            .setTitle(if (existing == null) "New credential slot" else "Rebind $existing")
+            .setView(body)
+            .setPositiveButton("save") { _, _ ->
+                val nm = nameField.text.toString().trim().uppercase()
+                if (nm.isEmpty()) { flash("slot needs a name"); return@setPositiveButton }
+                if (!Regex("^[A-Z][A-Z0-9_]{0,63}$").matches(nm)) {
+                    flash("slot name: A-Z start, A-Z0-9_ after"); return@setPositiveButton
+                }
+                val vault = srcOptions[srcSpinner.selectedItemPosition] == "vault item"
+                if (vault) {
+                    val picked = itemOptions.getOrElse(itemSpinner.selectedItemPosition) { "" }
+                    val item = if (picked.startsWith("\u2026")) itemManual.text.toString().trim() else picked
+                    if (item.isEmpty()) { flash("pick or type a vault item"); return@setPositiveButton }
+                    relay?.send(Term.secretsBind(nm, vaultItem = item))
+                    flash("binding $nm \u2192 $item\u2026")
+                } else {
+                    val v = literalField.text.toString()
+                    if (v.isEmpty()) { flash("enter a value"); return@setPositiveButton }
+                    relay?.send(Term.secretsBind(nm, literal = v))
+                    flash("saving $nm\u2026")
+                }
             }
             .setNegativeButton("cancel", null)
             .create()

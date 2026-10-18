@@ -727,3 +727,42 @@ needed. If a later phase wants daemon-mediated call control (e.g. the
 daemon dialing an outbound call on a trigger), that is a new frame
 family and must land here first.
 
+
+### 8.8 Credential slots + vault picker (2026-10-18)
+
+Owner-level credential management on every surface (mobile editor
+Secrets section, `ranch secrets`, daemon-proxied). Five frames, all
+client→daemon→forge (the daemon's key is the USER credential — which
+is exactly the tenancy forge requires: slots are strictly owner-scoped
+and restricted keys are barred there):
+
+| frame | direction | forge call |
+|---|---|---|
+| `SecretsList { req_id }` | → daemon | `GET /secrets` + `GET /bitwarden/secrets` |
+| `SecretsListOk { req_id, slots, vault_items, vault_enabled }` | → client | (merged; vault errors degrade to `vault_enabled:false`) |
+| `SecretsBind { req_id, name, vault_item?, literal? }` | → daemon | `PUT /secrets/{name}` (exactly one source) |
+| `SecretsBindOk { req_id, slot }` | → client | re-read row as `SecretSlot` |
+| `SecretsUnbind { req_id, name }` / `SecretsUnbindOk { …, removed }` | ↔ | `DELETE /secrets/{name}` |
+
+`SecretSlot = { name, vault, bw_ref?, updated_at?, valid_until? }` —
+**never carries a value**. `bw_ref` is the vault POINTER
+(`bw://notes/<item>`), an item locator rather than a credential, so it
+is listable; a literal slot renders as "•••• (literal)". The secret
+VALUE only ever transits forge→sandbox env at exec time (the
+`bitwarden` resolver), so nothing in this family can read a secret
+back — the picker only browses item NAMES.
+
+The mapping to agents rides the **existing** `AgentUpdate` frame: a
+new additive `env_refs: Option<Vec<String>>` writes forge
+`credentials_scope.env_refs` (Some replaces, `[]` clears; names
+validated daemon-side against forge's `^[A-Z][A-Z0-9_]*$` ≤ 64 —
+they become sandbox env var names). `AgentInfo.env_refs` (additive)
+carries the same list back, which is how the section shows
+"injected: ✓" per slot without a second round trip.
+
+Gotchas pinned in tests: ureq needs explicit PUT/DELETE arms
+(`forge_req`); forge's DELETE now answers `{ok,removed}` so the
+honest "no such slot" verdict reaches the client; bw 2026.8
+`list items --response` envelopes the array at `data.data[]` (the
+picker read it), and a vault NOTE may be prose — forge extracts the
+token-shaped line rather than injecting the blob.

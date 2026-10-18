@@ -7201,6 +7201,9 @@ pub fn main_client() {
         // wizard (forge agent row + optional mule cron wake).
         "agents" => crate::agents_new::run(&args[1..]),
         "sandbox" => crate::agents_new::run_sandbox(&args[1..]),
+        // ranch secrets — owner credential slots + Vaultwarden picker
+        // (the terminal twin of the mobile editor's Secrets section).
+        "secrets" => crate::agents_new::run_secrets(&args[1..]),
         "ls" | "list" => cmd_ls(),
         "--version" | "version" => {
             println!("ranch {}", crate::daemon::build_version());

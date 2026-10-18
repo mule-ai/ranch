@@ -1116,6 +1116,12 @@ pub enum Frame {
         tools_allowlist: Option<Vec<String>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         extra_instructions: Option<String>,
+        /// credential slot NAMES injected into the agent's sandbox
+        /// (forge `credentials_scope.env_refs`). Some(..) replaces the
+        /// set; Some(vec![]) clears it. Names are validated daemon-
+        /// side (`^[A-Z][A-Z0-9_]*$`, ≤ 64) — they become env vars.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        env_refs: Option<Vec<String>>,
     },
     /// Daemon -> client: the edited agent (the fresh forge row).
     AgentUpdateOk {
@@ -1226,6 +1232,57 @@ pub enum Frame {
     SandboxResetOk {
         req_id: String,
         rootfs_removed: u64,
+    },
+    // ----- credential slots + vault picker (client -> daemon, forge proxy) -----
+    // (2026-10-18) The mobile editor's Secrets section: the OWNER's
+    // credential slots (forge `secrets` table), the Vaultwarden item
+    // NAMES for the picker (never values — the vault's contents only
+    // ever transit at exec time inside the sandbox), and bind/unbind.
+    /// Client -> daemon: list the caller's slots + the vault's item
+    /// names. The daemon GETs `{forge}/secrets` and
+    /// `{forge}/bitwarden/secrets`; a missing/errored vault config
+    /// degrades to `vault_enabled: false` rather than failing the
+    /// whole reply (the section still manages literal slots).
+    SecretsList {
+        req_id: String,
+    },
+    /// Daemon -> client: the merged listing. `slots` come from
+    /// `GET /secrets` (metadata only — values are never serialized
+    /// anywhere); `vault_items` from `GET /bitwarden/secrets`.
+    SecretsListOk {
+        req_id: String,
+        slots: Vec<SecretSlot>,
+        vault_items: Vec<String>,
+        vault_enabled: bool,
+    },
+    /// Client -> daemon: create/replace one slot. Exactly one of
+    /// `vault_item` (binds the slot to `bw://notes/<item>` — the
+    /// picker's choice) or `literal` (a value typed into the app)
+    /// must be Some. The daemon PUTs `{forge}/secrets/{name}`.
+    SecretsBind {
+        req_id: String,
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        vault_item: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        literal: Option<String>,
+    },
+    /// Daemon -> client: the slot as forge now sees it.
+    SecretsBindOk {
+        req_id: String,
+        slot: SecretSlot,
+    },
+    /// Client -> daemon: drop one slot (the daemon does NOT touch any
+    /// agent's env_refs — unbound slots just stop being injectable).
+    SecretsUnbind {
+        req_id: String,
+        name: String,
+    },
+    /// Daemon -> client: whether a row was removed.
+    SecretsUnbindOk {
+        req_id: String,
+        name: String,
+        removed: bool,
     },
     /// Daemon -> clients: an explicit user notification emitted by an
     /// agent (its `notify_user` tool / `@notify:` message prefix).
@@ -1396,6 +1453,33 @@ pub struct AgentInfo {
     /// the H5.3 kill-switch state (forge `agents.paused`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paused: Option<bool>,
+    /// credential slot NAMES injected into this agent's sandbox
+    /// (forge `credentials_scope.env_refs`) — the reverse mapping the
+    /// Secrets section shows ("injected into: <agent>"). None = the
+    /// server did not return the column (older forge).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env_refs: Option<Vec<String>>,
+}
+
+/// One credential slot as listed for the mobile/CLI Secrets sections
+/// (2026-10-18). NEVER carries the value — `vault` + `bw_ref` locate
+/// the secret (the ref is a pointer, e.g. `bw://notes/mule-github-token-lab`,
+/// not a credential); a literal slot renders as "••••" client-side.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct SecretSlot {
+    pub name: String,
+    /// true when the slot stores a `bw://` vault reference
+    #[serde(default)]
+    pub vault: bool,
+    /// the vault reference itself (vault slots only)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bw_ref: Option<String>,
+    /// ISO-8601 last write (forge ON UPDATE trigger)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+    /// ISO-8601 expiry, None = never
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_until: Option<String>,
 }
 
 /// One row of the agent's mule wake list (H6.5b — the editor's
@@ -2572,6 +2656,7 @@ mod tests {
                     tools_allowlist: Some(vec!["bash".into(), "read".into()]),
                     extra_instructions: Some("be terse".into()),
                     paused: Some(false),
+                    env_refs: Some(vec!["GITHUB_TOKEN".into()]),
                 }],
             },
             Frame::AgentTalk {
@@ -2704,6 +2789,7 @@ mod tests {
                 visibility: None,
                 tools_allowlist: Some(vec![]),
                 extra_instructions: Some("be terse".into()),
+                env_refs: Some(vec!["GITHUB_TOKEN".into(), "SENTRY_DSN".into()]),
             },
             Frame::AgentUpdate {
                 req_id: "r12".into(),
@@ -2717,6 +2803,7 @@ mod tests {
                 visibility: None,
                 tools_allowlist: None,
                 extra_instructions: None,
+                env_refs: None,
             },
             Frame::AgentUpdateOk {
                 req_id: "r11".into(),
@@ -2734,6 +2821,7 @@ mod tests {
                     tools_allowlist: Some(vec![]),
                     extra_instructions: Some("be terse".into()),
                     paused: Some(true),
+                    env_refs: Some(vec!["GITHUB_TOKEN".into(), "SENTRY_DSN".into()]),
                 },
             },
             Frame::WakeList {
@@ -2812,6 +2900,55 @@ mod tests {
             Frame::SandboxRequestOk {
                 req_id: "r19".into(),
                 data: serde_json::json!({"requested": [{"id": "p1", "package": "nodejs"}]}),
+            },
+            Frame::SecretsList {
+                req_id: "r20".into(),
+            },
+            Frame::SecretsListOk {
+                req_id: "r20".into(),
+                slots: vec![
+                    SecretSlot {
+                        name: "GITHUB_TOKEN".into(),
+                        vault: true,
+                        bw_ref: Some("bw://notes/mule-github-token-lab".into()),
+                        updated_at: Some("2026-10-18T14:00:00Z".into()),
+                        valid_until: None,
+                    },
+                    SecretSlot {
+                        name: "DEMO_KEY".into(),
+                        vault: false,
+                        bw_ref: None,
+                        updated_at: None,
+                        valid_until: Some("2026-12-31T00:00:00Z".into()),
+                    },
+                ],
+                vault_items: vec!["mule-github-token-lab".into(), "db-url".into()],
+                vault_enabled: true,
+            },
+            Frame::SecretsBind {
+                req_id: "r21".into(),
+                name: "GITHUB_TOKEN".into(),
+                vault_item: Some("mule-github-token-lab".into()),
+                literal: None,
+            },
+            Frame::SecretsBindOk {
+                req_id: "r21".into(),
+                slot: SecretSlot {
+                    name: "GITHUB_TOKEN".into(),
+                    vault: true,
+                    bw_ref: Some("bw://notes/mule-github-token-lab".into()),
+                    updated_at: Some("2026-10-18T15:00:00Z".into()),
+                    valid_until: None,
+                },
+            },
+            Frame::SecretsUnbind {
+                req_id: "r22".into(),
+                name: "DEMO_KEY".into(),
+            },
+            Frame::SecretsUnbindOk {
+                req_id: "r22".into(),
+                name: "DEMO_KEY".into(),
+                removed: true,
             },
         ];
         for f in frames {

@@ -30,7 +30,7 @@
 
 use std::io::{BufRead, Write};
 
-use ranch_protocol::{AgentInfo, WakeInfo};
+use ranch_protocol::{AgentInfo, SecretSlot, WakeInfo};
 use serde_json::{Value, json};
 
 use crate::daemon::mule::load_mule_config;
@@ -338,6 +338,11 @@ fn forge_req(
             .patch(&url)
             .header("X-API-Key", &cfg.key)
             .send_json(b.cloned().unwrap_or(Value::Null)),
+        ("PUT", b) => agent
+            .put(&url)
+            .header("X-API-Key", &cfg.key)
+            .send_json(b.cloned().unwrap_or(Value::Null)),
+        ("DELETE", _) => agent.delete(&url).header("X-API-Key", &cfg.key).call(),
         _ => return Err(format!("unsupported method {m}")),
     };
     let mut res = sent.map_err(|e| format!("forge {m} {path}: {e}"))?;
@@ -378,6 +383,11 @@ pub struct UpdateRequest {
     /// Some(vec![]) = allow all tools
     pub tools_allowlist: Option<Vec<String>>,
     pub extra_instructions: Option<String>,
+    /// credential slot NAMES injected into the agent's sandbox (forge
+    /// `credentials_scope.env_refs`). Some(..) replaces the set;
+    /// Some(vec![]) clears it. (2026-10-18 — the mobile Secrets
+    /// section writes the mapping through AgentUpdate.)
+    pub env_refs: Option<Vec<String>>,
 }
 
 /// Build the forge `PATCH /agents/:id` body: only present, non-blank
@@ -414,7 +424,33 @@ pub fn update_agent_body(req: &UpdateRequest) -> Value {
             ),
         );
     }
+    if let Some(refs) = &req.env_refs {
+        // Some(vec![]) is meaningful (= inject nothing), so it is
+        // always sent. Names are validated (validate_update) before
+        // any HTTP — they become sandbox env var names.
+        v.insert(
+            "credentials_scope".to_string(),
+            serde_json::json!({
+                "env_refs": refs.iter().map(|r| r.trim().to_uppercase()).collect::<Vec<_>>()
+            }),
+        );
+    }
     Value::Object(v)
+}
+
+/// forge's slot-name rule (api/secrets.rs `valid_slot_name`): `^[A-Z]
+/// [A-Z0-9_]*$`, ≤ 64 — names become env var names. Duplicated here
+/// so the daemon rejects junk before the forge round trip.
+pub fn valid_slot_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name.bytes().enumerate().all(|(i, b)| {
+            if i == 0 {
+                b.is_ascii_uppercase()
+            } else {
+                b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_'
+            }
+        })
 }
 
 /// Validate an edit request (before any HTTP). At least one field must
@@ -434,6 +470,15 @@ pub fn validate_update(req: &UpdateRequest) -> Result<(), String> {
         && v != "org"
     {
         return Err(format!("visibility must be 'private' or 'org' (got '{v}')"));
+    }
+    if let Some(refs) = &req.env_refs {
+        for r in refs {
+            if !valid_slot_name(r.trim()) {
+                return Err(format!(
+                    "invalid credential slot name '{r}' (want A-Z start, A-Z0-9_ after, ≤ 64)"
+                ));
+            }
+        }
     }
     let body = update_agent_body(req);
     if body.as_object().map(|m| m.is_empty()).unwrap_or(true) {
@@ -493,6 +538,15 @@ pub fn agent_info_from_value(a: &Value) -> Option<AgentInfo> {
         tools_allowlist: tools,
         extra_instructions: opt_str("extra_instructions"),
         paused: a.get("paused").and_then(|x| x.as_bool()),
+        env_refs: a
+            .get("credentials_scope")
+            .and_then(|c| c.get("env_refs"))
+            .and_then(|e| e.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|t| t.as_str().map(str::to_string))
+                    .collect::<Vec<_>>()
+            }),
     })
 }
 
@@ -857,6 +911,35 @@ fn run_edit(target: &str) {
         .clone()
         .unwrap_or_default()
         .join(", ");
+    // credential slots injected into the agent's sandbox (the mobile
+    // Secrets section's CLI twin; `ranch secrets list` shows the
+    // owner's slot names to reference here)
+    let current_refs = current.env_refs.clone().unwrap_or_default().join(", ");
+    let refs = prompt(
+        &format!(
+            "credential slots (comma-separated ENV_NAMES; '-' = none; blank keeps '{}')",
+            if current_refs.is_empty() {
+                "none"
+            } else {
+                &current_refs
+            }
+        ),
+        "",
+    );
+    let refs_input = refs.trim().to_string();
+    let env_refs = if refs_input.is_empty() {
+        None
+    } else if refs_input == "-" {
+        Some(vec![])
+    } else {
+        Some(
+            refs_input
+                .split(',')
+                .map(|s| s.trim().to_uppercase())
+                .filter(|s| !s.is_empty())
+                .collect(),
+        )
+    };
     let tools = prompt(
         &format!(
             "tools allowlist (comma-separated; '*' = all; blank keeps '{}')",
@@ -930,6 +1013,7 @@ fn run_edit(target: &str) {
         visibility: None,
         tools_allowlist,
         extra_instructions,
+        env_refs,
     };
     if let Err(e) = validate_update(&req) {
         die(&e);
@@ -1364,6 +1448,7 @@ mod tests {
             visibility: None,
             tools_allowlist: Some(vec![]), // empty is MEANINGFUL
             extra_instructions: Some("be terse".into()),
+            env_refs: None,
         };
         let b = update_agent_body(&req);
         assert_eq!(b["name"], "Atlas II");
@@ -1588,9 +1673,13 @@ mod tests {
 /// Ids interpolate into URL paths — keep them strictly uuid-shaped.
 fn uuid_shaped(s: &str) -> bool {
     s.len() == 36
-        && s.chars()
-            .enumerate()
-            .all(|(i, c)| if matches!(i, 8 | 13 | 18 | 23) { c == '-' } else { c.is_ascii_hexdigit() })
+        && s.chars().enumerate().all(|(i, c)| {
+            if matches!(i, 8 | 13 | 18 | 23) {
+                c == '-'
+            } else {
+                c.is_ascii_hexdigit()
+            }
+        })
 }
 
 pub fn sandbox_packages(cfg: &ForgeConfig, agent_id: &str) -> Result<Value, String> {
@@ -1636,9 +1725,7 @@ pub fn sandbox_reset(cfg: &ForgeConfig, agent_id: &str) -> Result<u64, String> {
         &format!("/agents/{agent_id}/sandbox/reset"),
         None,
     )?;
-    Ok(v.get("rootfs_removed")
-        .and_then(Value::as_u64)
-        .unwrap_or(0))
+    Ok(v.get("rootfs_removed").and_then(Value::as_u64).unwrap_or(0))
 }
 
 #[cfg(test)]
@@ -1661,8 +1748,10 @@ mod sandbox_gov_tests {
 /// same calls the Sandbox* daemon frames proxy.
 pub fn run_sandbox(args: &[String]) {
     let Some(target) = args.first().map(|s| s.trim()).filter(|s| !s.is_empty()) else {
-        die("usage: ranch sandbox <name-or-id> [list | approve <req-id> | \
-             reject <req-id> [reason…] | reset | request <pkg> [pkg…] [--reason <why>]]");
+        die(
+            "usage: ranch sandbox <name-or-id> [list | approve <req-id> | \
+             reject <req-id> [reason…] | reset | request <pkg> [pkg…] [--reason <why>]]",
+        );
     };
     if matches!(target, "help" | "--help" | "-h") {
         println!(
@@ -1694,10 +1783,17 @@ pub fn run_sandbox(args: &[String]) {
                 Ok(v) => v,
                 Err(e) => die(&e),
             };
-            println!("sandbox for {name}  (base ready: {})",
-                data.get("base_ready").and_then(Value::as_bool).unwrap_or(false));
+            println!(
+                "sandbox for {name}  (base ready: {})",
+                data.get("base_ready")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+            );
             if let Some(appr) = data.get("approver").filter(|v| !v.is_null()) {
-                println!("  approver: {}", appr.get("name").and_then(Value::as_str).unwrap_or("?"));
+                println!(
+                    "  approver: {}",
+                    appr.get("name").and_then(Value::as_str).unwrap_or("?")
+                );
             }
             for (bucket, label) in [
                 ("pending", "PENDING"),
@@ -1705,8 +1801,12 @@ pub fn run_sandbox(args: &[String]) {
                 ("installed", "INSTALLED"),
                 ("rejected", "REJECTED"),
             ] {
-                let Some(rows) = data.get(bucket).and_then(Value::as_array) else { continue };
-                if rows.is_empty() { continue; }
+                let Some(rows) = data.get(bucket).and_then(Value::as_array) else {
+                    continue;
+                };
+                if rows.is_empty() {
+                    continue;
+                }
                 println!("  {label}:");
                 for r in rows {
                     let id = r.get("id").and_then(Value::as_str).unwrap_or("?");
@@ -1714,41 +1814,71 @@ pub fn run_sandbox(args: &[String]) {
                     let why = r.get("reason").and_then(Value::as_str).unwrap_or("");
                     let dec = r.get("decided_by").and_then(Value::as_str).unwrap_or("");
                     let err = r.get("install_error").and_then(Value::as_str).unwrap_or("");
-                    println!("    {id}  {pkg:<24} {why}{}{}",
-                        if dec.is_empty() { String::new() } else { format!(" [{dec}]") },
-                        if err.is_empty() { String::new() } else { format!(" ! {}", err.chars().take(60).collect::<String>()) });
+                    println!(
+                        "    {id}  {pkg:<24} {why}{}{}",
+                        if dec.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" [{dec}]")
+                        },
+                        if err.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" ! {}", err.chars().take(60).collect::<String>())
+                        }
+                    );
                 }
             }
             let empty = ["pending", "approved", "installed", "rejected"]
                 .iter()
-                .all(|k| data.get(*k).and_then(Value::as_array).is_none_or(|a| a.is_empty()));
+                .all(|k| {
+                    data.get(*k)
+                        .and_then(Value::as_array)
+                        .is_none_or(|a| a.is_empty())
+                });
             if empty {
-                println!("  (no packages beyond the base image — the agent can ask for more \
-                         with request_sandbox_packages)");
+                println!(
+                    "  (no packages beyond the base image — the agent can ask for more \
+                         with request_sandbox_packages)"
+                );
             }
         }
         "approve" | "reject" => {
             let Some(rid) = args.get(2) else {
-                die(&format!("{sub} needs a <request-id> (see `ranch sandbox {name} list`)"));
+                die(&format!(
+                    "{sub} needs a <request-id> (see `ranch sandbox {name} list`)"
+                ));
             };
             let reason = if sub == "reject" {
                 let r: Vec<&str> = args[3..].iter().map(|s| s.as_str()).collect();
-                if r.is_empty() { None } else { Some(r.join(" ")) }
-            } else { None };
+                if r.is_empty() {
+                    None
+                } else {
+                    Some(r.join(" "))
+                }
+            } else {
+                None
+            };
             match sandbox_decide(&cfg, rid, sub == "approve", reason.as_deref()) {
                 Ok(v) => println!(
                     "{} `{}`",
-                    if sub == "approve" { "Approved" } else { "Rejected" },
+                    if sub == "approve" {
+                        "Approved"
+                    } else {
+                        "Rejected"
+                    },
                     v.get("package").and_then(Value::as_str).unwrap_or("?")
                 ),
                 Err(e) => die(&e),
             }
         }
         "reset" => match sandbox_reset(&cfg, &agent_id) {
-            Ok(n) => println!("reset {name}: {n} rootfs tree(s) removed \
-                              (next bash re-copies a clean base + reinstalls approved packages)"),
+            Ok(n) => println!(
+                "reset {name}: {n} rootfs tree(s) removed \
+                              (next bash re-copies a clean base + reinstalls approved packages)"
+            ),
             Err(e) => die(&e),
-        }
+        },
         "request" => {
             let rest = &args[2..];
             let mut pkgs: Vec<String> = Vec::new();
@@ -1770,7 +1900,12 @@ pub fn run_sandbox(args: &[String]) {
             // credential bypasses the pending queue only via their own
             // decision — same flow, still approvable on the phone).
             let body = serde_json::json!({ "packages": pkgs, "reason": reason });
-            match forge_req(&cfg, "POST", &format!("/agents/{agent_id}/sandbox/requests"), Some(&body)) {
+            match forge_req(
+                &cfg,
+                "POST",
+                &format!("/agents/{agent_id}/sandbox/requests"),
+                Some(&body),
+            ) {
                 Ok(v) => {
                     let req = v.get("requested").and_then(Value::as_array);
                     let skp = v.get("skipped").and_then(Value::as_array);
@@ -1796,8 +1931,10 @@ pub fn run_sandbox(args: &[String]) {
                 Err(e) => die(&e),
             }
         }
-        other => die(&format!("unknown subcommand 'sandbox … {other}' \
-                     (try: list, approve, reject, reset, request)")),
+        other => die(&format!(
+            "unknown subcommand 'sandbox … {other}' \
+                     (try: list, approve, reject, reset, request)"
+        )),
     }
 }
 
@@ -1820,4 +1957,335 @@ pub fn sandbox_request(
         &format!("/agents/{agent_id}/sandbox/requests"),
         Some(&body),
     )
+}
+
+// ---------- credential slots + vault picker (2026-10-18) ----------
+//
+// The mobile editor's Secrets section (Secrets* frames) and
+// `ranch secrets` proxy these — the daemon holds the USER key, so
+// forge sees the owner (slots are strictly owner-scoped there). The
+// secret VALUE never transits any of this: binding a slot to the
+// vault stores only the `bw://…` pointer; the value is resolved by
+// forge at exec time inside the sandbox.
+
+/// Map one forge `GET /secrets` row into the wire `SecretSlot`.
+fn secret_slot_from_value(v: &Value) -> Option<SecretSlot> {
+    Some(SecretSlot {
+        name: v.get("name")?.as_str()?.to_string(),
+        vault: v.get("vault").and_then(Value::as_bool).unwrap_or(false),
+        bw_ref: v.get("bw_ref").and_then(|x| x.as_str()).map(str::to_string),
+        updated_at: v
+            .get("updated_at")
+            .and_then(|x| x.as_str())
+            .map(str::to_string),
+        valid_until: v
+            .get("valid_until")
+            .and_then(|x| x.as_str())
+            .map(str::to_string),
+    })
+}
+
+/// The caller's slots + the Vaultwarden item NAMES for the picker.
+/// A missing/failed vault config degrades to `(slots, [], false)`
+/// rather than failing the whole listing (the section still manages
+/// literal slots); slot-list failures are hard errors.
+pub fn secrets_list(cfg: &ForgeConfig) -> Result<(Vec<SecretSlot>, Vec<String>, bool), String> {
+    let v = forge_req(cfg, "GET", "/secrets", None)?;
+    let slots = v
+        .get("secrets")
+        .and_then(Value::as_array)
+        .map(|arr| arr.iter().filter_map(secret_slot_from_value).collect())
+        .unwrap_or_default();
+    let (items, enabled) = match forge_req(cfg, "GET", "/bitwarden/secrets", None) {
+        Ok(v) => (
+            v.get("keys")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|k| k.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            true,
+        ),
+        // 502/403-class (not configured, bw down, or a restricted key
+        // on the vault browse) — soft, per the doc comment.
+        Err(_) => (Vec::new(), false),
+    };
+    Ok((slots, items, enabled))
+}
+
+/// Create/replace one slot. Exactly one source: `vault_item` binds
+/// `bw://notes/<item>` (the picker's choice — one item, one note,
+/// one token is the lab convention), `literal` stores the typed
+/// value. Mirrors forge's PUT validation client-side first.
+pub fn secrets_bind(
+    cfg: &ForgeConfig,
+    name: &str,
+    vault_item: Option<&str>,
+    literal: Option<&str>,
+) -> Result<SecretSlot, String> {
+    let name = name.trim().to_uppercase();
+    if !valid_slot_name(&name) {
+        return Err(format!(
+            "invalid slot name '{name}' (want A-Z start, A-Z0-9_ after, ≤ 64)"
+        ));
+    }
+    let value = match (vault_item, literal) {
+        (Some(item), None) => {
+            let item = item.trim();
+            if item.is_empty() || item.contains("\n") || item.len() > 200 {
+                return Err("vault item name is not usable".into());
+            }
+            format!("bw://notes/{item}")
+        }
+        (None, Some(v)) => {
+            if v.is_empty() {
+                return Err("literal value is empty".into());
+            }
+            v.to_string()
+        }
+        _ => return Err("exactly one of vault_item / literal must be set".into()),
+    };
+    let body = serde_json::json!({ "value": value });
+    forge_req(cfg, "PUT", &format!("/secrets/{name}"), Some(&body))?;
+    // forge's PUT answers {ok:true}; re-read the one row's meta so
+    // the client gets the same SecretSlot shape as SecretsList.
+    let v = forge_req(cfg, "GET", "/secrets", None)?;
+    v.get("secrets")
+        .and_then(Value::as_array)
+        .and_then(|arr| {
+            arr.iter()
+                .find(|r| r.get("name").and_then(Value::as_str) == Some(name.as_str()))
+        })
+        .and_then(secret_slot_from_value)
+        .ok_or_else(|| format!("forge accepted the slot but did not list '{name}'"))
+}
+
+/// Drop one slot. Agents' env_refs may still name it — forge's
+/// credential gating degrades missing slots to "unavailable" (exec
+/// refusal + the agent's report), which is the desired loud failure.
+pub fn secrets_unbind(cfg: &ForgeConfig, name: &str) -> Result<bool, String> {
+    let name = name.trim().to_uppercase();
+    if !valid_slot_name(&name) {
+        return Err(format!(
+            "invalid slot name '{name}' (want A-Z start, A-Z0-9_ after, ≤ 64)"
+        ));
+    }
+    let v = forge_req(cfg, "DELETE", &format!("/secrets/{name}"), None)?;
+    Ok(v.get("removed").and_then(Value::as_bool).unwrap_or(false))
+}
+
+/// Entry for `ranch secrets [subcommand]` — terminal twin of the
+/// mobile Secrets section.
+pub fn run_secrets(args: &[String]) {
+    let sub = args.first().map(|s| s.as_str()).unwrap_or("list");
+    if matches!(sub, "help" | "--help" | "-h") {
+        println!(
+            "usage: ranch secrets list\n\
+             \t  ranch secrets bind <NAME> --vault <item>\n\
+             \t  ranch secrets bind <NAME> --literal <value>\n\
+             \t  ranch secrets unbind <NAME>\n\
+             \n\
+             Slots are owner-level credential env vars; agents name them in\n\
+             credentials_scope.env_refs (mobile editor: Secrets section).\n\
+             A --vault binding stores the pointer bw://notes/<item> — the\n\
+             value is fetched from the vault at exec time and never stored."
+        );
+        return;
+    }
+    let cfg = load_forge_config().unwrap_or_else(|| {
+        die("no forge config (set forge_api_key [+ forge_url] in \
+             ~/.config/ranch/daemon.toml — see `ranch register`)")
+    });
+    match sub {
+        "list" => {
+            let (slots, items, enabled) = match secrets_list(&cfg) {
+                Ok(v) => v,
+                Err(e) => die(&e),
+            };
+            println!("slots:");
+            if slots.is_empty() {
+                println!("  (none — bind one: ranch secrets bind MY_TOKEN --vault <item>)");
+            }
+            for s in &slots {
+                let src = match &s.bw_ref {
+                    Some(r) => r.clone(),
+                    None => "•••• (literal)".to_string(),
+                };
+                let exp = s
+                    .valid_until
+                    .as_deref()
+                    .map(|v| format!(" expires {v}"))
+                    .unwrap_or_default();
+                println!("  {:<28} {src}{}", s.name, exp);
+            }
+            println!(
+                "vault: {}",
+                if enabled {
+                    "configured"
+                } else {
+                    "not configured / unreachable"
+                }
+            );
+            if enabled {
+                println!(
+                    "  items: {}",
+                    if items.is_empty() {
+                        "(empty)".into()
+                    } else {
+                        items.join(", ")
+                    }
+                );
+            }
+        }
+        "bind" => {
+            let Some(name) = args.get(1) else {
+                die("bind needs <NAME> and --vault <item> | --literal <value>");
+            };
+            let mut vault_item = None;
+            let mut literal = None;
+            let mut i = 2;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--vault" => {
+                        vault_item = args.get(i + 1).cloned();
+                        i += 2;
+                    }
+                    "--literal" => {
+                        literal = args.get(i + 1).cloned();
+                        i += 2;
+                    }
+                    _ => i += 1,
+                }
+            }
+            match secrets_bind(&cfg, name, vault_item.as_deref(), literal.as_deref()) {
+                Ok(s) => println!(
+                    "bound {} → {}",
+                    s.name,
+                    s.bw_ref.unwrap_or_else(|| "•••• (literal)".into())
+                ),
+                Err(e) => die(&e),
+            }
+        }
+        "unbind" => {
+            let Some(name) = args.get(1) else {
+                die("unbind needs <NAME>");
+            };
+            match secrets_unbind(&cfg, name) {
+                Ok(true) => println!("removed slot {name}"),
+                Ok(false) => println!("no such slot (nothing removed)"),
+                Err(e) => die(&e),
+            }
+        }
+        other => die(&format!(
+            "unknown subcommand 'secrets … {other}' (try: list, bind, unbind)"
+        )),
+    }
+}
+
+#[cfg(test)]
+mod secrets_tests {
+    use super::*;
+
+    #[test]
+    fn slot_name_validation() {
+        assert!(valid_slot_name("GITHUB_TOKEN"));
+        assert!(valid_slot_name("A"));
+        assert!(valid_slot_name("SLOT_2"));
+        assert!(!valid_slot_name("github_token")); // lowercase
+        assert!(!valid_slot_name("1BAD")); // digit start
+        assert!(!valid_slot_name("HAS-DASH"));
+        assert!(!valid_slot_name(&"A".repeat(65)));
+    }
+
+    #[test]
+    fn update_body_env_refs() {
+        let req = UpdateRequest {
+            agent_id: "a".into(),
+            env_refs: Some(vec!["github_token ".into(), "SENTRY_DSN".into()]),
+            ..Default::default()
+        };
+        let b = update_agent_body(&req);
+        assert_eq!(b["credentials_scope"]["env_refs"][0], "GITHUB_TOKEN");
+        assert_eq!(b["credentials_scope"]["env_refs"][1], "SENTRY_DSN");
+        // clearing is expressible
+        let clear = UpdateRequest {
+            env_refs: Some(vec![]),
+            ..req
+        };
+        assert_eq!(
+            update_agent_body(&clear)["credentials_scope"]["env_refs"],
+            json!([])
+        );
+        // and validate_update gates junk before HTTP
+        let junk = UpdateRequest {
+            env_refs: Some(vec!["bad-name".into()]),
+            ..Default::default()
+        };
+        assert!(
+            validate_update(&junk)
+                .unwrap_err()
+                .contains("invalid credential slot")
+        );
+    }
+
+    #[test]
+    fn agent_info_env_refs_from_credentials_scope() {
+        let row = json!({
+            "id": "aa", "name": "dependabot",
+            "credentials_scope": {"env_refs": ["GITHUB_TOKEN"]}
+        });
+        let a = agent_info_from_value(&row).unwrap();
+        assert_eq!(
+            a.env_refs.as_deref(),
+            Some(&["GITHUB_TOKEN".to_string()][..])
+        );
+        // older forge rows (column absent) → None, not empty
+        let row2 = json!({"id": "bb", "name": "x"});
+        assert_eq!(agent_info_from_value(&row2).unwrap().env_refs, None);
+    }
+
+    #[test]
+    fn slot_mapping_and_bind_source() {
+        let row = json!({
+            "name": "GITHUB_TOKEN", "vault": true,
+            "bw_ref": "bw://notes/mule-github-token-lab",
+            "updated_at": "2026-10-18T14:00:00Z", "valid_until": null
+        });
+        let s = secret_slot_from_value(&row).unwrap();
+        assert_eq!(s.name, "GITHUB_TOKEN");
+        assert!(s.vault);
+        assert_eq!(
+            s.bw_ref.as_deref(),
+            Some("bw://notes/mule-github-token-lab")
+        );
+        assert_eq!(s.valid_until, None);
+        // bind source rules (no HTTP needed — errors before forge_req)
+        let cfg = ForgeConfig {
+            base: "http://127.0.0.1:1".into(),
+            key: "k".into(),
+            profile: None,
+        };
+        assert!(
+            secrets_bind(&cfg, "X", None, None)
+                .unwrap_err()
+                .contains("exactly one")
+        );
+        assert!(
+            secrets_bind(&cfg, "X", Some("i"), Some("v"))
+                .unwrap_err()
+                .contains("exactly one")
+        );
+        assert!(
+            secrets_bind(&cfg, "bad name", Some("i"), None)
+                .unwrap_err()
+                .contains("invalid slot name")
+        );
+        assert!(
+            secrets_bind(&cfg, "OK", Some(""), None)
+                .unwrap_err()
+                .contains("not usable")
+        );
+    }
 }

@@ -399,6 +399,10 @@ object Term {
         val toolsAllowlist: List<String>? = null,
         val extraInstructions: String? = null,
         val paused: Boolean? = null,
+        /** credential slot NAMES injected into the agent's sandbox
+         *  (forge credentials_scope.env_refs) — the Secrets section's
+         *  "injected" checkboxes. */
+        val envRefs: List<String>? = null,
     )
 
     private fun nullableStr(o: JSONObject, k: String): String? =
@@ -423,6 +427,9 @@ object Term {
             },
             extraInstructions = nullableStr(o, "extra_instructions"),
             paused = if (o.has("paused") && !o.isNull("paused")) o.optBoolean("paused") else null,
+            envRefs = o.optJSONArray("env_refs")?.let { arr ->
+                (0 until arr.length()).map { arr.optString(it) }
+            },
         )
 
     /** One of the agent's mule wakes (H6.5b editor schedule section) —
@@ -465,6 +472,7 @@ object Term {
         visibility: String? = null,
         tools: List<String>? = null,
         extraInstructions: String? = null,
+        envRefs: List<String>? = null,
         reqId: String = "au-" + newId(),
     ): JSONObject {
         val o = JSONObject()
@@ -487,8 +495,42 @@ object Term {
             tools.forEach { arr.put(it) }
             o.put("tools_allowlist", arr)
         }
+        // Some(env_refs) REPLACES the injected-slot set (empty = inject
+        // nothing); null leaves credentials_scope alone.
+        if (envRefs != null) {
+            val arr = JSONArray()
+            envRefs.forEach { arr.put(it) }
+            o.put("env_refs", arr)
+        }
         return o
     }
+
+    /** Credential slots + Vaultwarden picker (2026-10-18) — the
+     *  editor's Secrets section. Slots are OWNER-level (forge
+     *  `secrets` table, USER-key tenancy); binding a slot to the
+     *  vault stores only the bw://notes/<item> pointer — the value
+     *  never rides these frames (forge fetches it at exec time). */
+    fun secretsList(reqId: String = "sc-" + newId()): JSONObject =
+        JSONObject().put("t", "SecretsList").put("id", newId()).put("client", CLIENT)
+            .put("req_id", reqId)
+
+    fun secretsBind(
+        name: String,
+        vaultItem: String? = null,
+        literal: String? = null,
+        reqId: String = "sb-" + newId(),
+    ): JSONObject {
+        val o = JSONObject()
+            .put("t", "SecretsBind").put("id", newId()).put("client", CLIENT)
+            .put("req_id", reqId).put("name", name)
+        if (!vaultItem.isNullOrEmpty()) o.put("vault_item", vaultItem)
+        if (!literal.isNullOrEmpty()) o.put("literal", literal)
+        return o
+    }
+
+    fun secretsUnbind(name: String, reqId: String = "su-" + newId()): JSONObject =
+        JSONObject().put("t", "SecretsUnbind").put("id", newId()).put("client", CLIENT)
+            .put("req_id", reqId).put("name", name)
 
     /** H6.5b: the agent's mule wakes (list / create / update / delete). */
     fun wakeList(agentId: String, reqId: String = "wl-" + newId()): JSONObject =
