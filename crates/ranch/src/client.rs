@@ -7113,7 +7113,13 @@ fn cmd_register(name: Option<String>) {
     println!("  machine key (shown once, also stored in the config above):");
     println!("    {machine_key}");
     println!();
-    println!("restart ranchd to connect the relay.");
+    // ranchd reads daemon.toml ONCE at startup (mule_cfg/forge_cfg are
+    // captured then — 2026-10-17: a register-rewritten daemon.toml left
+    // the 12-day-old daemon posting wakes with a stale key → "mule
+    // 401" on the mobile +Agent form). Hot upgrade reloads it without
+    // killing any session, pane, or agent.
+    println!("restart ranchd to connect the relay — or, if it is already");
+    println!("running, hot-reload the config with:  ranch upgrade");
 }
 
 /// `ranch config <supabase-url> <anon-key>` — one-time client bootstrap.
