@@ -9,6 +9,7 @@
 //! M2 swap in styled cells without changing framing.
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::HashMap;
 
 pub const PROTO_VERSION: u32 = 0;
@@ -1165,6 +1166,49 @@ pub enum Frame {
     /// Daemon -> client: the wake was deleted.
     WakeDeleteOk {
         req_id: String,
+    },
+    // ----- sandbox package governance (client -> daemon, forge proxy) -----
+    /// Client -> daemon: the agent's sandbox package state (approved /
+    /// pending / rejected + base readiness + approver identity). The
+    /// daemon GETs `{forge}/agents/{id}/sandbox/packages`; the mobile
+    /// agent editor renders the queue and its approve/reject buttons
+    /// (2026-10-18).
+    SandboxPackages {
+        req_id: String,
+        agent_id: String,
+    },
+    /// Daemon -> client: forge's JSON payload verbatim
+    /// (`base_ready`, `approver`, `installed|approved|pending|rejected`).
+    SandboxPackagesOk {
+        req_id: String,
+        data: Value,
+    },
+    /// Client -> daemon: decide one pending request (the phone's
+    /// approve/reject tap; the daemon calls forge as the USER key, so
+    /// the decision is `decided_by: "user"`).
+    SandboxDecide {
+        req_id: String,
+        request_id: String,
+        approve: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    /// Daemon -> client: decision result (`{ok, status, package}`).
+    SandboxDecideOk {
+        req_id: String,
+        data: Value,
+    },
+    /// Client -> daemon: wipe the agent's sandbox rootfs trees (the
+    /// editor's "reinstall" — working files are kept; approved
+    /// packages re-install automatically).
+    SandboxReset {
+        req_id: String,
+        agent_id: String,
+    },
+    /// Daemon -> client: how many rootfs trees were removed.
+    SandboxResetOk {
+        req_id: String,
+        rootfs_removed: u64,
     },
     /// Daemon -> clients: an explicit user notification emitted by an
     /// agent (its `notify_user` tool / `@notify:` message prefix).
@@ -2711,6 +2755,36 @@ mod tests {
             },
             Frame::WakeDeleteOk {
                 req_id: "r15".into(),
+            },
+            Frame::SandboxPackages {
+                req_id: "r16".into(),
+                agent_id: "agent-1".into(),
+            },
+            Frame::SandboxPackagesOk {
+                req_id: "r16".into(),
+                data: serde_json::json!({
+                    "base_ready": true,
+                    "approver": {"id": "ea-1", "name": "executive assistant"},
+                    "pending": [{"id": "p1", "package": "nodejs", "reason": "tests"}],
+                }),
+            },
+            Frame::SandboxDecide {
+                req_id: "r17".into(),
+                request_id: "p1".into(),
+                approve: true,
+                reason: None,
+            },
+            Frame::SandboxDecideOk {
+                req_id: "r17".into(),
+                data: serde_json::json!({"ok": true, "status": "approved", "package": "nodejs"}),
+            },
+            Frame::SandboxReset {
+                req_id: "r18".into(),
+                agent_id: "agent-1".into(),
+            },
+            Frame::SandboxResetOk {
+                req_id: "r18".into(),
+                rootfs_removed: 2,
             },
         ];
         for f in frames {

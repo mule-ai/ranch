@@ -5441,6 +5441,107 @@ impl Daemon {
             Frame::WakeDelete { req_id, wake_id } => {
                 self.handle_wake(from, req_id.clone(), WakeOp::Delete(wake_id.clone()));
             }
+            // ----- sandbox package governance (2026-10-18) -----
+            // Forge-proxied (same inline-HTTP pattern as the wake ops;
+            // the daemon key is a USER credential, so phone decisions
+            // land as decided_by:"user").
+            Frame::SandboxPackages { req_id, agent_id } => {
+                let Some(forge_cfg) = forge::load_forge_config() else {
+                    self.reply_to(
+                        from,
+                        &Frame::Error {
+                            req_id: Some(req_id.clone()),
+                            message: "forge not configured (set forge_api_key in daemon.toml)"
+                                .into(),
+                        },
+                    );
+                    return;
+                };
+                match crate::agents_new::sandbox_packages(&forge_cfg, agent_id) {
+                    Ok(data) => self.reply_to(
+                        from,
+                        &Frame::SandboxPackagesOk {
+                            req_id: req_id.clone(),
+                            data,
+                        },
+                    ),
+                    Err(e) => self.reply_to(
+                        from,
+                        &Frame::Error {
+                            req_id: Some(req_id.clone()),
+                            message: e,
+                        },
+                    ),
+                }
+            }
+            Frame::SandboxDecide {
+                req_id,
+                request_id,
+                approve,
+                reason,
+            } => {
+                let Some(forge_cfg) = forge::load_forge_config() else {
+                    self.reply_to(
+                        from,
+                        &Frame::Error {
+                            req_id: Some(req_id.clone()),
+                            message: "forge not configured (set forge_api_key in daemon.toml)"
+                                .into(),
+                        },
+                    );
+                    return;
+                };
+                match crate::agents_new::sandbox_decide(
+                    &forge_cfg,
+                    request_id,
+                    *approve,
+                    reason.as_deref(),
+                ) {
+                    Ok(data) => self.reply_to(
+                        from,
+                        &Frame::SandboxDecideOk {
+                            req_id: req_id.clone(),
+                            data,
+                        },
+                    ),
+                    Err(e) => self.reply_to(
+                        from,
+                        &Frame::Error {
+                            req_id: Some(req_id.clone()),
+                            message: e,
+                        },
+                    ),
+                }
+            }
+            Frame::SandboxReset { req_id, agent_id } => {
+                let Some(forge_cfg) = forge::load_forge_config() else {
+                    self.reply_to(
+                        from,
+                        &Frame::Error {
+                            req_id: Some(req_id.clone()),
+                            message: "forge not configured (set forge_api_key in daemon.toml)"
+                                .into(),
+                        },
+                    );
+                    return;
+                };
+                match crate::agents_new::sandbox_reset(&forge_cfg, agent_id) {
+                    Ok(n) => self.reply_to(
+                        from,
+                        &Frame::SandboxResetOk {
+                            req_id: req_id.clone(),
+                            rootfs_removed: n,
+                        },
+                    ),
+                    Err(e) => self.reply_to(
+                        from,
+                        &Frame::Error {
+                            req_id: Some(req_id.clone()),
+                            message: e,
+                        },
+                    ),
+                }
+            }
             Frame::AgentTalk {
                 req_id,
                 agent,

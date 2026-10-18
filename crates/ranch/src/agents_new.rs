@@ -1577,3 +1577,226 @@ mod tests {
         );
     }
 }
+
+// ---------- sandbox package governance (2026-10-18) ----------
+//
+// The mobile agent editor's Sandbox section + `ranch sandbox` CLI
+// proxy these through the daemon (Sandbox* frames -> these calls ->
+// forge api/sandbox_pkgs.rs). The daemon holds a USER key, so phone
+// decisions land as decided_by:"user" on the forge side.
+
+/// Ids interpolate into URL paths — keep them strictly uuid-shaped.
+fn uuid_shaped(s: &str) -> bool {
+    s.len() == 36
+        && s.chars()
+            .enumerate()
+            .all(|(i, c)| if matches!(i, 8 | 13 | 18 | 23) { c == '-' } else { c.is_ascii_hexdigit() })
+}
+
+pub fn sandbox_packages(cfg: &ForgeConfig, agent_id: &str) -> Result<Value, String> {
+    if !uuid_shaped(agent_id) {
+        return Err("agent_id must be a uuid".into());
+    }
+    forge_req(
+        cfg,
+        "GET",
+        &format!("/agents/{agent_id}/sandbox/packages"),
+        None,
+    )
+}
+
+pub fn sandbox_decide(
+    cfg: &ForgeConfig,
+    request_id: &str,
+    approve: bool,
+    reason: Option<&str>,
+) -> Result<Value, String> {
+    if !uuid_shaped(request_id) {
+        return Err("request_id must be a uuid".into());
+    }
+    let body = serde_json::json!({
+        "decision": if approve { "approve" } else { "reject" },
+        "reason": reason,
+    });
+    forge_req(
+        cfg,
+        "POST",
+        &format!("/sandbox/requests/{request_id}/decision"),
+        Some(&body),
+    )
+}
+
+pub fn sandbox_reset(cfg: &ForgeConfig, agent_id: &str) -> Result<u64, String> {
+    if !uuid_shaped(agent_id) {
+        return Err("agent_id must be a uuid".into());
+    }
+    let v = forge_req(
+        cfg,
+        "POST",
+        &format!("/agents/{agent_id}/sandbox/reset"),
+        None,
+    )?;
+    Ok(v.get("rootfs_removed")
+        .and_then(Value::as_u64)
+        .unwrap_or(0))
+}
+
+#[cfg(test)]
+mod sandbox_gov_tests {
+    use super::*;
+
+    #[test]
+    fn uuid_shaped_gate() {
+        assert!(uuid_shaped("67d61b63-4970-4fb2-8aaa-f18da08e27c2"));
+        assert!(!uuid_shaped("../../etc/passwd"));
+        assert!(!uuid_shaped("67d61b63-4970-4fb2-8aaa-f18da08e27c"));
+        assert!(!uuid_shaped("67d61b63-4970-4fb2-8aaa-f18da08e27cz"));
+    }
+}
+
+// ---------- `ranch sandbox` CLI (TUI-surface parity, 2026-10-18) ----------
+
+/// Entry for `ranch sandbox <agent> [subcommand]` — the terminal twin
+/// of the mobile Sandbox section. Talks forge directly (USER key),
+/// same calls the Sandbox* daemon frames proxy.
+pub fn run_sandbox(args: &[String]) {
+    let Some(target) = args.first().map(|s| s.trim()).filter(|s| !s.is_empty()) else {
+        die("usage: ranch sandbox <name-or-id> [list | approve <req-id> | \
+             reject <req-id> [reason…] | reset | request <pkg> [pkg…] [--reason <why>]]");
+    };
+    if matches!(target, "help" | "--help" | "-h") {
+        println!(
+            "usage: ranch sandbox <name-or-id> [subcommand]\n\
+             \n\
+             (no subcommand or `list') show the agent's sandbox package queue\n\
+             \tapprove <request-id>          approve a pending request (persistent install)\n\
+             \treject <request-id> [reason]  reject a pending request\n\
+             \treset                         wipe rootfs trees (keep files; reinstall approved)\n\
+             \trequest <pkg> [pkg…] [--reason <why>]   ask the approver on the agent's behalf"
+        );
+        return;
+    }
+    let cfg = load_forge_config().unwrap_or_else(|| {
+        die("no forge config (set forge_api_key [+ forge_url] in \
+             ~/.config/ranch/daemon.toml — see `ranch register`)")
+    });
+    let agent_id = match resolve_agent_id(&cfg, target) {
+        Ok(id) => id,
+        Err(e) => die(&e),
+    };
+    let name = get_agent(&cfg, &agent_id)
+        .map(|a| a.name)
+        .unwrap_or_else(|_| agent_id.clone());
+    let sub = args.get(1).map(|s| s.as_str()).unwrap_or("list");
+    match sub {
+        "list" => {
+            let data = match sandbox_packages(&cfg, &agent_id) {
+                Ok(v) => v,
+                Err(e) => die(&e),
+            };
+            println!("sandbox for {name}  (base ready: {})",
+                data.get("base_ready").and_then(Value::as_bool).unwrap_or(false));
+            if let Some(appr) = data.get("approver").filter(|v| !v.is_null()) {
+                println!("  approver: {}", appr.get("name").and_then(Value::as_str).unwrap_or("?"));
+            }
+            for (bucket, label) in [
+                ("pending", "PENDING"),
+                ("approved", "APPROVED (installing)"),
+                ("installed", "INSTALLED"),
+                ("rejected", "REJECTED"),
+            ] {
+                let Some(rows) = data.get(bucket).and_then(Value::as_array) else { continue };
+                if rows.is_empty() { continue; }
+                println!("  {label}:");
+                for r in rows {
+                    let id = r.get("id").and_then(Value::as_str).unwrap_or("?");
+                    let pkg = r.get("package").and_then(Value::as_str).unwrap_or("?");
+                    let why = r.get("reason").and_then(Value::as_str).unwrap_or("");
+                    let dec = r.get("decided_by").and_then(Value::as_str).unwrap_or("");
+                    let err = r.get("install_error").and_then(Value::as_str).unwrap_or("");
+                    println!("    {id}  {pkg:<24} {why}{}{}",
+                        if dec.is_empty() { String::new() } else { format!(" [{dec}]") },
+                        if err.is_empty() { String::new() } else { format!(" ! {}", err.chars().take(60).collect::<String>()) });
+                }
+            }
+            let empty = ["pending", "approved", "installed", "rejected"]
+                .iter()
+                .all(|k| data.get(*k).and_then(Value::as_array).is_none_or(|a| a.is_empty()));
+            if empty {
+                println!("  (no packages beyond the base image — the agent can ask for more \
+                         with request_sandbox_packages)");
+            }
+        }
+        "approve" | "reject" => {
+            let Some(rid) = args.get(2) else {
+                die(&format!("{sub} needs a <request-id> (see `ranch sandbox {name} list`)"));
+            };
+            let reason = if sub == "reject" {
+                let r: Vec<&str> = args[3..].iter().map(|s| s.as_str()).collect();
+                if r.is_empty() { None } else { Some(r.join(" ")) }
+            } else { None };
+            match sandbox_decide(&cfg, rid, sub == "approve", reason.as_deref()) {
+                Ok(v) => println!(
+                    "{} `{}`",
+                    if sub == "approve" { "Approved" } else { "Rejected" },
+                    v.get("package").and_then(Value::as_str).unwrap_or("?")
+                ),
+                Err(e) => die(&e),
+            }
+        }
+        "reset" => match sandbox_reset(&cfg, &agent_id) {
+            Ok(n) => println!("reset {name}: {n} rootfs tree(s) removed \
+                              (next bash re-copies a clean base + reinstalls approved packages)"),
+            Err(e) => die(&e),
+        }
+        "request" => {
+            let rest = &args[2..];
+            let mut pkgs: Vec<String> = Vec::new();
+            let mut reason: Option<String> = None;
+            let mut i = 0;
+            while i < rest.len() {
+                if rest[i] == "--reason" {
+                    reason = rest.get(i + 1).cloned();
+                    i += 2;
+                } else {
+                    pkgs.push(rest[i].to_ascii_lowercase());
+                    i += 1;
+                }
+            }
+            if pkgs.is_empty() {
+                die("request needs at least one package name");
+            }
+            // User-side request: forge accepts it directly (the user
+            // credential bypasses the pending queue only via their own
+            // decision — same flow, still approvable on the phone).
+            let body = serde_json::json!({ "packages": pkgs, "reason": reason });
+            match forge_req(&cfg, "POST", &format!("/agents/{agent_id}/sandbox/requests"), Some(&body)) {
+                Ok(v) => {
+                    let req = v.get("requested").and_then(Value::as_array);
+                    let skp = v.get("skipped").and_then(Value::as_array);
+                    if let Some(rows) = req {
+                        for r in rows {
+                            println!(
+                                "requested `{}` (request {})",
+                                r.get("package").and_then(Value::as_str).unwrap_or("?"),
+                                r.get("id").and_then(Value::as_str).unwrap_or("?")
+                            );
+                        }
+                    }
+                    if let Some(rows) = skp {
+                        for r in rows {
+                            println!(
+                                "skipped `{}`: {}",
+                                r.get("package").and_then(Value::as_str).unwrap_or("?"),
+                                r.get("why").and_then(Value::as_str).unwrap_or("?")
+                            );
+                        }
+                    }
+                }
+                Err(e) => die(&e),
+            }
+        }
+        other => die(&format!("unknown subcommand 'sandbox … {other}' \
+                     (try: list, approve, reject, reset, request)")),
+    }
+}

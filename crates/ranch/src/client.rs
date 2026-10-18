@@ -7200,6 +7200,7 @@ pub fn main_client() {
         // ranch agents new — Herd H6.5 specialist-dot provisioning
         // wizard (forge agent row + optional mule cron wake).
         "agents" => crate::agents_new::run(&args[1..]),
+        "sandbox" => crate::agents_new::run_sandbox(&args[1..]),
         "ls" | "list" => cmd_ls(),
         "--version" | "version" => {
             println!("ranch {}", crate::daemon::build_version());
