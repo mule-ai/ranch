@@ -1800,3 +1800,24 @@ pub fn run_sandbox(args: &[String]) {
                      (try: list, approve, reject, reset, request)")),
     }
 }
+
+pub fn sandbox_request(
+    cfg: &ForgeConfig,
+    agent_id: &str,
+    packages: &[String],
+    reason: Option<&str>,
+) -> Result<Value, String> {
+    if !uuid_shaped(agent_id) {
+        return Err("agent_id must be a uuid".into());
+    }
+    if packages.is_empty() || packages.len() > 10 {
+        return Err("packages must hold 1-10 names".into());
+    }
+    let body = serde_json::json!({ "packages": packages, "reason": reason });
+    forge_req(
+        cfg,
+        "POST",
+        &format!("/agents/{agent_id}/sandbox/requests"),
+        Some(&body),
+    )
+}

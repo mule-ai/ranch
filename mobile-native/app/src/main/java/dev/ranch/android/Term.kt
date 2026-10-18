@@ -518,6 +518,45 @@ object Term {
         JSONObject().put("t", "WakeDelete").put("id", newId()).put("client", CLIENT)
             .put("req_id", reqId).put("wake_id", wakeId)
 
+    /** Sandbox package governance (2026-10-18) — the agent editor's
+     *  Sandbox section: queue read, approve/reject taps, user-side
+     *  package request, and the rootfs reinstall. Daemon proxies all
+     *  of these to forge (api/sandbox_pkgs.rs). */
+    fun sandboxPackages(agentId: String, reqId: String = "sp-" + newId()): JSONObject =
+        JSONObject().put("t", "SandboxPackages").put("id", newId()).put("client", CLIENT)
+            .put("req_id", reqId).put("agent_id", agentId)
+
+    fun sandboxDecide(
+        requestId: String,
+        approve: Boolean,
+        reason: String? = null,
+        reqId: String = "sd-" + newId(),
+    ): JSONObject {
+        val o = JSONObject()
+            .put("t", "SandboxDecide").put("id", newId()).put("client", CLIENT)
+            .put("req_id", reqId).put("request_id", requestId).put("approve", approve)
+        if (!reason.isNullOrEmpty()) o.put("reason", reason)
+        return o
+    }
+
+    fun sandboxRequest(
+        agentId: String,
+        packages: List<String>,
+        reason: String? = null,
+        reqId: String = "sq-" + newId(),
+    ): JSONObject {
+        val o = JSONObject()
+            .put("t", "SandboxRequest").put("id", newId()).put("client", CLIENT)
+            .put("req_id", reqId).put("agent_id", agentId)
+            .put("packages", JSONArray(packages))
+        if (!reason.isNullOrEmpty()) o.put("reason", reason)
+        return o
+    }
+
+    fun sandboxReset(agentId: String, reqId: String = "sr-" + newId()): JSONObject =
+        JSONObject().put("t", "SandboxReset").put("id", newId()).put("client", CLIENT)
+            .put("req_id", reqId).put("agent_id", agentId)
+
     /** One row of the Activity View (Herd H5.3) — mirrors
      *  `ranch_protocol::ActivityItem`. [agent] is the registry name;
      *  null = machine-wide item (local ask/spawn/trigger/mule_job). */

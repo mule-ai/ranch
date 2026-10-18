@@ -5513,6 +5513,45 @@ impl Daemon {
                     ),
                 }
             }
+                        Frame::SandboxRequest {
+                req_id,
+                agent_id,
+                packages,
+                reason,
+            } => {
+                let Some(forge_cfg) = forge::load_forge_config() else {
+                    self.reply_to(
+                        from,
+                        &Frame::Error {
+                            req_id: Some(req_id.clone()),
+                            message: "forge not configured (set forge_api_key in daemon.toml)"
+                                .into(),
+                        },
+                    );
+                    return;
+                };
+                match crate::agents_new::sandbox_request(
+                    &forge_cfg,
+                    agent_id,
+                    packages,
+                    reason.as_deref(),
+                ) {
+                    Ok(data) => self.reply_to(
+                        from,
+                        &Frame::SandboxRequestOk {
+                            req_id: req_id.clone(),
+                            data,
+                        },
+                    ),
+                    Err(e) => self.reply_to(
+                        from,
+                        &Frame::Error {
+                            req_id: Some(req_id.clone()),
+                            message: e,
+                        },
+                    ),
+                }
+            }
             Frame::SandboxReset { req_id, agent_id } => {
                 let Some(forge_cfg) = forge::load_forge_config() else {
                     self.reply_to(

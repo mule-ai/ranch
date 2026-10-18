@@ -57,6 +57,7 @@ class EditAgentActivity : Activity() {
     private lateinit var status: TextView
     private lateinit var form: LinearLayout
     private lateinit var wakeBox: LinearLayout
+    private lateinit var sandboxBox: LinearLayout
     private lateinit var saveBtn: Button
     private lateinit var profileChip: Button
 
@@ -206,6 +207,39 @@ class EditAgentActivity : Activity() {
                     setPadding(0, dp(4), 0, dp(4))
                     setOnClickListener { showWakeForm(null) }
                 })
+                // ---- sandbox packages (forge governance, 2026-10-18) ----
+                addView(AgentForm.label(this@EditAgentActivity, "sandbox packages (forge)", 14))
+                sandboxBox = LinearLayout(this@EditAgentActivity).apply {
+                    orientation = LinearLayout.VERTICAL
+                }
+                addView(sandboxBox)
+                val sbBtns = LinearLayout(this@EditAgentActivity).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                }
+                sbBtns.addView(Button(this@EditAgentActivity).apply {
+                    text = "＋ request package"
+                    isAllCaps = false; setTextColor(0xFF7FD4FF.toInt())
+                    setPadding(dp(8), 0, dp(8), 0)
+                    setOnClickListener { showPackageRequestForm() }
+                })
+                sbBtns.addView(Button(this@EditAgentActivity).apply {
+                    text = "reinstall sandbox"
+                    isAllCaps = false; setTextColor(0xFF6B7280.toInt())
+                    setPadding(dp(8), 0, dp(8), 0)
+                    setOnClickListener {
+                        android.app.AlertDialog.Builder(this@EditAgentActivity)
+                            .setTitle("Reinstall sandbox")
+                            .setMessage("Wipe the agent's Debian trees? Its files are kept; " +
+                                "approved packages reinstall automatically on the next bash run.")
+                            .setPositiveButton("reinstall") { _, _ ->
+                                relay?.send(Term.sandboxReset(agent.id))
+                                flash("reinstalling sandbox…")
+                            }
+                            .setNegativeButton("cancel", null)
+                            .show()
+                    }
+                })
+                addView(sbBtns)
             })
         }, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
@@ -230,6 +264,7 @@ class EditAgentActivity : Activity() {
         r.send(Term.modelCatalog())
         r.send(Term.agentList())        // refresh our row (paused state, columns)
         r.send(Term.wakeList(agent.id))
+        r.send(Term.sandboxPackages(agent.id))
     }
 
     override fun onDestroy() {
@@ -338,6 +373,23 @@ class EditAgentActivity : Activity() {
                 flash("wake deleted", green = true)
                 relay?.send(Term.wakeList(agent.id))
             }
+            "SandboxPackagesOk" -> renderSandbox(f.optJSONObject("data") ?: JSONObject())
+            "SandboxDecideOk" -> {
+                val pkg = f.optJSONObject("data")?.optString("package", "?") ?: "?"
+                flash(if (f.optJSONObject("data")?.optString("status") == "approved")
+                    "approved $pkg — installing" else "rejected $pkg", green = true)
+                relay?.send(Term.sandboxPackages(agent.id))
+            }
+            "SandboxRequestOk" -> {
+                val n = f.optJSONObject("data")?.optJSONArray("requested")?.length() ?: 0
+                flash(if (n > 0) "requested $n package(s) — the approver has been notified"
+                     else "nothing requested (already pending?)", green = n > 0)
+                relay?.send(Term.sandboxPackages(agent.id))
+            }
+            "SandboxResetOk" -> {
+                flash("sandbox reinstalled", green = true)
+                relay?.send(Term.sandboxPackages(agent.id))
+            }
             "Error" -> {
                 val rid = f.optString("req_id")
                 val msg = f.optString("message", "error")
@@ -346,6 +398,10 @@ class EditAgentActivity : Activity() {
                     rid.startsWith("wk-") || rid.startsWith("wp-") || rid.startsWith("wd-") ->
                         flash("wake: $msg")
                     rid.startsWith("wl-") -> renderWakes(emptyList(), "no wakes (mule down?)")
+                    rid.startsWith("sp-") -> renderSandboxUnavailable("forge down?")
+                    rid.startsWith("sd-") -> flash("decision failed: $msg")
+                    rid.startsWith("sq-") -> flash("request failed: $msg")
+                    rid.startsWith("sr-") -> flash("reinstall failed: $msg")
                     rid.startsWith("pp-") -> flash("profile save failed: $msg")
                     rid.startsWith("al-") -> { /* registry refresh is silent */ }
                 }
@@ -471,6 +527,152 @@ class EditAgentActivity : Activity() {
                     )
                 )
                 flash(if (w == null) "creating wake…" else "saving wake…")
+            }
+            .setNegativeButton("cancel", null)
+            .create()
+            .show()
+    }
+
+    // ---- sandbox package rows ----
+
+    private fun renderSandboxUnavailable(msg: String) {
+        sandboxBox.removeAllViews()
+        sandboxBox.addView(TextView(this).apply {
+            text = msg; setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            setTextColor(0xFF6b7280.toInt()); setPadding(0, dp(4), 0, dp(4))
+        })
+    }
+
+    /** One bucket row set of forge's sandbox payload. Pending rows get
+     *  the approve/reject doors (user decisions land as decided_by:
+     *  "user" — same authority as the approver agent, so the human
+     *  can always overrule from the phone). */
+    private fun renderSandbox(data: JSONObject) {
+        sandboxBox.removeAllViews()
+        val approver = data.optJSONObject("approver")?.optString("name", "") ?: ""
+        sandboxBox.addView(TextView(this).apply {
+            text = "base ready: ${data.optBoolean("base_ready", false)}" +
+                if (approver.isNotEmpty()) "  · approver: $approver" else "  · approver: none — you decide"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            setTextColor(0xFF6b7280.toInt())
+            setPadding(0, dp(4), 0, dp(2))
+        })
+        var any = false
+        for ((bucket, label) in listOf(
+            "pending" to "PENDING",
+            "approved" to "installing",
+            "installed" to "installed",
+            "rejected" to "rejected",
+        )) {
+            val arr = data.optJSONArray(bucket) ?: continue
+            if (arr.length() == 0) continue
+            any = true
+            sandboxBox.addView(TextView(this).apply {
+                text = label
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+                setTextColor(0xFF9aa0a6.toInt())
+                setPadding(0, dp(6), 0, 0)
+            })
+            for (i in 0 until arr.length()) {
+                val r = arr.optJSONObject(i) ?: continue
+                val id = r.optString("id")
+                val pkg = r.optString("package")
+                val why = r.optString("reason", "")
+                val dec = r.optString("decided_by", "")
+                val row = LinearLayout(this).apply {
+                    orientation = LinearLayout.VERTICAL
+                    setPadding(0, dp(4), 0, dp(4))
+                }
+                row.addView(TextView(this).apply {
+                    text = "📦 $pkg" + if (why.isNotEmpty()) "  · ${why.take(80)}" else ""
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+                    setTextColor(if (bucket == "rejected") 0xFF6b7280.toInt() else 0xFFE5E5E5.toInt())
+                })
+                val meta = buildString {
+                    if (dec.isNotEmpty()) append("by $dec  ")
+                    if (bucket == "pending") append("asked ${r.optString("created_at", "").take(16)}")
+                    if (bucket == "installed" || bucket == "approved")
+                        r.optString("install_error", "").takeIf { it.isNotEmpty() }?.let {
+                            append("⚠ install failed: ${it.take(70)}")
+                        }
+                }
+                if (meta.isNotEmpty()) row.addView(TextView(this).apply {
+                    text = meta.trim()
+                    setTextSize(TypedValue.COMPLEX_UNIT_SP, 10f)
+                    setTextColor(0xFF6b7280.toInt())
+                })
+                if (bucket == "pending" && id.isNotEmpty()) {
+                    val btns = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+                    btns.addView(Button(this).apply {
+                        text = "✓ approve"; isAllCaps = false
+                        setTextColor(0xFF34d399.toInt()); setPadding(dp(8), 0, dp(8), 0)
+                        setOnClickListener {
+                            relay?.send(Term.sandboxDecide(id, true))
+                            flash("approving $pkg…")
+                        }
+                    })
+                    btns.addView(Button(this).apply {
+                        text = "✕ reject"; isAllCaps = false
+                        setTextColor(0xFFF87171.toInt()); setPadding(dp(8), 0, dp(8), 0)
+                        setOnClickListener {
+                            val input = EditText(this@EditAgentActivity).apply {
+                                hint = "reason (the agent is told this)"
+                                setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+                            }
+                            android.app.AlertDialog.Builder(this@EditAgentActivity)
+                                .setTitle("Reject $pkg")
+                                .setView(input)
+                                .setPositiveButton("reject") { _, _ ->
+                                    relay?.send(
+                                        Term.sandboxDecide(
+                                            id, false,
+                                            input.text.toString().trim().ifEmpty { null },
+                                        )
+                                    )
+                                    flash("rejecting $pkg…")
+                                }
+                                .setNegativeButton("cancel", null)
+                                .show()
+                        }
+                    })
+                    row.addView(btns)
+                }
+                sandboxBox.addView(row)
+            }
+        }
+        if (!any) sandboxBox.addView(TextView(this).apply {
+            text = "base image only — agents ask via request_sandbox_packages, or tap ＋"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            setTextColor(0xFF6b7280.toInt()); setPadding(0, dp(4), 0, dp(4))
+        })
+    }
+
+    /** User-side package request (comma/space separated names). Lands
+     *  as a normal pending request — the approver chain stays intact
+     *  even when you provision it yourself. */
+    private fun showPackageRequestForm() {
+        val body = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(8), dp(8), dp(8), dp(8))
+        }
+        val pkgs = AgentForm.field(this, body, "packages (space or comma separated)", "jq, htop")
+        val reason = AgentForm.field(this, body, "reason (shown to the approver)", "needed for…", multiline = true)
+        android.app.AlertDialog.Builder(this)
+            .setTitle("Request sandbox packages")
+            .setView(body)
+            .setPositiveButton("request") { _, _ ->
+                val list = pkgs.text.toString()
+                    .split(Regex("[\\s,]+"))
+                    .map { it.trim().lowercase() }
+                    .filter { it.isNotEmpty() }
+                if (list.isEmpty()) { flash("name at least one package"); return@setPositiveButton }
+                relay?.send(
+                    Term.sandboxRequest(
+                        agent.id, list,
+                        reason.text.toString().trim().ifEmpty { null },
+                    )
+                )
+                flash("requesting ${list.joinToString(", ")}…")
             }
             .setNegativeButton("cancel", null)
             .create()

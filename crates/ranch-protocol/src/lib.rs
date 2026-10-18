@@ -1205,6 +1205,23 @@ pub enum Frame {
         req_id: String,
         agent_id: String,
     },
+    /// Client -> daemon: the USER asks for packages on an agent's
+    /// behalf (the editor's ＋ button). Lands as a normal pending
+    /// request (`requested_by: "user"`) — still EA-approvable, so the
+    /// audit chain is identical.
+    SandboxRequest {
+        req_id: String,
+        agent_id: String,
+        packages: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    /// Daemon -> client: `{requested:[{id,package,status}], skipped:
+    /// [{package,why}]}` verbatim from forge.
+    SandboxRequestOk {
+        req_id: String,
+        data: Value,
+    },
     /// Daemon -> client: how many rootfs trees were removed.
     SandboxResetOk {
         req_id: String,
@@ -2785,6 +2802,16 @@ mod tests {
             Frame::SandboxResetOk {
                 req_id: "r18".into(),
                 rootfs_removed: 2,
+            },
+            Frame::SandboxRequest {
+                req_id: "r19".into(),
+                agent_id: "agent-1".into(),
+                packages: vec!["nodejs".into(), "jq".into()],
+                reason: Some("run the test suite".into()),
+            },
+            Frame::SandboxRequestOk {
+                req_id: "r19".into(),
+                data: serde_json::json!({"requested": [{"id": "p1", "package": "nodejs"}]}),
             },
         ];
         for f in frames {
