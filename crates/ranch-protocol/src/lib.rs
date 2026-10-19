@@ -1288,6 +1288,12 @@ pub enum Frame {
     /// agent (its `notify_user` tool / `@notify:` message prefix).
     /// Clients post this as a notification regardless of background
     /// suppression; `priority` is "high" | "normal" | "quiet".
+    /// `seq` is the forge message-row sequence of the `@notify:` row
+    /// that spawned the frame — clients MUST dedupe on
+    /// (session/pane, seq) so SSE catch-up replays of the row do not
+    /// re-post the notification (mobile bug 2026-10-19: every
+    /// conversation open re-pinged the whole @notify: backlog because
+    /// the frame carried no identity at all).
     AgentNotify {
         session: String,
         pane: String,
@@ -1295,6 +1301,8 @@ pub enum Frame {
         message: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         priority: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        seq: Option<i64>,
     },
     // ----- triggers (Phase D) -----
     /// Client -> daemon: list trigger definitions + last runs.
