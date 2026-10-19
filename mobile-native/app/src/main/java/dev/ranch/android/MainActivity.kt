@@ -43,6 +43,15 @@ class MainActivity : Activity() {
     private lateinit var bannerBox: LinearLayout
     private var sessionsBox: LinearLayout? = null
     private var homeStatus: TextView? = null
+    // Herd-on-home (2026-10-19): the registry lives right on the main
+    // screen — before, finding your agents meant digging through
+    // sessions (which include one-off chats) or the Settings tools
+    // drawer. Rows come from AgentListOk (forge registry via the
+    // monitored daemon); tap = AgentTalk{continue}.
+    private var herdBox: LinearLayout? = null
+    private val herdAgents = ArrayList<Term.AgentInfo>()
+    /** AgentTalk req_id -> agent name while a row tap is in flight. */
+    private val pendingHerdTalk = HashMap<String, String>()
     private var monitorWanted = false
     private val machines = mutableListOf<Machine>()
     private var update: Version.Update? = null
@@ -418,6 +427,35 @@ class MainActivity : Activity() {
         }
         stateBox.addView(homeStatus)
 
+        // ---- Herd (forge registry) — first thing on the main screen ----
+        val herdHead = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
+        }
+        herdHead.addView(TextView(this).apply {
+            text = "Herd"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+            setTextColor(0xFF7FD4FF.toInt())
+            setPadding(0, dp(12), 0, dp(4))
+        }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        herdHead.addView(Button(this).apply {
+            text = "activity"; setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            setTextColor(0xFF4ade80.toInt())
+            setPadding(dp(6), 0, dp(6), 0)
+            setOnClickListener { startActivity(Intent(this@MainActivity, HerdActivity::class.java)) }
+        })
+        herdHead.addView(Button(this).apply {
+            text = "manage"; setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            setTextColor(0xFF7FD4FF.toInt())
+            setPadding(dp(6), 0, dp(6), 0)
+            setOnClickListener { startActivity(Intent(this@MainActivity, AgentsActivity::class.java)) }
+        })
+        stateBox.addView(herdHead)
+        val hBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        herdBox = hBox
+        stateBox.addView(hBox)
+        renderHerd()
+        Monitor.relay?.send(Term.agentList())
+
         stateBox.addView(TextView(this).apply {
             text = "Sessions"
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
@@ -494,6 +532,170 @@ class MainActivity : Activity() {
     private fun abbrevPath(p: String): String =
         if (p.length <= 33) p else "…" + p.takeLast(33)
 
+    // ---- Herd section (2026-10-19) ----
+
+    /** Registry rows on the home screen. Tap opens the agent's
+     *  most-active conversation (AgentTalk continue); the 📞/✎ buttons
+     *  dial and edit; long-press offers pause/resume (the H5.3 kill
+     *  switch, per agent). Newest-activity-first (AgentListOk sort). */
+    private fun renderHerd() {
+        val box = herdBox ?: return
+        box.removeAllViews()
+        if (herdAgents.isEmpty()) {
+            box.addView(TextView(this).apply {
+                text = "no agents in the herd yet — provision one, or start a one-off chat below"
+                setTextColor(0xFF6b7280.toInt())
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+                setPadding(dp(4), dp(4), 0, dp(4))
+            })
+            box.addView(Button(this).apply {
+                text = "＋ provision herd agent"
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+                setOnClickListener {
+                    startActivity(Intent(this@MainActivity, NewAgentActivity::class.java))
+                }
+            })
+            return
+        }
+        for (a in herdAgents) box.addView(herdRow(a))
+    }
+
+    private fun herdRow(a: Term.AgentInfo): LinearLayout {
+        val paused = a.paused == true
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(6), dp(8), dp(6), dp(8))
+            setOnClickListener { openHerdAgent(a) }
+            setOnLongClickListener {
+                val openAct: () -> Unit = { openHerdAgent(a) }
+                val pauseAct: () -> Unit = {
+                    Monitor.relay?.send(Term.agentPause(a.name, !paused, "hp-" + Term.newId()))
+                    homeStatus?.text = if (paused) "resuming ${a.name}…" else "pausing ${a.name}…"
+                }
+                val editAct: () -> Unit = {
+                    startActivity(Intent(this@MainActivity, EditAgentActivity::class.java)
+                        .putExtra(EditAgentActivity.EXTRA_AGENT, herdRowJson(a).toString()))
+                }
+                val callAct: () -> Unit = {
+                    startActivity(Intent(this@MainActivity, CallActivity::class.java)
+                        .putExtra(CallActivity.EXTRA_AGENT_ID, a.id)
+                        .putExtra(CallActivity.EXTRA_AGENT_NAME, a.name))
+                }
+                val actions = listOf(
+                    "open chat" to openAct,
+                    (if (paused) "resume" else "pause") to pauseAct,
+                    "edit" to editAct,
+                    "call" to callAct,
+                )
+                android.app.AlertDialog.Builder(this@MainActivity)
+                    .setTitle(a.name.ifEmpty { a.id.take(8) })
+                    .setItems(actions.map { it.first }.toTypedArray()) { _, i -> actions[i].second() }
+                    .show()
+                true
+            }
+        }
+        val initial = (a.avatarUrl?.lastOrNull { it.isLetterOrDigit() } ?: '?').toString().uppercase()
+        val tint = Math.abs((a.name + a.id).hashCode() % 0xFFFFFF).toInt().or(0xFF304050.toInt())
+        row.addView(TextView(this).apply {
+            text = initial
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+            setTextColor(0xFFFFFFFF.toInt())
+            gravity = Gravity.CENTER
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL; setColor(tint)
+            }
+            layoutParams = LinearLayout.LayoutParams(dp(36), dp(36))
+        })
+        val mid = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(10), 0, dp(10), 0)
+        }
+        mid.addView(TextView(this).apply {
+            text = (if (paused) "⏸ " else "") + a.name.ifEmpty { a.id.take(8) }
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+            setTextColor(if (paused) 0xFF6b7280.toInt() else 0xFFE5E5E5.toInt())
+        })
+        val sub = StringBuilder()
+        a.homeMachine?.let { sub.append("on ").append(if (it.length <= 18) it else "…" + it.takeLast(18)) }
+        a.conversationCount?.let { sub.append(" · ").append(it).append(" conv") }
+        a.lastActive?.let {
+            if (sub.isNotEmpty()) sub.append(" · ")
+            sub.append("last ").append(herdAgo(it))
+        }
+        if (sub.isNotEmpty()) mid.addView(TextView(this).apply {
+            text = sub.toString()
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            setTextColor(0xFF6b7280.toInt())
+        })
+        row.addView(mid, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        row.addView(Button(this).apply {
+            text = "📞"; setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+            minWidth = dp(40); minimumWidth = dp(40); minHeight = dp(40)
+            setPadding(dp(6), 0, dp(6), 0)
+            setOnClickListener {
+                startActivity(Intent(this@MainActivity, CallActivity::class.java)
+                    .putExtra(CallActivity.EXTRA_AGENT_ID, a.id)
+                    .putExtra(CallActivity.EXTRA_AGENT_NAME, a.name))
+            }
+        })
+        row.addView(Button(this).apply {
+            text = "✎"; setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+            setTextColor(0xFF7FD4FF.toInt())
+            minWidth = dp(40); minimumWidth = dp(40); minHeight = dp(40)
+            setPadding(dp(6), 0, dp(6), 0)
+            setOnClickListener {
+                startActivity(Intent(this@MainActivity, EditAgentActivity::class.java)
+                    .putExtra(EditAgentActivity.EXTRA_AGENT, herdRowJson(a).toString()))
+            }
+        })
+        return row
+    }
+
+    private fun openHerdAgent(a: Term.AgentInfo) {
+        val frame = Term.agentTalk(a.id, "continue", "at-" + Term.newId())
+        pendingHerdTalk[frame.getString("req_id")] = a.name.ifEmpty { a.id.take(8) }
+        Monitor.relay?.send(frame)
+        homeStatus?.text = "opening ${a.name.ifEmpty { a.id.take(8) }}…"
+    }
+
+    /** RFC3339 -> "3m ago" / "5h ago" / "11-19 14:02" (best-effort,
+     *  no parsing libs on this screen). */
+    private fun herdAgo(ts: String): String {
+        if (ts.length < 16 || ts[10] != 'T') return ts.take(16)
+        return try {
+            val then = java.time.OffsetDateTime.parse(ts)
+            val mins = java.time.Duration.between(then, java.time.OffsetDateTime.now()).toMinutes()
+            when {
+                mins < 1 -> "just now"
+                mins < 60 -> "${mins}m ago"
+                mins < 60 * 24 -> "${mins / 60}h ago"
+                mins < 60 * 24 * 7 -> "${mins / (60 * 24)}d ago"
+                else -> ts.substring(5, 10) + " " + ts.substring(11, 16)
+            }
+        } catch (_: Exception) {
+            ts.take(16)
+        }
+    }
+
+    /** Row as the wire JSON the editor prefills from (same field
+     *  names AgentListOk carries — mirrors AgentsActivity). */
+    private fun herdRowJson(a: Term.AgentInfo): JSONObject = JSONObject()
+        .put("id", a.id)
+        .put("name", a.name)
+        .apply {
+            a.avatarUrl?.let { put("avatar_url", it) }
+            a.homeMachine?.let { put("home_machine", it) }
+            a.primaryProfile?.let { put("primary_profile", it) }
+            a.memoryScope?.let { put("memory_scope", it) }
+            a.orgId?.let { put("org_id", it) }
+            a.visibility?.let { put("visibility", it) }
+            a.toolsAllowlist?.let { l -> put("tools_allowlist", org.json.JSONArray(l)) }
+            a.extraInstructions?.let { put("extra_instructions", it) }
+            a.paused?.let { put("paused", it) }
+            a.envRefs?.let { put("env_refs", org.json.JSONArray(it)) }
+        }
+
     // ---- new agent dialog: kind + name + working-dir picker (RN parity) ----
 
     private fun ensureFrameSink() {
@@ -504,6 +706,30 @@ class MainActivity : Activity() {
         val sink: (JSONObject) -> Unit = { f ->
             when (f.optString("t")) {
                 "DirListOk" -> handler.post { onDirListOk(f) }
+                "AgentListOk" -> handler.post {
+                    herdAgents.clear()
+                    f.optJSONArray("agents")?.let { a ->
+                        for (i in 0 until a.length())
+                            herdAgents.add(Term.parseAgentInfo(a.getJSONObject(i)))
+                    }
+                    // most-recently-active first; nulls last
+                    herdAgents.sortByDescending { it.lastActive ?: "" }
+                    renderHerd()
+                }
+                "AgentTalkOk" -> handler.post {
+                    val name = pendingHerdTalk.remove(f.optString("req_id")) ?: return@post
+                    startActivity(Intent(this@MainActivity, SessionActivity::class.java)
+                        .putExtra("sessionId", f.optString("session"))
+                        .putExtra("sessionName", name))
+                }
+                "AgentPauseOk" -> handler.post {
+                    val rid = f.optString("req_id")
+                    if (rid.startsWith("hp-")) {
+                        pendingHerdTalk.remove(rid)
+                        homeStatus?.text = "pause state updated"
+                        Monitor.relay?.send(Term.agentList())
+                    }
+                }
                 // Create-error surfacing: SessionsCreate failures (e.g.
                 // "pi spawn failed: No such file or directory") used to
                 // leave the "creating …" status hanging forever.
@@ -511,6 +737,8 @@ class MainActivity : Activity() {
                     val rid = f.optString("req_id", "")
                     if (rid.startsWith("sc-")) {
                         handler.post { homeStatus?.text = "create failed: ${f.optString("message", "unknown error")}" }
+                    } else if (rid.startsWith("at-") || rid.startsWith("hp-")) {
+                        handler.post { homeStatus?.text = "herd: ${f.optString("message", "error")}" }
                     }
                 }
             }
