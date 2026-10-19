@@ -777,3 +777,62 @@ assembleRelease` BUILD SUCCESSFUL (APK 1.39 MB). Frames + CLI verified
 against a mock forge/mule on an isolated `HOME` + throwaway daemon
 (patch body, wake filter/create/update/delete, error paths). On-device
 smoke of the ✎ screen is still owed.
+
+---
+
+## 2026-10-19 — Subagent sandbox inheritance + anchored-column sandbox-escape fix (forge `34ef5589`…`cf1adebc`, lab `1333fcd2`+)
+
+**The escape (live ~2.5 h, fixed same day).** Migration 031's
+workspace-binding feature persisted the resolved `working_dir` onto
+EVERY new conversation row. The streaming tool path inferred
+"anchored" (host-side, unsandboxed bash) from
+`working_dir IS NOT NULL` — so from the 003286d6 deploy (~16:52 UTC),
+every fresh agent conversation ran harness bash as root ON THE FORGE
+VM HOST. Confirmed with a probe (`/opt/forge-hotfix` visible, uid 0).
+Probe conversation + artifacts deleted.
+
+**Fix — explicit columns (migration 032):**
+- `sessions.anchored BOOLEAN` — set TRUE only by the real cwd-anchor
+  paths (`create_session`/`create_conversation` with `working_dir`);
+  the sandbox-vs-host decision in `stream_tool_execution` reads the
+  column, never the inference.
+- `sessions.sandbox_inherit BOOLEAN` — subagent children execute in
+  the parent's sandbox EXACTLY: `sandbox_key_for_session()` walks the
+  inherit chain (cycle-guarded, ≤10 hops) and every container lookup
+  — streaming bash (`execute_bash_streaming(sandbox_key)`), executor
+  bash (`ToolExecutor::with_sandbox_key`), package reconciliation,
+  `get_or_create_container` — keys on the nearest non-inheriting
+  ancestor. Audit rows stay attributed to the CHILD. Children also
+  inherit `agent_id` (credential env_refs resolve) and the parent's
+  `working_dir` (checkouts visible both ways; parent/child execs
+  serialize on the nspawn tree flock instead of EBUSY-colliding).
+- 032's backfill over-flagged workspace rows as anchored → corrected
+  in 033 (a real anchor differs from BOTH the convention path AND the
+  agent's declared `workspace_dir`). Mid-session lesson: sqlx
+  checksums APPLIED migrations — editing 032 boot-looped forge-api
+  ("migration 32 … modified"); 032 restored byte-exact from the
+  applied commit and the refinement shipped as 033.
+- `dispatch_message` self-heals workspace bindings: agent rows whose
+  conversation lost/never had `working_dir = agents.workspace_dir`
+  re-bind at message time (fixes the sticky steward conversation's
+  `wd=''` relic without a re-mint).
+- `agents.create_conversation` persists `working_dir` only for real
+  workspace bindings / host fallbacks — the per-session convention
+  path stays column-NULL again.
+
+**E2E on the live hot-patch (rev `cf1adebc`):** parent bash →
+`SANDBOXED`, container hostname, uid 0-in-container; synthetic child
+(`sandbox_inherit`, parent's id) → SAME hostname + cwd, writes visible
+parent⇄child both directions, audit row keyed to the child with the
+parent's `agent_id`; 6 parallel parent+child execs → no EBUSY;
+pollution counts zero; anchor-test rows unaffected. New test binary
+`subagent_sandbox_tests` (3: plain-not-anchored, anchor-sets-column,
+resolver chain + cycle) + lib 187 green.
+
+**Ops notes:** `fbuild4.sh` runs INSIDE the forge VM from the home
+mount (`container machine run --root -n forge --
+/run/current-system/sw/bin/bash /home/jbutler/fbuild4.sh`);
+`forge-ct.tar.gz` = re-tar of `alcbld/repo/ct/forge` (lab's ct flake +
+vendored `forge-src-<rev>.tar.gz`; `git archive --prefix=jbutlerdev-forge-<rev>/`
+is byte-stable); alcbuild2 egress can die — `container machine stop`
++ auto-start on next run clears it.
