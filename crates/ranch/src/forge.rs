@@ -377,6 +377,7 @@ fn handle_event(
                 let sid = state.forge_sid;
                 let cfg = cfg.clone();
                 let w = w.clone();
+                let seq = msg.seq;
                 std::thread::spawn(move || {
                     let agent = notify_agent_name(&cfg, sid);
                     write_frame(
@@ -387,6 +388,11 @@ fn handle_event(
                             agent,
                             message: body,
                             priority: None,
+                            // row identity for client-side dedup: an SSE
+                            // catch-up replay (or a second pane watching
+                            // the same session) must not re-ping — see
+                            // the protocol doc-comment.
+                            seq: Some(seq),
                         },
                     );
                 });

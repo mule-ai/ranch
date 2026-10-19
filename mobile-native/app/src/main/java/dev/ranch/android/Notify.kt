@@ -147,6 +147,24 @@ class Notify(private val app: App) {
     private val seenTasks = HashSet<String>()
     private var tasksPrimed = false
 
+    // F-006 (2026-10-19): keys of AgentNotify frames already posted —
+    // survives reset() AND process restart (persisted below) so a
+    // replay of the @notify: backlog can never re-ping. Bounded FIFO
+    // via markAgentNotified().
+    private val notifiedAgentMsgs = LinkedHashSet<String>()
+
+    init {
+        // re-arm the dedup set across process restarts (the whole
+        // point is surviving the app-relaunch-replays-backlog case).
+        runCatching {
+            val raw = app.prefs.getJson("agent_notify_seen")
+            if (raw.isNotEmpty()) {
+                val arr = org.json.JSONArray(raw)
+                for (i in 0 until arr.length()) notifiedAgentMsgs.add(arr.getString(i))
+            }
+        }
+    }
+
     // ---- diagnostics (in-memory, session scoped) ----
     @Volatile var framesSeen = 0; private set
     @Volatile var lastFrameAt: Long = 0; private set
@@ -383,19 +401,72 @@ class Notify(private val app: App) {
     }
 
     /** Explicit agent notification (the agent called notify_user).
-     *  Always posts — this is the opt-in path for background turns. */
+     *  Always posts — this is the opt-in path for background turns.
+     *
+     *  Dedup (mobile bug 2026-10-19, F-006): the frame used to carry
+     *  no identity at all, so ANY re-delivery — SSE catch-up replay
+     *  of the @notify: row, a second pane watching the same session,
+     *  an app restart inside a replay window — re-posted the ping,
+     *  and opening the conversation re-notified the whole backlog.
+     *  The daemon now stamps the forge row `seq` (protocol
+     *  2026-10-19); we key on (session|pane, seq) and fold repeats
+     *  silently. With an old daemon (no seq) fall back to a content
+     *  hash — weaker (two identical messages legitimately sent hours
+     *  apart collapse) but strictly better than pinging the backlog
+     *  on every open. The key set persists to prefs so a process
+     *  restart doesn't re-arm the backlog either. */
     private fun onAgentNotify(f: JSONObject) {
         framesSeen++
         lastFrameAt = System.currentTimeMillis()
         val agent = f.optString("agent").ifEmpty { "agent" }
         val msg = f.optString("message").replace(Regex("\\s+"), " ").take(200)
         val priority = f.optString("priority").ifEmpty { "normal" }
+        val pane = f.optString("pane").takeIf { it.isNotEmpty() }
+        val key = agentNotifyKey(f, msg)
+        if (key != null && !markAgentNotified(key)) {
+            skippedOff++
+            return // replay/re-delivery — already posted
+        }
         // Bypass the background gate: this is an explicit notification
         postLocal(
             agent, msg,
-            agent, f.optString("pane").takeIf { it.isNotEmpty() },
+            agent, pane,
             emptyList(), priority,
         )
+    }
+
+    /** Dedup key: prefer (session|pane, seq) — stable across panes
+     *  that watch the same session (the daemon fills `session` before
+     *  broadcast). Content-hash fallback when the daemon predates seq.
+     *  Returns null only when there is nothing to key on at all
+     *  (unattributed frame) — post it rather than lose a real ping. */
+    private fun agentNotifyKey(f: JSONObject, msg: String): String? {
+        val session = f.optString("session").ifEmpty { f.optString("pane") }
+        val seq = if (f.has("seq")) f.optLong("seq", -1) else -1
+        if (session.isEmpty() && seq < 0) return null
+        val ident = if (seq >= 0) "s$seq" else "h" + msg.hashCode()
+        return "$session|$ident"
+    }
+
+    /** Returns true when the key is NEW (post it); false when already
+     *  seen (suppress). Bounded FIFO so the persisted set can't grow
+     *  without limit; persists on every new key (cheap — notify_user
+     *  is rare by design). */
+    private fun markAgentNotified(key: String): Boolean {
+        if (!notifiedAgentMsgs.add(key)) return false
+        while (notifiedAgentMsgs.size > AGENT_NOTIFY_DEDUP_MAX) {
+            val it = notifiedAgentMsgs.iterator(); it.next(); it.remove()
+        }
+        persistAgentNotifyKeys()
+        return true
+    }
+
+    private fun persistAgentNotifyKeys() {
+        runCatching {
+            val arr = org.json.JSONArray()
+            notifiedAgentMsgs.forEach { arr.put(it) }
+            app.prefs.setJson("agent_notify_seen", arr.toString())
+        }
     }
 
     // ---- gating + posting ----
@@ -552,6 +623,8 @@ class Notify(private val app: App) {
     }
 
     companion object {
+        /** cap for the persisted AgentNotify dedup FIFO (F-006) */
+        const val AGENT_NOTIFY_DEDUP_MAX = 500
         /** MonitorService intent action for notification buttons. */
         const val ACTION_ASK = "dev.ranch.android.NOTIFY_ASK"
         /** Post-prime silence for history-replay bursts (see onChat). */
