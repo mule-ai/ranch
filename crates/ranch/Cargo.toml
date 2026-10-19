@@ -17,9 +17,9 @@ uuid = { version = "1", features = ["v4"] }
 tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 ureq = { version = "3", default-features = false, features = ["rustls", "json"] }
 crossterm = "0.28"
-ratatui = "0.29"
+ratatui = "0.30"
 sha2 = "0.10"
 base64 = { workspace = true }
 rpassword = "7"
-ansi-to-tui = "7"
+ansi-to-tui = "8"
 chrono = { workspace = true }
