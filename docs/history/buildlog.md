@@ -836,3 +836,32 @@ mount (`container machine run --root -n forge --
 vendored `forge-src-<rev>.tar.gz`; `git archive --prefix=jbutlerdev-forge-<rev>/`
 is byte-stable); alcbuild2 egress can die — `container machine stop`
 + auto-start on next run clears it.
+
+### 2026-10-19 (late) — herd_roster prompt section + sandbox git fail-fast
+
+EA "couldn't see" Shepherd: permissions fine (same owner, no
+allowlist, GET /agents healthy) — the sticky 126k-entry conversation
+was quoting its last cached `list_agents` toolResult, which predated
+Shepherd's row; control-plane wobble during the day's deploys pushed
+the model onto the stale list. Structural fix (forge `1938bcd1`,
+harness): per-turn `herd_roster` section (memory_signals pattern) —
+re-fetches GET /agents EVERY render (name/(you)/home8/PAUSED/role +
+"trust this over older list_agents output"); fetch failure ⇒ section
+omitted, never fails the turn. `list_agents` rows + `read_agent`
+header now carry the agent description (role). vitest 82/82 (18
+files, +3 herd-roster incl. the per-render re-fetch assertion).
+
+Deployment: forge-harness hot-patched like forge-api — new
+`fbuild5.sh` builds `.#packages.aarch64-linux.forge-harness`, stages
+to `/opt/forge/harness-patched` (dist mirrored to `<root>/dist/main.js`
+for the patched-unit ExecStart; @forge/durable-pg symlink repointed
+absolutely), restarts the unit. Old tree kept at `harness-old`.
+
+Bonus catch from the roster E2E turn: the steward's own
+git-push+gh-pr-create (it is now pushing F-00x fixes — PR
+`fix/graceful-drain-timeout-and-staging-validation`) hung on git's
+no-TTY credential prompt for 17+ min holding the sandbox tree flock —
+that IS the live "Directory tree busy" (F-005) shape. forge `cb7972db`:
+nspawn now sets `GIT_TERMINAL_PROMPT=0` ⇒ git errors immediately
+instead of hogging the tree until the exec timeout. Verified on the
+hot-patch binary (env present in a live exec, sandbox still sound).
