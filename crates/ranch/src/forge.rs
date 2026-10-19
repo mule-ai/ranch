@@ -334,6 +334,14 @@ fn handle_event(
                 return; // reconnect catch-up duplicate
             }
             state.last_seq.store(msg.seq, Ordering::Relaxed);
+            // NB: history replay (a watch armed with since=0) arrives
+            // here as one Chat frame per row. Those frames must NOT
+            // carry reset:true (clients treat a reset Chat as "the
+            // pane's whole state" — per-row reset would shred the
+            // visible history). Replay silence is handled by the
+            // clients' notification priming (Notify.kt quiet window)
+            // and prevented entirely by the worker seeding last_seq
+            // + AgentTalk-reuse no longer re-arming (2026-10-19).
             // a user row means the agent took the message; it works
             // until turn_ended. Clients show the working indicator.
             if msg.role == "user" {
@@ -1068,6 +1076,20 @@ pub fn spawn_worker(cfg: ForgeConfig, pipe_w: std::fs::File, rx: mpsc::Receiver<
                 Ok(job) => match job {
                     ForgeJob::Watch { pane, forge_sid } => {
                         // re-watch replaces (fresh high-water mark)
+                        // — but seeded from any still-running watch of
+                        // the SAME forge session: re-arming an
+                        // already-streamed pane (AgentTalk continue
+                        // reuse) must NOT replay the whole history
+                        // from since=0 (mobile bug 2026-10-19: the
+                        // replay arrived as per-message Chat frames,
+                        // which the notification engine read as new
+                        // activity and pinged the entire backlog).
+                        let seed = threads
+                            .iter()
+                            .filter(|(_, st)| st.forge_sid == forge_sid)
+                            .map(|(_, st)| st.last_seq.load(Ordering::Relaxed))
+                            .max()
+                            .unwrap_or(0);
                         if let Some((_, old)) = threads
                             .iter()
                             .position(|(_, st)| st.pane == pane)
@@ -1078,7 +1100,7 @@ pub fn spawn_worker(cfg: ForgeConfig, pipe_w: std::fs::File, rx: mpsc::Receiver<
                         let st = Arc::new(WatchState {
                             pane,
                             forge_sid,
-                            last_seq: AtomicI64::new(0),
+                            last_seq: AtomicI64::new(seed),
                             stop: AtomicBool::new(false),
                             turn_gen: AtomicU64::new(0),
                             background_turn: AtomicBool::new(false),

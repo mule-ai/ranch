@@ -56,7 +56,13 @@ import kotlin.concurrent.Volatile
  * Dedup rules (mirroring the RN client):
  *  - turn_end: only on a working -> idle edge for a pane we SAW working
  *  - every_message: only append frames (reset=false) past the pane's
- *    last-seen seq; the first frame for a pane primes the baseline
+ *    last-seen seq; the first frame for a pane primes the baseline,
+ *    and every frame within QUIET_WINDOW_MS of priming is folded into
+ *    the baseline silently — a forge history replay (watch armed with
+ *    since=0: daemon cold start, relay reconnect re-watch) lands as
+ *    one Chat frame per backlog row, and per-frame priming alone
+ *    would notify the WHOLE backlog (recurring notification bursts on
+ *    every EA chat open, 2026-10-19)
  *  - questions/cards: once per ask_id, until the AgentAskAnswer
  *    broadcast
  */
@@ -124,6 +130,10 @@ class Notify(private val app: App) {
     private val busy = HashMap<String, Boolean>()
     private val lastSeq = HashMap<String, Long>()
     private val primed = HashSet<String>()
+    // pane -> ms epoch at which it was primed; frames inside the quiet
+    // window after priming are a HISTORY REPLAY burst (one frame per
+    // backlog row) and fold into the baseline without notifying.
+    private val quietStart = HashMap<String, Long>()
     private val notifiedAsks = HashSet<String>()
     // pane -> ranch session id, captured from any frame carrying both —
     // notification taps deep-link into the conversation that fired them
@@ -155,6 +165,7 @@ class Notify(private val app: App) {
         busy.clear()
         lastSeq.clear()
         primed.clear()
+        quietStart.clear()
         turnLast.clear()
         paneSession.clear()
         seenTasks.clear()
@@ -235,13 +246,29 @@ class Notify(private val app: App) {
         if (f.optBoolean("reset", false)) {
             lastSeq[pane] = maxSeq
             primed.add(pane)
+            quietStart.remove(pane)
             return
         }
         if (!primed.contains(pane)) {
             lastSeq[pane] = maxSeq
             primed.add(pane)
+            quietStart[pane] = System.currentTimeMillis()
             return
         }
+        // Quiet window: the backlog replay that follows a prime
+        // arrives as a rapid per-row frame stream (forge SSE catch-up).
+        // Fold everything inside the window into the baseline —
+        // notifying a whole history every time a watch replays is the
+        // bug this guard kills. Live human-paced rows never fall in
+        // the window except in the first instants after a (re)watch,
+        // where the turn-end Meta still notifies the reply.
+        val qs = quietStart[pane]
+        if (qs != null && System.currentTimeMillis() - qs < QUIET_WINDOW_MS) {
+            lastSeq[pane] = maxOf(lastSeq[pane] ?: 0L, maxSeq)
+            skippedOff++
+            return
+        }
+        quietStart.remove(pane)
         val base = lastSeq[pane] ?: -1L
         val fresh = mutableListOf<JSONObject>()
         for (i in 0 until msgs.length()) {
@@ -527,6 +554,8 @@ class Notify(private val app: App) {
     companion object {
         /** MonitorService intent action for notification buttons. */
         const val ACTION_ASK = "dev.ranch.android.NOTIFY_ASK"
+        /** Post-prime silence for history-replay bursts (see onChat). */
+        const val QUIET_WINDOW_MS = 1_500L
     }
 }
 

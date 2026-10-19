@@ -1624,12 +1624,15 @@ impl Daemon {
                     "ranchd: agent_talk {name} (continue, reuse) -> session {existing_sid} pane {existing_pid} -> forge {forge_sid}"
                 );
                 if let Some(tx) = &self.forge_tx {
-                    // re-arm the watch (cheap + idempotent) so the surface
-                    // streams live, then deliver any inline text
-                    let _ = tx.send(forge::ForgeJob::Watch {
-                        pane: existing_pid,
-                        forge_sid,
-                    });
+                    // NOTE (2026-10-19): deliberately NO Watch re-arm
+                    // here. The pane's watch is already running; re-
+                    // arming replaced its state with last_seq=0, so
+                    // the SSE reconnected with since=0 and replayed
+                    // the WHOLE conversation as per-row Chat frames —
+                    // which the mobile notification engine read as
+                    // fresh activity (recurring notification bursts
+                    // on every EA chat open). Inline text still
+                    // delivers; the live stream was never stopped.
                     if let Some(t) = text.as_ref().filter(|t| !t.trim().is_empty()) {
                         let _ = tx.send(forge::ForgeJob::Send {
                             pane: existing_pid,
