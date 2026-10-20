@@ -81,6 +81,12 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Dead-session → graceful sign out (Auth.fatalAuthError): the
+        // relay's refresh hit a revoked/idle-expired session row, so
+        // tear the monitor down and show the sign-in form — do NOT
+        // keep flapping connecting→reconnecting on a token GoTrue
+        // will never reissue.
+        Monitor.onSignedOut = { runOnUiThread { if (!isFinishing) signOutAll() } }
         // monitoring survives app restarts: remember it across process death
         // (APK updates / Android reclaiming memory stop the service)
         monitorWanted = Monitor.running || app.prefs.getBool("monitor_wanted", false)
@@ -336,9 +342,22 @@ class MainActivity : Activity() {
             text = "sign out"
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
             setTextColor(0xFF6B7280.toInt())
-            setOnClickListener { auth.logout(); renderState() }
+            setOnClickListener { signOutAll() }
         })
         loadMachines(list, status)
+    }
+
+    /** Full teardown of the signed-in state: auth tokens + monitoring
+     * (+ its foreground service). Shared by the sign-out button and
+     * the fatal-auth callback (Realtime.onSignedOut). */
+    private fun signOutAll() {
+        auth.logout()
+        if (monitorWanted || Monitor.running) {
+            monitorWanted = false
+            app.prefs.setBool("monitor_wanted", false)
+            startService(Intent(this, MonitorService::class.java).setAction("stop"))
+        }
+        renderState()
     }
 
     private fun loadMachines(list: LinearLayout, status: TextView) {

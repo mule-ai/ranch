@@ -29,12 +29,26 @@ class Auth(private val prefs: Prefs) {
     @Volatile
     var expiresAt: Long = prefs.get("expires_at", "0").toLong()
 
+    /**
+     * Set when a REFRESH attempt fails in a way retrying can never
+     * fix — the session row is gone (expired >20 days, revoked,
+     * rotated-and-lost). The Realtime pump signs the user out on this
+     * signal instead of looping "reconnecting" forever against a
+     * token GoTrue will never reissue (observed live: a Sep-30
+     * session hit the idle-revoke window and the app flapped
+     * connecting→reconnecting indefinitely). Cleared on next success.
+     */
+    @Volatile
+    var fatalAuthError: String? = null
+        private set
+
     fun isLoggedIn(): Boolean = accessToken.isNotEmpty()
 
     fun logout() {
         accessToken = ""
         refreshToken = ""
         expiresAt = 0
+        fatalAuthError = null
         prefs.set("access_token", "")
         prefs.set("refresh_token", "")
         prefs.set("expires_at", "0")
@@ -105,7 +119,17 @@ class Auth(private val prefs: Prefs) {
                 .build()
             client.newCall(req).execute().use { resp ->
                 val text = resp.body?.string() ?: ""
-                if (!resp.isSuccessful) return "auth $grant failed: ${resp.code} $text"
+                if (!resp.isSuccessful) {
+                    val msg = "auth $grant failed: ${resp.code} $text"
+                    if (grant == "refresh_token" &&
+                        (resp.code == 400 || resp.code == 401 || resp.code == 403) &&
+                        (text.contains("refresh_token") || text.contains("invalid_grant"))
+                    ) {
+                        fatalAuthError = msg
+                    }
+                    return msg
+                }
+                fatalAuthError = null
                 applyToken(JSONObject(text))
                 null
             }

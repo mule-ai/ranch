@@ -44,6 +44,15 @@ class Realtime(
     @Volatile private var ws: WebSocket? = null
     @Volatile private var running = false
     @Volatile private var joinOk = false
+
+    /**
+     * Invoked when the socket layer discovers the auth session is
+     * unrecoverable (dead refresh token). The UI registers this to
+     * drop back to the sign-in form — the alternative historically was
+     * an endless connecting→reconnecting flap (Auth.fatalAuthError).
+     * Fires off-thread; handlers must marshal to the UI thread.
+     */
+    @Volatile var onSignedOut: (() -> Unit)? = null
     @Volatile private var lastServerSeen = 0L
     @Volatile private var lastHbSent = 0L
     @Volatile private var lastSeenUpd = 0L
@@ -90,7 +99,9 @@ class Realtime(
         lastServerSeen = System.currentTimeMillis()
         lastHbSent = lastServerSeen
         lastSeenUpd = lastServerSeen
-        ensureFreshToken()
+        ensureFreshToken().let { alive ->
+            if (!alive) return  // signed out (dead refresh token) — do not open the ws
+        }
         tokenDeadline = auth.expiresAt - 120_000L
         onStatus("connecting")
         val url = "${Supabase.realtimeWsUrl()}"
@@ -98,7 +109,9 @@ class Realtime(
         ws = client.newWebSocket(req, listener)
     }
 
-    private fun ensureFreshToken() {
+    /** @return false when the session is unrecoverable and the user
+     * was signed out; callers must not open the socket in that case. */
+    private fun ensureFreshToken(): Boolean {
         synchronized(auth) {
             if (System.currentTimeMillis() >= auth.expiresAt - 120_000L &&
                 auth.refreshToken.isNotEmpty()
@@ -106,9 +119,17 @@ class Realtime(
                 val err = auth.refresh()
                 if (err != null) {
                     onStatus("refresh failed: $err")
+                    if (auth.fatalAuthError != null) {
+                        onStatus("signed out — session expired, please sign in again")
+                        auth.logout()
+                        running = false
+                        onSignedOut?.invoke()
+                        return false
+                    }
                 }
             }
         }
+        return true
     }
 
     private val listener = object : WebSocketListener() {
@@ -171,6 +192,7 @@ class Realtime(
 
             // token refresh
             var doReconnect = false
+            var fatalSignOut = false
             synchronized(auth) {
                 if (now >= auth.expiresAt - 120_000L && auth.refreshToken.isNotEmpty()) {
                     val err = auth.refresh()
@@ -179,6 +201,11 @@ class Realtime(
                         sendAccessToken()
                         sendJoin()
                         onStatus("token refreshed")
+                    } else if (auth.fatalAuthError != null) {
+                        // Session row is gone (revoked / idle-expired).
+                        // Retrying forever is what the user saw as an
+                        // endless "reconnecting" — sign out instead.
+                        fatalSignOut = true
                     } else {
                         refreshFailures++
                         onStatus("refresh failed: $err")
@@ -188,6 +215,15 @@ class Realtime(
                         }
                     }
                 }
+            }
+            if (fatalSignOut) {
+                onStatus("signed out — session expired, please sign in again")
+                auth.logout()
+                running = false
+                try { ws?.close(1000, "signed-out") } catch (_: Exception) {}
+                ws = null
+                onSignedOut?.invoke()
+                return
             }
             if (doReconnect) {
                 onStatus("token refresh failed 3x — reconnecting")

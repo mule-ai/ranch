@@ -21,6 +21,17 @@ object Monitor {
     var running: Boolean = false
         private set
 
+    /**
+     * Invoked (off-thread) when the relay discovers the auth session
+     * is unrecoverable — dead refresh token. MainActivity registers
+     * this to tear the monitor down and drop back to the sign-in
+     * form, instead of the historical endless
+     * connecting→reconnecting flap against a token GoTrue will never
+     * reissue.
+     */
+    @Volatile
+    var onSignedOut: (() -> Unit)? = null
+
     @Volatile
     private var session: RelaySession? = null
 
@@ -151,6 +162,12 @@ class RelaySession(
         },
         onStatus = { status: String -> Monitor.status = status },
     )
+
+    init {
+        // Fatal auth state (dead refresh token) bubbles to Monitor —
+        // see Auth.fatalAuthError / Realtime.onSignedOut.
+        realtime.onSignedOut = { Monitor.onSignedOut?.invoke() }
+    }
 
     fun start() = realtime.start()
     fun stop() = realtime.stop()
