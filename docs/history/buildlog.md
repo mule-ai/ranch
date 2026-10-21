@@ -917,3 +917,37 @@ Full herd audit ("are they waking and acting?"). Found and fixed:
 Verified healthy: all 8 wakes fire on cadence (wake_log ok=t),
 dependabots produce real PR/CI sweeps, EA drives delegates, episodes
 capture, steward self-reports via AUDIT.md + notify.
+
+### Same-day follow-through (subagent fixes landed)
+
+- **mule F-002** → PR #141 merged (16-commit backlog + scheduler fix on
+  main); arm64 binary hot-patched to the mule VM (`/opt/mule-hotfix`,
+  unit `active`, 7 wakes armed). CI-hygiene follow-up PR #143 (lint
+  cleanups + the reflection-wasm `-o` cwd bug that fresh trees exposed:
+  `go build` ran with `cmd.Dir`=repo root so the test-cwd-relative `-o`
+  wrote wasms OUTSIDE the checkout — prebuilt local `dist/` had masked
+  it). ATE needs an approving review (branch protection blocks admin
+  merge).
+- **forge compaction hardening** `7f834d14` (subagent): bounded
+  summarizer input (trim-oldest to token budget), truncation fallback
+  when the summarizer still fails (conversation always becomes
+  compactable), ⚠ chat-row surfacing on the fallback path,
+  compaction-guard vitest (19/19 harness files green).
+- **forge wake-prompt coalescing** `e8c144f2` (subagent, cherry-picked
+  clean over the compaction commit): `wake.rs` pure gate
+  (`[mule wake <id>]` parse, duplicate-pending drop → `{"coalesced":
+  true}`, pending cap 8 → 429, settled rows never suppress re-fires,
+  fail-open on query error) + 4 live integration tests; lib 192/192,
+  clippy baseline-clean.
+- **Deploy chain**: lab flake `e8c144f2` (vendored tarball regenerated
+  via git archive + canary), forge-api + harness redeployed
+  (`63wvh8z9…` / harness-patched), live verify: `/agents` 200 JSON,
+  compaction guards present in dist, steward 21:05 wake ran the new
+  control-plane self-check (health canaries, log-gap backfill,
+  err/warn counts) — herd autonomy restored end to end.
+- Ops notes: two concurrent subagents on one repo (forge) crossed
+  commits — subagent tasks in one repo must own DISJOINT paths or run
+  sequentially; a killed duplicate runner kept writing until SIGKILL'd
+  and its scratch test got swept into a `git add -A` (cleaned in #143);
+  `pgrep/pkill -f <pattern>` self-matches the invoking shell — match on
+  process tables instead.
