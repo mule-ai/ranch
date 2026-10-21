@@ -865,3 +865,55 @@ that IS the live "Directory tree busy" (F-005) shape. forge `cb7972db`:
 nspawn now sets `GIT_TERMINAL_PROMPT=0` ⇒ git errors immediately
 instead of hogging the tree until the exec timeout. Verified on the
 hot-patch binary (env present in a live exec, sandbox still sound).
+
+---
+
+## 2026-10-21 — herd audit + the vendored-tarball incident (H7.x)
+
+Full herd audit ("are they waking and acting?"). Found and fixed:
+
+1. **Vendored forge-src tarballs were mislabeled** (lab `ct/forge`).
+   All nine `forge-src-<rev>.tar.gz` were `tar czf` of a STALE
+   checkout (worktree mtimes; tree predated the agents API), not
+   `git archive <rev>`. Consequence: the Oct 19 22:45 hotfix deploys
+   (fbuild4/fbuild5) shipped an ancient forge-api + harness — every
+   herd route (`/agents`, `/bugs`, roster, agent CRUD tools) fell
+   through to the SPA fallback for ~21h while wake dispatch kept
+   firing `ok=t`. Regenerated ALL tarballs with
+   `git archive --prefix=jbutlerdev-forge-<rev>/ <rev>` + canary
+   checks (agents routes present, migration 033, GIT_TERMINAL_PROMPT).
+   lab `7f806f7b`. Redeployed forge-api (store `a98zjssm…`) + harness
+   (`fihgh08f…`) from correct source. NOTE: forge's HTTP surface is
+   FLAT (`/agents`, `/health`) — `/api/v1/*` is MULE's prefix; an
+   earlier mis-diagnosis chased `/api/v1/agents` (which legitimately
+   404s→SPA).
+2. **Steward auto-compaction dead-lock**: the pi.compaction
+   summarizer request itself exceeded the 262k model context on the
+   huge sticky conversation → failed every turn, silently. Triaged by
+   re-minting the sticky session (`83d871e8`, fresh durable
+   conversation); harness fix (bounded summarizer input + truncation
+   fallback + ⚠ surfacing) via subagent.
+3. **Wake prompt backlog**: identical `[mule wake <id>]` prompts
+   queue while an agent is mid-turn (14 unanswered submissions; the
+   agent wasted turns commenting on its own backlog). Coalescing fix
+   (same-wake pending ⇒ drop, cap 8 pending/session) via subagent.
+4. **F-002 confirmed live**: wake-mule-dependabot `rate_limited`
+   storm (2+ fires/s on Oct 19 21:39-21:46) — failed fires didn't
+   advance next_due_at. Scheduler fix (advance unconditionally +
+   backoff floor) via subagent (mule repo).
+5. **credentials NULL-owner hard-fail** (found BY the steward, F-010):
+   `session_owner_and_agent` decoded user_id non-null; a session
+   minted without user_id made EVERY tool call 500. forge `fa5d423f`:
+   decode as Option; NULL owner/agent ⇒ "nothing declared".
+6. **Steward prompt hardened** with a control-plane self-check it now
+   runs FIRST (agents-list JSON canary, health, compaction failures,
+   unanswered-submission cap, wake_log hot-loop detection, wake→reply
+   liveness) — it slept through the 21h outage this time.
+7. Hygiene: `reflection-episodes-ready` wake disabled (no emitter —
+   dead config); 11 probe sessions deleted; **CEO agent paused**
+   (no wakes, no instructions, dormant since Oct 19 — needs purpose
+   or deletion).
+
+Verified healthy: all 8 wakes fire on cadence (wake_log ok=t),
+dependabots produce real PR/CI sweeps, EA drives delegates, episodes
+capture, steward self-reports via AUDIT.md + notify.
