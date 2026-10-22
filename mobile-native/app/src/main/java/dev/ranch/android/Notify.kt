@@ -131,9 +131,35 @@ class Notify(private val app: App) {
     private val lastSeq = HashMap<String, Long>()
     private val primed = HashSet<String>()
     // pane -> ms epoch at which it was primed; frames inside the quiet
+    // window fold into the baseline (watch-catch-up replay silence)
     // window after priming are a HISTORY REPLAY burst (one frame per
     // backlog row) and fold into the baseline without notifying.
     private val quietStart = HashMap<String, Long>()
+
+    // pane -> ms epochs of the last few emitted notifications. Burst
+    // fuse (allowPing): a real human-paced chat does not deliver more
+    // than four notify-worthy rows on one pane inside five seconds, so
+    // if it does, we are watching a replay whose rows all sat above
+    // the baseline (a partial re-watch the replay signature missed)
+    // or a pathological agent stream — fold the flood into a quiet
+    // window instead of pinging through it.
+    private val recentPings = HashMap<String, ArrayDeque<Long>>()
+
+    /** Returns false once a pane exceeds 4 notifications in 5 s, at
+     *  which point the pane gets a fresh quiet window and the rest of
+     *  the stream folds. */
+    private fun allowPing(pane: String): Boolean {
+        val now = System.currentTimeMillis()
+        val q = recentPings.getOrPut(pane) { ArrayDeque() }
+        while (q.isNotEmpty() && now - q.first() > 5_000) q.removeFirst()
+        if (q.size >= 4) {
+            quietStart[pane] = now
+            skippedOff++
+            return false
+        }
+        q.addLast(now)
+        return true
+    }
     private val notifiedAsks = HashSet<String>()
     // pane -> ranch session id, captured from any frame carrying both —
     // notification taps deep-link into the conversation that fired them
@@ -166,6 +192,7 @@ class Notify(private val app: App) {
         lastSeq.clear()
         primed.clear()
         quietStart.clear()
+        recentPings.clear()
         turnLast.clear()
         paneSession.clear()
         seenTasks.clear()
@@ -268,8 +295,27 @@ class Notify(private val app: App) {
             skippedOff++
             return
         }
-        quietStart.remove(pane)
+        // Replay signature: a LIVE frame can never contain a row at or
+        // below the pane's baseline — the daemon dedups per-watch, so
+        // anything <= base reaching us here means this frame is part of
+        // a watch catch-up replay (opening a conversation re-arms the
+        // SSE watch from since=0 and the whole history streams back as
+        // per-row frames for far longer than any fixed quiet window).
+        // Fold the frame AND chain the quiet window, so the rest of a
+        // long replay lands in the baseline instead of pinging row by
+        // row — the bug users still saw on every conversation open.
         val base = lastSeq[pane] ?: -1L
+        var replay = false
+        for (i in 0 until msgs.length()) {
+            if (msgs.getJSONObject(i).optLong("seq", 0) <= base) { replay = true; break }
+        }
+        if (replay) {
+            lastSeq[pane] = maxOf(base, maxSeq)
+            quietStart[pane] = System.currentTimeMillis()
+            skippedOff++
+            return
+        }
+        quietStart.remove(pane)
         val fresh = mutableListOf<JSONObject>()
         for (i in 0 until msgs.length()) {
             val m = msgs.getJSONObject(i)
@@ -288,7 +334,7 @@ class Notify(private val app: App) {
                     // because the error IS the turn-end news
                     busy[pane] = false
                     turnLast.remove(pane)
-                    notify(
+                    if (allowPing(pane)) notify(
                         NotifyPolicy.ERRORS, agent ?: name,
                         "agent error: " + text.replace(Regex("\\s+"), " ").take(120), agent, pane,
                     )
@@ -299,7 +345,7 @@ class Notify(private val app: App) {
                         // row means the FIRST message wakes the user, they
                         // open the app, and the final reply never notifies
                         turnLast[pane] = text
-                    } else {
+                    } else if (allowPing(pane)) {
                         notify(
                             NotifyPolicy.EVERY_MESSAGE, agent ?: name,
                             text.replace(Regex("\\s+"), " ").take(120), agent, pane,
@@ -307,7 +353,7 @@ class Notify(private val app: App) {
                     }
                 }
                 role == "tool" && !ignoreToolCalls && !turnEnd ->
-                    notify(
+                    if (allowPing(pane)) notify(
                         NotifyPolicy.EVERY_MESSAGE, agent ?: name,
                         "tool: " + m.optString("tool_name", "tool"), agent, pane,
                     )
@@ -555,7 +601,7 @@ class Notify(private val app: App) {
         /** MonitorService intent action for notification buttons. */
         const val ACTION_ASK = "dev.ranch.android.NOTIFY_ASK"
         /** Post-prime silence for history-replay bursts (see onChat). */
-        const val QUIET_WINDOW_MS = 1_500L
+        const val QUIET_WINDOW_MS = 3_000L
     }
 }
 
