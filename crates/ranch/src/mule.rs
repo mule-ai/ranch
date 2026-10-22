@@ -257,6 +257,7 @@ fn write_row(w: &PipeWriter, pane: Uuid, text: &str) {
                 created_at: Some(now_iso()),
                 attachments: None,
                 image_refs: None,
+                pinned: None,
             }],
             reset: false,
         },
