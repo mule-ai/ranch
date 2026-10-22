@@ -362,6 +362,10 @@ object Term {
         val createdAt: String?,
         val attachments: List<String>?,
         val imageRefs: List<String>?,
+        /** Forge migration 034: the row belongs to a check-in the
+         *  agent expanded (pin_checkin tool) or notified during — the
+         *  chat renders such check-ins expanded instead of collapsed. */
+        val pinned: Boolean = false,
     )
 
     data class ModelChoice(
@@ -717,5 +721,6 @@ object Term {
             createdAt = o.optString("created_at").takeIf { it.isNotEmpty() },
             attachments = strList(o, "attachments"),
             imageRefs = strList(o, "image_refs"),
+            pinned = o.optBoolean("pinned", false),
         )
 }

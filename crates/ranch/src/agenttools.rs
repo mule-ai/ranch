@@ -198,6 +198,7 @@ pub fn agent_done_row(
         created_at: Some(now_iso()),
         attachments: None,
         image_refs: None,
+        pinned: None,
     }
 }
 

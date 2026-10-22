@@ -650,6 +650,7 @@ impl LocalPi {
                     created_at,
                     attachments: None,
                     image_refs: None,
+                    pinned: None,
                 });
             };
 
@@ -1265,6 +1266,7 @@ fn run_pi_reader(stdout: Box<dyn std::io::Read + Send>, t_pane: Uuid, s: PiReade
                                         created_at: ts.clone(),
                                         attachments: None,
                                         image_refs: None,
+                                        pinned: None,
                                     });
                                 };
                             match role {
@@ -1655,6 +1657,7 @@ fn emit_chat(pipe: &PipeWriter, pane: Uuid, role: &str, text: &str, created_at: 
                 created_at: Some(created_at),
                 attachments: None,
                 image_refs: None,
+                pinned: None,
             }],
             reset: false,
         },
@@ -1695,6 +1698,7 @@ fn emit_user_row(
                 created_at: Some(created_at),
                 attachments,
                 image_refs,
+                pinned: None,
             }],
             reset: false,
         },
@@ -1739,6 +1743,7 @@ fn emit_tool(
                 created_at: Some(created_at),
                 attachments: None,
                 image_refs,
+                pinned: None,
             }],
             reset: false,
         },

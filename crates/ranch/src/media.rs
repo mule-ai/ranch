@@ -347,6 +347,7 @@ mod tests {
                 created_at: None,
                 attachments: None,
                 image_refs: None,
+                pinned: None,
             },
             ChatMsg {
                 seq: 2,
@@ -360,6 +361,7 @@ mod tests {
                 created_at: None,
                 attachments: None,
                 image_refs: None,
+                pinned: None,
             },
         ];
         flag_image_refs(&mut msgs);

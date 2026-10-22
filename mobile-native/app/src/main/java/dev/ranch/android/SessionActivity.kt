@@ -1298,14 +1298,102 @@ class SessionActivity : Activity() {
         })
     }
 
+    // ---- collapsible check-ins -------------------------------------
+    //
+    // A scheduled wake turn (the user row mule prefixes with
+    // "[mule wake …]") plus everything the agent writes after it —
+    // usually several messages — folds into one collapsed group, so
+    // background check-ins don't flood the conversation. The group
+    // renders expanded when:
+    //   * any row in it carries pinned (agent's pin_checkin tool, or
+    //     the automatic pin when it posts @notify: mid-check-in), or
+    //   * it contains a @notify: row (notification during a check-in
+    //     = the agent deemed it must-see; also covered by pinned
+    //     server-side but the row check keeps live sessions correct), or
+    //   * the user tapped the header open (remembered per group).
+    // The server's [checkin-pinned] system marker row is hidden.
+
+    private val checkinOverride = HashMap<String, Boolean>() // "pane:startSeq"
+
+    private fun isWakeRow(m: Term.ChatMsg) =
+        m.role == "user" && m.text.startsWith("[mule wake")
+
+    private fun isNotifyRow(m: Term.ChatMsg) =
+        m.role == "user" && m.text.replace(Regex("^\\s+"), "").startsWith("@notify")
+
+    private fun isCheckinMarker(m: Term.ChatMsg) =
+        m.role == "system" && m.text.startsWith("[checkin-pinned]")
+
     private fun renderChat(p: Pane, full: Boolean) {
-        if (full) { chatBox.removeAllViews(); renderedSeq = 0 }
-        for (m in p.chat) {
-            if (m.seq <= renderedSeq) continue   // already on screen
-            chatBox.addView(renderChatMsg(m))
-            renderedSeq = m.seq
+        // Check-in grouping needs whole-history context (wake starts,
+        // pins, notify rows), so always rebuild — the old incremental
+        // watermark could not see a group's boundaries change.
+        chatBox.removeAllViews()
+        renderedSeq = 0
+        var i = 0
+        while (i < p.chat.size) {
+            val m = p.chat[i]
+            if (!isWakeRow(m)) {
+                if (!isCheckinMarker(m)) chatBox.addView(renderChatMsg(m))
+                renderedSeq = m.seq
+                i++
+                continue
+            }
+            // scan the group: wake row through the next wake row or
+            // human user row (notify rows belong to the check-in)
+            var j = i + 1
+            var count = 1
+            var pinned = m.pinned
+            while (j < p.chat.size) {
+                val n = p.chat[j]
+                if (isWakeRow(n) || (n.role == "user" && !isNotifyRow(n) && !isCheckinMarker(n))) break
+                count++
+                if (n.pinned || isCheckinMarker(n) || isNotifyRow(n)) pinned = true
+                j++
+            }
+            val key = "$activePane:${m.seq}"
+            val expanded = checkinOverride[key] ?: pinned
+            chatBox.addView(checkinHeader(p, m, count, pinned, expanded))
+            if (expanded) {
+                for (k in i until j) {
+                    val n = p.chat[k]
+                    if (!isCheckinMarker(n)) chatBox.addView(renderChatMsg(n))
+                }
+            }
+            renderedSeq = p.chat[j - 1].seq
+            i = j
         }
         chatScrollBottom()
+    }
+
+    /** The fold header: tap toggles the check-in open/closed. */
+    private fun checkinHeader(
+        p: Pane, start: Term.ChatMsg, count: Int, pinned: Boolean, expanded: Boolean,
+    ): android.view.View {
+        val when_ = start.createdAt?.let { Regex("T(\\d\\d:\\d\\d)").find(it)?.groupValues?.get(1) } ?: ""
+        val tv = TextView(this).apply {
+            text = buildString {
+                append(if (expanded) "▾" else "▸")
+                append("  ⏰ Scheduled check-in")
+                if (when_.isNotEmpty()) append(" · $when_")
+                append(" · $count msgs")
+                if (pinned) append(" · 📌")
+            }
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            setTextColor(0xFF8ab4f8.toInt())
+            setBackgroundColor(0xFF161b22.toInt())
+            setPadding(dp(10), dp(8), dp(10), dp(8))
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+            ).apply { topMargin = dp(4) }
+            setOnClickListener {
+                val key = "$activePane:${start.seq}"
+                checkinOverride[key] = !expanded
+                renderChat(p, true)
+            }
+        }
+        return tv
     }
 
     /// Scroll to the newest message WITHOUT touching focus —

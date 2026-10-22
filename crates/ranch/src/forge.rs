@@ -215,6 +215,9 @@ fn to_chat_msg(r: &serde_json::Value) -> Option<ChatMsg> {
         }
     });
     let duration_ms = r.get("duration_ms").and_then(|d| d.as_i64());
+    // forge migration 034: check-in expansion marker; only serialize
+    // when true so normal rows keep their wire size
+    let pinned = r.get("pinned").and_then(|p| p.as_bool()).filter(|b| *b);
     let created_at = r
         .get("created_at")
         .and_then(|c| c.as_str())
@@ -246,6 +249,7 @@ fn to_chat_msg(r: &serde_json::Value) -> Option<ChatMsg> {
         created_at,
         attachments: None,
         image_refs,
+        pinned,
     })
 }
 

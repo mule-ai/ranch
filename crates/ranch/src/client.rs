@@ -943,7 +943,7 @@ impl PaneView {
         self.cursor = snap.cursor.map(|c| (c.x, c.y, c.visible));
         self.kind = snap.kind.clone();
         if let Some(chat) = &snap.chat {
-            self.chat = chat.clone();
+            self.chat = chat.iter().filter(|m| !is_checkin_marker(m)).cloned().collect();
         }
         self.model = snap.model.clone();
         self.context = snap.context.clone();
@@ -954,9 +954,12 @@ impl PaneView {
     /// Apply an append-only chat diff from a `chat` frame.
     fn apply_chat(&mut self, msgs: &[ranch_protocol::ChatMsg], reset: bool) {
         if reset {
-            self.chat = msgs.to_vec();
+            self.chat = msgs.iter().filter(|m| !is_checkin_marker(m)).cloned().collect();
         } else {
             for m in msgs {
+                if is_checkin_marker(m) {
+                    continue; // forge check-in pin marker — UI-invisible
+                }
                 if self.chat.last().map(|l| l.seq).is_none_or(|ls| m.seq > ls) {
                     self.chat.push(m.clone());
                 }
@@ -7490,4 +7493,12 @@ mod tests {
             vec!["h", "i", "t", "h", "e", "r", "e"]
         );
     }
+}
+
+/// Forge check-in pin marker (migration 034): a `system` row the
+/// pin_checkin flow inserts to make the fold-expansion visible to
+/// live views. It carries no content — only the mobile check-in UI
+/// consumes it (to expand the group); every other surface hides it.
+fn is_checkin_marker(m: &ranch_protocol::ChatMsg) -> bool {
+    m.role == "system" && m.text.starts_with("[checkin-pinned]")
 }

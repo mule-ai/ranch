@@ -1583,6 +1583,12 @@ pub struct ChatMsg {
     /// registry paths, so any client can fetch the bytes with `FileGet`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_refs: Option<Vec<String>>,
+    /// Forge `messages.pinned` (migration 034): the row belongs to a
+    /// check-in the agent expanded (pin_checkin tool) or notified
+    /// during — mobile renders such check-ins expanded instead of
+    /// collapsed. Only present when true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned: Option<bool>,
 }
 
 /// One window in a session's window stack (M5). A window is a named
@@ -2564,6 +2570,7 @@ mod tests {
                     created_at: None,
                     attachments: None,
                     image_refs: None,
+                    pinned: None,
                 }],
             },
             Frame::AgentClose {
