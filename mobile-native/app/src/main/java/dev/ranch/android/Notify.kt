@@ -161,6 +161,15 @@ class Notify(private val app: App) {
         return true
     }
     private val notifiedAsks = HashSet<String>()
+
+    // "agent|body" -> ms epoch of the last posted notification with
+    // that content. Redelivery (socket resume re-broadcasting private
+    // channel frames) and double-emission (an AgentNotify plus the
+    // same text quoted in the agent's reply) all funnel through
+    // postLocal; the same agent+body within 90 s is the same news.
+    // Survives reconnects (like notifiedAsks) — a resume is precisely
+    // when redeliveries arrive.
+    private val lastNotified = HashMap<String, Long>()
     // pane -> ranch session id, captured from any frame carrying both —
     // notification taps deep-link into the conversation that fired them
     private val paneSession = HashMap<String, String>()
@@ -529,6 +538,18 @@ class Notify(private val app: App) {
                 .takeUnless { it.isNullOrEmpty() }
         }
         val finalTitle = agent?.takeUnless { it.isEmpty() } ?: sname ?: title
+        // content dedup: one post per agent+body per 90 s window
+        val dk = "$finalTitle|$body"
+        val nowMs = System.currentTimeMillis()
+        val last = lastNotified[dk]
+        if (last != null && nowMs - last < 90_000) {
+            skippedOff++
+            return
+        }
+        if (lastNotified.size > 200) {
+            lastNotified.entries.removeAll { nowMs - it.value > 600_000 }
+        }
+        lastNotified[dk] = nowMs
         var notifTag = title
         if (!sid.isNullOrEmpty()) {
             intent.putExtra("open_session", sid)
