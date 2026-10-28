@@ -109,6 +109,9 @@ class CallActivity : Activity() {
         // triggers, and hysteresis (hot/cold gap + streaks) stops the
         // gain flickering on breathy speech.
         private const val MIC_HOT_RMS = 400.0
+        // Uplink attenuation while the speaker is audibly emitting
+        // (echo self-interruption guard, 2026-10-28).
+        private const val UPLINK_ECHO_GAIN = 0.2
         private const val MIC_COLD_RMS = 200.0
         private const val HOT_STREAK_MUTE = 3 // 3 frames ≈ 90 ms of speech
         private const val COLD_STREAK_UNMUTE = 8 // 8 frames ≈ 240 ms trailing silence
@@ -759,7 +762,40 @@ class CallActivity : Activity() {
                 val n = rec.read(buf, 0, buf.size)
                 if (n <= 0) continue
                 if (n < buf.size) System.arraycopy(buf, 0, buf, 0, n)
-                ws?.send(ByteString.of(*buf.copyOf(n))) ?: run {
+                // Echo-aware uplink (2026-10-28 "no audio" report): while
+                // the speaker is AUDIBLY emitting, the mic mostly hears
+                // the AGENT'S OWN voice. Mule's barge-in VAD cannot tell
+                // the difference, so every turn was flushed at playback
+                // start (barge_ins == turns, out_dropped 0). Quiet frames
+                // are attenuated during playback; a genuine (loud)
+                // interruptor still clears mule's 1400 barge threshold.
+                val rms = frameRms(buf, n)
+                var out = buf.copyOf(n)
+                val pl = player
+                if (pl != null && rms < MIC_HOT_RMS) {
+                    val played = try {
+                        pl.playbackHeadPosition.toLong()
+                    } catch (_: Exception) {
+                        0L
+                    }
+                    val buffered = bytesRequested.get() - played * 2L
+                    val audible = buffered > FRAME_BYTES ||
+                        SystemClock.uptimeMillis() - lastWriteAt < ECHO_GRACE_MS
+                    if (audible) {
+                        var i = 0
+                        while (i + 1 < n) {
+                            val s = (out[i].toInt() and 0xFF) or
+                                (out[i + 1].toInt() shl 8)
+                            val a = s * UPLINK_ECHO_GAIN
+                            val v = if (a < -32768) -32768
+                                else if (a > 32767) 32767 else a.toInt()
+                            out[i] = (v and 0xFF).toByte()
+                            out[i + 1] = ((v shr 8) and 0xFF).toByte()
+                            i += 2
+                        }
+                    }
+                }
+                ws?.send(ByteString.of(*out)) ?: run {
                     onCallDropped("in socket gone")
                     break
                 }
@@ -767,7 +803,6 @@ class CallActivity : Activity() {
                 // user is speaking so the speaker can't feed their own
                 // voice back into the mic. Capture-thread only; the
                 // AudioTrack volume is safe to set from any thread.
-                val rms = frameRms(buf, n)
                 when {
                     rms >= MIC_HOT_RMS -> { hotStreak++; coldStreak = 0 }
                     rms < MIC_COLD_RMS -> { coldStreak++; hotStreak = 0 }
