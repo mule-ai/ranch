@@ -177,6 +177,16 @@ class Notify(private val app: App) {
     // turn-end notification carries it so the ping lands on the LAST
     // message (with the actual reply), not the first
     private val turnLast = HashMap<String, String>()
+    // pane -> max created_at (ms epoch) ever observed for its chat rows.
+    // A row may only notify when its wall-clock ts ADVANCES this mark:
+    // opening a herd agent re-arms the forge SSE watch from seq 0 and
+    // the whole history streams back as per-row frames on a fresh pane
+    // key, where the seq/baseline heuristics misjudge a long catch-up
+    // (300+ rows outrun any fixed quiet window). Wall clock never lies:
+    // rows older than the mark — or older than STALE_NOTIFY_MS — are
+    // backlog, not news. Rows without a parseable ts fall back to the
+    // seq guards (local pi panes).
+    private val hwmTs = HashMap<String, Long>()
     // H6.1 task_done: forge_task item ids currently in the ActivityPush
     // set; an id leaving the set = its forge task went terminal
     private val seenTasks = HashSet<String>()
@@ -283,12 +293,14 @@ class Notify(private val app: App) {
             lastSeq[pane] = maxSeq
             primed.add(pane)
             quietStart.remove(pane)
+            observeTs(pane, msgs)
             return
         }
         if (!primed.contains(pane)) {
             lastSeq[pane] = maxSeq
             primed.add(pane)
             quietStart[pane] = System.currentTimeMillis()
+            observeTs(pane, msgs)
             return
         }
         // Quiet window: the backlog replay that follows a prime
@@ -301,6 +313,7 @@ class Notify(private val app: App) {
         val qs = quietStart[pane]
         if (qs != null && System.currentTimeMillis() - qs < QUIET_WINDOW_MS) {
             lastSeq[pane] = maxOf(lastSeq[pane] ?: 0L, maxSeq)
+            observeTs(pane, msgs)
             skippedOff++
             return
         }
@@ -321,6 +334,7 @@ class Notify(private val app: App) {
         if (replay) {
             lastSeq[pane] = maxOf(base, maxSeq)
             quietStart[pane] = System.currentTimeMillis()
+            observeTs(pane, msgs)
             skippedOff++
             return
         }
@@ -332,7 +346,15 @@ class Notify(private val app: App) {
         }
         if (fresh.isEmpty()) return
         lastSeq[pane] = maxSeq
+        val nowMs = System.currentTimeMillis()
+        var hwm = hwmTs[pane] ?: Long.MIN_VALUE
         for (m in fresh) {
+            val ts = rowTs(m)
+            if (ts != null) {
+                if (ts <= hwm) continue                       // row already processed once
+                hwm = maxOf(hwm, ts)
+                if (nowMs - ts > STALE_NOTIFY_MS) continue    // replayed backlog, not news
+            }
             val role = m.optString("role")
             val text = m.optString("text")
             when {
@@ -368,6 +390,7 @@ class Notify(private val app: App) {
                     )
             }
         }
+        hwmTs[pane] = hwm
     }
 
     /** H6.1: an AgentAskRequest — classify the card lane and post an
@@ -454,6 +477,28 @@ class Notify(private val app: App) {
     }
 
     // ---- gating + posting ----
+
+    private fun rowTs(m: JSONObject): Long? {
+        val raw = m.optString("created_at", "")
+        if (raw.isEmpty()) return null
+        return try {
+            java.time.Instant.parse(raw).toEpochMilli()
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    /** Fold a frame's row timestamps into the pane's high-water mark
+     *  without notifying — used on every silent (prime/fold/reset) path
+     *  so a later live row (strictly newer ts) still clears the gate. */
+    private fun observeTs(pane: String, msgs: org.json.JSONArray) {
+        var hwm = hwmTs[pane] ?: Long.MIN_VALUE
+        var moved = false
+        for (i in 0 until msgs.length()) {
+            rowTs(msgs.getJSONObject(i))?.let { if (it > hwm) { hwm = it; moved = true } }
+        }
+        if (moved) hwmTs[pane] = hwm
+    }
 
     private fun notify(
         kind: String,
@@ -622,7 +667,13 @@ class Notify(private val app: App) {
         /** MonitorService intent action for notification buttons. */
         const val ACTION_ASK = "dev.ranch.android.NOTIFY_ASK"
         /** Post-prime silence for history-replay bursts (see onChat). */
-        const val QUIET_WINDOW_MS = 3_000L
+        const val QUIET_WINDOW_MS = 10_000L
+        // Wall-clock freshness bound for notifying a chat row at all.
+        // A backlog replay (herd agent open re-arms the SSE watch) can
+        // deliver yesterday's rows as "new seq" frames on a fresh pane
+        // key; no row older than this may ping — live rows are inserted
+        // at completion, so genuine news is always well inside.
+        const val STALE_NOTIFY_MS = 180_000L
     }
 }
 
