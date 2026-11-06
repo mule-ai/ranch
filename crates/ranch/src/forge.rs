@@ -83,6 +83,18 @@ pub enum ForgeJob {
         forge_sid: Uuid,
         text: String,
     },
+    /// Page OLDER chat rows straight from forge (GET /messages) when the
+    /// daemon's pane buffer (last ~200 rows, bulk-prelude sized) cannot
+    /// satisfy a `ChatHistory before=` request. Worker writes the
+    /// `ChatHistoryOk` itself, echoing req_id + the RANCH pane string.
+    HistoryPage {
+        req_id: String,
+        /// ranch chat-pane id (echoed back for client matching)
+        pane: String,
+        forge_sid: Uuid,
+        before: i64,
+        limit: u32,
+    },
     /// List resumable forge sessions (GET /sessions).
     List { req_id: String },
     /// Model catalog + effective model for a chat pane's forge session.
@@ -1130,8 +1142,9 @@ pub fn spawn_worker(cfg: ForgeConfig, pipe_w: std::fs::File, rx: mpsc::Receiver<
                                 .unwrap_or(0),
                         );
                         if seed == 0 {
-                            if let Some((rows, head)) = fetch_history_page(&cfg, forge_sid, 200) {
-                                seed = head;
+                            if let Some((rows, head, _more)) =
+                                fetch_history_page(&cfg, forge_sid, 200, None)
+                            {                                seed = head;
                                 if let Ok(mut m) = sid_hwm.lock() {
                                     let e = m.entry(forge_sid).or_insert(0);
                                     if head > *e {
@@ -1215,6 +1228,39 @@ pub fn spawn_worker(cfg: ForgeConfig, pipe_w: std::fs::File, rx: mpsc::Receiver<
                         // the working indicator starts as soon as the
                         // POST is accepted; rows land via the SSE stream
                         write_agent_status(&pipe, pane, "working");
+                    }
+                    ForgeJob::HistoryPage {
+                        req_id,
+                        pane,
+                        forge_sid,
+                        before,
+                        limit,
+                    } => {
+                        // deep scrollback: older than the pane buffer
+                        // holds — fetch from forge on a helper thread so
+                        // the job loop keeps flowing
+                        let h_cfg = ForgeConfig {
+                            base: cfg.base.clone(),
+                            key: cfg.key.clone(),
+                            profile: cfg.profile.clone(),
+                        };
+                        let h_pipe = pipe.clone();
+                        std::thread::spawn(move || {
+                            let cap = (limit.clamp(1, 200)) as usize;
+                            if let Some((msgs, _head, has_more)) =
+                                fetch_history_page(&h_cfg, forge_sid, cap, Some(before))
+                            {
+                                write_frame(
+                                    &h_pipe,
+                                    &Frame::ChatHistoryOk {
+                                        req_id,
+                                        pane,
+                                        msgs,
+                                        has_more,
+                                    },
+                                );
+                            }
+                        });
                     }
                     ForgeJob::List { req_id } => match http_json(&cfg, "GET", "/sessions", None) {
                         Ok(v) => {
@@ -1708,7 +1754,8 @@ fn fetch_history_page(
     cfg: &ForgeConfig,
     forge_sid: Uuid,
     cap: usize,
-) -> Option<(Vec<ChatMsg>, i64)> {
+    before: Option<i64>,
+) -> Option<(Vec<ChatMsg>, i64, bool)> {
     let url = format!("{}/messages?session_id={}", cfg.base, forge_sid);
     let v: serde_json::Value = ureq::get(&url)
         .header("X-API-Key", &cfg.key)
@@ -1723,9 +1770,16 @@ fn fetch_history_page(
         .filter_map(|r| r.get("sequence").and_then(|s| s.as_i64()))
         .max()
         .unwrap_or(0);
-    let start = arr.len().saturating_sub(cap);
-    let msgs: Vec<ChatMsg> = arr[start..].iter().filter_map(to_chat_msg).collect();
-    Some((msgs, head))
+    let filtered: Vec<&serde_json::Value> = arr
+        .iter()
+        .filter(|r| {
+            before.is_none_or(|b| r.get("sequence").and_then(|s| s.as_i64()).unwrap_or(0) < b)
+        })
+        .collect();
+    let start = filtered.len().saturating_sub(cap);
+    let has_more = start > 0;
+    let msgs: Vec<ChatMsg> = filtered[start..].iter().filter_map(|r| to_chat_msg(r)).collect();
+    Some((msgs, head, has_more))
 }
 
 /// Send a user message (job thread only — blocking).
@@ -2482,6 +2536,51 @@ mod tests {
             &message_event(3, "user", "old"),
         );
         assert_eq!(state.hwm.lock().unwrap().get(&state.forge_sid).copied(), Some(7));
+    }
+
+    /// Deep scrollback (phase 2): a `before=` window past the pane
+    /// buffer is served from forge's full history — the slice is the
+    /// LAST `cap` rows under `before`, oldest first, and `has_more`
+    /// reports rows older than the slice still exist.
+    #[test]
+    fn fetch_history_page_before_slices_and_flags_has_more() {
+        let seen = Arc::new(Mutex::new(String::new()));
+        let rows = (1..=7i64)
+            .map(|i| {
+                format!(
+                    r#"{{"sequence":{},"role":"assistant","content":"m{}","created_at":"2026-11-06T00:00:00Z"}}"#,
+                    i, i
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let cfg = mock_forge(&format!(r#"{{"messages":[{rows}]}}"#), seen.clone());
+        let sid = Uuid::new_v4();
+        let (msgs, head, has_more) = fetch_history_page(&cfg, sid, 2, Some(4)).unwrap();
+        assert_eq!(head, 7, "head is the conversation head, not the slice");
+        assert_eq!(
+            msgs.iter().map(|m| m.seq).collect::<Vec<_>>(),
+            vec![2, 3],
+            "last `cap` rows under `before`, oldest first"
+        );
+        assert!(has_more, "rows 1..2 remain under the slice");
+
+        // no `before` (bulk prelude): tail page, nothing older flagged
+        let seen2 = Arc::new(Mutex::new(String::new()));
+        let rows2 = (1..=3i64)
+            .map(|i| {
+                format!(
+                    r#"{{"sequence":{},"role":"user","content":"q{}","created_at":"2026-11-06T00:00:00Z"}}"#,
+                    i, i
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let cfg2 = mock_forge(&format!(r#"{{"messages":[{rows2}]}}"#), seen2);
+        let (msgs, head, has_more) = fetch_history_page(&cfg2, sid, 200, None).unwrap();
+        assert_eq!(head, 3);
+        assert_eq!(msgs.len(), 3);
+        assert!(!has_more);
     }
 
     #[test]

@@ -473,6 +473,21 @@ class MainActivity : Activity() {
         herdBox = hBox
         stateBox.addView(hBox)
         renderHerd()
+        // phase 2 (2026-11-06): prefill the flock from the persistent
+        // mirror — a cold start shows the herd immediately (last known
+        // registry), and the live AgentListOk below replaces it the
+        // moment the daemon answers.
+        try {
+            if (herdAgents.isEmpty()) {
+                val (cached, _) = Mirror.get(this).getAgents()
+                if (cached.isNotEmpty()) {
+                    for (o in cached) herdAgents.add(Term.parseAgentInfo(o))
+                    herdAgents.sortByDescending { it.lastActive ?: "" }
+                    renderHerd()
+                }
+            }
+        } catch (e: Exception) {
+        }
         Monitor.relay?.send(Term.agentList())
 
         stateBox.addView(TextView(this).apply {

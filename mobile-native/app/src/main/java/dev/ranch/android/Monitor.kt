@@ -159,6 +159,12 @@ class RelaySession(
             trackAsks(frame)
             for (s in sinks) s(frame)
             notify.onFrame(frame, Monitor.machineName.ifEmpty { "agent" })
+            // persistent render mirror (phase 2): what the phone was
+            // shown survives app restarts — cold opens paint from disk
+            try {
+                Mirror.get(app).onFrame(frame)
+            } catch (e: Exception) {
+            }
         },
         onStatus = { status: String -> Monitor.status = status },
     )

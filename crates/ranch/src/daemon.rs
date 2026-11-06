@@ -5191,7 +5191,6 @@ impl Daemon {
             },
             // ----- agent registry (Herd H1) -----
             Frame::AgentList { req_id } => {
-                eprintln!("DEBUG: handle_frame AgentList {req_id}");
                 match &self.forge_tx {
                     Some(tx) => {
                         let _ = tx.send(forge::ForgeJob::AgentList {
@@ -6466,7 +6465,7 @@ impl Daemon {
                     Ok(p) => p,
                     Err(_) => return,
                 };
-                let page = self
+                let (page, deep) = self
                     .resolve_session(session)
                     .and_then(|s| s.chats.get(&pid))
                     .map(|cp| {
@@ -6477,8 +6476,35 @@ impl Daemon {
                             .filter(|m| before.is_none_or(|b| m.seq < b))
                             .collect();
                         let start = rows.len().saturating_sub(lim);
-                        (rows[start..].iter().cloned().cloned().collect(), start > 0)
-                    });
+                        let page: (Vec<ChatMsg>, bool) = (
+                            rows[start..].iter().cloned().cloned().collect(),
+                            start > 0,
+                        );
+                        // deep page: the pane buffer (sized to the bulk
+                        // prelude, ~200 rows) cannot satisfy this
+                        // `before=` window — let the worker answer it
+                        // from forge's full history
+                        let deep = match (before, page.0.is_empty()) {
+                            (Some(b), true) if cp.forge_sid != Uuid::nil() => {
+                                Some((cp.forge_sid, b, *limit))
+                            }
+                            _ => None,
+                        };
+                        (Some(page), deep)
+                    })
+                    .unwrap_or((None, None));
+                if let Some((fsid, b, lim)) = deep {
+                    if let Some(tx) = &self.forge_tx {
+                        let _ = tx.send(forge::ForgeJob::HistoryPage {
+                            req_id: req_id.clone(),
+                            pane: pid.to_string(),
+                            forge_sid: fsid,
+                            before: *b,
+                            limit: lim,
+                        });
+                    }
+                    return;
+                }
                 if let Some(c) = self.clients.get_mut(&from) {
                     match page {
                         Some((msgs, has_more)) => {

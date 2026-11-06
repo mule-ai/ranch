@@ -347,7 +347,7 @@ class Notify(private val app: App) {
         if (fresh.isEmpty()) return
         lastSeq[pane] = maxSeq
         val nowMs = System.currentTimeMillis()
-        var hwm = hwmTs[pane] ?: Long.MIN_VALUE
+        var hwm = hwmTs[pane] ?: seedHwm(pane)
         for (m in fresh) {
             val ts = rowTs(m)
             if (ts != null) {
@@ -391,6 +391,7 @@ class Notify(private val app: App) {
             }
         }
         hwmTs[pane] = hwm
+        if (hwm != Long.MIN_VALUE) app.prefs.set("hwm:$pane", hwm.toString())
     }
 
     /** H6.1: an AgentAskRequest — classify the card lane and post an
@@ -492,12 +493,24 @@ class Notify(private val app: App) {
      *  without notifying — used on every silent (prime/fold/reset) path
      *  so a later live row (strictly newer ts) still clears the gate. */
     private fun observeTs(pane: String, msgs: org.json.JSONArray) {
-        var hwm = hwmTs[pane] ?: Long.MIN_VALUE
+        var hwm = hwmTs[pane] ?: seedHwm(pane)
         var moved = false
         for (i in 0 until msgs.length()) {
             rowTs(msgs.getJSONObject(i))?.let { if (it > hwm) { hwm = it; moved = true } }
         }
-        if (moved) hwmTs[pane] = hwm
+        if (moved) {
+            hwmTs[pane] = hwm
+            app.prefs.set("hwm:$pane", hwm.toString())
+        }
+    }
+
+    /** Watermarks survive process death: prefs keeps the last row
+     *  timestamp per pane, so an app kill + relaunch mid-replay cannot
+     *  resurrect yesterday's rows as news. */
+    private fun seedHwm(pane: String): Long {
+        val v = app.prefs.get("hwm:$pane", "").toLongOrNull() ?: Long.MIN_VALUE
+        hwmTs[pane] = v
+        return v
     }
 
     private fun notify(

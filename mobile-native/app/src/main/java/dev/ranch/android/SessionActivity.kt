@@ -677,6 +677,19 @@ class SessionActivity : Activity() {
             val chat = p.optJSONArray("chat")
                 ?.let { a -> (0 until a.length()).map { Term.parseChatMsg(a.getJSONObject(it)) }.toMutableList() }
                 ?: mutableListOf()
+            // phase 2 (2026-11-06): the daemon's pane cache is empty on
+            // a cold daemon (before its bulk prelude lands) — paint the
+            // mirror's copy now; live Chat/reset frames reconcile by
+            // seq the instant they arrive, so this is never stale truth,
+            // just earlier pixels.
+            if (chat.isEmpty() && kind != "pty") {
+                try {
+                    for (o in Mirror.get(this@SessionActivity).getChat(id)) {
+                        chat.add(Term.parseChatMsg(o))
+                    }
+                } catch (e: Exception) {
+                }
+            }
             next[id] = Pane(
                 kind = kind,
                 cols = p.optInt("cols", 80),
