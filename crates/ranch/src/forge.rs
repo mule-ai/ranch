@@ -151,6 +151,14 @@ struct WatchState {
     /// forge re-sends catch-up rows after every reconnect and
     /// dedupes by sequence server-side too)
     last_seq: AtomicI64,
+    /// forge_sid -> highest sequence ever DELIVERED by any watch of this
+    /// forge session (shared across the worker's watch threads, lives as
+    /// long as the worker). Seeds new watches so re-opening a pane after
+    /// its watch thread died re-arms the SSE tail instead of replaying
+    /// the whole history row-by-row through the relay (slow mobile
+    /// open, 2026-11-06). A never-seen session seeds 0 and gets the
+    /// bulk-history prelude instead.
+    hwm: Arc<Mutex<std::collections::HashMap<Uuid, i64>>>,
     stop: AtomicBool,
     /// bumped on every "working" signal; delayed idle timers no-op if
     /// the generation moved on (a new turn started)
@@ -338,6 +346,14 @@ fn handle_event(
                 return; // reconnect catch-up duplicate
             }
             state.last_seq.store(msg.seq, Ordering::Relaxed);
+            // keep the shared per-session high-water so a future watch
+            // (pane re-open after this thread dies) arms at the tail
+            if let Ok(mut m) = state.hwm.lock() {
+                let e = m.entry(state.forge_sid).or_insert(0);
+                if msg.seq > *e {
+                    *e = msg.seq;
+                }
+            }
             // NB: history replay (a watch armed with since=0) arrives
             // here as one Chat frame per row. Those frames must NOT
             // carry reset:true (clients treat a reset Chat as "the
@@ -1075,6 +1091,11 @@ pub fn spawn_worker(cfg: ForgeConfig, pipe_w: std::fs::File, rx: mpsc::Receiver<
     let pipe: PipeWriter = Arc::new(Mutex::new(pipe_w));
     std::thread::spawn(move || {
         let mut threads: Vec<(Uuid, Arc<WatchState>)> = Vec::new();
+        // forge_sid -> highest sequence ever delivered by ANY watch of
+        // that session; survives pane unwatch/thread death (slow-open
+        // fix, 2026-11-06). Lives for the worker's lifetime.
+        let sid_hwm: Arc<Mutex<std::collections::HashMap<Uuid, i64>>> =
+            Arc::new(Mutex::new(std::collections::HashMap::new()));
         loop {
             match rx.recv() {
                 Ok(job) => match job {
@@ -1094,6 +1115,43 @@ pub fn spawn_worker(cfg: ForgeConfig, pipe_w: std::fs::File, rx: mpsc::Receiver<
                             .map(|(_, st)| st.last_seq.load(Ordering::Relaxed))
                             .max()
                             .unwrap_or(0);
+                        // no live sibling: fall back to the persistent
+                        // per-session high-water, and for a session the
+                        // worker has NEVER streamed, deliver the last
+                        // page of history as ONE reset frame and arm the
+                        // tail at its head — instead of 300+ per-row
+                        // Chat frames dribbling through the relay while
+                        // the phone re-renders on every one.
+                        let mut seed = seed.max(
+                            sid_hwm
+                                .lock()
+                                .ok()
+                                .and_then(|m| m.get(&forge_sid).copied())
+                                .unwrap_or(0),
+                        );
+                        if seed == 0 {
+                            if let Some((rows, head)) = fetch_history_page(&cfg, forge_sid, 200) {
+                                seed = head;
+                                if let Ok(mut m) = sid_hwm.lock() {
+                                    let e = m.entry(forge_sid).or_insert(0);
+                                    if head > *e {
+                                        *e = head;
+                                    }
+                                }
+                                if !rows.is_empty() {
+                                    write_frame(
+                                        &pipe,
+                                        &Frame::Chat {
+                                            id: String::new(),
+                                            session: String::new(), // filled by the main loop
+                                            pane: pane.to_string(),
+                                            msgs: rows,
+                                            reset: true,
+                                        },
+                                    );
+                                }
+                            }
+                        }
                         if let Some((_, old)) = threads
                             .iter()
                             .position(|(_, st)| st.pane == pane)
@@ -1105,6 +1163,7 @@ pub fn spawn_worker(cfg: ForgeConfig, pipe_w: std::fs::File, rx: mpsc::Receiver<
                             pane,
                             forge_sid,
                             last_seq: AtomicI64::new(seed),
+                            hwm: sid_hwm.clone(),
                             stop: AtomicBool::new(false),
                             turn_gen: AtomicU64::new(0),
                             background_turn: AtomicBool::new(false),
@@ -1637,6 +1696,36 @@ fn format_k(n: i64) -> String {
     } else {
         n.to_string()
     }
+}
+
+/// Bulk-history prelude (2026-11-06 slow-open fix): fetch the last
+/// `cap` rows of a forge conversation in one GET (the SSE `message`
+/// rows and the `GET /messages` table rows share a shape, so
+/// `to_chat_msg` maps both). Returns (oldest-first page, head
+/// sequence); None on any transport/parsing failure — the caller then
+/// arms from 0 and the old per-row replay still works as degradation.
+fn fetch_history_page(
+    cfg: &ForgeConfig,
+    forge_sid: Uuid,
+    cap: usize,
+) -> Option<(Vec<ChatMsg>, i64)> {
+    let url = format!("{}/messages?session_id={}", cfg.base, forge_sid);
+    let v: serde_json::Value = ureq::get(&url)
+        .header("X-API-Key", &cfg.key)
+        .call()
+        .ok()?
+        .into_body()
+        .read_json()
+        .ok()?;
+    let arr = v.get("messages")?.as_array()?;
+    let head = arr
+        .iter()
+        .filter_map(|r| r.get("sequence").and_then(|s| s.as_i64()))
+        .max()
+        .unwrap_or(0);
+    let start = arr.len().saturating_sub(cap);
+    let msgs: Vec<ChatMsg> = arr[start..].iter().filter_map(to_chat_msg).collect();
+    Some((msgs, head))
 }
 
 /// Send a user message (job thread only — blocking).
@@ -2328,6 +2417,7 @@ mod tests {
             pane: Uuid::new_v4(),
             forge_sid: Uuid::new_v4(),
             last_seq: AtomicI64::new(0),
+            hwm: Arc::new(Mutex::new(std::collections::HashMap::new())),
             stop: AtomicBool::new(false),
             turn_gen: AtomicU64::new(0),
             background_turn: AtomicBool::new(false),
@@ -2361,6 +2451,37 @@ mod tests {
             .filter(|l| !l.is_empty())
             .map(|l| serde_json::from_str::<Frame>(l).unwrap_or_else(|e| panic!("decode {l}: {e}")))
             .collect()
+    }
+
+    /// Slow-open fix (2026-11-06): every delivered row advances the
+    /// SHARED per-session high-water, so a watch armed after its
+    /// sibling thread died starts at the tail — and stale/replayed
+    /// rows never roll it backwards.
+    #[test]
+    fn handle_event_advances_shared_hwm() {
+        let (state, pipe, _path) = sse_fixture();
+        let cfg = ForgeConfig {
+            base: "http://127.0.0.1:0".into(),
+            key: "k".into(),
+            profile: None,
+        };
+        handle_event(
+            &state,
+            &cfg,
+            &pipe,
+            "message",
+            &message_event(7, "assistant", "news"),
+        );
+        assert_eq!(state.hwm.lock().unwrap().get(&state.forge_sid).copied(), Some(7));
+        // a stale replay row must not regress the mark
+        handle_event(
+            &state,
+            &cfg,
+            &pipe,
+            "message",
+            &message_event(3, "user", "old"),
+        );
+        assert_eq!(state.hwm.lock().unwrap().get(&state.forge_sid).copied(), Some(7));
     }
 
     #[test]
