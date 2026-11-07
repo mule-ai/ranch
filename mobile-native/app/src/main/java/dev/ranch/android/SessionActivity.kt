@@ -1383,7 +1383,7 @@ class SessionActivity : Activity() {
     private fun checkinHeader(
         p: Pane, start: Term.ChatMsg, count: Int, pinned: Boolean, expanded: Boolean,
     ): android.view.View {
-        val when_ = start.createdAt?.let { Regex("T(\\d\\d:\\d\\d)").find(it)?.groupValues?.get(1) } ?: ""
+        val when_ = fmtTime(start.createdAt)
         val tv = TextView(this).apply {
             text = buildString {
                 append(if (expanded) "▾" else "▸")
@@ -1646,9 +1646,22 @@ class SessionActivity : Activity() {
     private fun fmtTime(iso: String?): String {
         if (iso.isNullOrEmpty()) return ""
         return try {
-            java.time.format.DateTimeFormatter.ofPattern("HH:mm")
-                .withZone(java.time.ZoneId.systemDefault())
-                .format(java.time.Instant.parse(iso))
+            val zdt = java.time.Instant.parse(iso)
+                .atZone(java.time.ZoneId.systemDefault())
+            val hm = java.time.format.DateTimeFormatter.ofPattern("HH:mm")
+                .format(zdt)
+            val today = java.time.LocalDate.now()
+            when (zdt.toLocalDate()) {
+                today -> hm
+                today.minusDays(1) -> "Yesterday $hm"
+                else -> {
+                    val df = java.time.format.DateTimeFormatter.ofPattern(
+                        if (zdt.year == today.year) "MMM d" else "MMM d, yyyy",
+                        java.util.Locale.US,
+                    )
+                    "${df.format(zdt)} · $hm"
+                }
+            }
         } catch (_: Exception) { "" }
     }
 
