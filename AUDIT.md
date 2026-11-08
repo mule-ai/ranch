@@ -37,4 +37,4 @@
 19. 05:07Z: 'TRIPLE' label on 4-item armed line (narrated-count slip).
 20. 08:06Z: octal-crash in echo harness ('08'/'09' kill $((%2))); silent-default-if-suppressed = invisible false claim. FIX: 10#-base always + visible stderr. (Proven at 09h wake.)
 
-## User-pings today (Nov-8): 8 — [1–7 per v2 lineage incl. day-25 gate] + **#8 13:2xZ mule wake-engine DOWN (sev2)**.
+## User-pings today (Nov-8): 9 — [1–7 per v2 lineage incl. day-25 gate] + #8 13:2xZ mule-DOWN (sev2) + #9 15:50Z recovery-update (bundles sev2-resolved + F-027 + sev3-fallback — ONE ping for three items; verdict-row "9,10" was a count-of-notifications-vs-items slip, corrected same-turn per F-020).
