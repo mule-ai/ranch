@@ -1,6 +1,6 @@
-# Build release artifacts and publish them to the ranch-dist repo,
-# which the website links to. Runs on every push to main (nightly
-# releases tagged main-<short-sha>), on version tags (v*), and manually.
+# Build release artifacts and publish them to the ranch-dist repo, which
+# the website links to. Runs on version tags (v*) and manual dispatch ONLY
+# — never on plain pushes to main (see the `on:` block rationale).
 #
 # Required secrets:
 #   DIST_TOKEN — a PAT (fine-grained: contents rw on mule-ai/ranch-dist)
@@ -10,7 +10,11 @@ name: release
 
 on:
   push:
-    branches: [main]
+    # Explicit releases only: a `v*` tag (cut deliberately alongside a
+    # versionCode/versionName bump in app/build.gradle.kts) or a manual
+    # dispatch. NOT every push to main — the herd agents push to main
+    # hourly (steward journal commits), and per-push publishing turned
+    # the phone's update banner into hourly nag spam (2026-11-09).
     tags: ["v*"]
   workflow_dispatch:
 
